@@ -121,5 +121,17 @@ self_heal:                    # when a run fails: diagnose why, then retry with 
 approval:
   timeout_s: 3600             # dashboard approval requests auto-decline after this long
 
+# `swarmforge watch`: label a GitHub issue to hand it to the swarm. It is queued, labelled
+# swarmforge:queued -> working -> done/failed, and gets a comment with the summary and the draft PR.
+watch:
+  repos: []            # owner/name of each repository to watch
+  label: swarmforge
+  interval_s: 120
+  approval: dashboard       # dashboard = ask before pushing; yes = push the draft PR automatically
+  comment: true
+
+# Agent variant (from `swarmforge variants`) applied to every run; set with `swarmforge variants use ID`.
+# active_variant: v3
+
 # Where clones, worktrees, transcripts, logs and the SQLite DB live.
 workdir: ~/.swarmforge

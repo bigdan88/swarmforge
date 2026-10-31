@@ -138,6 +138,50 @@ process in it when the agent finishes. The tools need the rebuilt sandbox image
   whenever a run failed, needed repairs or had problems; failed runs also get a post-mortem note; and
   every run gets a run-log note containing its request and summary.
 
+## Hand issues over with a label (`swarmforge watch`)
+
+List repositories under `watch: repos:` in `swarmforge.yaml`, then run `swarmforge watch` (leave it
+running; `--once` polls a single time). Adding the `swarmforge` label to an issue queues it; the issue
+is relabelled `swarmforge:queued` -> `swarmforge:working` -> `swarmforge:done`/`swarmforge:failed`,
+and SwarmForge comments when it's queued and when it finishes (summary + draft PR link). The run reads
+the issue from GitHub, so the PR says "Addresses #N". Pushing still waits for your approval unless
+`watch.approval: yes`. The token needs Issues: write for labels and comments. Re-add the label to
+retry. (Modelled on the OpenHands issue resolver, but the agents run on your machine.)
+
+## SWE-bench Lite (`swarmforge swebench`)
+
+```
+swarmforge swebench fetch --limit 10            # task instances (problem statements only)
+swarmforge swebench run --label try1 --limit 3  # one full run per instance -> predictions.jsonl
+swarmforge swebench eval --label try1           # official harness: resolved / total
+```
+Agents see only the issue text. Patches exclude test files (the harness applies its own tests). The
+evaluation uses the official harness (`pip install swebench`, needs Docker; on Windows run it in WSL
+with the command `eval` prints, then run `eval` again to record the result). Results are stored as a
+benchmark and on the variant the runs used. Limitation: the sandbox doesn't reproduce each project's
+test environment, so agents often can't run the project's tests while working. Each instance is a full
+run: start with a few.
+
+## Variants and the evolve loop (`swarmforge variants`)
+
+A variant is a validated overlay on `swarmforge.yaml`: per-role models and step/time limits, team limits
+(tasks, repair cycles, concurrency, retries) and extra prompt guidance per role group (planner,
+developer, tester, reviewer, librarian). Sandbox, network, GitHub, budget and approval settings can't
+be changed by a variant. All variants are kept in an archive with their scores, as in the Darwin
+Gödel Machine:
+
+```
+swarmforge variants list                     # tree of variants with scores
+swarmforge variants eval v0                  # score the base config on bench/suite.yaml
+swarmforge variants evolve --generations 3   # pick a parent (high score, few children), let the
+                                             # planner model propose one change, score it, archive it
+swarmforge variants show v3                  # overlay, rationale, scores
+swarmforge variants use v3                   # apply it to every run (writes active_variant)
+```
+Score = share of hidden acceptance tests passed on the suite's cases (`bench/suite.yaml`; add cases,
+and use `--runs 2+` because single runs are noisy). SWE-bench results recorded with `swebench eval`
+appear on the variant too. Nothing changes for real runs until you `use` a variant.
+
 ## Speed
 
 Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.

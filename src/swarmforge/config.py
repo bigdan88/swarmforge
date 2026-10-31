@@ -81,6 +81,18 @@ class SandboxConfig:
 
 
 @dataclass
+class WatchConfig:
+    """`swarmforge watch`: turn labelled GitHub issues into queued runs."""
+    repos: list = field(default_factory=list)   # e.g. ["bigdan88/swarmforge"]
+    label: str = "swarmforge"                   # add this label to an issue to hand it to the swarm
+    interval_s: int = 120
+    approval: str = "dashboard"                 # dashboard (ask before pushing) | yes (push the draft PR)
+    budget_usd: float | None = None
+    max_cycles: int | None = None
+    comment: bool = True                        # comment on the issue when queued / finished
+
+
+@dataclass
 class ProjectConfig:
     test_command: str = "python -m pytest -q"
     agent_test_command: str | None = None  # quicker suite agents run while working (optional)
@@ -145,6 +157,10 @@ class Config:
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     self_heal: SelfHealConfig = field(default_factory=SelfHealConfig)
+    watch: WatchConfig = field(default_factory=WatchConfig)
+    active_variant: str | None = None            # variant id from `swarmforge variants` applied to every run
+    prompt_addenda: dict = field(default_factory=dict)   # filled from the active variant (role group -> text)
+    variant_applied: bool = False                # runtime flag: the variant overlay is already applied
     workdir: Path = field(default_factory=lambda: Path("~/.swarmforge").expanduser())
     source_path: Path | None = None
 
@@ -220,6 +236,8 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         knowledge=_build(KnowledgeConfig, raw.get("knowledge"), "knowledge"),
         approval=_build(ApprovalConfig, raw.get("approval"), "approval"),
         self_heal=_build(SelfHealConfig, raw.get("self_heal"), "self_heal"),
+        watch=_build(WatchConfig, raw.get("watch"), "watch"),
+        active_variant=(str(raw["active_variant"]) if raw.get("active_variant") else None),
         workdir=workdir,
         source_path=source_path,
     )

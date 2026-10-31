@@ -114,6 +114,10 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     issue_file.write_text(f"# {item['title']}\n\n{item['body']}\n", encoding="utf-8")
     store.queue_update(item["id"], status="running", run_id=run_id, started_at=time.time(),
                        base_branch=base, note=note)
+    issue_url = item.get("issue_url")
+    src = {"issue_url": issue_url} if issue_url else {"issue_file": str(issue_file), "repo": item["repo"]}
+    if issue_url:
+        _hook("on_run_start", cfg, item, echo=echo)
     def make(cc, seed, ctx=None, heal_of=None, attempt=None):
         orch = Orchestrator(cc, store, mode=item["mode"], echo=echo, llm_transport=llm_transport,
                             sandbox=sandbox, seed_run_id=seed, heal_of=heal_of, heal_attempt=attempt,
@@ -123,15 +127,13 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         else:
             orch.approve = dashboard_approver(store, lambda: orch.run_id, cc.approval.timeout_s)
         return orch
-    await make(c, item.get("seed_run_id")).execute(issue_file=str(issue_file), repo=item["repo"],
-                                                   base_branch=base, run_id=run_id)
+    await make(c, item.get("seed_run_id")).execute(**src, base_branch=base, run_id=run_id)
 
     async def launch(cc, seed, ctx, heal_of, attempt):
         rid = new_run_id()
         store.queue_update(item["id"], run_id=rid, note=(note + "; " if note else "")
                            + f"self-healing attempt {attempt} after {heal_of}")
-        return await make(cc, seed, ctx, heal_of, attempt).execute(
-            issue_file=str(issue_file), repo=item["repo"], base_branch=base, run_id=rid)
+        return await make(cc, seed, ctx, heal_of, attempt).execute(**src, base_branch=base, run_id=rid)
     from .postmortem import heal
     run_id = await heal(c, store, run_id, launch, attempts=item.get("heal_attempts"), echo=echo)
     run = store.get_run(run_id)
@@ -141,7 +143,19 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
                        note=(note + "; " if note else "")
                        + (f"after self-healing attempt {run['heal_attempt']}; " if run.get("heal_attempt") else "")
                        + f"{run['state']}: {(run['state_reason'] or '')[:300]}")
+    if issue_url:
+        _hook("on_run_end", cfg, store, item, run_id, echo=echo)
     return store.queue_item(item["id"])
+
+
+def _hook(name: str, *args, echo=None) -> None:
+    """Update the GitHub issue a watched task came from; never let that break the queue."""
+    from . import watch
+    try:
+        getattr(watch, name)(*args)
+    except Exception as e:  # noqa: BLE001
+        if echo:
+            echo(f"watch: could not update the GitHub issue ({name}): {type(e).__name__}: {e}")
 
 
 async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, sandbox=None,

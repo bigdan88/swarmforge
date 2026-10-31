@@ -89,6 +89,7 @@ def test_dashboard_approval_channel(tmp_path):
     assert quick("again?") is False
 
 
+@pytest.mark.slow  # starts real background processes (~1 min)
 def test_launcher_starts_background_run(tmp_path, monkeypatch, sample_repo):
     from swarmforge.launcher import pid_alive, start_run
     cfg = _write_cfg(tmp_path, monkeypatch)
@@ -114,6 +115,7 @@ def test_launcher_starts_background_run(tmp_path, monkeypatch, sample_repo):
     assert not pid_alive(run["pid"])
 
 
+@pytest.mark.slow  # starts real background processes (~1 min)
 def test_start_run_button_switches_to_runs(tmp_path, monkeypatch, sample_repo):
     cfg = _write_cfg(tmp_path, monkeypatch)
     at = AppTest.from_file(str(APP), default_timeout=60)
@@ -233,6 +235,7 @@ def test_live_settings_for_running_run(tmp_path, monkeypatch):
     assert store.get_run(rid)["cancel_requested"] == 1
 
 
+@pytest.mark.slow  # starts real background processes (~1 min)
 def test_background_queue_worker_processes_and_exits(tmp_path, monkeypatch, sample_repo):
     from swarmforge import runqueue as rq
     from swarmforge.launcher import pid_alive

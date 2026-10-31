@@ -70,6 +70,15 @@ class Orchestrator:
         assert mode in ("swarm", "single")
         self.cfg = copy.deepcopy(config)  # per-run copy: project profiles may adjust it
         self.store = store
+        self._variant_note = None
+        if self.cfg.active_variant and not self.cfg.variant_applied:
+            from .variants import apply_overlay
+            v = store.variant(self.cfg.active_variant)
+            if v:
+                self.cfg = apply_overlay(self.cfg, v["overlay"], v["id"])
+            else:
+                self._variant_note = f"active_variant {self.cfg.active_variant!r} not found; using the base config"
+                self.cfg.active_variant = None
         self._override_test_command = test_command
         self._override_image = sandbox_image
         self._repo_poll_s = 15.0   # how often a waiting run re-checks whether its repository is free
@@ -108,7 +117,7 @@ class Orchestrator:
         self.store.create_run(
             self.run_id, mode=self.mode, issue_url=issue_url or issue_file, run_dir=str(self.run_dir),
             seed_run_id=self.seed_run_id, heal_of=self.heal_of, heal_attempt=self.heal_attempt,
-            budget_usd=self.cfg.limits.budget_usd, pid=os.getpid(),
+            budget_usd=self.cfg.limits.budget_usd, pid=os.getpid(), variant_id=self.cfg.active_variant,
             max_runtime_s=int(self.cfg.limits.max_runtime_s),
             max_repair_cycles=int(self.cfg.limits.max_repair_cycles),
             config_json=json.dumps(_config_snapshot(self.cfg)))
@@ -121,6 +130,10 @@ class Orchestrator:
         self.repo_key: str | None = None
         self.knowledge_block = self.knowledge_dev_block = self.knowledge_review_block = ""
         self.knowledge_used: list[str] = []
+        if self._variant_note:
+            self.log("variant", self._variant_note, level="warn")
+        elif self.cfg.active_variant:
+            self.log("variant", f"using agent variant {self.cfg.active_variant}")
         self.log("run", f"run {self.run_id} started (mode={self.mode}, budget ${self.cfg.limits.budget_usd:.2f}, "
                         f"sandbox: {self.sandbox.describe()})")
         self._started = time.monotonic()
@@ -1092,6 +1105,13 @@ class Orchestrator:
         if announced:
             self.log("queue", f"repository is free after {waited / 60:.0f} min; starting")
 
+    def _prompt_group(self, role: str) -> str:
+        if role in self.cfg.developer_roles:
+            return "developer"
+        if role == self.cfg.librarian_role and role not in ("planner", "reviewer", "tester"):
+            return "librarian"
+        return role
+
     def _exec_tools(self) -> list[str]:
         return EXEC_TOOLS + (DEV_TOOLS if self.cfg.sandbox.dev_tools else [])
 
@@ -1104,6 +1124,9 @@ class Orchestrator:
                      terminal: TerminalTool, ctx: ToolContext, transcript_suffix: str = "") -> AgentResult:
         rc = self.cfg.roles[role]
         name = f"{key}-{role}" + (f"-{transcript_suffix}" if transcript_suffix else "")
+        extra = self.cfg.prompt_addenda.get(self._prompt_group(role))
+        if extra:
+            system = system + "\n\nAdditional guidance for this role:\n" + extra
         spec = AgentSpec(
             role=role, task_key=key, system_prompt=system, user_prompt=user, tools=tools,
             terminal=terminal, ctx=ctx, max_steps=rc.max_steps, timeout_s=rc.timeout_s,

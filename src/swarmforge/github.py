@@ -107,6 +107,38 @@ class GitHubClient:
         except httpx.HTTPError:
             return False
 
+    # ------------------------------------------------ issue labels and comments (`swarmforge watch`)
+    def labeled_issues(self, owner: str, repo: str, label: str) -> list[Issue]:
+        """Open issues (not pull requests) carrying `label`."""
+        r = self._client.get(f"/repos/{owner}/{repo}/issues",
+                             params={"labels": label, "state": "open", "per_page": 50})
+        if r.status_code >= 400:
+            raise GitHubError(f"listing issues of {owner}/{repo} failed: HTTP {r.status_code} {r.text[:300]}")
+        out = []
+        for d in r.json():
+            if "pull_request" in d:
+                continue
+            out.append(Issue(title=d["title"], body=d.get("body") or "", number=d["number"], owner=owner,
+                             repo=repo, url=d.get("html_url"), labels=[l["name"] for l in d.get("labels", [])]))
+        return out
+
+    def add_labels(self, owner: str, repo: str, number: int, labels: list[str]) -> None:
+        r = self._client.post(f"/repos/{owner}/{repo}/issues/{number}/labels", json={"labels": labels})
+        if r.status_code >= 400:
+            raise GitHubError(f"adding labels failed: HTTP {r.status_code} {r.text[:300]}")
+
+    def remove_label(self, owner: str, repo: str, number: int, label: str) -> None:
+        from urllib.parse import quote
+        r = self._client.delete(f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(label, safe='')}")
+        if r.status_code >= 400 and r.status_code != 404:
+            raise GitHubError(f"removing label failed: HTTP {r.status_code} {r.text[:300]}")
+
+    def comment(self, owner: str, repo: str, number: int, body: str) -> str:
+        r = self._client.post(f"/repos/{owner}/{repo}/issues/{number}/comments", json={"body": body[:60_000]})
+        if r.status_code >= 400:
+            raise GitHubError(f"commenting failed: HTTP {r.status_code} {r.text[:300]}")
+        return r.json().get("html_url", "")
+
     def create_draft_pr(self, owner: str, repo: str, head: str, base: str, title: str, body: str) -> str:
         if not self.token:
             raise GitHubError(f"no GitHub token ({self.cfg.token_env}) available")

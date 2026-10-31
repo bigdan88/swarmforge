@@ -1,0 +1,11 @@
+# Benchmark suite for `swarmforge variants eval/evolve`.
+# Each case: an issue, a repository (a template folder copied into a fresh git repo per run, or an
+# existing repo path/URL), and HIDDEN acceptance tests the agents never see. Score = share passed.
+# One case is a weak signal: add more cases (different kinds of work) before trusting the ranking,
+# and use `--runs 2+` to average out noise.
+name: samples
+cases:
+  - name: export-csv-json
+    issue: ../samples/issues/export-csv-json.md
+    repo_template: ../samples/inventory-app
+    acceptance: ../samples/acceptance/export

@@ -588,7 +588,129 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("policy", choices=["stop", "continue"])
     qs.add_parser("work", help="run the queue in this terminal (the dashboard starts it in the background)")
     q.set_defaults(fn=cmd_queue)
+
+    w = sub.add_parser("watch", help="queue GitHub issues that get the watch label (see watch: in the config)")
+    w.add_argument("--once", action="store_true", help="poll once and exit")
+    w.add_argument("--interval", type=int, help="seconds between polls (default watch.interval_s)")
+    w.add_argument("--no-worker", action="store_true", help="only queue; don't start the queue worker")
+    w.set_defaults(fn=cmd_watch)
+
+    sb = sub.add_parser("swebench", help="SWE-bench Lite: fetch tasks, run the swarm, evaluate with the official harness")
+    sbs = sb.add_subparsers(dest="sb_cmd", required=True)
+    x = sbs.add_parser("fetch", help="download task instances (problem statements only)")
+    x.add_argument("--limit", type=int, default=10)
+    x.add_argument("--offset", type=int, default=0)
+    x = sbs.add_parser("run", help="run SwarmForge on the fetched instances and write predictions.jsonl")
+    x.add_argument("--label", required=True, help="name of this attempt (folder under <workdir>/swebench)")
+    x.add_argument("--ids", nargs="*", help="only these instance ids")
+    x.add_argument("--limit", type=int, help="at most this many instances")
+    x.add_argument("--single", action="store_true", help="single-agent baseline instead of the swarm")
+    x.add_argument("--budget", type=float, help="budget per instance (USD)")
+    x.add_argument("--test-command", help="test command inside the sandbox (default: none; the harness tests)")
+    x = sbs.add_parser("eval", help="score predictions with the official harness and record the result")
+    x.add_argument("--label", required=True)
+    x.add_argument("--workers", type=int, default=2)
+    x.add_argument("--variant", help="record the score on this variant (default: the variant the runs used)")
+    sb.set_defaults(fn=cmd_swebench)
+
+    va = sub.add_parser("variants", help="archive of agent variants; evolve them on a benchmark suite")
+    vas = va.add_subparsers(dest="v_cmd", required=True)
+    x = vas.add_parser("list", help="show the variant tree with scores")
+    x.add_argument("--suite", help="show scores for this suite name only")
+    x = vas.add_parser("show", help="show one variant's overlay, rationale and scores")
+    x.add_argument("id")
+    x = vas.add_parser("add", help="add a hand-written variant from a YAML/JSON overlay file")
+    x.add_argument("file")
+    x.add_argument("--parent", default="v0")
+    x.add_argument("--why", default="hand-written")
+    x = vas.add_parser("eval", help="score a variant on a suite")
+    x.add_argument("id")
+    x.add_argument("--suite", default="bench/suite.yaml")
+    x.add_argument("--runs", type=int, default=1, help="runs per case (more = less noise, more cost)")
+    x = vas.add_parser("evolve", help="propose, score and archive new variants (Darwin Gödel Machine style)")
+    x.add_argument("--suite", default="bench/suite.yaml")
+    x.add_argument("--generations", type=int, default=1)
+    x.add_argument("--runs", type=int, default=1)
+    x.add_argument("--seed", type=int)
+    x = vas.add_parser("use", help="make a variant the default for every run (writes active_variant)")
+    x.add_argument("id", help="variant id, or 'none' for the base config")
+    va.set_defaults(fn=cmd_variants)
     return p
+
+
+def cmd_watch(args, cfg) -> int:
+    from .watch import watch
+    try:
+        return watch(cfg, _store(cfg), once=args.once, interval_s=args.interval, start_worker=not args.no_worker)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_swebench(args, cfg) -> int:
+    from . import swebench as sb
+    store = _store(cfg)
+    if args.sb_cmd == "fetch":
+        path = sb.fetch(cfg, limit=args.limit, offset=args.offset)
+        print(f"saved {sum(1 for _ in path.open(encoding='utf-8'))} instance(s) to {path}")
+        return 0
+    if args.sb_cmd == "run":
+        asyncio.run(sb.run_instances(cfg, store, label=args.label, ids=args.ids, limit=args.limit,
+                                     mode="single" if args.single else "swarm", budget=args.budget,
+                                     test_command=args.test_command))
+        return 0
+    return sb.evaluate(cfg, store, label=args.label, workers=args.workers, variant=args.variant)
+
+
+def cmd_variants(args, cfg) -> int:
+    import yaml as _yaml
+    from . import variants as V
+    store = _store(cfg)
+    V.ensure_root(store)
+    if args.v_cmd == "list":
+        print(V.render_archive(store.variants(), args.suite))
+        if cfg.active_variant:
+            print(f"\nactive variant: {cfg.active_variant}")
+        return 0
+    if args.v_cmd == "show":
+        v = store.variant(args.id)
+        if not v:
+            print(f"no variant {args.id}")
+            return 2
+        print(f"{v['id']} (parent {v['parent'] or '-'}, {v['status']})\n{v['rationale'] or ''}\n")
+        print(_yaml.safe_dump(v["overlay"] or {"(empty)": "base configuration"}, sort_keys=False))
+        for s in v["scores"]:
+            print(f"- {s['suite']}: score {s['score']:.2f}, ${s.get('cost_usd', 0):.2f}, runs {len(s.get('runs', []))}")
+        return 0
+    if args.v_cmd == "add":
+        overlay = _yaml.safe_load(Path(args.file).read_text(encoding="utf-8")) or {}
+        errs = V.validate_overlay(overlay, cfg)
+        if errs:
+            print("invalid overlay:\n- " + "\n- ".join(errs))
+            return 2
+        vid = V.next_id(store)
+        store.variant_add(vid, overlay, args.parent, args.why)
+        print(f"added {vid}")
+        return 0
+    if args.v_cmd == "eval":
+        asyncio.run(V.evaluate(cfg, store, args.id, args.suite, runs_per_case=args.runs))
+        return 0
+    if args.v_cmd == "evolve":
+        asyncio.run(V.evolve(cfg, store, args.suite, generations=args.generations, runs_per_case=args.runs,
+                             seed=args.seed))
+        return 0
+    if args.v_cmd == "use":
+        vid = None if args.id.lower() in ("none", "base") else args.id
+        if vid and not store.variant(vid):
+            print(f"no variant {vid}")
+            return 2
+        if cfg.source_path is None:
+            print(f"set `active_variant: {vid}` in your swarmforge.yaml")
+            return 0
+        V.set_active(cfg.source_path, vid)
+        print(f"{cfg.source_path}: active_variant = {vid or '(none: base configuration)'}. "
+              "Restart the dashboard and queue worker to apply it.")
+        return 0
+    return 2
 
 
 def main(argv: list[str] | None = None) -> int:

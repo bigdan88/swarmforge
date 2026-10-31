@@ -163,6 +163,15 @@ CREATE TABLE IF NOT EXISTS queue_items (
     started_at REAL,
     finished_at REAL
 );
+CREATE TABLE IF NOT EXISTS variants (
+    id TEXT PRIMARY KEY,
+    parent TEXT,
+    created_at REAL NOT NULL,
+    overlay TEXT NOT NULL,
+    rationale TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    scores TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE IF NOT EXISTS failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL UNIQUE,
@@ -224,6 +233,8 @@ class Store:
         ("runs", "heal_of", "TEXT"),
         ("runs", "heal_attempt", "INTEGER"),
         ("runs", "issue_body", "TEXT"),
+        ("runs", "variant_id", "TEXT"),
+        ("queue_items", "issue_url", "TEXT"),
         ("queue_items", "heal_attempts", "INTEGER"),
     ]
 
@@ -535,6 +546,26 @@ class Store:
     def queue_clear_finished(self) -> int:
         return self._exec("DELETE FROM queue_items WHERE status IN ('done','failed','cancelled','skipped')").rowcount
 
+    # ------------------------------------------------------------- variants
+    def variant_add(self, vid: str, overlay: dict, parent: str | None = None, rationale: str = "") -> None:
+        self._exec("INSERT INTO variants (id, parent, created_at, overlay, rationale) VALUES (?, ?, ?, ?, ?)",
+                   (vid, parent, time.time(), json.dumps(overlay), rationale))
+
+    def variant(self, vid: str) -> dict | None:
+        row = self._one("SELECT * FROM variants WHERE id = ?", (vid,))
+        return _variant_row(row) if row else None
+
+    def variants(self) -> list[dict]:
+        return [_variant_row(r) for r in self._all("SELECT * FROM variants ORDER BY created_at")]
+
+    def variant_update(self, vid: str, **fields: Any) -> None:
+        if "scores" in fields:
+            fields["scores"] = json.dumps(fields["scores"])
+        if "overlay" in fields:
+            fields["overlay"] = json.dumps(fields["overlay"])
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self._exec(f"UPDATE variants SET {sets} WHERE id = ?", (*fields.values(), vid))
+
     def kv_get(self, key: str, default: str | None = None) -> str | None:
         row = self._one("SELECT value FROM kv WHERE key = ?", (key,))
         return row["value"] if row else default
@@ -558,3 +589,10 @@ class Store:
         for r in rows:
             r["results"] = json.loads(r.pop("results_json") or "null")
         return rows
+
+
+def _variant_row(row: dict) -> dict:
+    d = dict(row)
+    d["overlay"] = json.loads(d.get("overlay") or "{}")
+    d["scores"] = json.loads(d.get("scores") or "[]")
+    return d

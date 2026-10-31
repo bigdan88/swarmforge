@@ -533,7 +533,8 @@ def run_detail(run_id, header=True):
 
     if header:
         st.subheader(run["issue_title"] or run_id)
-    st.caption(f"Run `{run_id}` · {run['mode']} · source {run['issue_url'] or '-'} · repo {run['repo'] or '-'}")
+    st.caption(f"Run `{run_id}` · {run['mode']} · source {run['issue_url'] or '-'} · repo {run['repo'] or '-'}"
+               + (f" · variant `{run['variant_id']}`" if run.get("variant_id") else ""))
 
     for ap in store.pending_approvals(run_id):
         with st.container(border=True):
