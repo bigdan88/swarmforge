@@ -89,6 +89,21 @@ def heal_input(col, key: str, value=None):
     return int(col.number_input("Auto-fix attempts", 0, 5, max(0, min(5, v)), key=key, help=HEAL_HELP))
 
 
+def repo_picker(label: str, key: str, *, where=None, value: str | None = None, help: str | None = None) -> str:
+    """Repository field that offers the repositories used before (newest first) and accepts new ones."""
+    where = where or st
+    opts = store.recent_repos()
+    if value and value not in opts:
+        opts = [value, *opts]
+    idx = opts.index(value) if value in opts else (0 if opts else None)
+    v = where.selectbox(label, opts, index=idx, key=key, accept_new_options=True,
+                        placeholder="Type a folder, owner/repo or GitHub URL",
+                        help=help or "Pick one you used before, or type a new one: a local git folder, "
+                                     "a GitHub owner/repo, or any GitHub URL of the repo (…/tree/branch "
+                                     "selects that branch).")
+    return (v or "").strip()
+
+
 def _hrs(seconds) -> float:
     """Seconds -> hours for number inputs, clamped to the inputs' range so odd configs never crash a form."""
     return float(min(72.0, max(0.05, round((seconds or 0) / 3600, 2))))
@@ -122,29 +137,73 @@ def wikilinks_to_md(text: str) -> str:
 
 # --------------------------------------------------------------------- sidebar
 PAGES = ["Work", "New task", "Failures", "Knowledge", "Benchmarks"]
-if st.session_state.get("page") not in PAGES:
-    st.session_state.page = "Work"
+NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
+            "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
+SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
+if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
+    st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
 if "goto" in st.session_state:  # navigation requested by a button on the previous script run
     st.session_state.page = st.session_state.pop("goto")
+page = st.session_state.page
 pending_all = store.pending_approvals()
+
+
+def _nav_badges() -> dict:
+    out = {}
+    try:
+        live = [r for r in store.list_runs(50) if r["state"] not in TERMINAL and r["pid"] and pid_alive(r["pid"])]
+        waiting = sum(1 for i in store.queue_items() if i["status"] == "queued")
+        bits = ([f"{len(live)} running"] if live else []) + ([f"{waiting} waiting"] if waiting else [])
+        if pending_all:
+            bits.insert(0, f"🔔 {len(pending_all)}")
+        out["Work"] = " · ".join(bits)
+        needs = sum(1 for f in store.failures() if (f["outcome"] or "").startswith(("needs you", "still failing",
+                                                                                      "not retried")))
+        out["Failures"] = f"{needs} need you" if needs else ""
+    except Exception:  # noqa: BLE001 - badges are decoration
+        pass
+    return out
+
+
+st.markdown(f"""<style>
+section[data-testid="stSidebar"] [class*="st-key-nav_"] button {{
+    justify-content: flex-start !important; padding: 0.5rem 0.8rem; border-radius: 0.6rem; width: 100%;
+    font-size: 0.95rem; color: inherit; }}
+section[data-testid="stSidebar"] [class*="st-key-nav_"] button > div {{ justify-content: flex-start !important; }}
+section[data-testid="stSidebar"] [class*="st-key-nav_"] button p {{ text-align: left; }}
+section[data-testid="stSidebar"] [class*="st-key-nav_"] button:hover {{ background: rgba(128,128,128,0.12); }}
+section[data-testid="stSidebar"] .st-key-nav_{SLUG[page]} button {{
+    background: rgba(255, 75, 75, 0.12); color: #ff4b4b; font-weight: 600; }}
+section[data-testid="stSidebar"] [class*="st-key-nav_"] {{ margin-bottom: -0.6rem; }}
+.sf-badge {{ font-size: 0.75rem; opacity: 0.7; }}
+</style>""", unsafe_allow_html=True)
+
 with st.sidebar:
-    st.title("🐝 SwarmForge")
-    st.radio("Go to", PAGES, key="page", label_visibility="collapsed",
-             format_func={"Work": "📋 Work", "New task": "➕ New task", "Failures": "🩺 Failures",
-                          "Knowledge": "📚 Knowledge",
-                          "Benchmarks": "📊 Benchmarks"}.get)
+    st.markdown("### 🐝 SwarmForge")
+    badges = _nav_badges()
+    for p in PAGES:
+        label = p + (f"  ·  {badges[p]}" if badges.get(p) else "")
+        if st.button(label, icon=NAV_ICON[p], key=f"nav_{SLUG[p]}", type="tertiary", width="stretch"):
+            st.session_state.page = p
+            st.rerun()
+    st.write("")
     if pending_all:
-        st.warning(f"🔔 {len(pending_all)} approval(s) waiting")
+        st.warning(f"🔔 {len(pending_all)} approval(s) waiting on the Work page")
     st.divider()
     auto = st.toggle("Live refresh (3 s)", value=os.environ.get("SWARMFORGE_DASH_AUTOREFRESH", "1") == "1",
-                     help="Refreshes the Work list and the open run while something is running.")
+                     help="Refreshes the Work list and the open task while something is running.")
     if cfg:
-        st.caption(f"Config: `{cfg.source_path}`")
-        st.caption(f"Knowledge vault: `{cfg.vault_path}`")
+        with st.expander("Setup", icon=":material/settings:"):
+            st.caption(f"Config: `{cfg.source_path}`")
+            st.caption(f"Knowledge vault: `{cfg.vault_path}`")
+            st.caption(f"Work folder: `{cfg.workdir}`")
     else:
         st.error("No swarmforge.yaml found. Start the dashboard with `swarmforge dashboard` "
                  "from your SwarmForge folder.")
-page = st.session_state.page
+try:
+    st.query_params["page"] = SLUG[page]
+except Exception:  # noqa: BLE001
+    pass
 
 
 # ============================================================== NEW RUN page
@@ -169,6 +228,7 @@ def page_new_run():
                 st.session_state.nr_source = "Describe it here"
                 st.session_state.nr_title = m.group(1) if m else "Sample issue"
                 st.session_state.nr_body = text[m.end():].strip() if m else text
+                store.remember_repo(str(sample_repo))
                 st.session_state.nr_repo = str(sample_repo)
                 st.rerun()
 
@@ -184,10 +244,7 @@ def page_new_run():
         body = st.text_area("Description, requirements and acceptance criteria", height=260, key="nr_body",
                             placeholder="Describe what you want built. Be specific about interfaces and "
                                         "acceptance criteria; the planner turns this into a task graph.")
-        repo = st.text_input("Repository", key="nr_repo",
-                             placeholder=r"C:\Users\you\code\myproject   or   owner/repo   or   https://github.com/owner/repo",
-                             help="A local git folder, a GitHub owner/repo, or any GitHub URL of the repo "
-                                  "(…/tree/branch selects that branch).")
+        repo = repo_picker("Repository", "nr_repo")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     mode = c1.selectbox("Team", ["swarm", "single"], format_func=lambda m: {
@@ -248,6 +305,7 @@ def page_new_run():
                 with st.spinner("Checking the repository…"):
                     ref = preflight(normalize_repo(repo), get_token(cfg.github))
                 repo_arg, base = ref.source, ref.branch
+                store.remember_repo(repo.strip() if ref.branch else ref.source)
                 if ref.source != repo.strip():
                     st.info(f"Using {ref.source}" + (f" (branch {ref.branch})" if ref.branch else ""))
             elif source != "GitHub issue":
@@ -845,29 +903,6 @@ def work_items() -> list[dict]:
     return out
 
 
-def _row(w: dict) -> dict:
-    r, i = w["run"], w["item"]
-    now = ""
-    if w["group"] == "active" and r:
-        now = r["state"].replace("_", " ").title() + (f" · repair cycle {r['repair_cycle']}" if r["repair_cycle"] else "")
-    elif r and r["state_reason"]:
-        now = r["state_reason"][:90]
-    elif i and i["note"]:
-        now = i["note"][:90]
-    cost = store.cost_summary(r["id"])["total"] if r else None
-    return {"": w["icon"], "Task": (w["title"] or "")[:80], "Status": w["status"], "Now / result": now,
-            "Repo": _short_repo(w["repo"]), "Cost $": round(cost, 3) if cost is not None else None,
-            "Time": fmt_dur((r["finished_at"] or time.time()) - r["created_at"]) if r else "",
-            "Started": fmt_ts(r["created_at"], True) if r else "",
-            "From": "queue" if i else "manual"}
-
-
-def select_item(key: str | None) -> None:
-    """Open an item in the detail panel (used by buttons; the table selection resets)."""
-    st.session_state.sel_item = key
-    st.session_state.wt_ver = st.session_state.get("wt_ver", 0) + 1
-
-
 def queue_bar() -> None:
     from swarmforge import runqueue as rq
     items = store.queue_items()
@@ -914,42 +949,237 @@ def queue_bar() -> None:
                                              f"· {len(queued)} waiting")
 
 
-def work_list() -> list[dict]:
+def select_item(key: str | None) -> None:
+    """Open (expand) an item in the Work list; None collapses."""
+    st.session_state.sel_item = key
+
+
+def _wkey(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", key)
+
+
+ROW_COLS = [0.32, 0.32, 4.4, 2.0, 2.8, 2.0, 0.85, 0.95]
+WORK_CSS = """<style>
+[class*="st-key-wr_"] { position: relative; border-bottom: 1px solid rgba(128,128,128,0.18);
+                        padding: 0.15rem 0.25rem; border-radius: 0.4rem; }
+[class*="st-key-wr_"]:hover { background: rgba(128,128,128,0.08); }
+[class*="st-key-wr_"] [data-testid="stColumn"],
+[class*="st-key-wr_"] [data-testid="stHorizontalBlock"],
+[class*="st-key-wr_"] [data-testid="stVerticalBlock"],
+[class*="st-key-wr_"] [data-testid="stElementContainer"],
+[class*="st-key-wr_"] .stButton { position: static !important; }
+[class*="st-key-op_"] { height: 0 !important; margin-top: -1rem; overflow: visible; }
+[class*="st-key-op_"] button { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0;
+                               z-index: 1; cursor: pointer; }
+[class*="st-key-wr_"]:has([class*="st-key-ck_"] input:checked) { background: rgba(255, 75, 75, 0.08); }
+[class*="st-key-ck_"], [class*="st-key-ckall"] { position: relative !important; z-index: 2; }
+[class*="st-key-wr_"] p { margin: 0; font-size: 0.9rem; white-space: nowrap; overflow: hidden;
+                          text-overflow: ellipsis; }
+.st-key-whead p { font-size: 0.78rem; opacity: 0.65; margin: 0; }
+[class*="st-key-wopen_"] { border-left: 3px solid #ff4b4b; padding-left: 0.9rem; margin: 0.2rem 0 1rem 0.4rem; }
+[class*="st-key-wsel_"] { background: rgba(255, 75, 75, 0.08) !important; }
+</style>"""
+
+
+def _cells(w: dict) -> dict:
+    r, i = w["run"], w["item"]
+    now = ""
+    if w["group"] == "active" and r:
+        now = r["state"].replace("_", " ").title() + (f" · repair cycle {r['repair_cycle']}" if r["repair_cycle"] else "")
+    elif r and r["state_reason"]:
+        now = r["state_reason"][:120]
+    elif i and i["note"]:
+        now = i["note"][:120]
+    cost = store.cost_summary(r["id"])["total"] if r else None
+    return {"now": now, "cost": f"${cost:.2f}" if cost is not None else "",
+            "time": fmt_dur((r["finished_at"] or time.time()) - r["created_at"]) if r else "",
+            "when": fmt_ts(r["created_at"], True)[5:] if r else ""}
+
+
+def _checked(shown: list[dict]) -> list[dict]:
+    return [w for w in shown if st.session_state.get(f"ck_{_wkey(w['key'])}")]
+
+
+def _run_chain(run_id: str) -> list[str]:
+    """A run plus the earlier self-healing attempts it continued from."""
+    out, seen = [], set()
+    while run_id and run_id not in seen:
+        seen.add(run_id)
+        r = store.get_run(run_id)
+        if not r:
+            break
+        out.append(run_id)
+        run_id = r.get("heal_of")
+    return out
+
+
+def _delete_items(ws: list[dict], files: bool) -> tuple[int, int]:
+    import shutil
+    import stat
+
+    def unlock(func, path, _exc):  # git objects are read-only on Windows
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+    done = skipped = 0
+    root = cfg.workdir.resolve() if cfg else None
+    for w in ws:
+        if w["group"] == "active":
+            skipped += 1
+            continue
+        runs = []
+        for q in ([w["item"]] if w["item"] else []):
+            runs += [q["run_id"]] if q["run_id"] else []
+            store.queue_remove(q["id"])
+        if w["run"]:
+            runs.append(w["run"]["id"])
+        for rid in {x for r0 in runs for x in _run_chain(r0)}:
+            r = store.get_run(rid)
+            if files and r and r["run_dir"] and root:
+                d = Path(r["run_dir"]).resolve()
+                if root in d.parents:  # never delete outside SwarmForge's work folder
+                    shutil.rmtree(d, onerror=unlock)
+            store.delete_run(rid)
+        done += 1
+    return done, skipped
+
+
+def bulk_bar(shown: list[dict]) -> None:
+    sel = _checked(shown)
+    if not sel:
+        return
+    with st.container(border=True, key="bulkbar"):
+        c = st.columns([1.6, 1, 1, 1, 1.1, 1])
+        c[0].markdown(f"**{len(sel)} selected**")
+        running = [w for w in sel if w["group"] == "active" and w["run"]]
+        waiting = [w for w in sel if w["group"] == "waiting"]
+        failed_q = [w for w in sel if w["item"] and w["item"]["status"] in ("failed", "cancelled", "skipped")]
+        if c[1].button("Delete", icon=":material/delete:", key="bk_del"):
+            st.session_state.confirm_delete = True
+        if c[2].button("Cancel", icon=":material/stop_circle:", key="bk_cancel", disabled=not running,
+                       help="Stop the selected running tasks."):
+            for w in running:
+                store.request_cancel(w["run"]["id"])
+                store.event(w["run"]["id"], "cancel", "cancel requested from dashboard", level="warn")
+            st.session_state.flash = f"Cancel requested for {len(running)} task(s)."
+            st.rerun(scope="app")
+        if c[3].button("Run again", icon=":material/replay:", key="bk_again", disabled=not failed_q,
+                       help="Put the selected failed queue tasks back in the queue (front of the line)."):
+            for w in failed_q:
+                i = w["item"]
+                _requeue_next(i, dict(mode=i["mode"], budget=i["budget"], max_cycles=i["max_cycles"],
+                                      chain=i["chain"], approval=i["approval"], max_runtime_s=i["max_runtime_s"],
+                                      heal_attempts=i.get("heal_attempts")))
+            st.session_state.flash = f"Queued {len(failed_q)} task(s) again."
+            _clear_checks(shown)
+            st.rerun(scope="app")
+        if c[4].button("Move to front", icon=":material/vertical_align_top:", key="bk_front", disabled=not waiting):
+            others = [q for q in store.queue_items() if q["status"] == "queued"]
+            top = min((q["position"] for q in others), default=1)
+            for n, w in enumerate(waiting):
+                store.queue_update(w["item"]["id"], position=top - len(waiting) + n - 0.5)
+            st.rerun(scope="app")
+        if c[5].button("Clear", icon=":material/close:", key="bk_clear", help="Unselect all"):
+            _clear_checks(shown)
+            st.rerun(scope="app")
+        if st.session_state.get("confirm_delete"):
+            n_active = sum(1 for w in sel if w["group"] == "active")
+            st.warning(f"Delete {len(sel) - n_active} task(s) and their run history? This can't be undone."
+                       + (f" {n_active} running task(s) will be skipped; cancel them first." if n_active else "")
+                       + " Failure post-mortems are kept for learning.")
+            files = st.checkbox("Also delete their files on disk (clones, logs, transcripts)", value=True,
+                                key="bk_files")
+            d1, d2, _ = st.columns([1, 1, 4])
+            if d1.button("Yes, delete", type="primary", key="bk_yes"):
+                done, skipped = _delete_items(sel, files)
+                st.session_state.confirm_delete = False
+                _clear_checks(shown)
+                if st.session_state.get("sel_item") in {w["key"] for w in sel if w["group"] != "active"}:
+                    select_item(None)
+                st.session_state.flash = f"Deleted {done} task(s)." + (f" Skipped {skipped} running." if skipped else "")
+                st.rerun(scope="app")
+            if d2.button("Keep them", key="bk_no"):
+                st.session_state.confirm_delete = False
+                st.rerun(scope="app")
+
+
+def _clear_checks(shown: list[dict]) -> None:
+    for w in shown:
+        st.session_state[f"ck_{_wkey(w['key'])}"] = False
+    st.session_state["ckall"] = False
+
+
+def _toggle_all(keys: list[str]) -> None:
+    v = st.session_state.get("ckall", False)
+    for k in keys:
+        st.session_state[f"ck_{k}"] = v
+
+
+def work_row(w: dict) -> None:
+    k = _wkey(w["key"])
+    is_open = st.session_state.get("sel_item") == w["key"]
+    cells = _cells(w)
+    with st.container(key=f"wr_{k}"):
+        c = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
+        c[0].checkbox("select", key=f"ck_{k}", label_visibility="collapsed")
+        c[1].markdown(w["icon"])
+        c[2].markdown(f"{'▾' if is_open else '▸'} **{w['title'] or '(untitled)'}**")
+        c[3].markdown(w["status"])
+        c[4].markdown(cells["now"] or " ")
+        c[5].markdown(_short_repo(w["repo"]))
+        c[6].markdown(cells["cost"] or " ")
+        c[7].markdown(cells["time"] or " ")
+        if c[7].button("open", key=f"op_{k}", help="Show / hide details"):
+            select_item(None if is_open else w["key"])
+            st.rerun(scope="app")
+
+
+def work_list(items: list[dict], every) -> None:
     queue_bar()
-    items = [w for w in work_items() if not w["hidden"]]
-    if not items:
+    visible = [w for w in items if not w["hidden"]]
+    if not visible:
         st.info("Nothing here yet. Go to **New task** to start a run or fill the queue.")
-        return items
-    counts = {g: sum(1 for w in items if w["group"] == g) for g in ("active", "waiting", "done", "failed")}
+        return
+    counts = {g: sum(1 for w in visible if w["group"] == g) for g in ("active", "waiting", "done", "failed")}
     f1, f2 = st.columns([3, 2])
-    labels = {"All": f"All ({len(items)})", "Active": f"Active ({counts['active']})",
+    labels = {"All": f"All ({len(visible)})", "Active": f"Active ({counts['active']})",
               "Waiting": f"Waiting ({counts['waiting']})", "Finished": f"Finished ({counts['done']})",
               "Failed": f"Failed ({counts['failed']})"}
-    filt = f1.radio("Show", list(FILTERS), horizontal=True, key="w_filter", format_func=labels.get,
-                    label_visibility="collapsed")
+    filt = f1.segmented_control("Show", list(FILTERS), key="w_filter", format_func=labels.get,
+                                label_visibility="collapsed", default="All") or "All"
     query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
                           label_visibility="collapsed").strip().lower()
-    shown = [w for w in items if (FILTERS[filt] is None or w["group"] in FILTERS[filt])
+    shown = [w for w in visible if (FILTERS[filt] is None or w["group"] in FILTERS[filt])
              and (not query or query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower())]
     if not shown:
         st.caption("No tasks match.")
-        return items
-    df = pd.DataFrame([_row(w) for w in shown])
-    tkey = f"wt_{st.session_state.get('wt_ver', 0)}_{abs(hash(tuple(w['key'] for w in shown))) % 10**8}"
-    ev = st.dataframe(df, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(shown)),
-                      on_select="rerun", selection_mode="single-row", key=tkey,
-                      column_config={"": st.column_config.TextColumn("", width=30),
-                                     "Task": st.column_config.TextColumn(width="large"),
-                                     "Now / result": st.column_config.TextColumn(width="medium"),
-                                     "Cost $": st.column_config.NumberColumn(format="$%.3f")})
-    rows = list(ev.selection.rows) if ev is not None and hasattr(ev, "selection") else []
-    if rows and st.session_state.get("_wt_last") != (tkey, rows):
-        st.session_state._wt_last = (tkey, rows)
-        if st.session_state.get("sel_item") != shown[rows[0]]["key"]:
-            st.session_state.sel_item = shown[rows[0]]["key"]
-            st.rerun(scope="app")
-    st.caption("Click a row to open it below.")
-    return items
+        return
+    bulk_bar(shown)
+    st.markdown(WORK_CSS, unsafe_allow_html=True)
+    keys = [_wkey(w["key"]) for w in shown]
+    with st.container(key="whead"):
+        h = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
+        h[0].checkbox("all", key="ckall", label_visibility="collapsed", on_change=_toggle_all, args=(keys,),
+                      help="Select all shown")
+        for col, name in zip(h[2:], ["TASK", "STATUS", "NOW / RESULT", "REPO", "COST", "TIME"]):
+            col.markdown(name)
+    sel = st.session_state.get("sel_item")
+    if sel and sel not in {w["key"] for w in shown}:  # opened from elsewhere (e.g. Failures): show on top
+        w = next((x for x in items if x["key"] == sel), None)
+        if w:
+            with st.container(key=f"wopen_top_{_wkey(w['key'])}"):
+                if st.button("Close", icon=":material/close:", key="w_close_top"):
+                    select_item(None)
+                    st.rerun(scope="app")
+                item_detail(w, every)
+    for w in shown:
+        work_row(w)
+        if sel == w["key"]:
+            with st.container(key=f"wopen_{_wkey(w['key'])}"):
+                item_detail(w, every)
+    st.caption("Click a task to open it. Tick boxes to act on several tasks at once.")
 
 
 def waiting_editor(i: dict) -> None:
@@ -976,7 +1206,7 @@ def waiting_editor(i: dict) -> None:
         st.markdown("**⚙️ Settings** (used when this task starts)")
         title = st.text_input("Title", i["title"], key=f"qe_t_{i['id']}")
         body = st.text_area("Description and acceptance criteria", i["body"], height=240, key=f"qe_d_{i['id']}")
-        repo = st.text_input("Repository", i["repo"], key=f"qe_r_{i['id']}")
+        repo = repo_picker("Repository", f"qe_r_{i['id']}", value=i["repo"])
         c1, c2, c3, c4, c5 = st.columns(5)
         mode = c1.selectbox("Team", ["swarm", "single"], index=["swarm", "single"].index(i["mode"] or "swarm"),
                             key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "single": "Single agent"}.get)
@@ -1112,7 +1342,6 @@ def diagnose_now(run_id: str) -> None:
 
 def item_detail(w: dict, every) -> None:
     i, r = w["item"], w["run"]
-    st.subheader(f"{w['icon']} {w['title']}")
     bits = [w["status"]]
     if i:
         bits.append(f"queue task #{i['id']}")
@@ -1144,42 +1373,29 @@ def item_detail(w: dict, every) -> None:
         if i and i["status"] != "queued":
             st.markdown(i["body"][:3000])
         return
-    active = w["group"] == "active"
-
-    @st.fragment(run_every=every if active else None)
-    def live():
-        run = store.get_run(r["id"])
-        if active and run["state"] in TERMINAL:
-            st.rerun(scope="app")  # finished while watching: refresh the settings panel too
-        run_detail(r["id"], header=False)
-    live()
+    run_detail(r["id"], header=False)
 
 
 def page_work():
     from swarmforge import runqueue as rq
     if "flash" in st.session_state:
         st.success(st.session_state.pop("flash"))
-    items = work_items()
-    busy = any(w["group"] == "active" for w in items) or bool(rq.worker_pid(store))
-    every = 3 if auto and busy else None
-    h1, h2 = st.columns([4, 1])
+    h1, h2 = st.columns([4, 1], vertical_alignment="bottom")
     h1.header("Work")
-    if h2.button("➕ New task", type="primary", width="stretch"):
+    if h2.button("New task", icon=":material/add:", type="primary", width="stretch"):
         st.session_state.goto = "New task"
         st.rerun()
+    items = work_items()
+    busy = any(w["group"] == "active" for w in items) or bool(rq.worker_pid(store))
+    open_w = next((w for w in items if w["key"] == st.session_state.get("sel_item")), None)
+    editing = bool(open_w and (open_w["group"] != "active" or st.session_state.get("confirm_delete")))
+    # refresh live while something runs, but not while you're editing an open waiting/finished task
+    every = 3 if auto and busy and not editing else None
 
     @st.fragment(run_every=every)
     def listing():
-        work_list()
+        work_list(work_items(), every)
     listing()
-    keys = [w["key"] for w in items]
-    if not keys:
-        return
-    if st.session_state.get("sel_item") not in keys:
-        st.session_state.sel_item = next(w["key"] for w in items if not w["hidden"]) \
-            if any(not w["hidden"] for w in items) else keys[0]
-    st.divider()
-    item_detail(next(w for w in items if w["key"] == st.session_state.sel_item), every)
 
 
 # ============================================================= FAILURES page
@@ -1293,8 +1509,7 @@ def queue_forms() -> None:
     with t_add:
         title = st.text_input("Title", key="qa_title")
         body = st.text_area("Description with acceptance criteria", height=200, key="qa_body")
-        repo = st.text_input("Repository", key="qa_repo", value=st.session_state.get("q_last_repo", ""),
-                             placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
+        repo = repo_picker("Repository", "qa_repo")
         mode, budget, cycles, approval, chain, runtime, heal = common("qa")
         if st.button("Add to queue", type="primary"):
             try:
@@ -1304,7 +1519,7 @@ def queue_forms() -> None:
                 new_id = store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget,
                                          max_cycles=int(cycles), chain=int(chain), approval=approval,
                                          max_runtime_s=runtime, heal_attempts=heal)
-                st.session_state.q_last_repo = repo
+                store.remember_repo(src)
                 st.session_state.flash = f"Queued: {title.strip()}. Press ▶ Start queue when you're ready."
                 select_item(f"q:{new_id}")
                 st.session_state.goto = "Work"
@@ -1316,9 +1531,7 @@ def queue_forms() -> None:
         default = str((cfg.source_path.parent / "docs" / "SELF_IMPROVEMENT_BACKLOG.md")) if cfg.source_path else ""
         path = st.text_input("Backlog file (Markdown with **Title:** / **Description:** sections)", value=default,
                              key="qi_path")
-        repo_i = st.text_input("Repository for all imported tasks", key="qi_repo",
-                               value=st.session_state.get("q_last_repo", ""),
-                               placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
+        repo_i = repo_picker("Repository for all imported tasks", "qi_repo")
         mode, budget, cycles, approval, chain, runtime, heal = common("qi")
         found = []
         if path and Path(path).is_file():
@@ -1333,7 +1546,7 @@ def queue_forms() -> None:
                     store.queue_add(f.title, f.body, src, mode=mode, budget=budget, max_cycles=int(cycles),
                                     chain=int(chain), approval=approval, max_runtime_s=runtime,
                                     heal_attempts=heal)
-                st.session_state.q_last_repo = repo_i
+                store.remember_repo(src)
                 st.session_state.flash = f"Imported {len(found)} task(s). Press ▶ Start queue when you're ready."
                 select_item(None)
                 st.session_state.goto = "Work"

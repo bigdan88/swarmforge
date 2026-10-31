@@ -475,6 +475,45 @@ class Store:
         sets = ", ".join(f"{k} = ?" for k in fields)
         self._exec(f"UPDATE queue_items SET {sets} WHERE id = ?", (*fields.values(), item_id))
 
+    RUN_TABLES = ("tasks", "events", "llm_calls", "test_runs", "findings", "acceptance", "interventions",
+                  "approvals")
+
+    def delete_run(self, run_id: str) -> None:
+        """Remove a run and everything recorded about it (its failure post-mortem is kept for learning)."""
+        with self._lock:
+            for t in self.RUN_TABLES:
+                self.conn.execute(f"DELETE FROM {t} WHERE run_id = ?", (run_id,))
+            self.conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+            self.conn.commit()
+
+    # ---------------------------------------------------------- recent repos
+    RECENT_REPOS_KEY = "recent_repos"
+
+    def recent_repos(self, limit: int = 15) -> list[str]:
+        import json as _json
+        try:
+            saved = _json.loads(self.kv_get(self.RECENT_REPOS_KEY) or "[]")
+        except ValueError:
+            saved = []
+        if not saved:  # first use: learn from history
+            rows = self._all("SELECT repo, MAX(t) AS t FROM (SELECT repo, created_at AS t FROM queue_items "
+                             "UNION ALL SELECT repo, created_at AS t FROM runs) WHERE repo IS NOT NULL "
+                             "AND repo != '' GROUP BY repo ORDER BY t DESC LIMIT ?", (limit,))
+            saved = [r["repo"] for r in rows]
+        return [r for r in saved if r][:limit]
+
+    def remember_repo(self, repo: str, limit: int = 15) -> None:
+        import json as _json
+        repo = (repo or "").strip()
+        if not repo:
+            return
+        items = [repo] + [r for r in self.recent_repos(limit) if r != repo]
+        self.kv_set(self.RECENT_REPOS_KEY, _json.dumps(items[:limit]))
+
+    def forget_repo(self, repo: str) -> None:
+        import json as _json
+        self.kv_set(self.RECENT_REPOS_KEY, _json.dumps([r for r in self.recent_repos(100) if r != repo] or [""]))
+
     def queue_remove(self, item_id: int) -> None:
         self._exec("DELETE FROM queue_items WHERE id = ? AND status != 'running'", (item_id,))
 

@@ -62,8 +62,10 @@ swarmforge dashboard          # opens http://localhost:8501
 ```
 
 * **Work**: one list of everything: running runs, waiting queue tasks, finished and failed work,
-  with filters (All / Active / Waiting / Finished / Failed) and search. **Click any row** to open
-  it underneath:
+  with filters (All / Active / Waiting / Finished / Failed) and search. **Click any task** to open
+  it right underneath. **Tick the boxes** to act on several tasks at once: delete (with their run
+  history and, optionally, their files), cancel, run again, or move to the front of the queue.
+  Opening a task shows:
   * **Waiting task**: change anything (title, description, repository, team, budget, repair cycles,
     time limit, chaining, GitHub approval), move it up/down or to the front, or remove it.
   * **Running run**: change its budget, time limit and repair cycles while it runs (applied within a
@@ -78,11 +80,13 @@ swarmforge dashboard          # opens http://localhost:8501
   The queue bar at the top starts, pauses and resumes the queue worker. Queued tasks run one after
   another; with chaining, each task starts from the previous task's result on the same repository.
   CLI: `swarmforge queue import FILE --repo R`, `queue list`, `queue resume`, `queue pause`.
-* **New task**: *Start now* (describe the work or paste a GitHub issue URL, point it at a
+* **New task**: the repository field remembers the repositories you used before (newest first)
+  and still accepts a new folder, owner/repo or URL. *Start now* (describe the work or paste a GitHub issue URL, point it at a
   repository, set budget, repair cycles and time limit, **Start run**; **Prepare sample** for a
   one-click demo) or *Add to the queue* (one task, or import a backlog file such as
   `docs/SELF_IMPROVEMENT_BACKLOG.md`). Runs are background processes and keep going if you close
   the browser.
+* Every page has its own address (`?page=work`, `?page=failures`, …), handy for bookmarks on an iPad.
 * **Knowledge**: the Zettelkasten. Browse, search, edit and link notes, view the note graph,
   and write your own notes for the agents to use.
 * **Benchmarks**: single agent vs swarm comparisons.

@@ -19,6 +19,18 @@ from .test_e2e import _run  # noqa: E402
 APP = Path(__file__).resolve().parents[1] / "src" / "swarmforge" / "dashboard.py"
 
 
+def _go(at, page):
+    at.button(key="nav_" + page.lower().replace(" ", "-")).click().run()
+    return at
+
+
+def _open(at, n=0):
+    """Click the n-th task row in the Work list (expands it underneath)."""
+    rows = [b for b in at.button if (b.key or "").startswith("op_")]
+    rows[n].click().run()
+    return at
+
+
 def _write_cfg(tmp_path, monkeypatch):
     import streamlit as st
     st.cache_resource.clear()  # the dashboard caches config/store per process
@@ -38,16 +50,18 @@ async def test_dashboard_pages_render(tmp_path, monkeypatch, sample_repo):
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
+    assert not at.metric  # rows start collapsed
+    _open(at)
     metrics = {m.label: m.value for m in at.metric}
     assert metrics["State"] == "Completed" and metrics["Repair cycle"] == "1"
     # delegation graph + transcripts rendered
     assert any("Planner" in g.proto.spec for g in at.get("graphviz_chart"))
     assert any("Brief handed to this agent" in m.value for m in at.markdown)
-    assert any("Click a row" in c.value for c in at.caption)
+    assert any("Click a task to open it" in c.value for c in at.caption)
     for page in ("Knowledge", "New task", "Benchmarks"):
-        at.sidebar.radio[0].set_value(page).run()
+        _go(at, page)
         assert not at.exception, (page, [e.value for e in at.exception])
-    at.sidebar.radio[0].set_value("Knowledge").run()
+    _go(at, "Knowledge")
     assert any("Exporters must wrap every OSError" in m.value for m in at.markdown)
 
 
@@ -101,10 +115,14 @@ def test_start_run_button_switches_to_runs(tmp_path, monkeypatch, sample_repo):
     cfg = _write_cfg(tmp_path, monkeypatch)
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
-    at.sidebar.radio[0].set_value("New task").run()
+    _go(at, "New task")
     at.text_input(key="nr_title").input("Add export")
     at.text_area(key="nr_body").input("Add CSV export with tests.")
-    at.text_input(key="nr_repo").input(str(sample_repo))
+    Store(cfg.db_path).remember_repo(str(sample_repo))  # AppTest can only pick listed options
+    _go(at, "Work"); _go(at, "New task")
+    at.text_input(key="nr_title").input("Add export")
+    at.text_area(key="nr_body").input("Add CSV export with tests.")
+    at.selectbox(key="nr_repo").set_value(str(sample_repo))
     next(b for b in at.button if "Start run" in b.label).click().run()
     assert not at.exception, [e.value for e in at.exception]
     assert at.session_state["page"] == "Work"
@@ -123,10 +141,14 @@ def test_new_run_form_validates_before_starting(tmp_path, monkeypatch):
     cfg = _write_cfg(tmp_path, monkeypatch)
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
-    at.sidebar.radio[0].set_value("New task").run()
+    _go(at, "New task")
     at.text_input(key="nr_title").input("Add export")
     at.text_area(key="nr_body").input("Add CSV export with tests.")
-    at.text_input(key="nr_repo").input(str(tmp_path / "missing-folder"))
+    Store(cfg.db_path).remember_repo(str(tmp_path / "missing-folder"))
+    _go(at, "Work"); _go(at, "New task")
+    at.text_input(key="nr_title").input("Add export")
+    at.text_area(key="nr_body").input("Add CSV export with tests.")
+    at.selectbox(key="nr_repo").set_value(str(tmp_path / "missing-folder"))
     next(b for b in at.button if "Start run" in b.label).click().run()
     assert not at.exception
     assert any("neither an existing folder" in e.value for e in at.error)
@@ -145,10 +167,14 @@ def test_queue_import_then_edit_and_reorder_on_work_page(tmp_path, monkeypatch, 
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert any("Nothing here yet" in i.value for i in at.info)
-    at.sidebar.radio[0].set_value("New task").run()
+    _go(at, "New task")
     at.radio(key="nt_how").set_value("Add to the queue").run()
     at.text_input(key="qi_path").input(str(ROOT / "docs" / "SELF_IMPROVEMENT_BACKLOG.md")).run()
-    at.text_input(key="qi_repo").input(str(sample_repo)).run()
+    Store(cfg.db_path).remember_repo(str(sample_repo))
+    _go(at, "Work"); _go(at, "New task")
+    at.radio(key="nt_how").set_value("Add to the queue").run()
+    at.text_input(key="qi_path").input(str(ROOT / "docs" / "SELF_IMPROVEMENT_BACKLOG.md")).run()
+    at.selectbox(key="qi_repo").set_value(str(sample_repo)).run()
     next(b for b in at.button if b.label == "Import into queue").click().run()
     assert not at.exception, [e.value for e in at.exception]
     store = Store(cfg.db_path)
@@ -158,9 +184,8 @@ def test_queue_import_then_edit_and_reorder_on_work_page(tmp_path, monkeypatch, 
     assert at.session_state["page"] == "Work"
     assert any("Start queue" in b.label for b in at.button)
     # the first waiting task opens by default; open the 2nd one and move it up
-    assert at.session_state["sel_item"] == f"q:{items[0]['id']}"
-    at.session_state["sel_item"] = f"q:{items[1]['id']}"
-    at.run()
+    _open(at, 1)  # the 2nd waiting task
+    assert at.session_state["sel_item"] == f"q:{items[1]['id']}"
     next(b for b in at.button if b.key == f"q_up_{items[1]['id']}").click().run()
     assert store.queue_items()[0]["id"] == items[1]["id"]
     # edit its settings
@@ -173,8 +198,10 @@ def test_queue_import_then_edit_and_reorder_on_work_page(tmp_path, monkeypatch, 
     it = store.queue_item(iid)
     assert it["title"] == "Renamed task" and it["budget"] == 12.5 and it["max_runtime_s"] == 36000
     # filters
-    at.radio(key="w_filter").set_value("Failed").run()
+    at.text_input(key="w_search").input("no such task").run()
     assert any("No tasks match" in c.value for c in at.caption)
+    # the imported repository is remembered for next time
+    assert store.recent_repos()[0] == str(sample_repo.resolve())
 
 
 def test_live_settings_for_running_run(tmp_path, monkeypatch):
@@ -189,6 +216,7 @@ def test_live_settings_for_running_run(tmp_path, monkeypatch):
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     rid = "20990101-000000-abcdef"
+    _open(at)
     assert at.session_state["sel_item"] == f"r:{rid}"
     at.number_input(key=f"ls_b_{rid}").set_value(9.0)
     at.number_input(key=f"ls_h_{rid}").set_value(8.0)
@@ -234,6 +262,7 @@ async def test_failed_run_offers_start_again_and_continue(tmp_path, monkeypatch,
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
+    _open(at)
     labels = {b.label: b for b in at.button}
     assert "↻ Start again from scratch" in labels
     cont = labels["⏩ Continue from where it stopped"]
@@ -259,9 +288,10 @@ def test_failures_page_and_hidden_attempts(tmp_path, monkeypatch):
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     # the healed attempt is hidden from the Work list; the successful retry says it fixed itself
-    df = at.dataframe[0].value
-    assert "Done (fixed itself, attempt 1)" in set(df["Status"]) and len(df) == 2
-    at.sidebar.radio[0].set_value("Failures").run()
+    rows = [b for b in at.button if (b.key or "").startswith("op_")]
+    texts = [m.value for m in at.markdown]
+    assert any("Done (fixed itself, attempt 1)" in t for t in texts) and len(rows) == 2
+    _go(at, "Failures")
     assert not at.exception, [e.value for e in at.exception]
     metrics = {m.label: m.value for m in at.metric}
     assert metrics["Failures"] == "1" and metrics["Fixed themselves"] == "1"
@@ -279,8 +309,50 @@ def test_password_gate(tmp_path, monkeypatch):
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
     assert not at.exception
-    assert not at.sidebar.radio  # nothing shown before the password
+    assert not [b for b in at.button if (b.key or "").startswith("nav_")]  # nothing before the password
     at.text_input(key="_pw").input("wrong").run()
     assert any("Wrong password" in e.value for e in at.error)
     at.text_input(key="_pw").input("open sesame").run()
-    assert not at.exception and at.sidebar.radio[0].value == "Work"
+    assert not at.exception and at.session_state["page"] == "Work"
+    assert [b for b in at.button if (b.key or "").startswith("nav_")]
+
+
+def test_bulk_select_and_delete(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    store = Store(cfg.db_path)
+    run_dir = cfg.workdir / "runs" / "20990101-000000-aaaaaa"
+    (run_dir / "repo").mkdir(parents=True)
+    store.create_run("20990101-000000-aaaaaa", state="FAILED", issue_title="Old one", repo="x/y", budget_usd=5,
+                     state_reason="boom", config_json="{}", run_dir=str(run_dir))
+    store.event("20990101-000000-aaaaaa", "run", "hello")
+    keep = store.queue_add("Keep me", "body", "x/y")
+    gone = store.queue_add("Remove me", "body", "x/y")
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not [b for b in at.button if b.key == "bk_del"]  # no bulk bar until something is ticked
+    at.checkbox(key=f"ck_q_{gone}").check().run()
+    at.checkbox(key="ck_r_20990101-000000-aaaaaa").check().run()
+    assert any("2 selected" in m.value for m in at.markdown)
+    at.button(key="bk_del").click().run()
+    assert any("can't be undone" in w.value for w in at.warning)
+    at.button(key="bk_yes").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert [i["id"] for i in store.queue_items()] == [keep]
+    assert store.get_run("20990101-000000-aaaaaa") is None and not store.events("20990101-000000-aaaaaa")
+    assert not run_dir.exists()
+    assert any("Deleted 2 task(s)" in s.value for s in at.success)
+
+
+def test_new_task_offers_recent_repos(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    store = Store(cfg.db_path)
+    store.remember_repo("bigdan88/old")
+    store.remember_repo("bigdan88/swarmforge")
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _go(at, "New task")
+    sb = at.selectbox(key="nr_repo")
+    assert sb.value == "bigdan88/swarmforge" and list(sb.options)[:2] == ["bigdan88/swarmforge", "bigdan88/old"]
+    store.remember_repo("bigdan88/old")
+    assert store.recent_repos()[:2] == ["bigdan88/old", "bigdan88/swarmforge"]
