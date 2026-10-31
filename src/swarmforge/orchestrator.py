@@ -63,13 +63,16 @@ class Orchestrator:
                  llm_transport=None,
                  test_command: str | None = None,
                  sandbox_image: str | None = None,
-                 seed_run_id: str | None = None):
+                 seed_run_id: str | None = None,
+                 heal_of: str | None = None, heal_attempt: int | None = None,
+                 heal_context: str | None = None):
         assert mode in ("swarm", "single")
         self.cfg = copy.deepcopy(config)  # per-run copy: project profiles may adjust it
         self.store = store
         self._override_test_command = test_command
         self._override_image = sandbox_image
         self.seed_run_id = seed_run_id
+        self.heal_of, self.heal_attempt, self.heal_context = heal_of, heal_attempt, heal_context
         self.mode = mode
         self.single_role = single_role or config.developer_roles[0]
         self.approve = approve
@@ -102,8 +105,10 @@ class Orchestrator:
         self.artifacts = self.run_dir / "artifacts"
         self.store.create_run(
             self.run_id, mode=self.mode, issue_url=issue_url or issue_file, run_dir=str(self.run_dir),
-            seed_run_id=self.seed_run_id,
+            seed_run_id=self.seed_run_id, heal_of=self.heal_of, heal_attempt=self.heal_attempt,
             budget_usd=self.cfg.limits.budget_usd, pid=os.getpid(),
+            max_runtime_s=int(self.cfg.limits.max_runtime_s),
+            max_repair_cycles=int(self.cfg.limits.max_repair_cycles),
             config_json=json.dumps(_config_snapshot(self.cfg)))
         self.sm = StateMachine(self.store, self.run_id)
         self.budget = Budget(self.cfg.limits.budget_usd)
@@ -116,12 +121,21 @@ class Orchestrator:
         self.knowledge_used: list[str] = []
         self.log("run", f"run {self.run_id} started (mode={self.mode}, budget ${self.cfg.limits.budget_usd:.2f}, "
                         f"sandbox: {self.sandbox.describe()})")
+        self._started = time.monotonic()
+        self._timed_out = False
         try:
-            await asyncio.wait_for(
-                self._pipeline(issue_url, issue_file, repo, base_branch),
-                timeout=self.cfg.limits.max_runtime_s)
+            pipeline = asyncio.ensure_future(self._pipeline(issue_url, issue_file, repo, base_branch))
+            watchdog = asyncio.ensure_future(self._watchdog(pipeline))
+            try:
+                await pipeline
+            except asyncio.CancelledError:
+                if not self._timed_out:
+                    raise
+                raise asyncio.TimeoutError from None
+            finally:
+                watchdog.cancel()
         except asyncio.TimeoutError:
-            self._abort(RunState.FAILED, f"maximum runtime of {self.cfg.limits.max_runtime_s}s exceeded")
+            self._abort(RunState.FAILED, f"maximum runtime of {int(self.cfg.limits.max_runtime_s)}s exceeded")
         except RunAborted as e:
             self._abort(e.state, e.reason)
         except BudgetExceeded as e:
@@ -148,7 +162,45 @@ class Orchestrator:
                 self.log("report", f"execution report written to {path}")
             except Exception as e:
                 self.log("error", f"failed to write report: {e}", level="error")
+            if self.store.get_run(self.run_id)["state"] not in ("COMPLETED", "CANCELLED"):
+                try:
+                    from .postmortem import diagnose
+                    await asyncio.wait_for(diagnose(self.cfg, self.store, self.run_id,
+                                                    transport=self._llm_transport), timeout=600)
+                except Exception as e:  # the post-mortem must never change the run outcome
+                    self.log("postmortem", f"post-mortem failed: {type(e).__name__}: {e}", level="warn")
         return self.run_id
+
+    def _apply_live_settings(self) -> None:
+        """Pick up limits changed from the dashboard while the run is going (budget, time, repair cycles)."""
+        try:
+            row = self.store.get_run(self.run_id) or {}
+        except Exception:
+            return
+        lim = self.cfg.limits
+        b = row.get("budget_usd")
+        if b is not None and abs(float(b) - self.budget.limit) > 1e-9:
+            self.log("settings", f"budget changed to ${float(b):.2f}")
+            self.budget.limit = float(b)
+            lim.budget_usd = float(b)
+        t = row.get("max_runtime_s")
+        if t and int(t) != int(lim.max_runtime_s):
+            self.log("settings", f"time limit changed to {int(t) / 3600:.2f} h")
+            lim.max_runtime_s = int(t)
+        c = row.get("max_repair_cycles")
+        if c is not None and int(c) != int(lim.max_repair_cycles):
+            self.log("settings", f"max repair cycles changed to {int(c)}")
+            lim.max_repair_cycles = int(c)
+
+    async def _watchdog(self, pipeline: asyncio.Future, every_s: float = 5.0) -> None:
+        """Enforces the (live-adjustable) time limit; replaces a fixed asyncio.wait_for."""
+        while not pipeline.done():
+            self._apply_live_settings()
+            if time.monotonic() - self._started > self.cfg.limits.max_runtime_s:
+                self._timed_out = True
+                pipeline.cancel()
+                return
+            await asyncio.sleep(min(every_s, max(0.05, self.cfg.limits.max_runtime_s)))
 
     def _abort(self, state: RunState, reason: str) -> None:
         if self.sm.terminal:
@@ -170,6 +222,10 @@ class Orchestrator:
             issue.body = issue.body.rstrip() + "\n\n" + ctx
             self.log("issue", f"continuing from run {self.seed_run_id}: its work is the starting point and its "
                               "unresolved problems were added to the task")
+        if self.heal_context:
+            issue.body = issue.body.rstrip() + "\n\n" + self.heal_context
+            self.log("selfheal", f"self-healing attempt {self.heal_attempt} after run {self.heal_of}: the "
+                                 "diagnosis of why it failed was added to the task")
         self.store.update_run(self.run_id, issue_title=issue.title, issue_number=issue.number,
                               repo=issue.full_repo or str(source))
         self.log("issue", f"issue: {issue.title}")
@@ -248,7 +304,6 @@ class Orchestrator:
         cycle = 0
         tasks = plan.tasks
         done_ids: set[str] = set()
-        max_cycles = self.cfg.limits.max_repair_cycles if self.mode == "swarm" else 0
         while True:
             self._check_cancel()
             # -------------------------------------------- execution
@@ -283,6 +338,7 @@ class Orchestrator:
             self.sm.transition(RunState.FIX_REQUIRED, f"{len(problems)} blocking problem(s)")
             for p in problems:
                 self.log("gate", p["summary"], level="warn")
+            max_cycles = self.cfg.limits.max_repair_cycles if self.mode == "swarm" else 0
             if cycle >= max_cycles:
                 raise RunAborted(RunState.FAILED,
                                  f"repair limit reached ({max_cycles} cycle(s)); "

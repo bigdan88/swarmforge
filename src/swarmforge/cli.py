@@ -44,22 +44,36 @@ def cmd_run(args, cfg) -> int:
     if args.max_runtime_hours is not None:
         cfg.limits.max_runtime_s = int(args.max_runtime_hours * 3600)
     mode = "yes" if args.yes else args.approval
-    orch = Orchestrator(cfg, store, mode="single" if args.single else "swarm", single_role=args.role,
-                        test_command=args.test_command, sandbox_image=args.sandbox_image,
-                        seed_run_id=args.continue_from)
-    if mode == "yes":
-        approve = lambda q: True  # noqa: E731
-    elif mode == "dashboard":
-        approve = dashboard_approver(store, lambda: orch.run_id, cfg.approval.timeout_s)
-    else:
-        approve = prompt_approver
-    orch.approve = approve
+    holder = {}
+
+    def make(c, seed=None, heal_context=None, heal_of=None, attempt=None):
+        o = Orchestrator(c, store, mode="single" if args.single else "swarm", single_role=args.role,
+                         test_command=args.test_command, sandbox_image=args.sandbox_image,
+                         seed_run_id=seed, heal_of=heal_of, heal_attempt=attempt, heal_context=heal_context)
+        holder["orch"] = o
+        if mode == "yes":
+            o.approve = lambda q: True  # noqa: E731
+        elif mode == "dashboard":
+            o.approve = dashboard_approver(store, lambda: holder["orch"].run_id, c.approval.timeout_s)
+        else:
+            o.approve = prompt_approver
+        return o
     if args.yes:
         print("note: --yes pre-approves pushing the branch and opening a draft PR (recorded as an intervention)")
+    issue_url = args.issue if args.issue and args.issue.startswith("http") else None
+    issue_file = args.issue_file or (args.issue if args.issue and not args.issue.startswith("http") else None)
+
+    async def go():
+        from .postmortem import heal
+        rid = await make(cfg, seed=args.continue_from).execute(
+            issue_url=issue_url, issue_file=issue_file, repo=args.repo, base_branch=args.base, run_id=args.run_id)
+
+        async def launch(c, seed, ctx, heal_of, attempt):
+            return await make(c, seed, ctx, heal_of, attempt).execute(
+                issue_url=issue_url, issue_file=issue_file, repo=args.repo, base_branch=args.base)
+        return await heal(cfg, store, rid, launch, attempts=args.heal_attempts, echo=print)
     try:
-        run_id = asyncio.run(orch.execute(issue_url=args.issue if args.issue and args.issue.startswith("http") else None,
-                                          issue_file=args.issue_file or (args.issue if args.issue and not args.issue.startswith("http") else None),
-                                          repo=args.repo, base_branch=args.base, run_id=args.run_id))
+        run_id = asyncio.run(go())
     except KeyboardInterrupt:
         print("interrupted")
         return 130
@@ -107,6 +121,43 @@ def cmd_runs(args, cfg) -> int:
         c = store.cost_summary(r["id"])
         print(f"{r['id']:24} {r['mode']:6} {r['state']:22} ${c['total']:8.4f}  {_fmt_age(r['created_at']):16}  "
               f"{(r['issue_title'] or r['issue_url'] or '')[:60]}")
+    return 0
+
+
+def cmd_failures(args, cfg) -> int:
+    from .postmortem import CATEGORIES
+    store = _store(cfg)
+    rows = store.failures(args.limit)
+    if args.json:
+        json.dump(rows, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+        return 0
+    if not rows:
+        print("no failures recorded")
+        return 0
+    for f in rows:
+        print(f"{_fmt_age(f['created_at'])}  {f['run_id']}  {CATEGORIES.get(f['category'], f['category'])}")
+        print(f"  task:    {(f['title'] or '')[:90]}")
+        print(f"  why:     {(f['root_cause'] or '')[:300]}")
+        print(f"  fix:     {(f['fix'] or '')[:300]}")
+        if f["outcome"]:
+            print(f"  outcome: {f['outcome']}")
+        print()
+    return 0
+
+
+def cmd_diagnose(args, cfg) -> int:
+    from .postmortem import CATEGORIES, diagnose
+    store = _store(cfg)
+    run = store.get_run(args.run_id)
+    if not run:
+        print(f"no run {args.run_id}")
+        return 1
+    d = asyncio.run(diagnose(cfg, store, run["id"]))
+    if not d:
+        print("nothing to diagnose (the run completed, was cancelled, or is still running)")
+        return 0
+    print(f"{CATEGORIES.get(d.category, d.category)} (by {d.diagnosed_by})\n\nWhy: {d.root_cause}\n\nFix: {d.fix}")
     return 0
 
 
@@ -246,14 +297,42 @@ def cmd_dashboard(args, cfg) -> int:
         return 2
     env = dict(os.environ, SWARMFORGE_DB=str(cfg.db_path), SWARMFORGE_CONFIG=str(cfg.source_path))
     url = f"http://localhost:{args.port}"
+    address = "127.0.0.1"
+    if args.lan:
+        if not os.environ.get("SWARMFORGE_DASH_PASSWORD"):
+            print("--lan makes the dashboard reachable from other devices, so it needs a password first.\n"
+                  "Add a line like  SWARMFORGE_DASH_PASSWORD=pick-a-long-passphrase  to your .env, then retry.")
+            return 2
+        address = "0.0.0.0"
     print(f"SwarmForge dashboard: {url}  (Ctrl+C to stop; runs started from it keep running)")
+    if args.lan:
+        for ip in _lan_ips():
+            print(f"  from your iPad / other devices: http://{ip}:{args.port}")
+        print("  (allow Python through the Windows firewall for private networks if the page doesn't load)")
     if not args.no_browser:
         import threading
         import webbrowser
         threading.Timer(2.5, lambda: webbrowser.open(url)).start()
     return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
-                            "--server.headless", "true", "--browser.gatherUsageStats", "false",
+                            "--server.address", address, "--server.headless", "true", "--browser.gatherUsageStats", "false",
                             "--client.toolbarMode", "minimal"], env=env)
+
+
+def _lan_ips() -> list[str]:
+    import socket
+    ips = set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+            sk.connect(("10.255.255.255", 1))  # no packet is sent; picks the outgoing interface
+            ips.add(sk.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith("127.")) or ["<this-computer's-IP>"]
 
 
 def _has_module(m: str) -> bool:
@@ -400,6 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--run-id", help=argparse.SUPPRESS)
     r.add_argument("--test-command", help="override the test command for this run")
     r.add_argument("--max-runtime-hours", type=float, help="override limits.max_runtime_s for this run")
+    r.add_argument("--heal-attempts", type=int, metavar="N",
+                   help="if the run fails, diagnose it and retry up to N times with more effort "
+                        "(default self_heal.max_attempts; 0 disables)")
     r.add_argument("--continue-from", metavar="RUN",
                    help="start from a stopped run's result and its unresolved problems")
     r.add_argument("--sandbox-image", help="override the sandbox image for this run (must already be built)")
@@ -413,6 +495,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=20)
     s.add_argument("--json", action="store_true", help="output JSON array of run objects")
     s.set_defaults(fn=cmd_runs)
+
+    s = sub.add_parser("failures", help="list failed runs with their diagnosis")
+    s.add_argument("--limit", type=int, default=30)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_failures)
+
+    s = sub.add_parser("diagnose", help="(re)write the post-mortem of a failed run")
+    s.add_argument("run_id")
+    s.set_defaults(fn=cmd_diagnose)
 
     s = sub.add_parser("status", help="show run status")
     s.add_argument("run_id", nargs="?", default="latest")
@@ -437,6 +528,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("dashboard", help="launch the Streamlit dashboard")
     s.add_argument("--port", type=int, default=8501)
     s.add_argument("--no-browser", action="store_true")
+    s.add_argument("--lan", action="store_true",
+                   help="also serve to other devices (iPad, phone; works over Tailscale too); "
+                        "requires SWARMFORGE_DASH_PASSWORD in .env")
     s.set_defaults(fn=cmd_dashboard)
 
     s = sub.add_parser("check", help="validate config, tools and provider connectivity")

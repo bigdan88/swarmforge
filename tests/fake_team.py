@@ -169,7 +169,19 @@ def librarian(body):
     return {"content": "", "tool_calls": [tool_call("submit_notes", {"notes": notes})]}
 
 
+def postmortem(body):
+    return {"content": json.dumps({
+        "category": "review_rejected",
+        "root_cause": "The reviewer blocked the run because README.md did not document --format, and no "
+                      "repair cycle was allowed to fix it.",
+        "fix": "Document the --format flag in README.md, then re-run the tests.",
+        "retry": True,
+        "lesson": "Documentation gaps are blocking review findings; update README with every CLI change."})}
+
+
 def planner(body):
+    if "post-mortem analyst" in body["messages"][0]["content"]:
+        return postmortem(body)
     if "Librarian" in body["messages"][0]["content"]:
         return librarian(body)
     n = _n_assistant(body)

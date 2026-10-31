@@ -43,7 +43,8 @@ async def test_dashboard_pages_render(tmp_path, monkeypatch, sample_repo):
     # delegation graph + transcripts rendered
     assert any("Planner" in g.proto.spec for g in at.get("graphviz_chart"))
     assert any("Brief handed to this agent" in m.value for m in at.markdown)
-    for page in ("Knowledge", "New run", "Benchmarks"):
+    assert any("Click a row" in c.value for c in at.caption)
+    for page in ("Knowledge", "New task", "Benchmarks"):
         at.sidebar.radio[0].set_value(page).run()
         assert not at.exception, (page, [e.value for e in at.exception])
     at.sidebar.radio[0].set_value("Knowledge").run()
@@ -100,13 +101,14 @@ def test_start_run_button_switches_to_runs(tmp_path, monkeypatch, sample_repo):
     cfg = _write_cfg(tmp_path, monkeypatch)
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
-    at.sidebar.radio[0].set_value("New run").run()
+    at.sidebar.radio[0].set_value("New task").run()
     at.text_input(key="nr_title").input("Add export")
     at.text_area(key="nr_body").input("Add CSV export with tests.")
     at.text_input(key="nr_repo").input(str(sample_repo))
     next(b for b in at.button if "Start run" in b.label).click().run()
     assert not at.exception, [e.value for e in at.exception]
-    assert at.session_state["page"] == "Runs"
+    assert at.session_state["page"] == "Work"
+    assert at.session_state["sel_item"].startswith("r:")
     runs = Store(cfg.db_path).list_runs()
     assert runs and runs[0]["issue_title"] == "Add export"
     from swarmforge.launcher import pid_alive
@@ -121,7 +123,7 @@ def test_new_run_form_validates_before_starting(tmp_path, monkeypatch):
     cfg = _write_cfg(tmp_path, monkeypatch)
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
-    at.sidebar.radio[0].set_value("New run").run()
+    at.sidebar.radio[0].set_value("New task").run()
     at.text_input(key="nr_title").input("Add export")
     at.text_area(key="nr_body").input("Add CSV export with tests.")
     at.text_input(key="nr_repo").input(str(tmp_path / "missing-folder"))
@@ -136,25 +138,68 @@ def test_new_run_form_validates_before_starting(tmp_path, monkeypatch):
     assert Store(cfg.db_path).list_runs() == []
 
 
-def test_queue_page_import_and_reorder(tmp_path, monkeypatch, sample_repo):
+def test_queue_import_then_edit_and_reorder_on_work_page(tmp_path, monkeypatch, sample_repo):
     from .conftest import ROOT
     cfg = _write_cfg(tmp_path, monkeypatch)
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
-    at.sidebar.radio[0].set_value("Queue").run()
     assert not at.exception, [e.value for e in at.exception]
-    assert any("queue is empty" in i.value for i in at.info)
+    assert any("Nothing here yet" in i.value for i in at.info)
+    at.sidebar.radio[0].set_value("New task").run()
+    at.radio(key="nt_how").set_value("Add to the queue").run()
     at.text_input(key="qi_path").input(str(ROOT / "docs" / "SELF_IMPROVEMENT_BACKLOG.md")).run()
     at.text_input(key="qi_repo").input(str(sample_repo)).run()
     next(b for b in at.button if b.label == "Import into queue").click().run()
     assert not at.exception, [e.value for e in at.exception]
-    items = Store(cfg.db_path).queue_items()
+    store = Store(cfg.db_path)
+    items = store.queue_items()
     assert len(items) == 7 and items[0]["title"] == "Make every dashboard section fail-safe"
     assert all(i["repo"] == str(sample_repo.resolve()) and i["chain"] == 1 for i in items)
-    # move the 2nd task up
-    next(b for b in at.button if b.key == f"q_up_{items[1]['id']}").click().run()
-    assert Store(cfg.db_path).queue_items()[0]["id"] == items[1]["id"]
+    assert at.session_state["page"] == "Work"
     assert any("Start queue" in b.label for b in at.button)
+    # the first waiting task opens by default; open the 2nd one and move it up
+    assert at.session_state["sel_item"] == f"q:{items[0]['id']}"
+    at.session_state["sel_item"] = f"q:{items[1]['id']}"
+    at.run()
+    next(b for b in at.button if b.key == f"q_up_{items[1]['id']}").click().run()
+    assert store.queue_items()[0]["id"] == items[1]["id"]
+    # edit its settings
+    iid = items[1]["id"]
+    at.number_input(key=f"qe_b_{iid}").set_value(12.5)
+    at.number_input(key=f"qe_h_{iid}").set_value(10.0)
+    at.text_input(key=f"qe_t_{iid}").input("Renamed task")
+    next(b for b in at.button if "Save changes" in b.label).click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    it = store.queue_item(iid)
+    assert it["title"] == "Renamed task" and it["budget"] == 12.5 and it["max_runtime_s"] == 36000
+    # filters
+    at.radio(key="w_filter").set_value("Failed").run()
+    assert any("No tasks match" in c.value for c in at.caption)
+
+
+def test_live_settings_for_running_run(tmp_path, monkeypatch):
+    import json
+    import os
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    store = Store(cfg.db_path)
+    store.create_run("20990101-000000-abcdef", state="TASK_EXECUTION", issue_title="Busy run", repo="x/y",
+                     budget_usd=5, pid=os.getpid(), max_runtime_s=3600, max_repair_cycles=2,
+                     config_json=json.dumps({"limits": {"max_runtime_s": 3600, "max_repair_cycles": 2}}))
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    rid = "20990101-000000-abcdef"
+    assert at.session_state["sel_item"] == f"r:{rid}"
+    at.number_input(key=f"ls_b_{rid}").set_value(9.0)
+    at.number_input(key=f"ls_h_{rid}").set_value(8.0)
+    at.number_input(key=f"ls_c_{rid}").set_value(4)
+    next(b for b in at.button if b.label == "Apply").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    run = store.get_run(rid)
+    assert run["budget_usd"] == 9.0 and run["max_runtime_s"] == 8 * 3600 and run["max_repair_cycles"] == 4
+    assert store.interventions(rid)[-1]["kind"] == "settings"
+    next(b for b in at.button if "Cancel this run" in b.label).click().run()
+    assert store.get_run(rid)["cancel_requested"] == 1
 
 
 def test_background_queue_worker_processes_and_exits(tmp_path, monkeypatch, sample_repo):
@@ -194,3 +239,48 @@ async def test_failed_run_offers_start_again_and_continue(tmp_path, monkeypatch,
     cont = labels["⏩ Continue from where it stopped"]
     assert not cont.disabled
     assert any(n.label == "Time limit (hours)" for n in at.number_input)
+
+
+def test_failures_page_and_hidden_attempts(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    store = Store(cfg.db_path)
+    store.create_run("20990101-000000-aaaaaa", state="FAILED", issue_title="Flaky task", repo="x/y", budget_usd=5,
+                     state_reason="maximum runtime of 5400s exceeded", config_json="{}")
+    store.create_run("20990101-010000-bbbbbb", state="COMPLETED", issue_title="Flaky task", repo="x/y",
+                     budget_usd=7.5, config_json="{}", heal_of="20990101-000000-aaaaaa", heal_attempt=1)
+    store.failure_save("20990101-000000-aaaaaa", title="Flaky task", repo="x/y", state="FAILED",
+                       reason="maximum runtime of 5400s exceeded", category="time_limit",
+                       root_cause="The tester ran the whole suite repeatedly.", fix="Run only the new tests.",
+                       retry=1, diagnosed_by="planner/qwen", evidence="...", heal_run_id="20990101-010000-bbbbbb",
+                       outcome="fixed itself on attempt 1")
+    store.create_run("20990101-020000-cccccc", state="FAILED", issue_title="Old failure", repo="x/y",
+                     budget_usd=5, state_reason="repair limit reached", config_json="{}")
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    # the healed attempt is hidden from the Work list; the successful retry says it fixed itself
+    df = at.dataframe[0].value
+    assert "Done (fixed itself, attempt 1)" in set(df["Status"]) and len(df) == 2
+    at.sidebar.radio[0].set_value("Failures").run()
+    assert not at.exception, [e.value for e in at.exception]
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Failures"] == "1" and metrics["Fixed themselves"] == "1"
+    assert any("have no post-mortem yet" in i.value for i in at.info)
+    assert any("The tester ran the whole suite repeatedly." in m.value for m in at.markdown)
+    # open the healing chain from the failure
+    next(b for b in at.button if b.label == "Open the retry").click().run()
+    assert at.session_state["page"] == "Work" and at.session_state["sel_item"] == "r:20990101-010000-bbbbbb"
+    assert any("Self-healing attempt 1" in m.value for m in at.markdown)
+
+
+def test_password_gate(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch)
+    monkeypatch.setenv("SWARMFORGE_DASH_PASSWORD", "open sesame")
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception
+    assert not at.sidebar.radio  # nothing shown before the password
+    at.text_input(key="_pw").input("wrong").run()
+    assert any("Wrong password" in e.value for e in at.error)
+    at.text_input(key="_pw").input("open sesame").run()
+    assert not at.exception and at.sidebar.radio[0].value == "Work"

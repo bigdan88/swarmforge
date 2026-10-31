@@ -351,3 +351,29 @@ def test_reviewer_fallback_cannot_overlap_developer(tmp_path):
 def test_generous_runtime_default():
     from swarmforge.config import Limits
     assert Limits().max_runtime_s >= 6 * 3600 and Limits().busy_wait_s >= 600
+
+
+def test_postmortem_classify_parse_and_escalate(cfg):
+    from swarmforge.postmortem import classify, escalate, parse_diagnosis, rules_diagnosis
+    run = {"state": "FAILED", "state_reason": "maximum runtime of 5400s exceeded"}
+    assert classify(run, [], [], []) == "time_limit"
+    assert classify({"state": "BUDGET_EXCEEDED", "state_reason": "x"}, [], [], []) == "budget"
+    assert classify({"state": "BLOCKED", "state_reason": "Docker is not responding"}, [], [], []) == "environment"
+    assert classify({"state": "BLOCKED", "state_reason": "repository is empty"}, [], [], []) == "repository"
+    assert classify({"state": "FAILED", "state_reason": "planner: model busy (HTTP 429)"}, [], [], []) == "model_unavailable"
+    failing = [{"label": "cycle", "exit_code": 1, "failed": 2, "errors": 0}]
+    rl = {"state": "FAILED", "state_reason": "repair limit reached (2 cycle(s)); review still blocking"}
+    assert classify(rl, [], [], failing) == "tests_failing"
+    assert classify(rl, [], [], []) == "review_rejected"
+    assert classify({"state": "CANCELLED", "state_reason": ""}, [], [], []) == "cancelled"
+    fb = rules_diagnosis("environment", {"state_reason": "docker down"})
+    assert fb.retry is False
+    d = parse_diagnosis('sure: {"category": "tests_failing", "root_cause": "x", "fix": "y", "retry": true}', fb)
+    assert d.category == "tests_failing" and d.retry is False  # environment problems are never retried
+    assert parse_diagnosis("no json here", fb) is None
+    cfg.limits.max_runtime_s, cfg.limits.budget_usd, cfg.limits.max_repair_cycles = 3600, 4.0, 2
+    steps = cfg.roles["planner"].max_steps
+    e2 = escalate(cfg, 2, budget_cap=7.0)
+    assert e2.limits.max_runtime_s == int(3600 * 2.25) and e2.limits.budget_usd == 7.0
+    assert e2.limits.max_repair_cycles == 4 and e2.roles["planner"].max_steps == int(steps * 2.25)
+    assert cfg.limits.max_repair_cycles == 2  # original untouched

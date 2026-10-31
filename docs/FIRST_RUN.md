@@ -34,8 +34,8 @@ macOS/Linux: same, with `python3.12 -m venv .venv && source .venv/bin/activate` 
 
 ## 2. Rehearse locally (no GitHub needed)
 
-From the dashboard: `swarmforge dashboard` → **New run** → **Prepare sample** → **Start run**,
-then watch it on **Runs**. Or from the command line:
+From the dashboard: `swarmforge dashboard` → **New task** → **Prepare sample** → **Start run**,
+then watch it on **Work**. Or from the command line:
 
 ```powershell
 python samples\make_sample_repo.py $HOME\swarmforge-sample

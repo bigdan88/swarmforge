@@ -107,6 +107,17 @@ knowledge:                    # Zettelkasten shared by all runs (Obsidian-compat
   max_notes_in_prompt: 6      # most relevant notes given to planner (fewer to developers/reviewer)
   max_notes_per_run: 6        # cap on notes the librarian writes per run
 
+self_heal:                    # when a run fails: diagnose why, then retry with more effort
+  enabled: true
+  max_attempts: 2             # automatic retries per task (0 = never); per task in the dashboard too
+  time_factor: 1.5            # each retry gets 1.5x the time, 2.25x on the 2nd retry, ...
+  budget_factor: 1.5          # ... the budget ...
+  extra_repair_cycles: 1      # ... one more repair cycle ...
+  steps_factor: 1.5           # ... and 1.5x the agent steps per session
+  max_total_budget_usd: 0     # cap for a task plus its retries; 0 = 3x the task's budget
+  diagnose: true              # ask a model why a run failed (one cheap call); stored under Failures
+  diagnosis_role: planner
+
 approval:
   timeout_s: 3600             # dashboard approval requests auto-decline after this long
 

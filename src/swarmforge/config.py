@@ -110,6 +110,20 @@ class KnowledgeConfig:
 
 
 @dataclass
+class SelfHealConfig:
+    enabled: bool = True
+    max_attempts: int = 2              # automatic retries after a failure (0 = never retry)
+    time_factor: float = 1.5           # each retry gets this much more time (compounding) ...
+    budget_factor: float = 1.5         # ... and budget ...
+    extra_repair_cycles: int = 1       # ... and repair cycles ...
+    steps_factor: float = 1.5          # ... and agent steps per session
+    max_total_budget_usd: float = 0.0  # cap for a run plus all its retries; 0 = 3x the first run's budget
+    diagnose: bool = True              # ask a model why a run failed (cheap, ~1 call)
+    diagnosis_role: str = "planner"
+    diagnosis_budget_usd: float = 0.5
+
+
+@dataclass
 class ApprovalConfig:
     timeout_s: int = 3600              # how long a dashboard approval request waits before declining
 
@@ -126,6 +140,7 @@ class Config:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
+    self_heal: SelfHealConfig = field(default_factory=SelfHealConfig)
     workdir: Path = field(default_factory=lambda: Path("~/.swarmforge").expanduser())
     source_path: Path | None = None
 
@@ -200,6 +215,7 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         review=_build(ReviewConfig, raw.get("review"), "review"),
         knowledge=_build(KnowledgeConfig, raw.get("knowledge"), "knowledge"),
         approval=_build(ApprovalConfig, raw.get("approval"), "approval"),
+        self_heal=_build(SelfHealConfig, raw.get("self_heal"), "self_heal"),
         workdir=workdir,
         source_path=source_path,
     )
@@ -219,6 +235,13 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("limits.max_concurrent_agents must be >= 1")
     if not 0 <= lim.max_repair_cycles <= 10:
         raise ConfigError("limits.max_repair_cycles must be between 0 and 10")
+    sh = cfg.self_heal
+    if not 0 <= sh.max_attempts <= 5:
+        raise ConfigError("self_heal.max_attempts must be between 0 and 5")
+    if sh.time_factor < 1 or sh.budget_factor < 1 or sh.steps_factor < 1:
+        raise ConfigError("self_heal factors must be >= 1")
+    if sh.diagnosis_role not in cfg.roles:
+        sh.diagnosis_role = "planner"
     if cfg.sandbox.mode not in ("docker", "local"):
         raise ConfigError("sandbox.mode must be 'docker' or 'local'")
     if cfg.sandbox.install_network not in ("none", "bridge"):

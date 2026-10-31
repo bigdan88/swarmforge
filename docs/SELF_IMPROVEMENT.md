@@ -41,12 +41,12 @@ SwarmForge pull an image it hasn't been told to build.
 ## Each improvement
 
 1. **Commit first.** Uncommitted changes in NiBot are not seen by the swarm.
-2. `swarmforge dashboard` → **New run** → *Describe it here*:
+2. `swarmforge dashboard` → **New task** → *Start now* → *Describe it here*:
    * **Title / description**: the change you want, with acceptance criteria (see example below).
    * **Repository**: `C:\Users\danie\Projects\NiBot`
    * Start with **Max repair cycles 2** and a modest budget ($3–5); SwarmForge's test suite takes
      about 2 minutes per run, so a run takes 30–60 minutes.
-3. Watch it under **Runs**. When it completes, the reason line says
+3. Watch it under **Work**. When it completes, the reason line says
    `delivered to branch swarmforge/task-xxxxxx in C:\Users\danie\Projects\NiBot`.
 4. Review and merge (stop the dashboard first if the change touches the dashboard):
    ```powershell
@@ -61,7 +61,7 @@ SwarmForge pull an image it hasn't been told to build.
 
 ## Many improvements in a row: the queue
 
-Dashboard → **Queue** → *Import a backlog file* → `docs/SELF_IMPROVEMENT_BACKLOG.md` →
+Dashboard → **New task** → *Add to the queue* → *Import a backlog file* → `docs/SELF_IMPROVEMENT_BACKLOG.md` →
 repository NiBot (or `bigdan88/swarmforge`) → **Start queue**. With chaining on, task 2 starts
 from task 1's result branch, task 3 from task 2's, and so on. At the end, review the last branch
 (it contains every step) and merge it. If a task fails, the queue pauses so nothing builds on a

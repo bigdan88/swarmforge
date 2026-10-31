@@ -31,6 +31,7 @@ def base_raw(workdir: Path, sandbox_mode: str = "local") -> dict:
         "project": {"test_command": f"{Path(sys.executable).as_posix()} -m pytest -q -p no:cacheprovider"},
         "workdir": str(workdir),
         "knowledge": {"vault": str(workdir / "knowledge")},
+        "self_heal": {"max_attempts": 0},  # tests that need it turn it on
     }
 
 

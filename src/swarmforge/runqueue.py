@@ -114,18 +114,33 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     issue_file.write_text(f"# {item['title']}\n\n{item['body']}\n", encoding="utf-8")
     store.queue_update(item["id"], status="running", run_id=run_id, started_at=time.time(),
                        base_branch=base, note=note)
-    orch = Orchestrator(c, store, mode=item["mode"], echo=echo, llm_transport=llm_transport, sandbox=sandbox,
-                        seed_run_id=item.get("seed_run_id"))
-    if item["approval"] == "yes":
-        orch.approve = lambda q: True
-    else:
-        orch.approve = dashboard_approver(store, lambda: orch.run_id, c.approval.timeout_s)
-    await orch.execute(issue_file=str(issue_file), repo=item["repo"], base_branch=base, run_id=run_id)
+    def make(cc, seed, ctx=None, heal_of=None, attempt=None):
+        orch = Orchestrator(cc, store, mode=item["mode"], echo=echo, llm_transport=llm_transport,
+                            sandbox=sandbox, seed_run_id=seed, heal_of=heal_of, heal_attempt=attempt,
+                            heal_context=ctx)
+        if item["approval"] == "yes":
+            orch.approve = lambda q: True
+        else:
+            orch.approve = dashboard_approver(store, lambda: orch.run_id, cc.approval.timeout_s)
+        return orch
+    await make(c, item.get("seed_run_id")).execute(issue_file=str(issue_file), repo=item["repo"],
+                                                   base_branch=base, run_id=run_id)
+
+    async def launch(cc, seed, ctx, heal_of, attempt):
+        rid = new_run_id()
+        store.queue_update(item["id"], run_id=rid, note=(note + "; " if note else "")
+                           + f"self-healing attempt {attempt} after {heal_of}")
+        return await make(cc, seed, ctx, heal_of, attempt).execute(
+            issue_file=str(issue_file), repo=item["repo"], base_branch=base, run_id=rid)
+    from .postmortem import heal
+    run_id = await heal(c, store, run_id, launch, attempts=item.get("heal_attempts"), echo=echo)
     run = store.get_run(run_id)
     status = {"COMPLETED": "done", "CANCELLED": "cancelled"}.get(run["state"], "failed")
     rb = result_branch_of(run)
     store.queue_update(item["id"], status=status, finished_at=time.time(), result_branch=rb,
-                       note=(note + "; " if note else "") + f"{run['state']}: {(run['state_reason'] or '')[:300]}")
+                       note=(note + "; " if note else "")
+                       + (f"after self-healing attempt {run['heal_attempt']}; " if run.get("heal_attempt") else "")
+                       + f"{run['state']}: {(run['state_reason'] or '')[:300]}")
     return store.queue_item(item["id"])
 
 

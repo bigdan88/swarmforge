@@ -163,6 +163,27 @@ CREATE TABLE IF NOT EXISTS queue_items (
     started_at REAL,
     finished_at REAL
 );
+CREATE TABLE IF NOT EXISTS failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL,
+    title TEXT,
+    repo TEXT,
+    state TEXT,
+    reason TEXT,
+    category TEXT,
+    root_cause TEXT,
+    fix TEXT,
+    lesson TEXT,
+    retry INTEGER NOT NULL DEFAULT 0,
+    diagnosed_by TEXT,
+    evidence TEXT,
+    note_stem TEXT,
+    heal_run_id TEXT,
+    outcome TEXT,
+    cost_usd REAL,
+    elapsed_s REAL
+);
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -198,6 +219,11 @@ class Store:
         ("queue_items", "max_runtime_s", "INTEGER"),
         ("queue_items", "seed_run_id", "TEXT"),
         ("runs", "seed_run_id", "TEXT"),
+        ("runs", "max_runtime_s", "INTEGER"),
+        ("runs", "max_repair_cycles", "INTEGER"),
+        ("runs", "heal_of", "TEXT"),
+        ("runs", "heal_attempt", "INTEGER"),
+        ("queue_items", "heal_attempts", "INTEGER"),
     ]
 
     def _migrate(self) -> None:
@@ -366,6 +392,35 @@ class Store:
     def acceptance(self, run_id: str) -> list[dict]:
         return self._all("SELECT * FROM acceptance WHERE run_id = ? ORDER BY id", (run_id,))
 
+    # -------------------------------------------------------------- failures
+    FAILURE_FIELDS = ("title", "repo", "state", "reason", "category", "root_cause", "fix", "lesson", "retry",
+                      "diagnosed_by", "evidence", "note_stem", "heal_run_id", "outcome", "cost_usd", "elapsed_s")
+
+    def failure_save(self, run_id: str, **fields: Any) -> None:
+        bad = set(fields) - set(self.FAILURE_FIELDS)
+        if bad:
+            raise ValueError(f"unknown failure fields {bad}")
+        if self.failure(run_id):
+            self.failure_update(run_id, **fields)
+            return
+        cols = ", ".join(["run_id", "created_at", *fields])
+        marks = ", ".join("?" * (len(fields) + 2))
+        self._exec(f"INSERT INTO failures ({cols}) VALUES ({marks})", (run_id, time.time(), *fields.values()))
+
+    def failure_update(self, run_id: str, **fields: Any) -> None:
+        bad = set(fields) - set(self.FAILURE_FIELDS)
+        if bad:
+            raise ValueError(f"unknown failure fields {bad}")
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            self._exec(f"UPDATE failures SET {sets} WHERE run_id = ?", (*fields.values(), run_id))
+
+    def failure(self, run_id: str) -> dict | None:
+        return self._one("SELECT * FROM failures WHERE run_id = ?", (run_id,))
+
+    def failures(self, limit: int = 500) -> list[dict]:
+        return self._all("SELECT * FROM failures ORDER BY created_at DESC LIMIT ?", (limit,))
+
     # ---------------------------------------------------------- interventions
     def record_intervention(self, run_id: str, kind: str, detail: str = "") -> None:
         self._exec("INSERT INTO interventions (run_id, ts, kind, detail) VALUES (?, ?, ?, ?)",
@@ -394,7 +449,7 @@ class Store:
     # ------------------------------------------------------------------ queue
     QUEUE_FIELDS = ("title", "body", "repo", "mode", "budget", "max_cycles", "chain", "approval",
                     "status", "run_id", "base_branch", "result_branch", "note", "started_at",
-                    "finished_at", "position", "max_runtime_s", "seed_run_id")
+                    "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts")
 
     def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
         row = self._one("SELECT MAX(position) AS m FROM queue_items")

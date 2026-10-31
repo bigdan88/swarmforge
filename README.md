@@ -61,25 +61,28 @@ The dashboard is the control center:
 swarmforge dashboard          # opens http://localhost:8501
 ```
 
-* **New run**: describe the work (or paste a GitHub issue URL), point it at a repository,
-  pick swarm or single agent, set the budget and repair cycles, then **Start run**. Runs are
-  background processes and keep going if you close the browser. Use **Prepare sample** for a
-  one-click demo.
-* **Runs**: every run, live. Each run has these tabs:
-  * **Delegation**: planner → tasks → agents → tester → reviewer → repair cycles, with each
-    agent's brief and what it reported back.
-  * **Agents & timeline**: what is running now and which tasks overlapped.
-  * **Transcripts**: every agent session, showing the prompt it received, its reasoning, each tool
-    call and result, and what it submitted.
-  * **Tests, Review, Knowledge, Tokens & cost, Console, Events**.
+* **Work**: one list of everything: running runs, waiting queue tasks, finished and failed work,
+  with filters (All / Active / Waiting / Finished / Failed) and search. **Click any row** to open
+  it underneath:
+  * **Waiting task**: change anything (title, description, repository, team, budget, repair cycles,
+    time limit, chaining, GitHub approval), move it up/down or to the front, or remove it.
+  * **Running run**: change its budget, time limit and repair cycles while it runs (applied within a
+    few seconds, no restart), or cancel it. Approve or decline GitHub pushes.
+  * **Failed/stopped run**: start it again from scratch, or continue from where it stopped, with new
+    limits.
+  * Every run shows these tabs: **Delegation** (planner → tasks → agents → tester → reviewer →
+    repair cycles, with each agent's brief and hand-back), **Agents & timeline**, **Transcripts**
+    (each agent's prompt, reasoning, tool calls and results), **Tests, Review, Knowledge, Tokens &
+    cost, Console, Events**.
 
-  Approve or decline the GitHub push with a button. Cancel runs.
-* **Queue**: line up tasks (or import a backlog file such as
-  `docs/SELF_IMPROVEMENT_BACKLOG.md`) and press **Start queue**. Tasks run one after another in
-  a background worker. With chaining, each task starts from the previous task's result on the same
-  repository, so a series of improvements builds up without merging in between. The queue pauses
-  if a task fails. CLI: `swarmforge queue import FILE --repo R`, `queue list`, `queue resume`,
-  `queue pause`.
+  The queue bar at the top starts, pauses and resumes the queue worker. Queued tasks run one after
+  another; with chaining, each task starts from the previous task's result on the same repository.
+  CLI: `swarmforge queue import FILE --repo R`, `queue list`, `queue resume`, `queue pause`.
+* **New task**: *Start now* (describe the work or paste a GitHub issue URL, point it at a
+  repository, set budget, repair cycles and time limit, **Start run**; **Prepare sample** for a
+  one-click demo) or *Add to the queue* (one task, or import a backlog file such as
+  `docs/SELF_IMPROVEMENT_BACKLOG.md`). Runs are background processes and keep going if you close
+  the browser.
 * **Knowledge**: the Zettelkasten. Browse, search, edit and link notes, view the note graph,
   and write your own notes for the agents to use.
 * **Benchmarks**: single agent vs swarm comparisons.
@@ -98,6 +101,33 @@ Machine-readable output (added by SwarmForge itself in its first self-improvemen
 `swarmforge status [RUN] --json` prints one object with the same fields plus
 `integration_branch`, `pr_url`, `repair_cycle`, `interventions` and a `tasks` list. An unknown
 run prints `{"error": "run not found: <id>"}` and exits with status 2.
+
+## Failures and self-healing
+
+Every run that fails gets a **post-mortem**. SwarmForge sorts the failure into a cause (time limit,
+budget, tests failing, review rejected, environment, ...) and asks the planner model *why it
+failed and what the next attempt should do differently*. The post-mortem is kept in three places:
+
+* the dashboard's **Failures** page, with counts by cause and what happened next;
+* the run's `postmortem.md`;
+* a `failure` note in the knowledge vault, linked from the **Failures** hub note. Later runs on
+  the same repository are given these notes, so the agents learn from them.
+
+CLI: `swarmforge failures`, `swarmforge diagnose RUN`.
+
+If a retry can fix the failure, SwarmForge **heals itself**:
+
+* It starts a new attempt that continues from the failed run's code.
+* The diagnosis is added to the task.
+* The new attempt gets more effort: 1.5x the time, budget and agent steps, compounding with each
+  attempt, plus one more repair cycle.
+* It never retries problems a human must fix first, such as Docker being down, a missing key or
+  a bad repository.
+* Retries are capped by *Auto-fix attempts* (default 2, settable per task) and by a total budget
+  of 3x the task's budget. See `self_heal:` in `swarmforge.example.yaml`.
+
+On the Work page, a task that healed itself shows as "Done (fixed itself, attempt N)". Its earlier
+attempts are listed under Failures.
 
 ## Repositories and dependencies
 

@@ -31,10 +31,30 @@ FLOW = ["ISSUE_RECEIVED", "REPOSITORY_INSPECTION", "PLANNING", "TASK_VALIDATION"
 PALETTE = ["#4c78a8", "#f58518", "#54a24b", "#b279a2", "#e45756", "#72b7b2", "#eeca3b", "#9d755d"]
 TYPE_COLORS = {"decision": "#4c78a8", "pitfall": "#e45756", "pattern": "#54a24b", "repo-fact": "#72b7b2",
                "review-lesson": "#f58518", "model-behavior": "#b279a2", "run-log": "#bab0ac",
-               "hub": "#333333", "user-note": "#eeca3b"}
+               "hub": "#333333", "user-note": "#eeca3b", "failure": "#d62728"}
 ROLE_ICON = {"planner": "🧭", "reviewer": "🔍", "tester": "🧪", "librarian": "📚"}
 
 st.set_page_config(page_title="SwarmForge", page_icon="🐝", layout="wide")
+
+
+def _password_gate() -> None:
+    """When SWARMFORGE_DASH_PASSWORD is set (required for `swarmforge dashboard --lan`), ask for it once
+    per browser session before showing anything."""
+    import hmac
+    pw = os.environ.get("SWARMFORGE_DASH_PASSWORD")
+    if not pw or st.session_state.get("_authed"):
+        return
+    st.title("🐝 SwarmForge")
+    given = st.text_input("Password", type="password", key="_pw")
+    if given:
+        if hmac.compare_digest(given.encode(), pw.encode()):
+            st.session_state._authed = True
+            st.rerun()
+        st.error("Wrong password.")
+    st.stop()
+
+
+_password_gate()
 
 
 # ------------------------------------------------------------------ resources
@@ -57,6 +77,16 @@ db_path = os.environ.get("SWARMFORGE_DB") or (str(cfg.db_path) if cfg else
                                               str(Path("~/.swarmforge/swarmforge.db").expanduser()))
 store = get_store(db_path)
 vault = Vault(cfg.vault_path) if cfg else None
+
+
+HEAL_HELP = ("If the task fails, SwarmForge asks a model why, then automatically retries this many times, "
+             "continuing from the failed work with the diagnosis added and more time, budget, repair cycles "
+             "and agent steps each attempt. 0 = never retry.")
+
+
+def heal_input(col, key: str, value=None):
+    v = cfg.self_heal.max_attempts if value is None else int(value)
+    return int(col.number_input("Auto-fix attempts", 0, 5, max(0, min(5, v)), key=key, help=HEAL_HELP))
 
 
 def _hrs(seconds) -> float:
@@ -91,20 +121,23 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-if "page" not in st.session_state:
-    st.session_state.page = "Runs"
+PAGES = ["Work", "New task", "Failures", "Knowledge", "Benchmarks"]
+if st.session_state.get("page") not in PAGES:
+    st.session_state.page = "Work"
 if "goto" in st.session_state:  # navigation requested by a button on the previous script run
     st.session_state.page = st.session_state.pop("goto")
 pending_all = store.pending_approvals()
 with st.sidebar:
     st.title("🐝 SwarmForge")
-    pages = ["Runs", "New run", "Queue", "Knowledge", "Benchmarks"]
-    st.radio("Go to", pages, key="page", label_visibility="collapsed")
+    st.radio("Go to", PAGES, key="page", label_visibility="collapsed",
+             format_func={"Work": "📋 Work", "New task": "➕ New task", "Failures": "🩺 Failures",
+                          "Knowledge": "📚 Knowledge",
+                          "Benchmarks": "📊 Benchmarks"}.get)
     if pending_all:
         st.warning(f"🔔 {len(pending_all)} approval(s) waiting")
     st.divider()
     auto = st.toggle("Live refresh (3 s)", value=os.environ.get("SWARMFORGE_DASH_AUTOREFRESH", "1") == "1",
-                     help="Refreshes the Runs page while a run is active.")
+                     help="Refreshes the Work list and the open run while something is running.")
     if cfg:
         st.caption(f"Config: `{cfg.source_path}`")
         st.caption(f"Knowledge vault: `{cfg.vault_path}`")
@@ -116,7 +149,6 @@ page = st.session_state.page
 
 # ============================================================== NEW RUN page
 def page_new_run():
-    st.header("Start a new run")
     if not cfg:
         st.error("Configuration not loaded; cannot start runs.")
         return
@@ -167,6 +199,7 @@ def page_new_run():
                                  "(limits.max_runtime_s).")
     approval = c5.selectbox("Before pushing to GitHub", ["dashboard", "yes"], format_func=lambda a: {
         "dashboard": "Ask me here", "yes": "Pre-approve"}[a])
+    heal = heal_input(st.columns(5)[0], "nr_heal")
 
     with st.expander("Advanced: test command and sandbox image"):
         st.caption("Leave blank to use the repository's `swarmforge.project.yml` (if it has one), "
@@ -223,17 +256,17 @@ def page_new_run():
                                     mode=mode, budget=budget, max_cycles=int(cycles), approval=approval,
                                     test_command=(test_cmd or "").strip() or None,
                                     sandbox_image=(image or "").strip() or None, base=base,
-                                    max_runtime_s=int(hours * 3600))
+                                    max_runtime_s=int(hours * 3600), heal_attempts=heal)
         except (ValueError, RepoError) as e:
             st.error(str(e))
             return
-        st.session_state.sel_run = run_id
-        st.session_state.goto = "Runs"
+        select_item(f"r:{run_id}")
+        st.session_state.goto = "Work"
         time.sleep(1.5)  # give the process a moment to register the run
         st.rerun()
 
 
-# ================================================================= RUNS page
+# ============================================================ run details
 def runs_overview(runs):
     rows = []
     for r in runs:
@@ -365,35 +398,10 @@ def render_transcript(path: Path):
                 + (f" — {d.get('error')}" if d.get("error") else ""))
 
 
-def page_runs():
-    runs = store.list_runs(200)
-    st.header("Runs")
-    if not runs:
-        st.info("No runs yet. Go to **New run** to start one.")
-        return
-    runs_overview(runs)
-    ids = [r["id"] for r in runs]
-    default = st.session_state.get("sel_run")
-    idx = ids.index(default) if default in ids else 0
-    labels = {r["id"]: f"{STATE_ICON.get(r['state'], '🟢')} {r['id']} · {(r['issue_title'] or '')[:50]}" for r in runs}
-    run_id = st.selectbox("Open run", ids, index=idx, format_func=labels.get)
-    st.session_state.sel_run = run_id
-    st.divider()
-    run_detail(run_id)
-    run = store.get_run(run_id)
-    if auto and (run["state"] not in TERMINAL or store.pending_approvals()):
-        time.sleep(3)
-        st.rerun()
-
-
 def run_resumable(run_id: str) -> bool:
     """True if a stopped run left a clone with integrated work that a new run can continue from."""
-    r = store.get_run(run_id)
-    if not r or not r["integration_branch"] or not r["run_dir"]:
-        return False
-    if not (Path(r["run_dir"]) / "repo").is_dir():
-        return False
-    return any(t["state"] == "INTEGRATED" and t["kind"] in ("implement", "fix") for t in store.tasks(run_id))
+    from swarmforge.postmortem import resumable
+    return resumable(store, run_id)
 
 
 def _requeue_next(item: dict, kw: dict) -> None:
@@ -437,7 +445,8 @@ def restart_panel(run: dict) -> None:
                                    mode=run["mode"], budget=budget, max_cycles=int(cycles),
                                    max_runtime_s=int(hours * 3600), seed_run_id=seed,
                                    base=run["base_branch"] if not seed else run["base_branch"])
-                st.session_state.sel_run = rid
+                select_item(f"r:{rid}")
+                st.session_state.flash = f"Started run {rid}."
                 st.rerun()
             except ValueError as e:
                 st.error(str(e))
@@ -453,7 +462,7 @@ def restart_panel(run: dict) -> None:
 
 
 
-def run_detail(run_id):
+def run_detail(run_id, header=True):
     run = store.get_run(run_id)
     tasks = store.tasks(run_id)
     events = store.events(run_id)
@@ -464,7 +473,8 @@ def run_detail(run_id):
     acc = store.acceptance(run_id)
     elapsed = (run["finished_at"] or time.time()) - run["created_at"]
 
-    st.subheader(run["issue_title"] or run_id)
+    if header:
+        st.subheader(run["issue_title"] or run_id)
     st.caption(f"Run `{run_id}` · {run['mode']} · source {run['issue_url'] or '-'} · repo {run['repo'] or '-'}")
 
     for ap in store.pending_approvals(run_id):
@@ -511,13 +521,6 @@ def run_detail(run_id):
                 else:
                     st.error("Publishing failed: check that the token has Contents and Pull requests write "
                              "access to this repository (details in the Events tab).")
-    if run["state"] in ("FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED") and cfg:
-        restart_panel(run)
-    if active and not run["cancel_requested"]:
-        if st.button("⏹ Request cancel"):
-            store.request_cancel(run_id)
-            store.event(run_id, "cancel", "cancel requested from dashboard", level="warn")
-            st.rerun()
 
     visited = [json.loads(e["data"])["to"] for e in events if e["kind"] == "state" and e["data"]]
     chips = [("🔵" if s == run["state"] else "🟢" if s in visited else "⚪") + f" {s}" for s in FLOW]
@@ -772,125 +775,497 @@ def page_knowledge():
                     st.success("Note created")
 
 
-# ================================================================ QUEUE page
+# ================================================================= WORK page
 QSTATUS = {"queued": "⏳", "running": "🟢", "done": "✅", "failed": "❌", "cancelled": "⏹️", "skipped": "⏭️"}
+FAILED_STATES = {"FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
+FILTERS = {"All": None, "Active": {"active"}, "Waiting": {"waiting"}, "Finished": {"done"},
+           "Failed": {"failed"}}
 
 
-def page_queue():
+def _short_repo(repo: str) -> str:
+    repo = (repo or "").rstrip("/\\")
+    parts = re.split(r"[/\\]", repo)
+    return "/".join(parts[-2:]) if len(parts) > 2 else repo
+
+
+def _run_status(r: dict, approvals: set) -> tuple[str, str, str]:
+    """(group, icon, label) for a run."""
+    if r["id"] in approvals:
+        return "active", "🔔", "Needs your approval"
+    if r["state"] not in TERMINAL:
+        if r["pid"] and not pid_alive(r["pid"]):
+            return "failed", "⚠️", "Stopped unexpectedly"
+        if r.get("heal_attempt"):
+            return "active", "🩹", f"Self-healing (attempt {r['heal_attempt']})"
+        return "active", "🟢", "Running"
+    if r["state"] == "COMPLETED" and r.get("heal_attempt"):
+        return "done", "✅", f"Done (fixed itself, attempt {r['heal_attempt']})"
+    if r["state"] == "COMPLETED":
+        return "done", "✅", "Done"
+    return "failed", STATE_ICON.get(r["state"], "❌"), r["state"].replace("_", " ").title()
+
+
+def work_items() -> list[dict]:
+    """Every queue task and every run as one list: active first, then waiting (queue order), then newest."""
+    runs = store.list_runs(300)
+    by_id = {r["id"]: r for r in runs}
+    healed = {r["heal_of"] for r in runs if r.get("heal_of")}  # earlier attempts: shown under Failures
+    approvals = {a["run_id"] for a in store.pending_approvals()}
+    out, used = [], set()
+    queue = store.queue_items()
+    waiting_pos = {i["id"]: n for n, i in enumerate([q for q in queue if q["status"] == "queued"], 1)}
+    for i in queue:
+        r = by_id.get(i["run_id"]) if i["run_id"] else None
+        if r:
+            used.add(r["id"])
+        if i["status"] == "queued":
+            grp, icon, label = "waiting", "⏳", f"Waiting (#{waiting_pos[i['id']]} in line)"
+        elif r:
+            grp, icon, label = _run_status(r, approvals)
+        elif i["status"] == "running":
+            grp, icon, label = "active", "🟢", "Starting"
+        elif i["status"] == "done":
+            grp, icon, label = "done", "✅", "Done"
+        else:
+            grp, icon, label = "failed", QSTATUS.get(i["status"], "❌"), i["status"].title()
+        out.append({"key": f"q:{i['id']}", "group": grp, "icon": icon, "status": label, "title": i["title"],
+                    "repo": i["repo"], "item": i, "run": r,
+                    "when": (r["created_at"] if r else i.get("created_at")) or 0,
+                    "order": waiting_pos.get(i["id"], 0), "hidden": False})
+    for r in runs:
+        if r["id"] in used:
+            continue
+        grp, icon, label = _run_status(r, approvals)
+        out.append({"key": f"r:{r['id']}", "group": grp, "icon": icon, "status": label,
+                    "title": r["issue_title"] or r["issue_url"] or r["id"], "repo": r["repo"] or "",
+                    "item": None, "run": r, "when": r["created_at"] or 0, "order": 0,
+                    "hidden": r["id"] in healed})
+    rank = {"active": 0, "waiting": 1}
+    out.sort(key=lambda w: (rank.get(w["group"], 2), w["order"] if w["group"] == "waiting" else -w["when"]))
+    return out
+
+
+def _row(w: dict) -> dict:
+    r, i = w["run"], w["item"]
+    now = ""
+    if w["group"] == "active" and r:
+        now = r["state"].replace("_", " ").title() + (f" · repair cycle {r['repair_cycle']}" if r["repair_cycle"] else "")
+    elif r and r["state_reason"]:
+        now = r["state_reason"][:90]
+    elif i and i["note"]:
+        now = i["note"][:90]
+    cost = store.cost_summary(r["id"])["total"] if r else None
+    return {"": w["icon"], "Task": (w["title"] or "")[:80], "Status": w["status"], "Now / result": now,
+            "Repo": _short_repo(w["repo"]), "Cost $": round(cost, 3) if cost is not None else None,
+            "Time": fmt_dur((r["finished_at"] or time.time()) - r["created_at"]) if r else "",
+            "Started": fmt_ts(r["created_at"], True) if r else "",
+            "From": "queue" if i else "manual"}
+
+
+def select_item(key: str | None) -> None:
+    """Open an item in the detail panel (used by buttons; the table selection resets)."""
+    st.session_state.sel_item = key
+    st.session_state.wt_ver = st.session_state.get("wt_ver", 0) + 1
+
+
+def queue_bar() -> None:
     from swarmforge import runqueue as rq
-    st.header("Queue")
-    st.caption("Line up tasks; SwarmForge runs them one after another. With **chaining**, each task starts "
-               "from the previous task's result on the same repository, so improvements build on each other "
-               "without merging in between. Nothing is ever merged into your main branch.")
-    if not cfg:
-        st.error("Configuration not loaded.")
-        return
     items = store.queue_items()
     pid = rq.worker_pid(store)
     paused = store.kv_get(rq.PAUSED_KEY) == "1"
     queued = [i for i in items if i["status"] == "queued"]
     running = [i for i in items if i["status"] == "running"]
-
+    if not items:
+        return
     with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
+        c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 2])
         if pid:
-            c1.markdown(f"**Worker:** 🟢 running (pid {pid})" + (" — will pause after the current run" if paused else ""))
+            c1.markdown(f"**Queue:** 🟢 working (pid {pid})" + (" — pauses after the current task" if paused else ""))
         else:
-            c1.markdown("**Worker:** ⚪ stopped" + (" (paused)" if paused and queued else ""))
+            c1.markdown("**Queue:** ⚪ stopped" + (" (paused)" if paused and queued else "")
+                        + (f" · {len(queued)} waiting" if queued else ""))
         if not pid:
-            if c2.button("▶ Start queue", type="primary", disabled=not queued):
+            if c2.button("▶ Start queue", type="primary", disabled=not queued or not cfg, key="qb_start"):
                 rq.start_worker(cfg, store)
                 time.sleep(1.5)
-                st.rerun()
+                st.rerun(scope="app")
         elif not paused:
-            if c2.button("⏸ Pause after current"):
+            if c2.button("⏸ Pause after current", key="qb_pause"):
                 store.kv_set(rq.PAUSED_KEY, "1")
-                st.rerun()
+                st.rerun(scope="app")
         else:
-            if c2.button("▶ Keep going"):
+            if c2.button("▶ Keep going", key="qb_resume"):
                 store.kv_set(rq.PAUSED_KEY, "0")
-                st.rerun()
-        if running and c3.button("⏹ Cancel current run"):
-            store.request_cancel(running[0]["run_id"])
-            store.kv_set(rq.PAUSED_KEY, "1")
-            st.rerun()
+                st.rerun(scope="app")
+        if any(i["status"] in ("done", "failed", "cancelled", "skipped") for i in items):
+            if c3.button("🧹 Clear finished", key="qb_clear", help="Removes finished queue entries from the "
+                         "queue. Their runs stay in the list."):
+                store.queue_clear_finished()
+                st.rerun(scope="app")
         policy = store.kv_get(rq.POLICY_KEY) or "stop"
         new_policy = c4.selectbox("If a task fails", ["stop", "continue"], index=["stop", "continue"].index(policy),
-                                  format_func=lambda p: {"stop": "Pause the queue (recommended)",
-                                                         "continue": "Continue with the next task"}[p])
+                                  key="qb_policy", format_func=lambda p: {"stop": "If a task fails: pause the queue",
+                                                         "continue": "If a task fails: continue"}[p],
+                                  label_visibility="collapsed")
         if new_policy != policy:
             store.kv_set(rq.POLICY_KEY, new_policy)
-        n_total = len(items)
-        n_done = sum(1 for i in items if i["status"] == "done")
-        if n_total:
-            st.progress(n_done / n_total, text=f"{n_done} of {n_total} done · {len(queued)} waiting")
+        done = sum(1 for i in items if i["status"] == "done")
+        st.progress(done / len(items), text=f"{done} of {len(items)} queue tasks done · {len(running)} running "
+                                             f"· {len(queued)} waiting")
 
+
+def work_list() -> list[dict]:
+    queue_bar()
+    items = [w for w in work_items() if not w["hidden"]]
     if not items:
-        st.info("The queue is empty. Add a task below or import a backlog file.")
-    for i in items:
-        icon = QSTATUS.get(i["status"], "")
-        label = f"{icon} #{i['id']} {i['title']}  ·  {i['status']}"
-        with st.expander(label, expanded=i["status"] == "running"):
-            st.caption(f"repo `{i['repo']}` · {i['mode']} · budget ${i['budget'] or cfg.limits.budget_usd:.2f} · "
-                       f"repair cycles {i['max_cycles'] if i['max_cycles'] is not None else cfg.limits.max_repair_cycles} · "
-                       f"{'chained' if i['chain'] else 'independent'} · "
-                       f"{'draft PRs without asking' if i['approval'] == 'yes' else 'ask before pushing'}")
-            if i["base_branch"]:
-                st.markdown(f"Started from `{i['base_branch']}`")
-            if i["result_branch"]:
-                st.markdown(f"Result branch: `{i['result_branch']}`")
-            if i["note"]:
-                st.caption(i["note"])
-            if i["run_id"]:
-                if st.button("Open run", key=f"q_open_{i['id']}"):
-                    st.session_state.sel_run = i["run_id"]
-                    st.session_state.goto = "Runs"
-                    st.rerun()
-            if i["status"] == "queued":
-                b1, b2, b3, b4 = st.columns(4)
-                if b1.button("⬆ Up", key=f"q_up_{i['id']}"):
-                    store.queue_move(i["id"], -1)
-                    st.rerun()
-                if b2.button("⬇ Down", key=f"q_dn_{i['id']}"):
-                    store.queue_move(i["id"], +1)
-                    st.rerun()
-                if b3.button("🗑 Remove", key=f"q_rm_{i['id']}"):
-                    store.queue_remove(i["id"])
-                    st.rerun()
-                if b4.toggle("Edit", key=f"q_ed_{i['id']}"):
-                    with st.form(f"q_form_{i['id']}"):
-                        t = st.text_input("Title", i["title"])
-                        b = st.text_area("Description", i["body"], height=260)
-                        r = st.text_input("Repository", i["repo"])
-                        if st.form_submit_button("Save"):
-                            store.queue_update(i["id"], title=t, body=b, repo=r)
-                            st.rerun()
-                else:
-                    st.markdown(i["body"][:3000])
-            elif i["status"] in ("failed", "cancelled", "skipped"):
-                r1, r2, r3 = st.columns([1, 1, 1])
-                more = r3.number_input("Time limit (h)", 0.05, 72.0,
-                                       _hrs(max(i["max_runtime_s"] or cfg.limits.max_runtime_s,
-                                                cfg.limits.max_runtime_s)), 0.5, key=f"q_h_{i['id']}")
-                kw = dict(mode=i["mode"], budget=i["budget"], max_cycles=i["max_cycles"], chain=i["chain"],
-                          approval=i["approval"], max_runtime_s=int(more * 3600))
-                if r1.button("↻ Start again", key=f"q_re_{i['id']}",
-                             help="Queue this task again from scratch (same description)."):
-                    _requeue_next(i, kw)
-                    st.rerun()
-                can_continue = bool(i["run_id"]) and run_resumable(i["run_id"])
-                if r2.button("⏩ Continue where it stopped", key=f"q_co_{i['id']}", disabled=not can_continue,
-                             help="Queue it again starting from the failed run's code, with its unresolved "
-                                  "problems added to the task."):
-                    _requeue_next(i, {**kw, "seed_run_id": i["run_id"]})
-                    st.rerun()
-    if any(i["status"] in ("done", "failed", "cancelled", "skipped") for i in items):
-        if st.button("Clear finished tasks"):
-            store.queue_clear_finished()
+        st.info("Nothing here yet. Go to **New task** to start a run or fill the queue.")
+        return items
+    counts = {g: sum(1 for w in items if w["group"] == g) for g in ("active", "waiting", "done", "failed")}
+    f1, f2 = st.columns([3, 2])
+    labels = {"All": f"All ({len(items)})", "Active": f"Active ({counts['active']})",
+              "Waiting": f"Waiting ({counts['waiting']})", "Finished": f"Finished ({counts['done']})",
+              "Failed": f"Failed ({counts['failed']})"}
+    filt = f1.radio("Show", list(FILTERS), horizontal=True, key="w_filter", format_func=labels.get,
+                    label_visibility="collapsed")
+    query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
+                          label_visibility="collapsed").strip().lower()
+    shown = [w for w in items if (FILTERS[filt] is None or w["group"] in FILTERS[filt])
+             and (not query or query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower())]
+    if not shown:
+        st.caption("No tasks match.")
+        return items
+    df = pd.DataFrame([_row(w) for w in shown])
+    tkey = f"wt_{st.session_state.get('wt_ver', 0)}_{abs(hash(tuple(w['key'] for w in shown))) % 10**8}"
+    ev = st.dataframe(df, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(shown)),
+                      on_select="rerun", selection_mode="single-row", key=tkey,
+                      column_config={"": st.column_config.TextColumn("", width=30),
+                                     "Task": st.column_config.TextColumn(width="large"),
+                                     "Now / result": st.column_config.TextColumn(width="medium"),
+                                     "Cost $": st.column_config.NumberColumn(format="$%.3f")})
+    rows = list(ev.selection.rows) if ev is not None and hasattr(ev, "selection") else []
+    if rows and st.session_state.get("_wt_last") != (tkey, rows):
+        st.session_state._wt_last = (tkey, rows)
+        if st.session_state.get("sel_item") != shown[rows[0]]["key"]:
+            st.session_state.sel_item = shown[rows[0]]["key"]
+            st.rerun(scope="app")
+    st.caption("Click a row to open it below.")
+    return items
+
+
+def waiting_editor(i: dict) -> None:
+    """Everything about a not-yet-started queue task can be changed."""
+    b1, b2, b3, b4, _ = st.columns([1, 0.7, 0.8, 0.9, 5])
+    if b1.button("⏫ Run next", key=f"q_top_{i['id']}", help="Move to the front of the waiting line."):
+        waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != i["id"]]
+        if waiting:
+            store.queue_update(i["id"], position=waiting[0]["position"] - 0.5)
+        st.rerun()
+    if b2.button("⬆ Up", key=f"q_up_{i['id']}"):
+        store.queue_move(i["id"], -1)
+        st.rerun()
+    if b3.button("⬇ Down", key=f"q_dn_{i['id']}"):
+        store.queue_move(i["id"], +1)
+        st.rerun()
+    if b4.button("🗑 Remove", key=f"q_rm_{i['id']}"):
+        store.queue_remove(i["id"])
+        select_item(None)
+        st.rerun()
+    if i["seed_run_id"]:
+        st.caption(f"Continues from run `{i['seed_run_id']}` (its code and unresolved problems).")
+    with st.form(f"q_form_{i['id']}", border=True):
+        st.markdown("**⚙️ Settings** (used when this task starts)")
+        title = st.text_input("Title", i["title"], key=f"qe_t_{i['id']}")
+        body = st.text_area("Description and acceptance criteria", i["body"], height=240, key=f"qe_d_{i['id']}")
+        repo = st.text_input("Repository", i["repo"], key=f"qe_r_{i['id']}")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        mode = c1.selectbox("Team", ["swarm", "single"], index=["swarm", "single"].index(i["mode"] or "swarm"),
+                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "single": "Single agent"}.get)
+        budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(i["budget"] or cfg.limits.budget_usd), 0.5,
+                                 key=f"qe_b_{i['id']}")
+        cycles = c3.number_input("Max repair cycles", 0, 10, int(i["max_cycles"] if i["max_cycles"] is not None
+                                                                 else cfg.limits.max_repair_cycles),
+                                 key=f"qe_c_{i['id']}")
+        hours = c4.number_input("Time limit (hours)", 0.05, 72.0, _hrs(i["max_runtime_s"] or cfg.limits.max_runtime_s),
+                                0.5, key=f"qe_h_{i['id']}")
+        approval = c5.selectbox("GitHub pushes", ["yes", "dashboard"],
+                                index=["yes", "dashboard"].index(i["approval"] or "yes"), key=f"qe_a_{i['id']}",
+                                format_func={"yes": "Draft PR without asking", "dashboard": "Ask me"}.get)
+        h1, h2 = st.columns([1, 4])
+        heal = heal_input(h1, f"qe_hl_{i['id']}", i.get("heal_attempts"))
+        chain = h2.checkbox("Chain: start from the previous task's result on this repository", bool(i["chain"]),
+                            key=f"qe_ch_{i['id']}")
+        if st.form_submit_button("💾 Save changes", type="primary"):
+            if not title.strip() or not body.strip() or not repo.strip():
+                st.error("Title, description and repository can't be empty.")
+            else:
+                store.queue_update(i["id"], title=title.strip(), body=body.strip(), repo=repo.strip(), mode=mode,
+                                   budget=float(budget), max_cycles=int(cycles), max_runtime_s=int(hours * 3600),
+                                   approval=approval, chain=int(chain), heal_attempts=heal)
+                st.session_state.flash = f"Saved “{title.strip()}”."
+                st.rerun()
+
+
+def live_settings(run: dict) -> None:
+    """Change limits of a run that is going right now; the run picks them up within a few seconds."""
+    rid = run["id"]
+    lim = json.loads(run["config_json"] or "{}").get("limits", {})
+    cur_t = run.get("max_runtime_s") or lim.get("max_runtime_s") or cfg.limits.max_runtime_s
+    cur_c = run.get("max_repair_cycles")
+    if cur_c is None:
+        cur_c = lim.get("max_repair_cycles", cfg.limits.max_repair_cycles)
+    elapsed = time.time() - run["created_at"]
+    with st.form(f"live_{rid}", border=True):
+        st.markdown("**⚙️ Settings for this run** — applied within a few seconds, no restart needed")
+        c1, c2, c3 = st.columns(3)
+        budget = c1.number_input("Budget (USD)", 0.1, 1000.0, float(run["budget_usd"] or cfg.limits.budget_usd),
+                                 0.5, key=f"ls_b_{rid}", help=f"Spent so far: ${store.cost_summary(rid)['total']:.3f}")
+        hours = c2.number_input("Time limit (hours)", 0.05, 72.0, _hrs(cur_t), 0.5, key=f"ls_h_{rid}",
+                                help=f"Running for {fmt_dur(elapsed)} so far. The run stops when it reaches this.")
+        cycles = c3.number_input("Max repair cycles", 0, 10, int(cur_c), key=f"ls_c_{rid}",
+                                 help=f"Currently in repair cycle {run['repair_cycle']}.")
+        if st.form_submit_button("Apply", type="primary"):
+            if hours * 3600 <= elapsed:
+                st.error(f"The run has already been going for {fmt_dur(elapsed)}; pick a longer time limit "
+                         "(or use Cancel below).")
+            else:
+                store.update_run(rid, budget_usd=float(budget), max_runtime_s=int(hours * 3600),
+                                 max_repair_cycles=int(cycles))
+                store.record_intervention(rid, "settings", f"budget ${budget:.2f}, time limit {hours:g} h, "
+                                                           f"max repair cycles {int(cycles)}")
+                st.session_state.flash = "Settings sent to the run; it applies them within a few seconds."
+                st.rerun()
+    if not run["cancel_requested"]:
+        if st.button("⏹ Cancel this run", key=f"cancel_{rid}"):
+            store.request_cancel(rid)
+            store.event(rid, "cancel", "cancel requested from dashboard", level="warn")
+            st.rerun()
+    else:
+        st.caption("Cancel requested; the run stops at its next checkpoint.")
+
+
+def queue_restart(i: dict) -> None:
+    with st.container(border=True):
+        st.markdown("**Try this task again** (it goes to the front of the waiting line)")
+        r1, r2, r3 = st.columns(3)
+        more = r3.number_input("Time limit (h)", 0.05, 72.0,
+                               _hrs(max(i["max_runtime_s"] or cfg.limits.max_runtime_s, cfg.limits.max_runtime_s)),
+                               0.5, key=f"q_h_{i['id']}")
+        kw = dict(mode=i["mode"], budget=i["budget"], max_cycles=i["max_cycles"], chain=i["chain"],
+                  approval=i["approval"], max_runtime_s=int(more * 3600), heal_attempts=i.get("heal_attempts"))
+        if r1.button("↻ Start again", key=f"q_re_{i['id']}", help="Queue this task again from scratch."):
+            _requeue_next(i, kw)
+            st.session_state.flash = "Queued again. Press ▶ Start queue if the queue is stopped."
+            st.rerun()
+        can_continue = bool(i["run_id"]) and run_resumable(i["run_id"])
+        if r2.button("⏩ Continue where it stopped", key=f"q_co_{i['id']}", disabled=not can_continue,
+                     help="Queue it again starting from the failed run's code, with its unresolved problems "
+                          "added to the task."):
+            _requeue_next(i, {**kw, "seed_run_id": i["run_id"]})
+            st.session_state.flash = "Queued to continue. Press ▶ Start queue if the queue is stopped."
             st.rerun()
 
+
+def open_run_button(label: str, run_id: str, key: str) -> None:
+    if st.button(label, key=key):
+        select_item(f"r:{run_id}")
+        st.session_state.goto = "Work"
+        st.rerun()
+
+
+def diagnosis_box(r: dict, w: dict) -> None:
+    """Self-healing lineage and the post-mortem of this run, if any."""
+    from swarmforge.postmortem import CATEGORIES
+    if r.get("heal_of"):
+        prev = store.failure(r["heal_of"])
+        with st.container(border=True):
+            st.markdown(f"🩹 **Self-healing attempt {r['heal_attempt']}.** The previous attempt failed"
+                        + (f" ({CATEGORIES.get(prev['category'], prev['category'])}): {prev['root_cause']}"
+                           if prev else "."))
+            st.caption("This attempt continues from that work with the diagnosis added to the task and more "
+                       "time, budget, repair cycles and agent steps.")
+            open_run_button("Open the previous attempt", r["heal_of"], f"prev_{r['id']}")
+    f = store.failure(r["id"])
+    if f:
+        with st.container(border=True):
+            st.markdown(f"🩺 **Why it failed** · {CATEGORIES.get(f['category'], f['category'])}"
+                        + (f" · _{f['outcome']}_" if f["outcome"] else ""))
+            st.write(f["root_cause"])
+            st.markdown(f"**What to do differently:** {f['fix']}")
+            if f["heal_run_id"]:
+                open_run_button("Open the retry", f["heal_run_id"], f"next_{r['id']}")
+    elif w["group"] == "failed" and cfg and r["state"] != "CANCELLED":
+        if st.button("🩺 Diagnose why it failed", key=f"diag_{r['id']}",
+                     help="Asks a model to explain the failure from the run's evidence (about a cent)."):
+            diagnose_now(r["id"])
+            st.rerun()
+
+
+def diagnose_now(run_id: str) -> None:
+    import asyncio
+    from swarmforge.postmortem import diagnose
+    with st.spinner("Diagnosing…"):
+        try:
+            asyncio.run(diagnose(cfg, store, run_id))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Diagnosis failed: {e}")
+
+
+def item_detail(w: dict, every) -> None:
+    i, r = w["item"], w["run"]
+    st.subheader(f"{w['icon']} {w['title']}")
+    bits = [w["status"]]
+    if i:
+        bits.append(f"queue task #{i['id']}")
+    if r:
+        bits.append(f"run `{r['id']}`")
+    bits.append(f"repo `{w['repo']}`")
+    st.caption(" · ".join(bits))
+    if i and i["status"] != "queued":
+        extra = []
+        if i["base_branch"]:
+            extra.append(f"started from `{i['base_branch']}`")
+        if i["result_branch"]:
+            extra.append(f"result branch `{i['result_branch']}`")
+        if extra:
+            st.caption(" · ".join(extra))
+    if r:
+        diagnosis_box(r, w)
+    if not cfg:
+        st.warning("Configuration not loaded: settings can't be changed.")
+    elif i and i["status"] == "queued":
+        waiting_editor(i)
+    elif r and w["group"] == "active":
+        live_settings(r)
+    elif i and i["status"] in ("failed", "cancelled", "skipped"):
+        queue_restart(i)
+    elif r and (r["state"] in FAILED_STATES or w["status"] == "Stopped unexpectedly"):
+        restart_panel(r)
+    if not r:
+        if i and i["status"] != "queued":
+            st.markdown(i["body"][:3000])
+        return
+    active = w["group"] == "active"
+
+    @st.fragment(run_every=every if active else None)
+    def live():
+        run = store.get_run(r["id"])
+        if active and run["state"] in TERMINAL:
+            st.rerun(scope="app")  # finished while watching: refresh the settings panel too
+        run_detail(r["id"], header=False)
+    live()
+
+
+def page_work():
+    from swarmforge import runqueue as rq
+    if "flash" in st.session_state:
+        st.success(st.session_state.pop("flash"))
+    items = work_items()
+    busy = any(w["group"] == "active" for w in items) or bool(rq.worker_pid(store))
+    every = 3 if auto and busy else None
+    h1, h2 = st.columns([4, 1])
+    h1.header("Work")
+    if h2.button("➕ New task", type="primary", width="stretch"):
+        st.session_state.goto = "New task"
+        st.rerun()
+
+    @st.fragment(run_every=every)
+    def listing():
+        work_list()
+    listing()
+    keys = [w["key"] for w in items]
+    if not keys:
+        return
+    if st.session_state.get("sel_item") not in keys:
+        st.session_state.sel_item = next(w["key"] for w in items if not w["hidden"]) \
+            if any(not w["hidden"] for w in items) else keys[0]
     st.divider()
-    t_add, t_imp = st.tabs(["➕ Add a task", "📥 Import a backlog file"])
+    item_detail(next(w for w in items if w["key"] == st.session_state.sel_item), every)
+
+
+# ============================================================= FAILURES page
+def page_failures():
+    from swarmforge.postmortem import CATEGORIES
+    st.header("Failures")
+    st.caption("Every run that failed, why, and what happened next. SwarmForge diagnoses each failure "
+               "automatically and, if a retry can fix it, tries again with more effort. The same post-mortems "
+               "are in your knowledge vault (note **Failures**) so agents learn from them, and in each run's "
+               "`postmortem.md`. CLI: `swarmforge failures`.")
+    fails = store.failures()
+    recorded = {f["run_id"] for f in fails}
+    undiagnosed = [r for r in store.list_runs(300) if r["id"] not in recorded
+                   and r["state"] in ("FAILED", "BLOCKED", "BUDGET_EXCEEDED")]
+    if undiagnosed and cfg:
+        c1, c2 = st.columns([3, 1])
+        c1.info(f"{len(undiagnosed)} failed run(s) from before automatic diagnosis have no post-mortem yet.")
+        if c2.button(f"🩺 Diagnose {len(undiagnosed)} run(s)", key="diag_all"):
+            for r in undiagnosed:
+                diagnose_now(r["id"])
+            st.rerun()
+    if not fails:
+        st.success("No failures recorded.")
+        return
+    fixed = sum(1 for f in fails if (f["outcome"] or "").startswith("fixed itself"))
+    needs = sum(1 for f in fails if (f["outcome"] or "").startswith(("needs you", "still failing", "not retried")))
+    cats = pd.Series([f["category"] for f in fails]).value_counts()
+    m = st.columns(3)
+    m[0].metric("Failures", len(fails))
+    m[1].metric("Fixed themselves", fixed)
+    m[2].metric("Need you", needs)
+    chart = pd.DataFrame({"cause": [CATEGORIES.get(c, c) for c in cats.index], "failures": cats.values})
+    st.altair_chart(alt.Chart(chart).mark_bar(color="#e45756").encode(
+        x=alt.X("failures:Q", title=None, axis=alt.Axis(tickMinStep=1)), y=alt.Y("cause:N", sort="-x", title=None),
+        tooltip=["cause", "failures"]).properties(height=max(60, 28 * len(chart))), width="stretch")
+    pick = st.multiselect("Cause", list(cats.index), format_func=lambda c: CATEGORIES.get(c, c), key="f_cat",
+                          placeholder="All causes")
+    shown = [f for f in fails if not pick or f["category"] in pick]
+    df = pd.DataFrame([{"When": fmt_ts(f["created_at"], True), "Task": (f["title"] or "")[:70],
+                        "Cause": CATEGORIES.get(f["category"], f["category"]),
+                        "Why": (f["root_cause"] or "")[:140], "What happened next": f["outcome"] or "",
+                        "Cost $": round(f["cost_usd"] or 0, 3)} for f in shown])
+    tkey = f"ft_{abs(hash(tuple(f['run_id'] for f in shown))) % 10**8}"
+    ev = st.dataframe(df, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(shown)),
+                      on_select="rerun", selection_mode="single-row", key=tkey,
+                      column_config={"Why": st.column_config.TextColumn(width="large"),
+                                     "Cost $": st.column_config.NumberColumn(format="$%.3f")})
+    rows = list(ev.selection.rows) if ev is not None and hasattr(ev, "selection") else []
+    if rows:
+        st.session_state.sel_failure = shown[rows[0]]["run_id"]
+    sel = st.session_state.get("sel_failure")
+    f = next((x for x in shown if x["run_id"] == sel), shown[0] if shown else None)
+    if not f:
+        return
+    st.divider()
+    st.subheader(f["title"] or f["run_id"])
+    st.caption(f"run `{f['run_id']}` · repo `{f['repo'] or '-'}` · {f['state']}: {(f['reason'] or '')[:200]} · "
+               f"diagnosed by {f['diagnosed_by']}")
+    st.markdown(f"**Cause:** {CATEGORIES.get(f['category'], f['category'])}"
+                + (f"  ·  **What happened next:** {f['outcome']}" if f["outcome"] else ""))
+    st.markdown("#### Why it failed")
+    st.write(f["root_cause"])
+    st.markdown("#### What to do differently")
+    st.write(f["fix"])
+    if f["lesson"]:
+        st.markdown("#### Lesson")
+        st.write(f["lesson"])
+    with st.expander("Evidence the diagnosis was based on"):
+        st.code(f["evidence"] or "", language=None)
+    b = st.columns(3)
+    with b[0]:
+        open_run_button("Open this run", f["run_id"], f"fo_{f['run_id']}")
+    if f["heal_run_id"]:
+        with b[1]:
+            open_run_button("Open the retry", f["heal_run_id"], f"fh_{f['run_id']}")
+    if cfg and b[2].button("↻ Diagnose again", key=f"fd_{f['run_id']}"):
+        diagnose_now(f["run_id"])
+        st.rerun()
+
+
+# ============================================================ NEW TASK page
+def queue_forms() -> None:
+    from swarmforge import runqueue as rq
+    st.caption("Queued tasks run one after another. With **chaining**, each task starts from the previous "
+               "task's result on the same repository, so improvements build on each other. Nothing is ever "
+               "merged into your main branch.")
 
     def common(prefix):
         c1, c2, c3, c5, c4 = st.columns(5)
@@ -903,30 +1278,36 @@ def page_queue():
         approval = c4.selectbox("GitHub pushes", ["yes", "dashboard"], key=f"{prefix}_appr",
                                 format_func=lambda a: {"yes": "Draft PRs without asking",
                                                        "dashboard": "Ask me each time"}[a])
-        chain = st.checkbox("Chain: start from the previous task's result on this repository", value=True,
+        h1, h2 = st.columns([1, 4])
+        heal = heal_input(h1, f"{prefix}_heal")
+        chain = h2.checkbox("Chain: start from the previous task's result on this repository", value=True,
                             key=f"{prefix}_chain")
-        return mode, budget, cycles, approval, chain, int(hours * 3600)
+        return mode, budget, cycles, approval, chain, int(hours * 3600), heal
 
     def checked_repo(repo):
         from swarmforge.repos import normalize_repo, preflight
         from swarmforge.github import get_token
         return preflight(normalize_repo(repo), get_token(cfg.github)).source
 
+    t_add, t_imp = st.tabs(["➕ One task", "📥 Import a backlog file"])
     with t_add:
         title = st.text_input("Title", key="qa_title")
         body = st.text_area("Description with acceptance criteria", height=200, key="qa_body")
         repo = st.text_input("Repository", key="qa_repo", value=st.session_state.get("q_last_repo", ""),
                              placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
-        mode, budget, cycles, approval, chain, runtime = common("qa")
+        mode, budget, cycles, approval, chain, runtime, heal = common("qa")
         if st.button("Add to queue", type="primary"):
             try:
                 if not title.strip() or not body.strip():
                     raise ValueError("title and description are required")
                 src = checked_repo(repo)
-                store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget, max_cycles=int(cycles),
-                                chain=int(chain), approval=approval, max_runtime_s=runtime)
+                new_id = store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget,
+                                         max_cycles=int(cycles), chain=int(chain), approval=approval,
+                                         max_runtime_s=runtime, heal_attempts=heal)
                 st.session_state.q_last_repo = repo
-                st.success(f"Queued: {title}")
+                st.session_state.flash = f"Queued: {title.strip()}. Press ▶ Start queue when you're ready."
+                select_item(f"q:{new_id}")
+                st.session_state.goto = "Work"
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
@@ -938,7 +1319,7 @@ def page_queue():
         repo_i = st.text_input("Repository for all imported tasks", key="qi_repo",
                                value=st.session_state.get("q_last_repo", ""),
                                placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
-        mode, budget, cycles, approval, chain, runtime = common("qi")
+        mode, budget, cycles, approval, chain, runtime, heal = common("qi")
         found = []
         if path and Path(path).is_file():
             found = rq.parse_backlog(Path(path).read_text(encoding="utf-8"))
@@ -950,17 +1331,30 @@ def page_queue():
                 src = checked_repo(repo_i)
                 for f in found:
                     store.queue_add(f.title, f.body, src, mode=mode, budget=budget, max_cycles=int(cycles),
-                                    chain=int(chain), approval=approval, max_runtime_s=runtime)
+                                    chain=int(chain), approval=approval, max_runtime_s=runtime,
+                                    heal_attempts=heal)
                 st.session_state.q_last_repo = repo_i
-                st.success(f"Imported {len(found)} task(s). Press ▶ Start queue.")
+                st.session_state.flash = f"Imported {len(found)} task(s). Press ▶ Start queue when you're ready."
+                select_item(None)
+                st.session_state.goto = "Work"
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
 
-    if auto and (pid or running):
-        time.sleep(3)
-        st.rerun()
 
+def page_new_task():
+    st.header("New task")
+    if not cfg:
+        st.error("Configuration not loaded; cannot start runs.")
+        return
+    how = st.radio("How should it run?", ["Start now", "Add to the queue"], horizontal=True, key="nt_how",
+                   captions=["Runs right away in the background.",
+                             "Waits its turn; tasks run one after another."])
+    st.divider()
+    if how == "Start now":
+        page_new_run()
+    else:
+        queue_forms()
 
 
 # =========================================================== BENCHMARKS page
@@ -975,5 +1369,5 @@ def page_benchmarks():
         st.dataframe(df.astype(str), width="stretch")
 
 
-{"Runs": page_runs, "New run": page_new_run, "Queue": page_queue, "Knowledge": page_knowledge,
+{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Knowledge": page_knowledge,
  "Benchmarks": page_benchmarks}[page]()

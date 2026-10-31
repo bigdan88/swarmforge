@@ -21,7 +21,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
               approval: str = "dashboard", single_role: str | None = None,
               test_command: str | None = None, sandbox_image: str | None = None,
               base: str | None = None, issue_file: str | None = None,
-              max_runtime_s: int | None = None, seed_run_id: str | None = None) -> tuple[str, Path]:
+              max_runtime_s: int | None = None, seed_run_id: str | None = None,
+              heal_attempts: int | None = None) -> tuple[str, Path]:
     if not issue_url and not issue_file and not (issue_title and issue_body):
         raise ValueError("give a GitHub issue URL, or a title and description")
     if not issue_url and not repo and not issue_file:
@@ -59,6 +60,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args += ["--max-runtime-hours", f"{max_runtime_s / 3600:.4g}"]
     if seed_run_id:
         args += ["--continue-from", seed_run_id]
+    if heal_attempts is not None:
+        args += ["--heal-attempts", str(int(heal_attempts))]
     if test_command:
         args += ["--test-command", test_command]
     if sandbox_image:

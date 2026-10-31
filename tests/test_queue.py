@@ -129,3 +129,16 @@ async def test_queue_item_continue_uses_seed_and_runtime(cfg, sample_repo):
     r2 = store.get_run(i2["run_id"])
     assert r2["seed_run_id"] == i1["run_id"]
     assert __import__("json").loads(r2["config_json"])["limits"]["max_runtime_s"] == 7200
+
+
+async def test_queue_item_heals_itself(cfg, sample_repo):
+    store = Store(cfg.db_path)
+    body = ISSUE.read_text(encoding="utf-8").split("\n", 2)[2]
+    iid = store.queue_add("Export", body, str(sample_repo.resolve()), max_cycles=0, heal_attempts=1)
+    await rq.work(cfg, store, echo=None, llm_transport=_provider().transport)
+    item = store.queue_item(iid)
+    assert item["status"] == "done", item["note"]
+    run = store.get_run(item["run_id"])
+    assert run["heal_attempt"] == 1 and run["state"] == "COMPLETED"
+    assert store.failure(run["heal_of"])["outcome"] == "fixed itself on attempt 1"
+    assert "after self-healing attempt 1" in item["note"]

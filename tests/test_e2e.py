@@ -345,3 +345,59 @@ async def test_continue_from_missing_workspace_is_blocked(cfg, sample_repo):
     second = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
     r2 = store.get_run(second)
     assert r2["state"] == "BLOCKED" and "Start again" in r2["state_reason"]
+
+
+async def test_live_settings_and_runtime_watchdog(cfg):
+    import asyncio
+    import time
+    from swarmforge.llm import Budget
+    store = Store(cfg.db_path)
+    orch = Orchestrator(cfg, store, echo=None)
+    orch.run_id = "r-live"
+    store.create_run("r-live", budget_usd=5, max_runtime_s=300, max_repair_cycles=2)
+    orch.budget = Budget(5)
+    store.update_run("r-live", budget_usd=9, max_runtime_s=1, max_repair_cycles=0)
+    orch._apply_live_settings()
+    assert orch.budget.limit == 9 and orch.cfg.limits.max_repair_cycles == 0 and orch.cfg.limits.max_runtime_s == 1
+    assert any("budget changed" in e["message"] for e in store.events("r-live"))
+    orch._started, orch._timed_out = time.monotonic(), False
+    slow = asyncio.ensure_future(asyncio.sleep(30))
+    await asyncio.wait_for(orch._watchdog(slow, every_s=0.05), 10)
+    assert orch._timed_out
+    await asyncio.sleep(0)
+    assert slow.cancelled()
+
+
+async def test_failed_run_gets_postmortem_and_heals_itself(cfg, sample_repo):
+    from swarmforge.knowledge import Vault
+    from swarmforge.postmortem import heal
+    cfg.limits.max_repair_cycles = 0  # the first attempt fails on the README review finding
+    cfg.self_heal.max_attempts = 2
+    store = Store(cfg.db_path)
+    fake = _provider()
+
+    def make(c, seed=None, ctx=None, heal_of=None, attempt=None):
+        return Orchestrator(c, store, echo=None, llm_transport=fake.transport, seed_run_id=seed,
+                            heal_of=heal_of, heal_attempt=attempt, heal_context=ctx)
+    first = await make(cfg).execute(issue_file=str(ISSUE), repo=str(sample_repo))
+    assert store.get_run(first)["state"] == "FAILED"
+    f = store.failure(first)
+    assert f and f["category"] == "review_rejected" and f["retry"] == 1
+    assert "README.md did not document --format" in f["root_cause"] and f["diagnosed_by"].startswith("planner/")
+    assert (Path(store.get_run(first)["run_dir"]) / "postmortem.md").is_file()
+    vault = Vault(cfg.vault_path)
+    assert any(n.type == "failure" and n.run == first for n in vault.notes())
+    assert vault.get("Failures") is not None
+
+    async def launch(c, seed, ctx, heal_of, attempt):
+        assert c.limits.max_repair_cycles == attempt and c.limits.max_runtime_s > cfg.limits.max_runtime_s
+        assert "README.md did not document --format" in ctx
+        return await make(c, seed, ctx, heal_of, attempt).execute(issue_file=str(ISSUE), repo=str(sample_repo))
+    last = await heal(cfg, store, first, launch)
+    assert last != first
+    run = store.get_run(last)
+    assert run["heal_of"] == first and run["heal_attempt"] == 1 and run["seed_run_id"] == first
+    assert run["state"] == "COMPLETED", run["state_reason"]
+    assert store.failure(first)["heal_run_id"] == last
+    assert store.failure(first)["outcome"] == "fixed itself on attempt 1"
+    assert store.failure(last) is None

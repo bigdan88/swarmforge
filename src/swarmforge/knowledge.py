@@ -26,7 +26,7 @@ from pathlib import Path
 import yaml
 
 NOTE_TYPES = ("decision", "pitfall", "pattern", "repo-fact", "review-lesson", "model-behavior",
-              "run-log", "hub", "user-note")
+              "run-log", "hub", "user-note", "failure")
 AGENT_NOTE_TYPES = ("decision", "pitfall", "pattern", "repo-fact", "review-lesson", "model-behavior")
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]*))?\]\]")
 # note types that can carry over from one repository to another
