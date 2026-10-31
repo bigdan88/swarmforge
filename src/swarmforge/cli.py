@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -306,6 +307,75 @@ def cmd_bench(args, cfg) -> int:
                                      include_runs=args.include_run))
 
 
+# ------------------------------------------------------------------ queue
+def cmd_queue(args, cfg) -> int:
+    from . import runqueue as rq
+    from .repos import RepoError, normalize_repo
+    store = _store(cfg)
+
+    def norm(repo: str) -> str:
+        try:
+            return normalize_repo(repo).source
+        except RepoError as e:
+            raise SystemExit(f"error: {e}")
+
+    a = args.qcmd
+    if a == "list":
+        items = store.queue_items()
+        if not items:
+            print("queue is empty")
+        for i in items:
+            print(f"#{i['id']:<4} {i['status']:9} {(i['title'] or '')[:60]:60} {i['repo'][:40]:40} "
+                  f"{i['run_id'] or ''}")
+        pid = rq.worker_pid(store)
+        print(f"\nworker: {'running (pid %d)' % pid if pid else 'stopped'}; "
+              f"paused={store.kv_get(rq.PAUSED_KEY) == '1'}; on failure: {store.kv_get(rq.POLICY_KEY) or 'stop'}")
+        return 0
+    if a == "add":
+        body = Path(args.file).read_text(encoding="utf-8") if args.file else (args.body or "")
+        if not body.strip():
+            print("error: give --file or --body")
+            return 2
+        iid = store.queue_add(args.title, body, norm(args.repo), mode=args.mode, budget=args.budget,
+                              max_cycles=args.max_cycles, chain=0 if args.no_chain else 1,
+                              approval=args.approval)
+        print(f"queued #{iid}")
+        return 0
+    if a == "import":
+        items = rq.parse_backlog(Path(args.file).read_text(encoding="utf-8"))
+        for it in items:
+            iid = store.queue_add(it.title, it.body, norm(args.repo), mode=args.mode, budget=args.budget,
+                                  max_cycles=args.max_cycles, chain=0 if args.no_chain else 1,
+                                  approval=args.approval)
+            print(f"queued #{iid} {it.title}")
+        print(f"{len(items)} item(s) imported")
+        return 0
+    if a == "remove":
+        store.queue_remove(args.id)
+        return 0
+    if a == "clear":
+        print(f"removed {store.queue_clear_finished()} finished item(s)")
+        return 0
+    if a == "pause":
+        store.kv_set(rq.PAUSED_KEY, "1")
+        print("queue will pause after the current run")
+        return 0
+    if a == "resume":
+        store.kv_set(rq.PAUSED_KEY, "0")
+        pid = rq.start_worker(cfg, store)
+        print(f"queue worker running (pid {pid})")
+        return 0
+    if a == "policy":
+        store.kv_set(rq.POLICY_KEY, args.policy)
+        return 0
+    if a == "work":
+        store.kv_set(rq.PAUSED_KEY, "0")
+        n = asyncio.run(rq.work(cfg, store))
+        print(f"queue worker finished: {n} item(s) processed")
+        return 0
+    return 2
+
+
 # ------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="swarmforge", description="Autonomous multi-agent software development")
@@ -386,6 +456,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--label", default="")
     s.add_argument("--max-cycles", type=int)
     s.set_defaults(fn=cmd_bench)
+    q = sub.add_parser("queue", help="queue tasks and run them one after another")
+    qs = q.add_subparsers(dest="qcmd", required=True)
+    qs.add_parser("list", help="show the queue")
+    for name, hlp in (("add", "add one task"), ("import", "add every task from a backlog Markdown file")):
+        x = qs.add_parser(name, help=hlp)
+        if name == "add":
+            x.add_argument("title")
+            x.add_argument("--file", help="Markdown file with the description")
+            x.add_argument("--body", help="description text")
+        else:
+            x.add_argument("file", help="e.g. docs/SELF_IMPROVEMENT_BACKLOG.md")
+        x.add_argument("--repo", required=True, help="local folder, owner/repo or GitHub URL")
+        x.add_argument("--mode", choices=["swarm", "single"], default="swarm")
+        x.add_argument("--budget", type=float, default=None)
+        x.add_argument("--max-cycles", type=int, default=None)
+        x.add_argument("--no-chain", action="store_true", help="start from the default branch, not the previous result")
+        x.add_argument("--approval", choices=["yes", "dashboard"], default="yes",
+                       help="GitHub repos: open draft PRs without asking (yes) or ask in the dashboard")
+    x = qs.add_parser("remove")
+    x.add_argument("id", type=int)
+    qs.add_parser("clear", help="remove finished items")
+    qs.add_parser("pause", help="stop after the current run")
+    qs.add_parser("resume", help="start the background worker")
+    x = qs.add_parser("policy", help="what to do when an item fails")
+    x.add_argument("policy", choices=["stop", "continue"])
+    qs.add_parser("work", help="run the queue in this terminal (the dashboard starts it in the background)")
+    q.set_defaults(fn=cmd_queue)
     return p
 
 

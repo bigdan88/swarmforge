@@ -93,7 +93,7 @@ if "goto" in st.session_state:  # navigation requested by a button on the previo
 pending_all = store.pending_approvals()
 with st.sidebar:
     st.title("🐝 SwarmForge")
-    pages = ["Runs", "New run", "Knowledge", "Benchmarks"]
+    pages = ["Runs", "New run", "Queue", "Knowledge", "Benchmarks"]
     st.radio("Go to", pages, key="page", label_visibility="collapsed")
     if pending_all:
         st.warning(f"🔔 {len(pending_all)} approval(s) waiting")
@@ -694,6 +694,183 @@ def page_knowledge():
                     st.success("Note created")
 
 
+# ================================================================ QUEUE page
+QSTATUS = {"queued": "⏳", "running": "🟢", "done": "✅", "failed": "❌", "cancelled": "⏹️", "skipped": "⏭️"}
+
+
+def page_queue():
+    from swarmforge import runqueue as rq
+    st.header("Queue")
+    st.caption("Line up tasks; SwarmForge runs them one after another. With **chaining**, each task starts "
+               "from the previous task's result on the same repository, so improvements build on each other "
+               "without merging in between. Nothing is ever merged into your main branch.")
+    if not cfg:
+        st.error("Configuration not loaded.")
+        return
+    items = store.queue_items()
+    pid = rq.worker_pid(store)
+    paused = store.kv_get(rq.PAUSED_KEY) == "1"
+    queued = [i for i in items if i["status"] == "queued"]
+    running = [i for i in items if i["status"] == "running"]
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
+        if pid:
+            c1.markdown(f"**Worker:** 🟢 running (pid {pid})" + (" — will pause after the current run" if paused else ""))
+        else:
+            c1.markdown("**Worker:** ⚪ stopped" + (" (paused)" if paused and queued else ""))
+        if not pid:
+            if c2.button("▶ Start queue", type="primary", disabled=not queued):
+                rq.start_worker(cfg, store)
+                time.sleep(1.5)
+                st.rerun()
+        elif not paused:
+            if c2.button("⏸ Pause after current"):
+                store.kv_set(rq.PAUSED_KEY, "1")
+                st.rerun()
+        else:
+            if c2.button("▶ Keep going"):
+                store.kv_set(rq.PAUSED_KEY, "0")
+                st.rerun()
+        if running and c3.button("⏹ Cancel current run"):
+            store.request_cancel(running[0]["run_id"])
+            store.kv_set(rq.PAUSED_KEY, "1")
+            st.rerun()
+        policy = store.kv_get(rq.POLICY_KEY) or "stop"
+        new_policy = c4.selectbox("If a task fails", ["stop", "continue"], index=["stop", "continue"].index(policy),
+                                  format_func=lambda p: {"stop": "Pause the queue (recommended)",
+                                                         "continue": "Continue with the next task"}[p])
+        if new_policy != policy:
+            store.kv_set(rq.POLICY_KEY, new_policy)
+        n_total = len(items)
+        n_done = sum(1 for i in items if i["status"] == "done")
+        if n_total:
+            st.progress(n_done / n_total, text=f"{n_done} of {n_total} done · {len(queued)} waiting")
+
+    if not items:
+        st.info("The queue is empty. Add a task below or import a backlog file.")
+    for i in items:
+        icon = QSTATUS.get(i["status"], "")
+        label = f"{icon} #{i['id']} {i['title']}  ·  {i['status']}"
+        with st.expander(label, expanded=i["status"] == "running"):
+            st.caption(f"repo `{i['repo']}` · {i['mode']} · budget ${i['budget'] or cfg.limits.budget_usd:.2f} · "
+                       f"repair cycles {i['max_cycles'] if i['max_cycles'] is not None else cfg.limits.max_repair_cycles} · "
+                       f"{'chained' if i['chain'] else 'independent'} · "
+                       f"{'draft PRs without asking' if i['approval'] == 'yes' else 'ask before pushing'}")
+            if i["base_branch"]:
+                st.markdown(f"Started from `{i['base_branch']}`")
+            if i["result_branch"]:
+                st.markdown(f"Result branch: `{i['result_branch']}`")
+            if i["note"]:
+                st.caption(i["note"])
+            if i["run_id"]:
+                if st.button("Open run", key=f"q_open_{i['id']}"):
+                    st.session_state.sel_run = i["run_id"]
+                    st.session_state.goto = "Runs"
+                    st.rerun()
+            if i["status"] == "queued":
+                b1, b2, b3, b4 = st.columns(4)
+                if b1.button("⬆ Up", key=f"q_up_{i['id']}"):
+                    store.queue_move(i["id"], -1)
+                    st.rerun()
+                if b2.button("⬇ Down", key=f"q_dn_{i['id']}"):
+                    store.queue_move(i["id"], +1)
+                    st.rerun()
+                if b3.button("🗑 Remove", key=f"q_rm_{i['id']}"):
+                    store.queue_remove(i["id"])
+                    st.rerun()
+                if b4.toggle("Edit", key=f"q_ed_{i['id']}"):
+                    with st.form(f"q_form_{i['id']}"):
+                        t = st.text_input("Title", i["title"])
+                        b = st.text_area("Description", i["body"], height=260)
+                        r = st.text_input("Repository", i["repo"])
+                        if st.form_submit_button("Save"):
+                            store.queue_update(i["id"], title=t, body=b, repo=r)
+                            st.rerun()
+                else:
+                    st.markdown(i["body"][:3000])
+            elif i["status"] in ("failed", "cancelled", "skipped"):
+                if st.button("↻ Queue again", key=f"q_re_{i['id']}"):
+                    store.queue_add(i["title"], i["body"], i["repo"], mode=i["mode"], budget=i["budget"],
+                                    max_cycles=i["max_cycles"], chain=i["chain"], approval=i["approval"])
+                    st.rerun()
+    if any(i["status"] in ("done", "failed", "cancelled", "skipped") for i in items):
+        if st.button("Clear finished tasks"):
+            store.queue_clear_finished()
+            st.rerun()
+
+    st.divider()
+    t_add, t_imp = st.tabs(["➕ Add a task", "📥 Import a backlog file"])
+
+    def common(prefix):
+        c1, c2, c3, c4 = st.columns(4)
+        mode = c1.selectbox("Team", ["swarm", "single"], key=f"{prefix}_mode",
+                            format_func=lambda m: {"swarm": "Swarm", "single": "Single agent"}[m])
+        budget = c2.number_input("Budget per task (USD)", 0.5, 500.0, 5.0, 0.5, key=f"{prefix}_budget")
+        cycles = c3.number_input("Max repair cycles", 0, 10, 2, key=f"{prefix}_cycles")
+        approval = c4.selectbox("GitHub pushes", ["yes", "dashboard"], key=f"{prefix}_appr",
+                                format_func=lambda a: {"yes": "Draft PRs without asking",
+                                                       "dashboard": "Ask me each time"}[a])
+        chain = st.checkbox("Chain: start from the previous task's result on this repository", value=True,
+                            key=f"{prefix}_chain")
+        return mode, budget, cycles, approval, chain
+
+    def checked_repo(repo):
+        from swarmforge.repos import normalize_repo, preflight
+        from swarmforge.github import get_token
+        return preflight(normalize_repo(repo), get_token(cfg.github)).source
+
+    with t_add:
+        title = st.text_input("Title", key="qa_title")
+        body = st.text_area("Description with acceptance criteria", height=200, key="qa_body")
+        repo = st.text_input("Repository", key="qa_repo", value=st.session_state.get("q_last_repo", ""),
+                             placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
+        mode, budget, cycles, approval, chain = common("qa")
+        if st.button("Add to queue", type="primary"):
+            try:
+                if not title.strip() or not body.strip():
+                    raise ValueError("title and description are required")
+                src = checked_repo(repo)
+                store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget, max_cycles=int(cycles),
+                                chain=int(chain), approval=approval)
+                st.session_state.q_last_repo = repo
+                st.success(f"Queued: {title}")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    with t_imp:
+        default = str((cfg.source_path.parent / "docs" / "SELF_IMPROVEMENT_BACKLOG.md")) if cfg.source_path else ""
+        path = st.text_input("Backlog file (Markdown with **Title:** / **Description:** sections)", value=default,
+                             key="qi_path")
+        repo_i = st.text_input("Repository for all imported tasks", key="qi_repo",
+                               value=st.session_state.get("q_last_repo", ""),
+                               placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
+        mode, budget, cycles, approval, chain = common("qi")
+        found = []
+        if path and Path(path).is_file():
+            found = rq.parse_backlog(Path(path).read_text(encoding="utf-8"))
+            st.caption(f"{len(found)} task(s) found: " + "; ".join(f.title for f in found))
+        elif path:
+            st.warning("File not found.")
+        if st.button("Import into queue", disabled=not found):
+            try:
+                src = checked_repo(repo_i)
+                for f in found:
+                    store.queue_add(f.title, f.body, src, mode=mode, budget=budget, max_cycles=int(cycles),
+                                    chain=int(chain), approval=approval)
+                st.session_state.q_last_repo = repo_i
+                st.success(f"Imported {len(found)} task(s). Press ▶ Start queue.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    if auto and (pid or running):
+        time.sleep(3)
+        st.rerun()
+
+
+
 # =========================================================== BENCHMARKS page
 def page_benchmarks():
     st.header("Benchmarks: single agent vs swarm")
@@ -706,4 +883,5 @@ def page_benchmarks():
         st.dataframe(df.astype(str), width="stretch")
 
 
-{"Runs": page_runs, "New run": page_new_run, "Knowledge": page_knowledge, "Benchmarks": page_benchmarks}[page]()
+{"Runs": page_runs, "New run": page_new_run, "Queue": page_queue, "Knowledge": page_knowledge,
+ "Benchmarks": page_benchmarks}[page]()

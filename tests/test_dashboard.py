@@ -134,3 +134,48 @@ def test_new_run_form_validates_before_starting(tmp_path, monkeypatch):
     next(b for b in at.button if "Start run" in b.label).click().run()
     assert any("is not a GitHub issue URL" in e.value for e in at.error)
     assert Store(cfg.db_path).list_runs() == []
+
+
+def test_queue_page_import_and_reorder(tmp_path, monkeypatch, sample_repo):
+    from .conftest import ROOT
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    at.sidebar.radio[0].set_value("Queue").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("queue is empty" in i.value for i in at.info)
+    at.text_input(key="qi_path").input(str(ROOT / "docs" / "SELF_IMPROVEMENT_BACKLOG.md")).run()
+    at.text_input(key="qi_repo").input(str(sample_repo)).run()
+    next(b for b in at.button if b.label == "Import into queue").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    items = Store(cfg.db_path).queue_items()
+    assert len(items) == 7 and items[0]["title"] == "Make every dashboard section fail-safe"
+    assert all(i["repo"] == str(sample_repo.resolve()) and i["chain"] == 1 for i in items)
+    # move the 2nd task up
+    next(b for b in at.button if b.key == f"q_up_{items[1]['id']}").click().run()
+    assert Store(cfg.db_path).queue_items()[0]["id"] == items[1]["id"]
+    assert any("Start queue" in b.label for b in at.button)
+
+
+def test_background_queue_worker_processes_and_exits(tmp_path, monkeypatch, sample_repo):
+    from swarmforge import runqueue as rq
+    from swarmforge.launcher import pid_alive
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    store = Store(cfg.db_path)
+    iid = store.queue_add("Add export", "Add CSV export with tests.", str(sample_repo), budget=1)
+    store.queue_add("Second", "Something else.", str(sample_repo))
+    pid = rq.start_worker(cfg, store)
+    assert pid
+    for _ in range(240):
+        it = Store(cfg.db_path).queue_item(iid)
+        if it["status"] not in ("queued", "running") and not pid_alive(pid):
+            break
+        time.sleep(0.5)
+    it = Store(cfg.db_path).queue_item(iid)
+    # the fake provider is unreachable, so the run fails at planning and the queue pauses (policy: stop)
+    assert it["status"] == "failed" and it["run_id"], it
+    assert Store(cfg.db_path).kv_get(rq.PAUSED_KEY) == "1"
+    assert [i["status"] for i in Store(cfg.db_path).queue_items()][1] == "queued"
+    assert not pid_alive(pid)
+    log = (cfg.workdir / "logs" / "queue-worker.log").read_text()
+    assert "queue: starting #" in log and "queue paused" in log

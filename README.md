@@ -74,6 +74,12 @@ swarmforge dashboard          # opens http://localhost:8501
   * **Tests, Review, Knowledge, Tokens & cost, Console, Events**.
 
   Approve or decline the GitHub push with a button. Cancel runs.
+* **Queue**: line up tasks (or import a backlog file such as
+  `docs/SELF_IMPROVEMENT_BACKLOG.md`) and press **Start queue**. Tasks run one after another in
+  a background worker. With chaining, each task starts from the previous task's result on the same
+  repository, so a series of improvements builds up without merging in between. The queue pauses
+  if a task fails. CLI: `swarmforge queue import FILE --repo R`, `queue list`, `queue resume`,
+  `queue pause`.
 * **Knowledge**: the Zettelkasten. Browse, search, edit and link notes, view the note graph,
   and write your own notes for the agents to use.
 * **Benchmarks**: single agent vs swarm comparisons.

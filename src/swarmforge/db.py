@@ -143,6 +143,30 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_at REAL,
     decided_by TEXT
 );
+CREATE TABLE IF NOT EXISTS queue_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position REAL NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'swarm',
+    budget REAL,
+    max_cycles INTEGER,
+    chain INTEGER NOT NULL DEFAULT 1,
+    approval TEXT NOT NULL DEFAULT 'yes',
+    status TEXT NOT NULL DEFAULT 'queued',
+    run_id TEXT,
+    base_branch TEXT,
+    result_branch TEXT,
+    note TEXT,
+    created_at REAL,
+    started_at REAL,
+    finished_at REAL
+);
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS benchmarks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at REAL NOT NULL,
@@ -352,6 +376,66 @@ class Store:
         if run_id:
             return self._all("SELECT * FROM approvals WHERE status = 'pending' AND run_id = ? ORDER BY id", (run_id,))
         return self._all("SELECT * FROM approvals WHERE status = 'pending' ORDER BY id")
+
+    # ------------------------------------------------------------------ queue
+    QUEUE_FIELDS = ("title", "body", "repo", "mode", "budget", "max_cycles", "chain", "approval",
+                    "status", "run_id", "base_branch", "result_branch", "note", "started_at",
+                    "finished_at", "position")
+
+    def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
+        row = self._one("SELECT MAX(position) AS m FROM queue_items")
+        pos = (row["m"] or 0) + 1
+        fields = {"mode": "swarm", "chain": 1, "approval": "yes", **fields}
+        cols = ", ".join(["position", "title", "body", "repo", "created_at", *fields])
+        qs = ", ".join(["?"] * (5 + len(fields)))
+        return self._exec(f"INSERT INTO queue_items ({cols}) VALUES ({qs})",
+                          (pos, title, body, repo, time.time(), *fields.values())).lastrowid
+
+    def queue_items(self, include_finished: bool = True) -> list[dict]:
+        if include_finished:
+            return self._all("SELECT * FROM queue_items ORDER BY position")
+        return self._all("SELECT * FROM queue_items WHERE status IN ('queued','running') ORDER BY position")
+
+    def queue_item(self, item_id: int) -> dict | None:
+        return self._one("SELECT * FROM queue_items WHERE id = ?", (item_id,))
+
+    def queue_update(self, item_id: int, **fields: Any) -> None:
+        bad = set(fields) - set(self.QUEUE_FIELDS)
+        if bad:
+            raise ValueError(f"unknown queue fields {bad}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self._exec(f"UPDATE queue_items SET {sets} WHERE id = ?", (*fields.values(), item_id))
+
+    def queue_remove(self, item_id: int) -> None:
+        self._exec("DELETE FROM queue_items WHERE id = ? AND status != 'running'", (item_id,))
+
+    def queue_move(self, item_id: int, direction: int) -> None:
+        """Swap an item with its neighbour among not-yet-started items (direction -1 up, +1 down)."""
+        items = [i for i in self.queue_items() if i["status"] == "queued"]
+        idx = next((n for n, i in enumerate(items) if i["id"] == item_id), None)
+        if idx is None:
+            return
+        j = idx + direction
+        if 0 <= j < len(items):
+            a, b = items[idx], items[j]
+            with self._lock:
+                self.conn.execute("UPDATE queue_items SET position = ? WHERE id = ?", (b["position"], a["id"]))
+                self.conn.execute("UPDATE queue_items SET position = ? WHERE id = ?", (a["position"], b["id"]))
+                self.conn.commit()
+
+    def queue_clear_finished(self) -> int:
+        return self._exec("DELETE FROM queue_items WHERE status IN ('done','failed','cancelled','skipped')").rowcount
+
+    def kv_get(self, key: str, default: str | None = None) -> str | None:
+        row = self._one("SELECT value FROM kv WHERE key = ?", (key,))
+        return row["value"] if row else default
+
+    def kv_set(self, key: str, value: str | None) -> None:
+        if value is None:
+            self._exec("DELETE FROM kv WHERE key = ?", (key,))
+        else:
+            self._exec("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                       (key, value))
 
     # ------------------------------------------------------------- benchmarks
     def record_benchmark(self, label: str, issue: str, results: Any) -> int:

@@ -234,8 +234,8 @@ async def test_unbuilt_profile_image_is_blocked(cfg, sample_repo):
     orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport,
                         sandbox_image="definitely-not-built-image:42")
     orch._sandbox_override = None
-    if not shutil.which("docker"):
-        pytest.skip("docker CLI not available")
+    if not shutil.which("docker") or subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        pytest.skip("docker daemon not available")
     run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
     run = store.get_run(run_id)
     assert run["state"] == "BLOCKED" and "not built" in run["state_reason"]

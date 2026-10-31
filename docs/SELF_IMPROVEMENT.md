@@ -59,6 +59,15 @@ SwarmForge pull an image it hasn't been told to build.
    `swarmforge sandbox build --dev`.
 5. Don't like it? `git branch -D swarmforge/task-xxxxxx`. Nothing else was touched.
 
+## Many improvements in a row: the queue
+
+Dashboard → **Queue** → *Import a backlog file* → `docs/SELF_IMPROVEMENT_BACKLOG.md` →
+repository NiBot (or `bigdan88/swarmforge`) → **Start queue**. With chaining on, task 2 starts
+from task 1's result branch, task 3 from task 2's, and so on. At the end, review the last branch
+(it contains every step) and merge it. If a task fails, the queue pauses so nothing builds on a
+broken result. Fix the item's description and click **Queue again**, or switch the policy to
+*continue*.
+
 ## Writing good self-improvement issues
 
 The team does best with small, testable changes that name files and interfaces. Example (this
