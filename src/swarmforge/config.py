@@ -54,6 +54,7 @@ class Limits:
     max_runtime_s: int = 21600     # 6 hours
     busy_wait_s: int = 900         # keep retrying a busy/rate-limited model this long before falling back
     max_concurrent_agents: int = 2
+    one_run_per_repo: bool = True     # a run waits while an earlier run on the same repository is active
     max_repair_cycles: int = 3
     max_tasks: int = 8
     max_conflict_resolutions: int = 3
@@ -75,11 +76,14 @@ class SandboxConfig:
     dependency_install: bool = True   # install the project's declared packages (network only for that step)
     install_network: str = "bridge"
     install_timeout_s: int = 900
+    reuse_container: bool = True      # agents' run_command execs into one long-lived container per agent
+    dev_tools: bool = True            # processes, headless browser and check_code for developers/tester
 
 
 @dataclass
 class ProjectConfig:
     test_command: str = "python -m pytest -q"
+    agent_test_command: str | None = None  # quicker suite agents run while working (optional)
     setup_command: str | None = None
 
 

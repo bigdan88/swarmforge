@@ -16,6 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 dashboard = ["streamlit>=1.50", "pandas>=2.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# agent developer tools in `sandbox.mode: local` (the Docker sandbox image already has them);
+# after installing, run `python -m playwright install chromium`
+tools = ["ruff>=0.6", "mypy>=1.11", "playwright>=1.45"]
 
 [project.scripts]
 swarmforge = "swarmforge.cli:main"
@@ -30,3 +33,4 @@ swarmforge = ["resources/*"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = ["slow: end-to-end runs of the whole fake swarm (skip with -m \"not slow\" while iterating)"]

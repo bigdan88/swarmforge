@@ -377,3 +377,78 @@ def test_postmortem_classify_parse_and_escalate(cfg):
     assert e2.limits.max_runtime_s == int(3600 * 2.25) and e2.limits.budget_usd == 7.0
     assert e2.limits.max_repair_cycles == 4 and e2.roles["planner"].max_steps == int(steps * 2.25)
     assert cfg.limits.max_repair_cycles == 2  # original untouched
+
+
+def test_postmortem_stale_base_is_retryable():
+    from swarmforge.postmortem import classify, rules_diagnosis
+    run = {"state": "BLOCKED", "state_reason": "cannot continue from 20261031-132618-deaf83: the previous "
+                                               "result swarmforge/task-deaf83 is not based on main; cannot continue from it"}
+    assert classify(run, [], [], []) == "stale_base"
+    assert rules_diagnosis("stale_base", run).retry is True
+
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+def _origin(tmp_path, files):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.name", "t")
+    _git(origin, "config", "user.email", "t@t")
+    for name, text in files.items():
+        (origin / name).write_text(text)
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "base")
+    return origin
+
+
+def _commit(repo, name, text, msg):
+    (repo / name).write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg)
+
+
+def test_seed_from_merges_base_that_moved_on(tmp_path):
+    from swarmforge.workspace import GitWorkspace
+    origin = _origin(tmp_path, {"a.txt": "a\n", "b.txt": "b\n"})
+    old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
+    old.prepare(str(origin), None)
+    _commit(old.repo, "a.txt", "a changed by the swarm\n", "swarm work")
+    _commit(origin, "b.txt", "b changed on main\n", "main moved")   # main moves on meanwhile
+    new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
+    new.prepare(str(origin), None)
+    sha = new.seed_from(old.repo, old.integration_branch)
+    assert new.seed_updated is True and sha == new.head(new.repo)
+    assert (new.repo / "a.txt").read_text() == "a changed by the swarm\n"
+    assert (new.repo / "b.txt").read_text() == "b changed on main\n"
+
+
+def test_seed_from_unchanged_base_is_a_plain_continue(tmp_path):
+    from swarmforge.workspace import GitWorkspace
+    origin = _origin(tmp_path, {"a.txt": "a\n"})
+    old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
+    old.prepare(str(origin), None)
+    _commit(old.repo, "a.txt", "swarm\n", "swarm work")
+    new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
+    new.prepare(str(origin), None)
+    sha = new.seed_from(old.repo, old.integration_branch)
+    assert new.seed_updated is False and sha == old.head(old.repo)
+
+
+def test_seed_from_conflicting_base_raises_stale_seed_and_resets(tmp_path):
+    from swarmforge.workspace import GitWorkspace, StaleSeed
+    origin = _origin(tmp_path, {"a.txt": "a\n"})
+    old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
+    old.prepare(str(origin), None)
+    _commit(old.repo, "a.txt", "swarm version\n", "swarm work")
+    _commit(origin, "a.txt", "main version\n", "main moved")
+    new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
+    new.prepare(str(origin), None)
+    with pytest.raises(StaleSeed) as e:
+        new.seed_from(old.repo, old.integration_branch)
+    assert e.value.conflicts == ["a.txt"]
+    assert new.head(new.repo) == new.base_sha                  # back on a clean, current base
+    assert (new.repo / "a.txt").read_text() == "main version\n"

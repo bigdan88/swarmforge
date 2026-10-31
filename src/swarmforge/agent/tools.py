@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from ..sandbox import Sandbox
+from ..sandbox import DockerSandbox, Sandbox
 
 MAX_READ_CHARS = 40_000
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv", ".mypy_cache",
@@ -30,6 +30,18 @@ class ToolContext:
     files_written: set[str] = field(default_factory=set)
     commands_run: list[dict] = field(default_factory=list)
     installer: Callable[[Path], Awaitable[str]] | None = None   # dependency install step
+    session: Any = None                                        # devtools.Session (processes/browser)
+    processes: dict[str, str] = field(default_factory=dict)    # name -> command (start_process)
+    browse_count: int = 0
+
+    async def aclose(self) -> None:
+        """Stop every process and the sandbox session this agent started."""
+        if self.session is not None:
+            try:
+                await self.session.close()
+            finally:
+                self.session = None
+                self.processes.clear()
 
     def resolve(self, rel: str, must_exist: bool = False) -> Path:
         if rel is None or rel == "":
@@ -162,7 +174,11 @@ async def run_command(ctx: ToolContext, command: str, timeout_s: int | None = No
     if ctx.sandbox is None:
         raise ToolError("command execution is not available to this role")
     t = min(int(timeout_s or ctx.command_timeout_s), ctx.command_timeout_s)
-    res = await ctx.sandbox.run(ctx.workspace, command, timeout_s=t, artifacts_dir=ctx.artifacts_dir)
+    if isinstance(ctx.sandbox, DockerSandbox) and ctx.sandbox.cfg.reuse_container:
+        from .devtools import session_run   # one long-lived container per agent: no startup per command
+        res = await session_run(ctx, command, t)
+    else:
+        res = await ctx.sandbox.run(ctx.workspace, command, timeout_s=t, artifacts_dir=ctx.artifacts_dir)
     ctx.commands_run.append({"command": command, "exit_code": res.exit_code,
                              "timed_out": res.timed_out, "duration_s": round(res.duration_s, 2)})
     return res.summary()
@@ -215,9 +231,15 @@ async def install_dependencies(ctx: ToolContext) -> str:
 ASYNC_IMPLS: dict[str, Callable[..., Awaitable[str]]] = {"run_command": run_command,
                                                         "install_dependencies": install_dependencies}
 
+from .devtools import DEV_IMPLS, DEV_SCHEMAS, DEV_TOOLS  # noqa: E402  (needs the names above)
+
+TOOL_SCHEMAS.update(DEV_SCHEMAS)
+ASYNC_IMPLS.update(DEV_IMPLS)
+
 READ_TOOLS = ["list_files", "read_file", "search"]
 WRITE_TOOLS = ["write_file", "edit_file", "delete_file"]
 EXEC_TOOLS = ["run_command", "install_dependencies"]
+# DEV_TOOLS (start_process, read_process_output, stop_process, browse, check_code) come from devtools
 
 
 @dataclass

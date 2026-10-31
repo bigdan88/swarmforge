@@ -17,10 +17,10 @@ swarmforge run https://github.com/you/repo/issues/42
 | Role | Default model (DeepInfra) | Tools |
 |---|---|---|
 | Planner / Eng. manager | `Qwen/Qwen3.5-397B-A17B` | read-only, `submit_plan` |
-| Backend developer | `deepseek-ai/DeepSeek-V4-Pro` | read/write files, sandboxed commands, `finish` |
+| Backend developer | `deepseek-ai/DeepSeek-V4-Pro` | read/write files, sandboxed commands, dev tools (processes, browser, `check_code`), `finish` |
 | Frontend developer | `moonshotai/Kimi-K2.6` | same, runs concurrently |
 | Reviewer | `zai-org/GLM-5.3` | read-only, `submit_review` |
-| Test engineer | `MiniMaxAI/MiniMax-M3` | test files only, sandboxed commands, `submit_test_report` |
+| Test engineer | `MiniMaxAI/MiniMax-M3` | test files only, sandboxed commands, dev tools, `submit_test_report` |
 | Librarian | `deepseek-ai/DeepSeek-V4-Flash` | read-only, `submit_notes` (Zettelkasten) |
 
 All of these are set in `swarmforge.yaml`; any role can use any model.
@@ -105,6 +105,43 @@ Machine-readable output (added by SwarmForge itself in its first self-improvemen
 `swarmforge status [RUN] --json` prints one object with the same fields plus
 `integration_branch`, `pr_url`, `repair_cycle`, `interventions` and a `tasks` list. An unknown
 run prints `{"error": "run not found: <id>"}` and exits with status 2.
+
+## Agent developer tools
+
+Developers, the conflict resolver and the test engineer get, besides files and `run_command`:
+
+| Tool | What it does |
+|---|---|
+| `start_process` / `read_process_output` / `stop_process` | Run a server or app in the background (e.g. `streamlit run app.py --server.headless true --server.port 8501`), wait until a port or log line says it's ready, read its output, stop it. |
+| `browse` | Open `http://localhost:<port>` in headless Chromium: visible text, errors shown on the page (Streamlit exceptions, tracebacks, `role=alert`), uncaught JS errors, console errors, failed requests and the clickable elements. Optional actions (click, fill, press, select, wait) run first; optional screenshot to the run's artifacts. Local URLs only. |
+| `check_code` | `ruff` + `mypy` on the changed files (or given paths), returned as `file:line:col code message`. Respects the project's own ruff/mypy config. |
+
+They run where `run_command` runs, with the same isolation: in Docker, one long-lived session
+container per agent (no network, read-only root, dropped capabilities), which is killed with every
+process in it when the agent finishes. The tools need the rebuilt sandbox image
+(`swarmforge sandbox build`, plus `--dev` for SwarmForge's own runs); the browser adds roughly
+500 MB to the image. In `sandbox.mode: local`, install them with `pip install -e ".[tools]"` and
+`python -m playwright install chromium`. Turn them off with `sandbox.dev_tools: false`.
+
+## Speed
+
+Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.
+These settings (all on by default) keep that down:
+
+* **Targeted tests.** Agents are told to run only the tests relevant to their change; the orchestrator
+  still runs the full `test_command` as the evidence. A repository can name a quicker suite for agents
+  with `agent_test_command` in `swarmforge.project.yml` (SwarmForge's own skips the `slow`-marked
+  end-to-end tests: `pytest -m "not slow"`).
+* **One active run per repository** (`limits.one_run_per_repo`). A run started while another run on
+  the same repository is active waits for it ("waiting: run(s) ... are already working on this
+  repository") instead of competing for the model rate limit and editing the same files. Its time
+  limit starts when it actually starts.
+* **One container per agent** (`sandbox.reuse_container`). `run_command` executes inside the agent's
+  long-lived sandbox container instead of starting a new one per command; the timeout is enforced
+  inside the container.
+* **Fewer, larger tasks.** The planner aims for 2-4 tasks (`limits.max_tasks: 5`).
+* **Faster developer models.** `swarmforge.yaml` uses Flash models for the developers, with the
+  previous models as fallbacks. Compare with `swarmforge bench` and switch back if quality drops.
 
 ## Failures and self-healing
 

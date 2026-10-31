@@ -14,6 +14,8 @@ from swarmforge.sandbox import DockerSandbox
 from . import fake_team
 from .conftest import ISSUE, FakeProvider
 
+pytestmark = pytest.mark.slow
+
 
 def _provider():
     return FakeProvider({

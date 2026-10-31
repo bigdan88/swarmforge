@@ -29,6 +29,7 @@ CATEGORIES = {
     "model_unavailable": "Model provider busy or unavailable",
     "environment": "Environment problem (Docker, keys, sandbox)",
     "repository": "Repository problem",
+    "stale_base": "Base branch moved since the previous attempt",
     "planning": "Planner could not make a valid plan",
     "tests_failing": "Tests kept failing",
     "review_rejected": "Reviewer kept rejecting the work",
@@ -37,7 +38,7 @@ CATEGORIES = {
     "other": "Other",
 }
 # failures a new attempt (with more effort) can plausibly fix; the rest need a human
-RETRYABLE = {"time_limit", "budget", "model_unavailable", "planning", "tests_failing", "review_rejected",
+RETRYABLE = {"stale_base", "time_limit", "budget", "model_unavailable", "planning", "tests_failing", "review_rejected",
              "agent_failure", "crash", "other"}
 FAILED_STATES = {"FAILED", "BLOCKED", "BUDGET_EXCEEDED"}
 
@@ -83,6 +84,8 @@ def classify(run: dict, events: list[dict], tasks: list[dict], tests: list[dict]
     busy = re.compile(r"\b(429|503|529)\b|busy|overloaded|rate.?limit|unavailable|no model could")
     if busy.search(reason):
         return "model_unavailable"
+    if re.search(r"is not based on|moved on since the previous", reason):
+        return "stale_base"
     if state == "BLOCKED":
         if re.search(r"repositor|clone|empty|branch|not a git", reason):
             return "repository"
@@ -167,6 +170,8 @@ def rules_diagnosis(category: str, run: dict) -> Diagnosis:
         "model_unavailable": "Retry later; the provider was busy. Fallback models are tried automatically.",
         "environment": "Fix the environment first (start Docker, build the sandbox image, set API keys), then retry.",
         "repository": "Check the repository URL/branch and that it is not empty, then retry.",
+        "stale_base": ("New commits landed on the base branch after the previous attempt. Continue merges "
+                       "them into the old work automatically; if that conflicts, start again from scratch."),
         "planning": "Make the task description more concrete (interfaces, files, acceptance criteria).",
         "tests_failing": "Start by running the failing tests and fixing their root cause before anything else.",
         "review_rejected": "Address every unresolved review finding explicitly and verify each with a test.",

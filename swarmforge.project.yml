@@ -4,3 +4,6 @@ description: SwarmForge itself
 # Runs SwarmForge's own suite inside the dev sandbox (build it with `swarmforge sandbox build --dev`).
 test_command: PYTHONPATH=/workspace/src python -m pytest -q -p no:cacheprovider tests
 sandbox_image: swarmforge-dev-sandbox:latest
+# What agents run while they work: everything except the slow end-to-end swarm tests (~2 min).
+# The orchestrator still runs the full test_command above as the evidence.
+agent_test_command: PYTHONPATH=/workspace/src python -m pytest -q -p no:cacheprovider -m "not slow" tests

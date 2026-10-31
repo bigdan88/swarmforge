@@ -9,6 +9,8 @@ from swarmforge.db import Store
 from . import fake_team
 from .conftest import ISSUE, ROOT, FakeProvider
 
+pytestmark = pytest.mark.slow
+
 
 def _provider():
     return FakeProvider({

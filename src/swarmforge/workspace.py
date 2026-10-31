@@ -30,6 +30,15 @@ class EmptyRepository(GitError):
     """The source repository has no commits yet."""
 
 
+class StaleSeed(GitError):
+    """A previous run's result can't be brought up to date with the current base branch
+    (the base moved on and merging it in conflicts)."""
+
+    def __init__(self, message: str, conflicts: list[str] | None = None):
+        super().__init__(message)
+        self.conflicts = conflicts or []
+
+
 def git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> str:
     p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
                        encoding="utf-8", errors="replace", env=env)
@@ -69,6 +78,7 @@ class GitWorkspace:
         self.integration_branch: str | None = None
         self._lock = threading.RLock()  # serializes operations on the main repo / git metadata
         self._leases: dict[Path, str] = {}
+        self.seed_updated = False  # set by seed_from when the base had to be merged in
 
     # ----------------------------------------------------------------- setup
     def prepare(self, source: str, issue_number: int | None, base_branch: str | None = None,
@@ -113,11 +123,27 @@ class GitWorkspace:
         with self._lock:
             git(self.repo, "fetch", "--quiet", str(other_repo), f"+refs/heads/{branch}:refs/remotes/seed/{branch}")
             seed_sha = git(self.repo, "rev-parse", f"refs/remotes/seed/{branch}").strip()
-            rc, _ = git_rc(self.repo, "merge-base", "--is-ancestor", self.base_sha, seed_sha)
-            if rc != 0:
-                raise GitError(f"the previous result {branch} is not based on {self.base_branch}; cannot continue from it")
+            self.seed_updated = False
             git(self.repo, "reset", "--quiet", "--hard", seed_sha)
-            return seed_sha
+            rc, _ = git_rc(self.repo, "merge-base", "--is-ancestor", self.base_sha, seed_sha)
+            if rc == 0:
+                return seed_sha
+            # The base branch moved on since the previous attempt (e.g. new commits were pushed to
+            # main). Bring the previous result up to date by merging the current base into it.
+            rc, out = git_rc(self.repo, "merge", "--no-ff", "--no-edit", "-m",
+                             f"SwarmForge: update previous result with {self.base_branch} "
+                             f"({self.base_sha[:8]})", self.base_sha)
+            if rc != 0:
+                conflicts = [c for c in git(self.repo, "diff", "--name-only", "--diff-filter=U",
+                                             check=False).splitlines() if c]
+                git_rc(self.repo, "merge", "--abort")
+                git(self.repo, "reset", "--quiet", "--hard", self.base_sha)
+                raise StaleSeed(
+                    f"{self.base_branch} moved on since the previous result {branch} was made, and "
+                    f"merging it in conflicts ({', '.join(conflicts[:10]) or out.strip()[:200]})",
+                    conflicts)
+            self.seed_updated = True
+            return self.head(self.repo)
 
     def attach(self, base_branch: str, base_sha: str, integration_branch: str) -> None:
         """Re-attach to an existing run directory (used by benchmark/report tooling)."""

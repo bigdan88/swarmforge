@@ -188,7 +188,7 @@ async def run_agent(llm: LLMClient, spec: AgentSpec) -> AgentResult:
                     elif name not in allowed:
                         out = f"ERROR: tool '{name}' is not available to the {spec.role} role."
                     elif name in ASYNC_IMPLS:
-                        log("tool", f"{name}: {str(args.get('command', ''))[:160]}", {"tool": name})
+                        log("tool", f"{name}: {str(args.get('command') or args.get('url') or args.get('name') or args.get('paths') or '')[:160]}", {"tool": name})
                         out = await ASYNC_IMPLS[name](spec.ctx, **args)
                     else:
                         out = SYNC_IMPLS[name](spec.ctx, **args)

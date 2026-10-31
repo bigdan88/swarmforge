@@ -22,7 +22,7 @@ import yaml
 
 from . import prompts
 from .agent.runtime import AgentResult, AgentSpec, run_agent
-from .agent.tools import EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext
+from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext
 from .config import Config
 from .db import Store
 from .github import GitHubClient, GitHubError, Issue, get_token, load_issue_file, parse_issue_url, push_branch
@@ -38,7 +38,8 @@ from .sandbox import Sandbox, make_sandbox
 from .scheduler import Scheduler
 from .state import RunAborted, RunState, StateMachine, TaskState
 from .testing import TestEvidence, evaluate_criteria, run_tests
-from .workspace import EmptyRepository, GitError, GitWorkspace, git
+from .repolock import blocking_runs, repo_key as lock_key
+from .workspace import EmptyRepository, GitError, GitWorkspace, StaleSeed, git
 
 TEST_PATH_HINTS = ("tests/", "test/", "testing/")
 
@@ -71,6 +72,7 @@ class Orchestrator:
         self.store = store
         self._override_test_command = test_command
         self._override_image = sandbox_image
+        self._repo_poll_s = 15.0   # how often a waiting run re-checks whether its repository is free
         self.seed_run_id = seed_run_id
         self.heal_of, self.heal_attempt, self.heal_context = heal_of, heal_attempt, heal_context
         self.mode = mode
@@ -124,6 +126,8 @@ class Orchestrator:
         self._started = time.monotonic()
         self._timed_out = False
         try:
+            await self._wait_for_repo(repo, issue_url)
+            self._started = time.monotonic()
             pipeline = asyncio.ensure_future(self._pipeline(issue_url, issue_file, repo, base_branch))
             watchdog = asyncio.ensure_future(self._watchdog(pipeline))
             try:
@@ -276,10 +280,20 @@ class Orchestrator:
                                                    "(clone) no longer exists; use Start again instead")
             try:
                 sha = await asyncio.to_thread(self.ws.seed_from, seed_repo, seed["integration_branch"])
+            except StaleSeed as e:
+                # the base branch moved and the old work conflicts with it: start fresh from the
+                # current base (the previous attempt's diagnosis is still part of the task)
+                sha = None
+                self.log("repo", f"cannot reuse the previous attempt's code: {e}. Starting fresh from "
+                                 f"{self.ws.base_branch} @ {self.ws.base_sha[:8]}", level="warn")
             except GitError as e:
                 raise RunAborted(RunState.BLOCKED, f"cannot continue from {self.seed_run_id}: {e}")
-            self.log("repo", f"starting from the previous attempt's result {seed['integration_branch']} "
-                             f"({sha[:8]}); reviews and PRs still compare against {self.ws.base_branch}")
+            if sha and self.ws.seed_updated:
+                self.log("repo", f"{self.ws.base_branch} moved on since the previous attempt; merged it "
+                                 f"into {seed['integration_branch']} cleanly ({sha[:8]})", level="warn")
+            if sha:
+                self.log("repo", f"starting from the previous attempt's result {seed['integration_branch']} "
+                                 f"({sha[:8]}); reviews and PRs still compare against {self.ws.base_branch}")
         self._apply_project_profile()
         if getattr(self.ws, "source_dirty", False):
             self.log("repo", "source checkout has uncommitted changes; they are NOT included (only "
@@ -531,7 +545,7 @@ class Orchestrator:
             parts.append(f"Your dependencies ({', '.join(task.depends_on)}) are already merged into your worktree.")
         if self.knowledge_dev_block:
             parts.append(self.knowledge_dev_block)
-        parts.append(f"Test command for this project: `{self.cfg.project.test_command}`")
+        parts.append(self._test_hint())
         if attempt > 1:
             parts.append(f"NOTE: a previous attempt at this task ended with: {prev_error}. Your worktree "
                          "contains whatever that attempt changed. Review it and complete the task.")
@@ -553,7 +567,7 @@ class Orchestrator:
                               artifacts_dir=self.artifacts / f"task-{task.id}")
             res = await self._agent(task.role, task.id, prompts.DEVELOPER_SYSTEM,
                                     self._dev_prompt(task, attempt, prev_error),
-                                    READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS, self._finish_terminal(), ctx,
+                                    READ_TOOLS + WRITE_TOOLS + self._exec_tools(), self._finish_terminal(), ctx,
                                     transcript_suffix=f"a{attempt}")
             if res.ok:
                 break
@@ -597,13 +611,13 @@ class Orchestrator:
                 prompts.render_issue(self.issue.title, self.issue.body),
                 f"Task being integrated: {task.id} {task.title}\n{task.description}",
                 "Conflicted files:\n" + "\n".join(f"- {c}" for c in conflicts),
-                f"Test command: `{self.cfg.project.test_command}`",
+                self._test_hint(),
             ])
             ctx = ToolContext(workspace=rpath, sandbox=self.sandbox, installer=self._tool_installer(),
                               command_timeout_s=self.cfg.sandbox.command_timeout_s,
                               artifacts_dir=self.artifacts / f"merge-{task.id}")
             res = await self._agent(task.role, key, prompts.CONFLICT_SYSTEM, user,
-                                    READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS, self._finish_terminal(), ctx)
+                                    READ_TOOLS + WRITE_TOOLS + self._exec_tools(), self._finish_terminal(), ctx)
             if not res.ok:
                 self.log("integrate", f"conflict resolution failed: {res.error}", task_key=task.id, level="error")
                 return False
@@ -663,7 +677,7 @@ class Orchestrator:
             prompts.render_issue(self.issue.title, self.issue.body),
             "Acceptance criteria:\n" + (crit or "(none listed)"),
             "Files changed by the developers:\n" + "\n".join(await asyncio.to_thread(self.ws.changed_files)),
-            f"Test command: `{self.cfg.project.test_command}`",
+            self._test_hint(),
             "This is a re-test after corrective work; update existing acceptance tests if needed."
             if cycle else "",
         ])
@@ -673,7 +687,7 @@ class Orchestrator:
                                role="tester", model=self.cfg.roles["tester"].model, state="RUNNING", attempts=1,
                                started_at=time.time(), branch=branch, worktree=str(path))
         res = await self._agent("tester", key, prompts.TESTER_SYSTEM, user,
-                                READ_TOOLS + WRITE_TOOLS + EXEC_TOOLS, self._tester_terminal(), ctx)
+                                READ_TOOLS + WRITE_TOOLS + self._exec_tools(), self._tester_terminal(), ctx)
         # Deterministic guard: the tester may only add/modify test files.
         reverted = await asyncio.to_thread(_revert_non_test_changes, path)
         if reverted:
@@ -844,7 +858,8 @@ class Orchestrator:
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} is not valid YAML: {e}")
             if not isinstance(prof, dict):
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} must be a mapping")
-            unknown = set(prof) - {"test_command", "sandbox_image", "install_command", "description"}
+            unknown = set(prof) - {"test_command", "agent_test_command", "sandbox_image", "install_command",
+                                   "description"}
             if unknown:
                 self.log("project", f"ignoring unsupported keys in {PROJECT_FILE}: {sorted(unknown)}", level="warn")
         inst = prof.get("install_command")
@@ -853,6 +868,11 @@ class Orchestrator:
                 raise RunAborted(RunState.BLOCKED, "install_command must be a non-empty string")
             self.install_command = inst.strip()
         test_cmd = self._override_test_command or prof.get("test_command")
+        quick = prof.get("agent_test_command")
+        if quick is not None and not self._override_test_command:
+            if not isinstance(quick, str) or not quick.strip():
+                raise RunAborted(RunState.BLOCKED, "agent_test_command must be a non-empty string")
+            self.cfg.project.agent_test_command = quick.strip()
         image = self._override_image or prof.get("sandbox_image")
         if test_cmd:
             if not isinstance(test_cmd, str) or not test_cmd.strip():
@@ -1024,6 +1044,46 @@ class Orchestrator:
                  data=[{"stem": n.stem, "title": n.title, "type": n.type} for n in written + [log_note]])
 
     # ================================================================= helpers
+    def _test_hint(self) -> str:
+        quick = self.cfg.project.agent_test_command
+        return "\n".join([
+            f"Full test suite (the orchestrator runs it independently as the evidence): "
+            f"`{self.cfg.project.test_command}`",
+            "While you work, run only the tests relevant to your change (e.g. "
+            "`python -m pytest -q -x tests/test_<module>.py`)"
+            + (f", or the quick suite `{quick}` before you finish" if quick else
+               "; run the full suite at most once, at the end") + ".",
+        ])
+
+    async def _wait_for_repo(self, repo: str | None, issue_url: str | None) -> None:
+        """Wait while an earlier run on the same repository is still active (see repolock.py)."""
+        if not self.cfg.limits.one_run_per_repo:
+            return
+        key = lock_key(repo, issue_url)
+        if not key:
+            return
+        if not (self.store.get_run(self.run_id) or {}).get("repo"):
+            self.store.update_run(self.run_id, repo=repo or key)
+        waited, announced = 0.0, None
+        while True:
+            blockers = await asyncio.to_thread(blocking_runs, self.store, self.run_id, key)
+            if not blockers:
+                break
+            ids = ", ".join(b["id"] for b in blockers)
+            if ids != announced:
+                self.log("queue", f"waiting: run(s) {ids} are already working on this repository; this run "
+                                  "starts when they finish (the time limit starts then)")
+                announced = ids
+            if self._should_cancel():
+                raise RunAborted(RunState.CANCELLED, "cancelled while waiting for the repository")
+            await asyncio.sleep(self._repo_poll_s)
+            waited += self._repo_poll_s
+        if announced:
+            self.log("queue", f"repository is free after {waited / 60:.0f} min; starting")
+
+    def _exec_tools(self) -> list[str]:
+        return EXEC_TOOLS + (DEV_TOOLS if self.cfg.sandbox.dev_tools else [])
+
     def _check_cancel(self) -> None:
         if self._should_cancel():
             self.store.record_intervention(self.run_id, "cancel", "cancel requested via CLI")
@@ -1040,7 +1100,10 @@ class Orchestrator:
             should_cancel=self._should_cancel,
             on_event=lambda kind, msg, data: self.log("agent", msg, task_key=key, role=role, data=data))
         self.log("agent", f"start ({rc.model})", task_key=key, role=role)
-        res = await run_agent(self.llm, spec)
+        try:
+            res = await run_agent(self.llm, spec)
+        finally:
+            await ctx.aclose()   # stop processes/browser session the agent left running
         self.log("agent", f"end: {res.status} after {res.steps} step(s), {res.tool_calls} tool call(s), "
                           f"{res.duration_s:.0f}s" + (f" - {res.error}" if res.error else ""),
                  task_key=key, role=role, level="info" if res.ok else "warn")
