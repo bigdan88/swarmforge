@@ -1,0 +1,6 @@
+# Settings SwarmForge uses when it works on THIS repository (self-improvement runs).
+# Only these two keys are read from a repository; all safety settings stay in swarmforge.yaml.
+description: SwarmForge itself
+# Runs SwarmForge's own suite inside the dev sandbox (build it with `swarmforge sandbox build --dev`).
+test_command: PYTHONPATH=/workspace/src python -m pytest -q -p no:cacheprovider tests
+sandbox_image: swarmforge-dev-sandbox:latest

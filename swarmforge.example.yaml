@@ -1,0 +1,107 @@
+# SwarmForge configuration. Copy to swarmforge.yaml and adjust.
+# Secrets are NOT stored here: providers name the environment variable that holds the key
+# (put it in a .env file next to this config, see .env.example).
+
+providers:
+  deepinfra:
+    base_url: https://api.deepinfra.com/v1/openai
+    api_key_env: DEEPINFRA_API_KEY
+    # Public model listing incl. per-token prices; used for cost *estimates* and `swarmforge check`.
+    pricing_url: https://api.deepinfra.com/v1/openai/models
+
+# Any role can use any model; one model may serve several roles.
+# Model ids must exactly match DeepInfra's catalogue (run `swarmforge check` to verify).
+roles:
+  planner:              # Engineering Manager: analysis, task graph, corrective planning
+    provider: deepinfra
+    model: Qwen/Qwen3.5-397B-A17B
+    temperature: 0.2
+    max_steps: 30
+    timeout_s: 900
+    max_output_tokens: 16384
+  developer_backend:    # general / backend developer
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4-Pro
+    temperature: 0.2
+    max_steps: 45
+    timeout_s: 1200
+    max_output_tokens: 16384
+  developer_frontend:   # general / frontend developer, runs concurrently with backend
+    provider: deepinfra
+    model: moonshotai/Kimi-K2.6
+    temperature: 0.3
+    max_steps: 45
+    timeout_s: 1200
+    max_output_tokens: 16384
+  reviewer:             # independent reviewer - must differ from every developer model
+    provider: deepinfra
+    model: zai-org/GLM-5.3
+    temperature: 0.1
+    max_steps: 30
+    timeout_s: 900
+    max_output_tokens: 16384
+  tester:               # test engineer: writes acceptance tests, maps criteria -> tests, files defects
+    provider: deepinfra
+    model: MiniMaxAI/MiniMax-M3
+    temperature: 0.2
+    max_steps: 40
+    timeout_s: 2400           # writes + runs tests; slow test suites need more time
+    max_output_tokens: 16384
+
+  librarian:            # distills Zettelkasten notes after each run (optional; falls back to planner)
+    provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4-Flash
+    temperature: 0.2
+    max_steps: 12
+    timeout_s: 600
+    max_output_tokens: 8192
+
+developer_roles: [developer_backend, developer_frontend]
+
+limits:
+  budget_usd: 20.0            # hard stop for the whole run (provider-reported + estimated cost)
+  max_runtime_s: 5400         # wall clock for the whole run
+  max_concurrent_agents: 2    # coding agents running at the same time
+  max_repair_cycles: 3        # test/review -> fix iterations
+  max_tasks: 8
+  max_conflict_resolutions: 3
+  task_retries: 1
+  max_planning_attempts: 2
+
+sandbox:
+  mode: docker                # docker (recommended) | local (UNSANDBOXED, last resort)
+  image: swarmforge-sandbox:latest
+  base_image: python:3.12-slim   # used by `swarmforge sandbox build`
+  network: none               # agents' commands get no network
+  memory: 2g
+  cpus: "2"
+  pids_limit: 256
+  command_timeout_s: 300
+
+project:
+  # Executed by the orchestrator (not by an LLM) to produce test evidence. pytest gets
+  # --junitxml added automatically for per-test results.
+  test_command: python -m pytest -q
+
+github:
+  token_env: GITHUB_TOKEN     # falls back to `gh auth token` if gh is installed and logged in
+  branch_prefix: swarmforge/  # every pushed branch starts with this; protected names are refused
+  require_push_approval: true # ask before pushing / opening the draft PR
+  create_pr: true
+
+review:
+  blocking_severities: [critical, major]
+  allow_same_model_review: false
+
+knowledge:                    # Zettelkasten shared by all runs (Obsidian-compatible Markdown)
+  enabled: true
+  vault: knowledge            # folder relative to this config file
+  librarian_role: librarian
+  max_notes_in_prompt: 6      # most relevant notes given to planner (fewer to developers/reviewer)
+  max_notes_per_run: 6        # cap on notes the librarian writes per run
+
+approval:
+  timeout_s: 3600             # dashboard approval requests auto-decline after this long
+
+# Where clones, worktrees, transcripts, logs and the SQLite DB live.
+workdir: ~/.swarmforge

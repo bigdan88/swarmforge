@@ -1,0 +1,13 @@
+.env
+swarmforge.yaml
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+build/
+dist/
+.swarmforge/
+knowledge/
+_to_delete/
+*.tar.gz
