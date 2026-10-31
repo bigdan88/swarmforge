@@ -91,3 +91,41 @@ def test_resolve_base_without_chain_or_result(tmp_path):
     base, note = rq.resolve_base(s, s.queue_item(c))
     assert base is None and "not reachable" in note
     assert rq.resolve_base(s, s.queue_item(d)) == (None, None)  # different repository
+
+
+def test_old_database_is_migrated(tmp_path):
+    import sqlite3
+    db = tmp_path / "old.sqlite"
+    con = sqlite3.connect(db)
+    con.executescript("""CREATE TABLE queue_items (id INTEGER PRIMARY KEY AUTOINCREMENT, position REAL NOT NULL,
+        title TEXT NOT NULL, body TEXT NOT NULL, repo TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'swarm',
+        budget REAL, max_cycles INTEGER, chain INTEGER NOT NULL DEFAULT 1, approval TEXT NOT NULL DEFAULT 'yes',
+        status TEXT NOT NULL DEFAULT 'queued', run_id TEXT, base_branch TEXT, result_branch TEXT, note TEXT,
+        created_at REAL, started_at REAL, finished_at REAL);
+        INSERT INTO queue_items (position, title, body, repo) VALUES (1, 'old', 'b', 'r');""")
+    con.commit()
+    con.close()
+    s = Store(db)
+    item = s.queue_items()[0]
+    assert item["title"] == "old" and "max_runtime_s" in item and "seed_run_id" in item
+    s.queue_update(item["id"], max_runtime_s=7200, seed_run_id="x")
+    assert s.queue_item(item["id"])["max_runtime_s"] == 7200
+
+
+async def test_queue_item_continue_uses_seed_and_runtime(cfg, sample_repo):
+    store = Store(cfg.db_path)
+    body = ISSUE.read_text(encoding="utf-8").split("\n", 2)[2]
+    cfg.limits.max_repair_cycles = 0
+    first = store.queue_add("Export", body, str(sample_repo.resolve()), max_cycles=0)
+    await rq.work(cfg, store, echo=None, llm_transport=_provider().transport)
+    i1 = store.queue_item(first)
+    assert i1["status"] == "failed"
+    store.kv_set(rq.PAUSED_KEY, "0")
+    again = store.queue_add("Export", body, str(sample_repo.resolve()), max_cycles=2,
+                            seed_run_id=i1["run_id"], max_runtime_s=7200)
+    await rq.work(cfg, store, echo=None, llm_transport=_provider().transport)
+    i2 = store.queue_item(again)
+    assert i2["status"] == "done", i2["note"]
+    r2 = store.get_run(i2["run_id"])
+    assert r2["seed_run_id"] == i1["run_id"]
+    assert __import__("json").loads(r2["config_json"])["limits"]["max_runtime_s"] == 7200

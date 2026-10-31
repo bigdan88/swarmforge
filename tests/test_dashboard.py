@@ -179,3 +179,18 @@ def test_background_queue_worker_processes_and_exits(tmp_path, monkeypatch, samp
     assert not pid_alive(pid)
     log = (cfg.workdir / "logs" / "queue-worker.log").read_text()
     assert "queue: starting #" in log and "queue paused" in log
+
+
+async def test_failed_run_offers_start_again_and_continue(tmp_path, monkeypatch, sample_repo):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    cfg.limits.max_repair_cycles = 0
+    store, run_id, _ = await _run(cfg, sample_repo)
+    assert store.get_run(run_id)["state"] == "FAILED"
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    labels = {b.label: b for b in at.button}
+    assert "↻ Start again from scratch" in labels
+    cont = labels["⏩ Continue from where it stopped"]
+    assert not cont.disabled
+    assert any(n.label == "Time limit (hours)" for n in at.number_input)

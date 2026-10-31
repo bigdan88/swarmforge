@@ -104,6 +104,8 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         c.limits.budget_usd = float(item["budget"])
     if item["max_cycles"] is not None:
         c.limits.max_repair_cycles = int(item["max_cycles"])
+    if item.get("max_runtime_s"):
+        c.limits.max_runtime_s = int(item["max_runtime_s"])
     base, note = resolve_base(store, item)
     run_id = new_run_id()
     issues = c.workdir / "issues"
@@ -112,7 +114,8 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     issue_file.write_text(f"# {item['title']}\n\n{item['body']}\n", encoding="utf-8")
     store.queue_update(item["id"], status="running", run_id=run_id, started_at=time.time(),
                        base_branch=base, note=note)
-    orch = Orchestrator(c, store, mode=item["mode"], echo=echo, llm_transport=llm_transport, sandbox=sandbox)
+    orch = Orchestrator(c, store, mode=item["mode"], echo=echo, llm_transport=llm_transport, sandbox=sandbox,
+                        seed_run_id=item.get("seed_run_id"))
     if item["approval"] == "yes":
         orch.approve = lambda q: True
     else:

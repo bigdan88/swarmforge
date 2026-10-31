@@ -107,6 +107,18 @@ class GitWorkspace:
         git(self.repo, "checkout", "-q", "-b", self.integration_branch)
         self.worktrees_dir.mkdir(exist_ok=True)
 
+    def seed_from(self, other_repo: Path, branch: str) -> str:
+        """Start the integration branch from another run's result (same repository).
+        The base branch/sha stay the original ones, so diffs, reviews and PRs cover all the work."""
+        with self._lock:
+            git(self.repo, "fetch", "--quiet", str(other_repo), f"+refs/heads/{branch}:refs/remotes/seed/{branch}")
+            seed_sha = git(self.repo, "rev-parse", f"refs/remotes/seed/{branch}").strip()
+            rc, _ = git_rc(self.repo, "merge-base", "--is-ancestor", self.base_sha, seed_sha)
+            if rc != 0:
+                raise GitError(f"the previous result {branch} is not based on {self.base_branch}; cannot continue from it")
+            git(self.repo, "reset", "--quiet", "--hard", seed_sha)
+            return seed_sha
+
     def attach(self, base_branch: str, base_sha: str, integration_branch: str) -> None:
         """Re-attach to an existing run directory (used by benchmark/report tooling)."""
         self.base_branch, self.base_sha, self.integration_branch = base_branch, base_sha, integration_branch

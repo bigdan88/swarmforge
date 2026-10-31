@@ -94,6 +94,11 @@ async def run_checks(cfg: Config, live: bool = False, roles: list[str] | None = 
                 else:
                     _line(FAIL, f"{name}: model {role.model} is NOT in {pname}'s model list")
                     failures += 1
+                for fb in role.fallback_models:
+                    if fb in ids:
+                        _line(OK, f"{name}: fallback {fb} listed")
+                    else:
+                        _line(WARN, f"{name}: fallback model {fb} is NOT in {pname}'s model list (it will be skipped)")
         except Exception as e:
             _line(WARN, f"could not fetch model list from {p.pricing_url}: {e}")
 

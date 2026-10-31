@@ -20,10 +20,11 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
               mode: str = "swarm", budget: float | None = None, max_cycles: int | None = None,
               approval: str = "dashboard", single_role: str | None = None,
               test_command: str | None = None, sandbox_image: str | None = None,
-              base: str | None = None) -> tuple[str, Path]:
-    if not issue_url and not (issue_title and issue_body):
+              base: str | None = None, issue_file: str | None = None,
+              max_runtime_s: int | None = None, seed_run_id: str | None = None) -> tuple[str, Path]:
+    if not issue_url and not issue_file and not (issue_title and issue_body):
         raise ValueError("give a GitHub issue URL, or a title and description")
-    if not issue_url and not repo:
+    if not issue_url and not repo and not issue_file:
         raise ValueError("a repository (local path or git URL) is required for a local issue")
     if cfg.source_path is None:
         raise ValueError("config path unknown; launch the dashboard with `swarmforge dashboard`")
@@ -34,6 +35,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
             "--run-id", run_id, "--approval", approval]
     if issue_url:
         args.append(issue_url.strip())
+    elif issue_file:
+        args += ["--issue-file", str(issue_file)]
     else:
         issues = cfg.workdir / "issues"
         issues.mkdir(parents=True, exist_ok=True)
@@ -52,6 +55,10 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args += ["--max-cycles", str(max_cycles)]
     if base:
         args += ["--base", base]
+    if max_runtime_s:
+        args += ["--max-runtime-hours", f"{max_runtime_s / 3600:.4g}"]
+    if seed_run_id:
+        args += ["--continue-from", seed_run_id]
     if test_command:
         args += ["--test-command", test_command]
     if sandbox_image:

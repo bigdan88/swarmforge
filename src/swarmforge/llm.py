@@ -91,8 +91,9 @@ class PriceTable:
         self._fetched: set[str] = set()
         self._lock = asyncio.Lock()
 
-    async def get(self, provider: ProviderConfig, role: RoleConfig) -> dict[str, float] | None:
-        if role.price_in_per_mtok is not None and role.price_out_per_mtok is not None:
+    async def get(self, provider: ProviderConfig, role: RoleConfig, model: str | None = None) -> dict[str, float] | None:
+        model = model or role.model
+        if model == role.model and role.price_in_per_mtok is not None and role.price_out_per_mtok is not None:
             return {"in": role.price_in_per_mtok, "out": role.price_out_per_mtok, "cached": None}
         async with self._lock:
             if provider.name not in self._fetched and provider.pricing_url:
@@ -101,7 +102,7 @@ class PriceTable:
                     await self._fetch(provider)
                 except Exception:  # pricing is best-effort
                     pass
-        return self._prices.get((provider.name, role.model))
+        return self._prices.get((provider.name, model))
 
     async def _fetch(self, provider: ProviderConfig) -> None:
         async with httpx.AsyncClient(timeout=30) as c:
@@ -145,13 +146,19 @@ def parse_usage(raw_usage: dict | None, prices: dict | None) -> Usage:
 
 
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+BUSY_STATUS = RETRY_STATUS  # "model busy"/overloaded/rate limited/gateway errors: wait patiently
+
+
+class _ModelUnavailable(Exception):
+    """This model can't serve the request right now; try the role's next fallback model."""
 
 
 class LLMClient:
     def __init__(self, config: Config, store=None, run_id: str | None = None,
                  budget: Budget | None = None, transport: httpx.AsyncBaseTransport | None = None,
-                 max_retries: int = 4):
+                 max_retries: int = 4, busy_wait_s: float | None = None):
         self.config = config
+        self.busy_wait_s = busy_wait_s
         self.store = store
         self.run_id = run_id
         self.budget = budget or Budget(config.limits.budget_usd)
@@ -161,15 +168,30 @@ class LLMClient:
 
     async def chat(self, role: str, messages: list[dict], *, tools: list[dict] | None = None,
                    task_key: str | None = None, tool_choice: Any = None) -> ChatResult:
+        """Call the role's model. Busy/overloaded responses (429/503/529…) are retried patiently
+        for up to `limits.busy_wait_s` per model; then the role's `fallback_models` are tried in
+        order. Every attempt that fails is recorded; the successful call records the model used."""
         rc = self.config.role(role)
         pc = self.config.providers[rc.provider]
         key = pc.api_key()
         if not key:
             raise LLMError(f"environment variable {pc.api_key_env} is not set (provider {pc.name})")
         self.budget.check()
+        models = [rc.model, *[m for m in rc.fallback_models if m != rc.model]]
+        errors: list[str] = []
+        for idx, model in enumerate(models):
+            if idx > 0:
+                self._event(f"{role}: {models[idx - 1]} unavailable; falling back to {model}", task_key, role)
+            try:
+                return await self._chat_model(role, rc, pc, key, model, messages, tools, tool_choice, task_key)
+            except _ModelUnavailable as e:
+                errors.append(f"{model}: {e}")
+                continue
+        raise LLMError(f"{role} call failed on every configured model: " + " | ".join(errors))
 
+    async def _chat_model(self, role, rc, pc, key, model, messages, tools, tool_choice, task_key) -> ChatResult:
         body: dict[str, Any] = {
-            "model": rc.model,
+            "model": model,
             "messages": messages,
             "temperature": rc.temperature,
             "max_tokens": rc.max_output_tokens,
@@ -182,57 +204,101 @@ class LLMClient:
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                    **pc.extra_headers}
         url = pc.base_url.rstrip("/") + "/chat/completions"
+        busy_wait = self.busy_wait_s if self.busy_wait_s is not None else self.config.limits.busy_wait_s
 
         started = time.time()
         last_err: str | None = None
         data: dict | None = None
+        transient = 0
+        busy_attempt = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(rc.timeout_s, connect=30),
                                      transport=self._transport) as client:
-            for attempt in range(self.max_retries + 1):
+            while True:
                 try:
                     r = await client.post(url, headers=headers, json=body)
-                    if r.status_code in RETRY_STATUS and attempt < self.max_retries:
-                        last_err = f"HTTP {r.status_code}: {r.text[:300]}"
-                        await asyncio.sleep(_backoff(attempt, r))
-                        continue
-                    if r.status_code >= 400:
-                        last_err = f"HTTP {r.status_code}: {r.text[:1000]}"
-                        break
-                    data = r.json()
-                    break
                 except (httpx.TimeoutException, httpx.TransportError) as e:
                     last_err = f"{type(e).__name__}: {e}"
-                    if attempt < self.max_retries:
-                        await asyncio.sleep(_backoff(attempt))
+                    transient += 1
+                    if transient <= self.max_retries:
+                        await asyncio.sleep(_backoff(transient - 1))
                         continue
-                    break
+                    self._record(role, model, pc, task_key, started, Usage(), "error", last_err)
+                    raise _ModelUnavailable(last_err)
+                if r.status_code in BUSY_STATUS:
+                    last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+                    waited = time.time() - started
+                    if waited < busy_wait:
+                        delay = min(_busy_backoff(busy_attempt, r), max(1.0, busy_wait - waited))
+                        if busy_attempt in (0, 3, 8):
+                            self._event(f"{role}: {model} is busy ({r.status_code}); retrying for up to "
+                                        f"{int(busy_wait // 60)} min", task_key, role, level="warn")
+                        busy_attempt += 1
+                        await asyncio.sleep(delay)
+                        continue
+                    self._record(role, model, pc, task_key, started, Usage(), "error", last_err)
+                    raise _ModelUnavailable(f"busy for {int(waited)}s: {last_err}")
+                if r.status_code in (404,) or (r.status_code == 400 and "model" in r.text.lower()
+                                               and ("not found" in r.text.lower() or "does not exist" in r.text.lower())):
+                    last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+                    self._record(role, model, pc, task_key, started, Usage(), "error", last_err)
+                    raise _ModelUnavailable(last_err)
+                if r.status_code >= 400:
+                    last_err = f"HTTP {r.status_code}: {r.text[:1000]}"
+                    self._record(role, model, pc, task_key, started, Usage(), "error", last_err)
+                    raise LLMError(f"{role} ({model}) call failed: {last_err}")
+                try:
+                    data = r.json()
+                except ValueError:
+                    data = None
+                if not data or not data.get("choices"):
+                    last_err = f"no choices in response: {r.text[:300]}"
+                    transient += 1
+                    if transient <= self.max_retries:
+                        await asyncio.sleep(_backoff(transient - 1))
+                        continue
+                    self._record(role, model, pc, task_key, started, Usage(), "error", last_err)
+                    raise _ModelUnavailable(last_err)
+                break
 
-        if data is None or not data.get("choices"):
-            if data is not None:
-                last_err = f"no choices in response: {json.dumps(data)[:500]}"
-            self._record(role, rc, pc, task_key, started, Usage(), "error", last_err)
-            raise LLMError(f"{role} ({rc.model}) call failed: {last_err}")
-
-        prices = await self.prices.get(pc, rc)
+        prices = await self.prices.get(pc, rc, model)
         usage = parse_usage(data.get("usage"), prices)
         self.budget.add(usage)
         choice = data["choices"][0]
         msg = dict(choice.get("message") or {})
         msg.setdefault("role", "assistant")
-        self._record(role, rc, pc, task_key, started, usage, "ok", None)
+        self._record(role, model, pc, task_key, started, usage, "ok", None)
         return ChatResult(message=msg, finish_reason=choice.get("finish_reason"), usage=usage, raw=data)
 
-    def _record(self, role, rc, pc, task_key, started, usage: Usage, status, error):
+    def _event(self, message: str, task_key, role, level: str = "info") -> None:
+        if self.store and self.run_id:
+            try:
+                self.store.event(self.run_id, "model", message, level=level, task_key=task_key, role=role)
+            except Exception:
+                pass
+
+    def _record(self, role, model, pc, task_key, started, usage: Usage, status, error):
         if not self.store or not self.run_id:
             return
         self.store.record_llm_call(
-            self.run_id, task_key=task_key, role=role, provider=pc.name, model=rc.model,
+            self.run_id, task_key=task_key, role=role, provider=pc.name, model=model,
             started_at=started, ended_at=time.time(), prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens, total_tokens=usage.total_tokens,
             cached_tokens=usage.cached_tokens, cost_usd=usage.cost_usd,
             cost_source=usage.cost_source if status == "ok" else "unavailable",
             status=status, error=error,
         )
+
+
+def _busy_backoff(attempt: int, resp: httpx.Response | None = None) -> float:
+    """5s, 10s, 20s, 40s, then every 60s (honours Retry-After up to 2 min), with jitter."""
+    if resp is not None:
+        ra = resp.headers.get("retry-after")
+        if ra:
+            try:
+                return min(120.0, float(ra)) + random.random()
+            except ValueError:
+                pass
+    return min(60.0, 5.0 * (2 ** attempt)) + random.random() * 2
 
 
 def _backoff(attempt: int, resp: httpx.Response | None = None) -> float:

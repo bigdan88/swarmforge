@@ -41,9 +41,12 @@ def cmd_run(args, cfg) -> int:
         cfg.limits.max_repair_cycles = args.max_cycles
     if args.budget is not None:
         cfg.limits.budget_usd = args.budget
+    if args.max_runtime_hours is not None:
+        cfg.limits.max_runtime_s = int(args.max_runtime_hours * 3600)
     mode = "yes" if args.yes else args.approval
     orch = Orchestrator(cfg, store, mode="single" if args.single else "swarm", single_role=args.role,
-                        test_command=args.test_command, sandbox_image=args.sandbox_image)
+                        test_command=args.test_command, sandbox_image=args.sandbox_image,
+                        seed_run_id=args.continue_from)
     if mode == "yes":
         approve = lambda q: True  # noqa: E731
     elif mode == "dashboard":
@@ -308,6 +311,10 @@ def cmd_bench(args, cfg) -> int:
 
 
 # ------------------------------------------------------------------ queue
+def _hours(h):
+    return int(h * 3600) if h else None
+
+
 def cmd_queue(args, cfg) -> int:
     from . import runqueue as rq
     from .repos import RepoError, normalize_repo
@@ -338,7 +345,7 @@ def cmd_queue(args, cfg) -> int:
             return 2
         iid = store.queue_add(args.title, body, norm(args.repo), mode=args.mode, budget=args.budget,
                               max_cycles=args.max_cycles, chain=0 if args.no_chain else 1,
-                              approval=args.approval)
+                              approval=args.approval, max_runtime_s=_hours(args.max_runtime_hours))
         print(f"queued #{iid}")
         return 0
     if a == "import":
@@ -346,7 +353,7 @@ def cmd_queue(args, cfg) -> int:
         for it in items:
             iid = store.queue_add(it.title, it.body, norm(args.repo), mode=args.mode, budget=args.budget,
                                   max_cycles=args.max_cycles, chain=0 if args.no_chain else 1,
-                                  approval=args.approval)
+                                  approval=args.approval, max_runtime_s=_hours(args.max_runtime_hours))
             print(f"queued #{iid} {it.title}")
         print(f"{len(items)} item(s) imported")
         return 0
@@ -392,6 +399,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how to ask before pushing: terminal prompt (default), dashboard button, or pre-approved")
     r.add_argument("--run-id", help=argparse.SUPPRESS)
     r.add_argument("--test-command", help="override the test command for this run")
+    r.add_argument("--max-runtime-hours", type=float, help="override limits.max_runtime_s for this run")
+    r.add_argument("--continue-from", metavar="RUN",
+                   help="start from a stopped run's result and its unresolved problems")
     r.add_argument("--sandbox-image", help="override the sandbox image for this run (must already be built)")
     r.add_argument("--single", action="store_true", help="single-agent baseline mode")
     r.add_argument("--role", help="developer role for --single (default: first developer role)")
@@ -471,6 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
         x.add_argument("--mode", choices=["swarm", "single"], default="swarm")
         x.add_argument("--budget", type=float, default=None)
         x.add_argument("--max-cycles", type=int, default=None)
+        x.add_argument("--max-runtime-hours", type=float, default=None)
         x.add_argument("--no-chain", action="store_true", help="start from the default branch, not the previous result")
         x.add_argument("--approval", choices=["yes", "dashboard"], default="yes",
                        help="GitHub repos: open draft PRs without asking (yes) or ask in the dashboard")

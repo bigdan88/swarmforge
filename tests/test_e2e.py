@@ -308,3 +308,40 @@ async def test_environment_problems_block_before_any_work(cfg, sample_repo, monk
     assert run["state"] == "BLOCKED"
     assert "FAKE_KEY" in run["state_reason"] and "Docker is not responding" in run["state_reason"]
     assert store.cost_summary(run_id)["calls"] == 0
+
+
+async def test_continue_from_stopped_run(cfg, sample_repo):
+    cfg.limits.max_repair_cycles = 0          # first attempt stops at the review's major finding
+    store, first, _ = await _run(cfg, sample_repo)
+    r1 = store.get_run(first)
+    assert r1["state"] == "FAILED" and "repair limit" in r1["state_reason"]
+    repo1 = cfg.workdir / "runs" / first / "repo"
+    t1_commit = subprocess.run(["git", "log", "--format=%H", "--grep", "^T1:", r1["integration_branch"]],
+                               cwd=repo1, capture_output=True, text=True).stdout.split()[0]
+
+    cfg.limits.max_repair_cycles = 2
+    fake = _provider()
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=fake.transport, seed_run_id=first)
+    second = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+    r2 = store.get_run(second)
+    assert r2["state"] == "COMPLETED", r2["state_reason"]
+    assert r2["seed_run_id"] == first
+    repo2 = cfg.workdir / "runs" / second / "repo"
+    # the first attempt's work is part of the new result; diffs still compare against main
+    assert subprocess.run(["git", "merge-base", "--is-ancestor", t1_commit, r2["integration_branch"]],
+                          cwd=repo2).returncode == 0
+    assert r2["base_branch"] == "main"
+    planner_prompt = next(r for r in fake.requests if r["model"] == "qwen-fake")["messages"][1]["content"]
+    assert "Previous attempt (continue from here)" in planner_prompt
+    assert "--format undocumented" in planner_prompt          # the unresolved major finding is carried over
+    assert any("starting from the previous attempt's result" in e["message"] for e in store.events(second))
+
+
+async def test_continue_from_missing_workspace_is_blocked(cfg, sample_repo):
+    cfg.limits.max_repair_cycles = 0
+    store, first, _ = await _run(cfg, sample_repo)
+    shutil.rmtree(cfg.workdir / "runs" / first / "repo")
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport, seed_run_id=first)
+    second = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+    r2 = store.get_run(second)
+    assert r2["state"] == "BLOCKED" and "Start again" in r2["state_reason"]

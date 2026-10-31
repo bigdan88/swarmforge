@@ -190,7 +190,21 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    # columns added after the first release; existing databases get them on open
+    MIGRATIONS = [
+        ("queue_items", "max_runtime_s", "INTEGER"),
+        ("queue_items", "seed_run_id", "TEXT"),
+        ("runs", "seed_run_id", "TEXT"),
+    ]
+
+    def _migrate(self) -> None:
+        for table, col, typ in self.MIGRATIONS:
+            cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
 
     # ---------------------------------------------------------------- helpers
     def _exec(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
@@ -380,7 +394,7 @@ class Store:
     # ------------------------------------------------------------------ queue
     QUEUE_FIELDS = ("title", "body", "repo", "mode", "budget", "max_cycles", "chain", "approval",
                     "status", "run_id", "base_branch", "result_branch", "note", "started_at",
-                    "finished_at", "position")
+                    "finished_at", "position", "max_runtime_s", "seed_run_id")
 
     def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
         row = self._one("SELECT MAX(position) AS m FROM queue_items")

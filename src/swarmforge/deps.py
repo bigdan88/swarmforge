@@ -17,6 +17,8 @@ dev-requirements.txt in the repo root; [project] dependencies + optional-depende
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +64,73 @@ def _pyproject_deps(ws: Path) -> list[str]:
     return sorted({d for d in deps if isinstance(d, str) and d.strip()})
 
 
+HELPER = r"""
+# Written by SwarmForge into <worktree>/.swarmforge/ and run inside the sandbox.
+# 1) If every declared requirement is already satisfied (by the image or a previous install) do nothing.
+# 2) Otherwise pip-install into .swarmforge/pydeps, unpacking in an on-disk temp dir (the sandbox's
+#    /tmp is a small RAM disk that big wheels like pyarrow overflow).
+import json, os, shutil, subprocess, sys
+here = os.path.dirname(os.path.abspath(__file__))
+spec = json.load(open(os.path.join(here, "sf_deps.json")))
+target = os.path.join(here, "pydeps")
+
+def satisfied():
+    if spec["req_files"] and not spec["file_reqs_parsed"]:
+        return False
+    try:
+        from pip._vendor.packaging.requirements import Requirement
+    except Exception:
+        return False
+    from importlib import metadata
+    for line in spec["requirements"]:
+        try:
+            req = Requirement(line)
+        except Exception:
+            return False
+        if req.marker is not None and not req.marker.evaluate():
+            continue
+        try:
+            ver = metadata.version(req.name)
+        except metadata.PackageNotFoundError:
+            return False
+        if req.specifier and not req.specifier.contains(ver, prereleases=True):
+            return False
+    return True
+
+if satisfied():
+    print("SWARMFORGE-DEPS: all requirements already satisfied; nothing to install")
+    sys.exit(0)
+tmp = os.path.join(here, "piptmp")
+os.makedirs(tmp, exist_ok=True)
+env = dict(os.environ, TMPDIR=tmp, TEMP=tmp, TMP=tmp)
+args = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location",
+        "--root-user-action=ignore", "--upgrade", "--target", target]
+for f in spec["req_files"]:
+    args += ["-r", f]
+args += spec["pyproject_reqs"]
+rc = subprocess.call(args, env=env)
+shutil.rmtree(tmp, ignore_errors=True)
+sys.exit(rc)
+"""
+
+_SIMPLE_REQ = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[^\]]*\])?\s*([<>=!~].*)?(;.*)?$")
+
+
+def _file_requirements(files: list[Path]) -> tuple[list[str], bool]:
+    """Requirement lines from requirements files; False if some line can't be checked offline."""
+    reqs, ok = [], True
+    for f in files:
+        for raw in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.split(" #", 1)[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            if _SIMPLE_REQ.match(line):
+                reqs.append(line)
+            else:  # -r/-e/--options/paths/URLs: install to be safe
+                ok = False
+    return reqs, ok
+
+
 def plan_install(ws: Path, install_command: str | None = None) -> InstallPlan:
     h = hashlib.sha256()
     sources: list[str] = []
@@ -79,15 +148,25 @@ def plan_install(ws: Path, install_command: str | None = None) -> InstallPlan:
     if install_command:
         cmd = install_command
     elif files or pp:
-        args = []
-        for f in files:
-            args += ["-r", shlex.quote(f.relative_to(ws).as_posix())]
-        args += [shlex.quote(d) for d in pp]
-        cmd = ("python -m pip install --disable-pip-version-check --no-warn-script-location --root-user-action=ignore "
-               f"--upgrade --target {DEPS_CONTAINER_PATH} " + " ".join(args))
+        cmd = "python .swarmforge/sf_deps.py"
     else:
         cmd = None
     return InstallPlan(cmd, sources, h.hexdigest()[:16])
+
+
+def _write_helper(ws: Path) -> None:
+    files = _req_files(ws)
+    file_reqs, parsed = _file_requirements(files)
+    d = ws / ".swarmforge"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "sf_deps.py").write_text(HELPER, encoding="utf-8")
+    pp = _pyproject_deps(ws)
+    (d / "sf_deps.json").write_text(json.dumps({
+        "req_files": [f.relative_to(ws).as_posix() for f in files],
+        "file_reqs_parsed": parsed,
+        "requirements": file_reqs + pp,
+        "pyproject_reqs": pp,
+    }), encoding="utf-8")
 
 
 def is_current(ws: Path, plan: InstallPlan) -> bool:
@@ -98,15 +177,19 @@ def is_current(ws: Path, plan: InstallPlan) -> bool:
 async def ensure_deps(sandbox: Sandbox, ws: Path, *, network: str = "bridge", timeout_s: int = 900,
                       cache_dir: Path | None = None, install_command: str | None = None,
                       force: bool = False) -> tuple[str, CommandResult | None, InstallPlan]:
-    """Returns (status, result, plan); status in {"none", "current", "installed", "failed"}."""
+    """Returns (status, result, plan); status in {"none", "current", "satisfied", "installed", "failed"}."""
     plan = plan_install(ws, install_command)
     if not plan.command:
         return "none", None, plan
     if not force and is_current(ws, plan):
         return "current", None, plan
     (ws / DEPS_DIR).mkdir(parents=True, exist_ok=True)
+    if plan.command.endswith(".swarmforge/sf_deps.py"):
+        _write_helper(ws)
     res = await sandbox.run(ws, plan.command, timeout_s=timeout_s, network=network, cache_dir=cache_dir)
     if res.exit_code == 0 and not res.timed_out:
         (ws / DEPS_DIR / STAMP).write_text(plan.fingerprint)
+        if "SWARMFORGE-DEPS: all requirements already satisfied" in res.output:
+            return "satisfied", res, plan
         return "installed", res, plan
     return "failed", res, plan

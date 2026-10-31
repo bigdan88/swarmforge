@@ -59,6 +59,11 @@ store = get_store(db_path)
 vault = Vault(cfg.vault_path) if cfg else None
 
 
+def _hrs(seconds) -> float:
+    """Seconds -> hours for number inputs, clamped to the inputs' range so odd configs never crash a form."""
+    return float(min(72.0, max(0.05, round((seconds or 0) / 3600, 2))))
+
+
 def fmt_ts(t, full=False):
     return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M" if full else "%H:%M:%S") if t else "-"
 
@@ -152,12 +157,15 @@ def page_new_run():
                              help="A local git folder, a GitHub owner/repo, or any GitHub URL of the repo "
                                   "(…/tree/branch selects that branch).")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     mode = c1.selectbox("Team", ["swarm", "single"], format_func=lambda m: {
         "swarm": "Swarm (5 roles)", "single": "Single agent (baseline)"}[m])
     budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(cfg.limits.budget_usd), 0.5)
     cycles = c3.number_input("Max repair cycles", 0, 10, int(cfg.limits.max_repair_cycles))
-    approval = c4.selectbox("Before pushing to GitHub", ["dashboard", "yes"], format_func=lambda a: {
+    hours = c4.number_input("Time limit (hours)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s), 0.5,
+                            help="The whole run stops after this long. Default from swarmforge.yaml "
+                                 "(limits.max_runtime_s).")
+    approval = c5.selectbox("Before pushing to GitHub", ["dashboard", "yes"], format_func=lambda a: {
         "dashboard": "Ask me here", "yes": "Pre-approve"}[a])
 
     with st.expander("Advanced: test command and sandbox image"):
@@ -214,7 +222,8 @@ def page_new_run():
             run_id, log = start_run(cfg, repo=repo_arg, issue_url=url, issue_title=title, issue_body=body,
                                     mode=mode, budget=budget, max_cycles=int(cycles), approval=approval,
                                     test_command=(test_cmd or "").strip() or None,
-                                    sandbox_image=(image or "").strip() or None, base=base)
+                                    sandbox_image=(image or "").strip() or None, base=base,
+                                    max_runtime_s=int(hours * 3600))
         except (ValueError, RepoError) as e:
             st.error(str(e))
             return
@@ -377,6 +386,73 @@ def page_runs():
         st.rerun()
 
 
+def run_resumable(run_id: str) -> bool:
+    """True if a stopped run left a clone with integrated work that a new run can continue from."""
+    r = store.get_run(run_id)
+    if not r or not r["integration_branch"] or not r["run_dir"]:
+        return False
+    if not (Path(r["run_dir"]) / "repo").is_dir():
+        return False
+    return any(t["state"] == "INTEGRATED" and t["kind"] in ("implement", "fix") for t in store.tasks(run_id))
+
+
+def _requeue_next(item: dict, kw: dict) -> None:
+    """Re-add a queue item right after the items that are already running (front of the waiting line)."""
+    new_id = store.queue_add(item["title"], item["body"], item["repo"], **kw)
+    waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != new_id]
+    if waiting:
+        store.queue_update(new_id, position=waiting[0]["position"] - 0.5)
+    store.kv_set("queue_paused", "0")
+
+
+def restart_panel(run: dict) -> None:
+    """Start again / continue a stopped run, with editable limits."""
+    from swarmforge.launcher import start_run
+    issue_src = run["issue_url"] or ""
+    is_url = issue_src.startswith("http")
+    issue_ok = is_url or Path(issue_src).is_file()
+    can_continue = run_resumable(run["id"])
+    cl = json.loads(run["config_json"] or "{}").get("limits", {})
+    with st.container(border=True):
+        st.markdown("**Restart this task**")
+        if not issue_ok:
+            st.caption("The original task description file is missing, so this run can't be restarted from here.")
+            return
+        c1, c2, c3 = st.columns(3)
+        hours = c1.number_input("Time limit (hours)", 0.05, 72.0,
+                                _hrs(max(cl.get("max_runtime_s", 0) * 1.5, cfg.limits.max_runtime_s)),
+                                0.5, key=f"rs_h_{run['id']}")
+        budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(run["budget_usd"] or cfg.limits.budget_usd),
+                                 0.5, key=f"rs_b_{run['id']}")
+        cycles = c3.number_input("Max repair cycles", 0, 10, int(cl.get("max_repair_cycles",
+                                                                        cfg.limits.max_repair_cycles)),
+                                 key=f"rs_c_{run['id']}")
+        b1, b2 = st.columns(2)
+
+        def launch(seed):
+            try:
+                rid, _ = start_run(cfg, repo=None if is_url else (run["repo"] or None),
+                                   issue_url=issue_src if is_url else None,
+                                   issue_file=None if is_url else issue_src,
+                                   mode=run["mode"], budget=budget, max_cycles=int(cycles),
+                                   max_runtime_s=int(hours * 3600), seed_run_id=seed,
+                                   base=run["base_branch"] if not seed else run["base_branch"])
+                st.session_state.sel_run = rid
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+        if b1.button("↻ Start again from scratch", key=f"rs_new_{run['id']}"):
+            launch(None)
+        if b2.button("⏩ Continue from where it stopped", key=f"rs_cont_{run['id']}", disabled=not can_continue,
+                     type="primary" if can_continue else "secondary",
+                     help="Starts from this run's code (its integrated work) and adds its unresolved problems "
+                          "to the task, so nothing already done is lost."):
+            launch(run["id"])
+        if not can_continue:
+            st.caption("Continue is available when the run integrated some work and its workspace still exists.")
+
+
+
 def run_detail(run_id):
     run = store.get_run(run_id)
     tasks = store.tasks(run_id)
@@ -435,6 +511,8 @@ def run_detail(run_id):
                 else:
                     st.error("Publishing failed: check that the token has Contents and Pull requests write "
                              "access to this repository (details in the Events tab).")
+    if run["state"] in ("FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED") and cfg:
+        restart_panel(run)
     if active and not run["cancel_requested"]:
         if st.button("⏹ Request cancel"):
             store.request_cancel(run_id)
@@ -790,9 +868,21 @@ def page_queue():
                 else:
                     st.markdown(i["body"][:3000])
             elif i["status"] in ("failed", "cancelled", "skipped"):
-                if st.button("↻ Queue again", key=f"q_re_{i['id']}"):
-                    store.queue_add(i["title"], i["body"], i["repo"], mode=i["mode"], budget=i["budget"],
-                                    max_cycles=i["max_cycles"], chain=i["chain"], approval=i["approval"])
+                r1, r2, r3 = st.columns([1, 1, 1])
+                more = r3.number_input("Time limit (h)", 0.05, 72.0,
+                                       _hrs(max(i["max_runtime_s"] or cfg.limits.max_runtime_s,
+                                                cfg.limits.max_runtime_s)), 0.5, key=f"q_h_{i['id']}")
+                kw = dict(mode=i["mode"], budget=i["budget"], max_cycles=i["max_cycles"], chain=i["chain"],
+                          approval=i["approval"], max_runtime_s=int(more * 3600))
+                if r1.button("↻ Start again", key=f"q_re_{i['id']}",
+                             help="Queue this task again from scratch (same description)."):
+                    _requeue_next(i, kw)
+                    st.rerun()
+                can_continue = bool(i["run_id"]) and run_resumable(i["run_id"])
+                if r2.button("⏩ Continue where it stopped", key=f"q_co_{i['id']}", disabled=not can_continue,
+                             help="Queue it again starting from the failed run's code, with its unresolved "
+                                  "problems added to the task."):
+                    _requeue_next(i, {**kw, "seed_run_id": i["run_id"]})
                     st.rerun()
     if any(i["status"] in ("done", "failed", "cancelled", "skipped") for i in items):
         if st.button("Clear finished tasks"):
@@ -803,17 +893,19 @@ def page_queue():
     t_add, t_imp = st.tabs(["➕ Add a task", "📥 Import a backlog file"])
 
     def common(prefix):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c5, c4 = st.columns(5)
         mode = c1.selectbox("Team", ["swarm", "single"], key=f"{prefix}_mode",
                             format_func=lambda m: {"swarm": "Swarm", "single": "Single agent"}[m])
         budget = c2.number_input("Budget per task (USD)", 0.5, 500.0, 5.0, 0.5, key=f"{prefix}_budget")
         cycles = c3.number_input("Max repair cycles", 0, 10, 2, key=f"{prefix}_cycles")
+        hours = c5.number_input("Time limit per task (h)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s),
+                                0.5, key=f"{prefix}_hours")
         approval = c4.selectbox("GitHub pushes", ["yes", "dashboard"], key=f"{prefix}_appr",
                                 format_func=lambda a: {"yes": "Draft PRs without asking",
                                                        "dashboard": "Ask me each time"}[a])
         chain = st.checkbox("Chain: start from the previous task's result on this repository", value=True,
                             key=f"{prefix}_chain")
-        return mode, budget, cycles, approval, chain
+        return mode, budget, cycles, approval, chain, int(hours * 3600)
 
     def checked_repo(repo):
         from swarmforge.repos import normalize_repo, preflight
@@ -825,14 +917,14 @@ def page_queue():
         body = st.text_area("Description with acceptance criteria", height=200, key="qa_body")
         repo = st.text_input("Repository", key="qa_repo", value=st.session_state.get("q_last_repo", ""),
                              placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
-        mode, budget, cycles, approval, chain = common("qa")
+        mode, budget, cycles, approval, chain, runtime = common("qa")
         if st.button("Add to queue", type="primary"):
             try:
                 if not title.strip() or not body.strip():
                     raise ValueError("title and description are required")
                 src = checked_repo(repo)
                 store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget, max_cycles=int(cycles),
-                                chain=int(chain), approval=approval)
+                                chain=int(chain), approval=approval, max_runtime_s=runtime)
                 st.session_state.q_last_repo = repo
                 st.success(f"Queued: {title}")
                 st.rerun()
@@ -846,7 +938,7 @@ def page_queue():
         repo_i = st.text_input("Repository for all imported tasks", key="qi_repo",
                                value=st.session_state.get("q_last_repo", ""),
                                placeholder="bigdan88/swarmforge   or   C:\\Users\\danie\\Projects\\NiBot")
-        mode, budget, cycles, approval, chain = common("qi")
+        mode, budget, cycles, approval, chain, runtime = common("qi")
         found = []
         if path and Path(path).is_file():
             found = rq.parse_backlog(Path(path).read_text(encoding="utf-8"))
@@ -858,7 +950,7 @@ def page_queue():
                 src = checked_repo(repo_i)
                 for f in found:
                     store.queue_add(f.title, f.body, src, mode=mode, budget=budget, max_cycles=int(cycles),
-                                    chain=int(chain), approval=approval)
+                                    chain=int(chain), approval=approval, max_runtime_s=runtime)
                 st.session_state.q_last_repo = repo_i
                 st.success(f"Imported {len(found)} task(s). Press ▶ Start queue.")
                 st.rerun()

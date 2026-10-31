@@ -44,12 +44,15 @@ class RoleConfig:
     price_in_per_mtok: float | None = None
     price_out_per_mtok: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
+    # tried in order when the main model is busy/unavailable for longer than limits.busy_wait_s
+    fallback_models: list[str] = field(default_factory=list)
 
 
 @dataclass
 class Limits:
     budget_usd: float = 20.0
-    max_runtime_s: int = 3600
+    max_runtime_s: int = 21600     # 6 hours
+    busy_wait_s: int = 900         # keep retrying a busy/rate-limited model this long before falling back
     max_concurrent_agents: int = 2
     max_repair_cycles: int = 3
     max_tasks: int = 8
@@ -229,8 +232,14 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError(f"review.blocking_severities must be a subset of {sorted(sev)}")
     if not cfg.review.allow_same_model_review:
         rev = cfg.roles["reviewer"]
+        rev_models = {rev.model, *rev.fallback_models}
         for d in cfg.developer_roles:
             dr = cfg.roles[d]
+            overlap = rev_models & {dr.model, *dr.fallback_models}
+            if dr.provider == rev.provider and overlap:
+                raise ConfigError(
+                    f"reviewer and developer role '{d}' share model(s) {sorted(overlap)} (including fallbacks); "
+                    "an implementation model must not approve its own work.")
             if (dr.provider, dr.model) == (rev.provider, rev.model):
                 raise ConfigError(
                     f"reviewer uses the same model as developer role '{d}' ({rev.model}). "

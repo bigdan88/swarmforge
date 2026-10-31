@@ -306,3 +306,48 @@ async def test_agent_gets_wrap_up_call_after_limit(tmp_path):
     assert "LIMIT REACHED" in last_user
     # a reminder was appended to a tool result before the limit
     assert any("Wrap up" in m.get("content", "") for m in fake.requests[-1]["messages"] if m["role"] == "tool")
+
+
+async def test_busy_model_waits_then_falls_back(cfg, tmp_path):
+    from swarmforge.db import Store
+    cfg.roles["planner"].fallback_models = ["qwen-backup"]
+    calls = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        calls.append(body["model"])
+        if body["model"] == "qwen-fake":
+            return httpx.Response(429, headers={"retry-after": "0"},
+                                  json={"error": {"message": "Model busy, retry later", "code": "engine_overloaded"}})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "estimated_cost": 0.001}})
+    store = Store(tmp_path / "db.sqlite")
+    store.create_run("r")
+    llm = LLMClient(cfg, store, "r", transport=httpx.MockTransport(handler), busy_wait_s=1.5)
+    res = await llm.chat("planner", [{"role": "user", "content": "x"}])
+    assert res.content == "ok"
+    assert calls.count("qwen-fake") >= 2 and calls[-1] == "qwen-backup"   # retried, then fell back
+    recorded = store.llm_calls("r")
+    assert recorded[-1]["model"] == "qwen-backup" and recorded[-1]["status"] == "ok"
+    assert any("falling back to qwen-backup" in e["message"] for e in store.events("r"))
+
+
+async def test_all_models_busy_raises_clear_error(cfg):
+    def handler(req):
+        return httpx.Response(503, headers={"retry-after": "0"}, json={"error": "overloaded"})
+    llm = LLMClient(cfg, transport=httpx.MockTransport(handler), busy_wait_s=0.5)
+    from swarmforge.llm import LLMError
+    with pytest.raises(LLMError, match="every configured model"):
+        await llm.chat("planner", [{"role": "user", "content": "x"}])
+
+
+def test_reviewer_fallback_cannot_overlap_developer(tmp_path):
+    raw = base_raw(tmp_path)
+    raw["roles"]["reviewer"]["fallback_models"] = ["kimi-fake"]
+    with pytest.raises(ConfigError, match="must not approve its own work"):
+        parse_config(raw)
+
+
+def test_generous_runtime_default():
+    from swarmforge.config import Limits
+    assert Limits().max_runtime_s >= 6 * 3600 and Limits().busy_wait_s >= 600

@@ -15,6 +15,7 @@ roles:
   planner:              # Engineering Manager: analysis, task graph, corrective planning
     provider: deepinfra
     model: Qwen/Qwen3.5-397B-A17B
+    fallback_models: [Qwen/Qwen3.8-Max, Qwen/Qwen3-235B-A22B-Instruct-2507]   # used if the main model stays busy
     temperature: 0.2
     max_steps: 30
     timeout_s: 900
@@ -22,6 +23,7 @@ roles:
   developer_backend:    # general / backend developer
     provider: deepinfra
     model: deepseek-ai/DeepSeek-V4-Pro
+    fallback_models: [deepseek-ai/DeepSeek-V4-Flash]   # used if the main model stays busy
     temperature: 0.2
     max_steps: 45
     timeout_s: 1200
@@ -29,6 +31,7 @@ roles:
   developer_frontend:   # general / frontend developer, runs concurrently with backend
     provider: deepinfra
     model: moonshotai/Kimi-K2.6
+    fallback_models: [deepseek-ai/DeepSeek-V4-Flash]   # used if the main model stays busy
     temperature: 0.3
     max_steps: 45
     timeout_s: 1200
@@ -36,21 +39,24 @@ roles:
   reviewer:             # independent reviewer - must differ from every developer model
     provider: deepinfra
     model: zai-org/GLM-5.3
+    fallback_models: [zai-org/GLM-5.2]   # used if the main model stays busy
     temperature: 0.1
-    max_steps: 30
+    max_steps: 45
     timeout_s: 900
     max_output_tokens: 16384
   tester:               # test engineer: writes acceptance tests, maps criteria -> tests, files defects
     provider: deepinfra
     model: MiniMaxAI/MiniMax-M3
+    fallback_models: [deepseek-ai/DeepSeek-V4-Flash]   # used if the main model stays busy
     temperature: 0.2
     max_steps: 40
-    timeout_s: 2400           # writes + runs tests; slow test suites need more time
+    timeout_s: 3600           # writes + runs tests; slow test suites need more time
     max_output_tokens: 16384
 
   librarian:            # distills Zettelkasten notes after each run (optional; falls back to planner)
     provider: deepinfra
     model: deepseek-ai/DeepSeek-V4-Flash
+    fallback_models: [Qwen/Qwen3.8-Flash]   # used if the main model stays busy
     temperature: 0.2
     max_steps: 12
     timeout_s: 600
@@ -60,7 +66,8 @@ developer_roles: [developer_backend, developer_frontend]
 
 limits:
   budget_usd: 20.0            # hard stop for the whole run (provider-reported + estimated cost)
-  max_runtime_s: 5400         # wall clock for the whole run
+  max_runtime_s: 21600        # wall clock for the whole run (6 h); also settable per run in the dashboard
+  busy_wait_s: 900            # keep retrying a busy model (HTTP 429/503) this long, then use its fallback_models
   max_concurrent_agents: 2    # coding agents running at the same time
   max_repair_cycles: 3        # test/review -> fix iterations
   max_tasks: 8

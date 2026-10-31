@@ -26,7 +26,7 @@ from .agent.tools import EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, Tool
 from .config import Config
 from .db import Store
 from .github import GitHubClient, GitHubError, Issue, get_token, load_issue_file, parse_issue_url, push_branch
-from .deps import ensure_deps
+from .deps import ensure_deps, plan_install
 from .preflight import environment_problems
 from .repos import RepoError, _redact, auth_args, normalize_repo, preflight
 from .knowledge import NOTES_JSON_SCHEMA, Vault, render_for_prompt, validate_notes, write_distilled
@@ -62,12 +62,14 @@ class Orchestrator:
                  sandbox: Sandbox | None = None,
                  llm_transport=None,
                  test_command: str | None = None,
-                 sandbox_image: str | None = None):
+                 sandbox_image: str | None = None,
+                 seed_run_id: str | None = None):
         assert mode in ("swarm", "single")
         self.cfg = copy.deepcopy(config)  # per-run copy: project profiles may adjust it
         self.store = store
         self._override_test_command = test_command
         self._override_image = sandbox_image
+        self.seed_run_id = seed_run_id
         self.mode = mode
         self.single_role = single_role or config.developer_roles[0]
         self.approve = approve
@@ -100,6 +102,7 @@ class Orchestrator:
         self.artifacts = self.run_dir / "artifacts"
         self.store.create_run(
             self.run_id, mode=self.mode, issue_url=issue_url or issue_file, run_dir=str(self.run_dir),
+            seed_run_id=self.seed_run_id,
             budget_usd=self.cfg.limits.budget_usd, pid=os.getpid(),
             config_json=json.dumps(_config_snapshot(self.cfg)))
         self.sm = StateMachine(self.store, self.run_id)
@@ -160,6 +163,13 @@ class Orchestrator:
         issue, source = await asyncio.to_thread(self._load_issue, issue_url, issue_file, repo)
         self.issue = issue
         self.repo_key = repo_key(issue, str(source))
+        if self.seed_run_id:
+            ctx = continue_context(self.store, self.seed_run_id)
+            if ctx is None:
+                raise RunAborted(RunState.BLOCKED, f"cannot continue: run {self.seed_run_id} not found")
+            issue.body = issue.body.rstrip() + "\n\n" + ctx
+            self.log("issue", f"continuing from run {self.seed_run_id}: its work is the starting point and its "
+                              "unresolved problems were added to the task")
         self.store.update_run(self.run_id, issue_title=issue.title, issue_number=issue.number,
                               repo=issue.full_repo or str(source))
         self.log("issue", f"issue: {issue.title}")
@@ -202,6 +212,18 @@ class Orchestrator:
                 "'Add a README' (or push any initial commit), then start the run again."))
         except GitError as e:
             raise RunAborted(RunState.BLOCKED, f"could not clone {source}: {_redact(str(e), token)}")
+        if self.seed_run_id:
+            seed = self.store.get_run(self.seed_run_id)
+            seed_repo = Path(seed["run_dir"] or "") / "repo"
+            if not seed["integration_branch"] or not seed_repo.is_dir():
+                raise RunAborted(RunState.BLOCKED, f"cannot continue from {self.seed_run_id}: its workspace "
+                                                   "(clone) no longer exists; use Start again instead")
+            try:
+                sha = await asyncio.to_thread(self.ws.seed_from, seed_repo, seed["integration_branch"])
+            except GitError as e:
+                raise RunAborted(RunState.BLOCKED, f"cannot continue from {self.seed_run_id}: {e}")
+            self.log("repo", f"starting from the previous attempt's result {seed['integration_branch']} "
+                             f"({sha[:8]}); reviews and PRs still compare against {self.ws.base_branch}")
         self._apply_project_profile()
         if getattr(self.ws, "source_dirty", False):
             self.log("repo", "source checkout has uncommitted changes; they are NOT included (only "
@@ -801,6 +823,10 @@ class Orchestrator:
         """Install declared project dependencies into the worktree (network only for this step)."""
         if not self.cfg.sandbox.dependency_install:
             return "disabled"
+        plan = plan_install(path, getattr(self, "install_command", None))
+        failed = getattr(self, "_deps_failed", set())
+        if plan.command and plan.fingerprint in failed:
+            return "failed"  # same dependency set already failed in this run; don't repeat it
         status, res, plan = await ensure_deps(
             self.sandbox, path, network=self.cfg.sandbox.install_network,
             timeout_s=self.cfg.sandbox.install_timeout_s, cache_dir=self.cfg.workdir / "pipcache",
@@ -808,7 +834,11 @@ class Orchestrator:
         if status == "installed":
             self.log("deps", f"installed dependencies from {', '.join(plan.sources)} in {res.duration_s:.0f}s",
                      task_key=key if key != "repo" else None)
+        elif status == "satisfied":
+            self.log("deps", f"dependencies from {', '.join(plan.sources)} are already provided by the sandbox image",
+                     task_key=key if key != "repo" else None)
         elif status == "failed":
+            self._deps_failed = failed | {plan.fingerprint}
             self.log("deps", f"dependency install from {', '.join(plan.sources)} failed (exit {res.exit_code}); "
                              f"tests may fail with import errors:\n{res.output[-1500:]}", level="warn",
                      task_key=key if key != "repo" else None)
@@ -967,6 +997,33 @@ class Orchestrator:
             self.store.record_intervention(self.run_id, "cancel", "cancel requested via CLI")
             raise RunAborted(RunState.CANCELLED, "cancel requested")
         return res
+
+
+def continue_context(store, run_id: str) -> str | None:
+    """Text appended to the task when continuing a stopped run: what was done and what's still open."""
+    run = store.get_run(run_id)
+    if not run:
+        return None
+    L = ["## Previous attempt (continue from here)",
+         f"A previous SwarmForge run ({run['id']}) worked on this task and stopped: "
+         f"{run['state']} - {(run['state_reason'] or '')[:400]}.",
+         "Its code changes are ALREADY in this repository. Do not redo finished work; build on it and "
+         "resolve the remaining problems below, then make sure every acceptance criterion is met."]
+    tasks = [t for t in store.tasks(run_id) if t["kind"] in ("implement", "fix")]
+    if tasks:
+        L.append("\nWork already done:")
+        L += [f"- {t['task_key']} {t['title']} ({t['state']})" for t in tasks]
+    last_cycle = run["repair_cycle"]
+    blocking = [f for f in store.findings(run_id, last_cycle) if f["severity"] in ("critical", "major")]
+    if blocking:
+        L.append("\nUnresolved problems from the last review/test cycle:")
+        L += [f"- [{f['severity']}] {f['file'] or ''}: {f['title']} -> {(f['recommendation'] or '')[:300]}"
+              for f in blocking[:12]]
+    tests = [t for t in store.test_runs(run_id) if t["label"] != "baseline"]
+    if tests and (tests[-1]["exit_code"] != 0 or tests[-1]["failed"] or tests[-1]["errors"]):
+        t = tests[-1]
+        L.append(f"\nLast test run was failing: {t['passed']} passed, {t['failed']} failed, {t['errors']} errors.")
+    return "\n".join(L)
 
 
 PROJECT_FILE = "swarmforge.project.yml"
