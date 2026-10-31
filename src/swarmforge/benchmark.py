@@ -35,6 +35,10 @@ async def evaluate_hidden(cfg: Config, run: dict, acceptance: Path, label: str) 
     git(repo, "worktree", "add", "--detach", str(eval_dir), run["integration_branch"])
     shutil.copytree(acceptance, eval_dir / HIDDEN_DIR)
     sandbox = make_sandbox(cfg.sandbox)
+    if cfg.sandbox.dependency_install:
+        from .deps import ensure_deps
+        await ensure_deps(sandbox, eval_dir, network=cfg.sandbox.install_network,
+                          timeout_s=cfg.sandbox.install_timeout_s, cache_dir=cfg.workdir / "pipcache")
     ev = await run_tests(sandbox, eval_dir, f"python -m pytest -q {HIDDEN_DIR}", run_dir / "artifacts",
                          f"hidden-{label}", cfg.sandbox.command_timeout_s)
     total = ev.passed + ev.failed + ev.errors

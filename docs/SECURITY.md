@@ -29,9 +29,13 @@ they do not eliminate it.
   git hooks are not used by SwarmForge but a script you run might be). Review the diff before
   running the result outside the sandbox.
 * **`sandbox.mode: local` provides no isolation.** It exists only for machines without Docker.
-* **Tests that need network or extra packages** fail under `--network none` with the default
-  image. Prefer a custom sandbox image with dependencies preinstalled over enabling
-  `network: bridge` (which lets generated code reach the internet).
+* **The dependency install step has network access.** `pip install` runs packages' build code,
+  and agents choose what goes into requirements.txt, so a prompt-injected agent could pull a
+  malicious package. That code runs in the same locked-down container (no credentials,
+  non-root, read-only root fs, only the worktree mounted) but can reach the internet during the
+  install. Set `sandbox.dependency_install: false` (and use a custom image with dependencies
+  preinstalled) if that's unacceptable. Regular agent commands and tests always run with
+  `--network none`.
 * **Model providers see your code.** Issue text and repository content are sent to DeepInfra (or
   whichever provider you configure). Don't use SwarmForge on code you can't share with them.
 * **The knowledge base is a persistence channel.** Notes written by the librarian are derived

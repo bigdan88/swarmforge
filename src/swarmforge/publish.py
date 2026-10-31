@@ -33,11 +33,13 @@ async def publish_run(cfg: Config, store: Store, run_id: str, approve) -> int:
     owner, repo = run["repo"].split("/", 1)
     gh = GitHubClient(cfg.github)
     if not gh.token or not gh.can_push(owner, repo):
-        print(f"no push access to {owner}/{repo}; set {cfg.github.token_env}")
+        msg = f"no push access to {owner}/{repo}; set {cfg.github.token_env} or run `gh auth login`"
+        print(msg)
+        store.event(run_id, "pr", msg, level="warn")
         return 1
     q = (f"Push branch '{run['integration_branch']}' to {owner}/{repo} and open a DRAFT PR "
          f"against '{run['base_branch']}'?")
-    ok = bool(approve(q))
+    ok = bool(approve(q))  # in the dashboard, clicking the Publish button is the approval
     store.record_intervention(run_id, "push_approval", f"{'approved' if ok else 'declined'} (manual publish): {q}")
     if not ok:
         print("declined")
@@ -47,7 +49,8 @@ async def publish_run(cfg: Config, store: Store, run_id: str, approve) -> int:
                             run["base_branch"], cfg.github.branch_prefix)
     issue_title = run["issue_title"] or "SwarmForge change"
     url = gh.create_draft_pr(owner, repo, run["integration_branch"], run["base_branch"],
-                             f"[SwarmForge] {issue_title} (#{run['issue_number']})", build_pr_body(store, run_id))
+                             f"[SwarmForge] {issue_title}" + (f" (#{run['issue_number']})" if run["issue_number"] else ""),
+                             build_pr_body(store, run_id))
     store.update_run(run_id, pr_url=url, state_reason=f"draft PR created: {url}")
     store.event(run_id, "pr", f"draft pull request (manual publish): {url}")
     write_report(store, run_id, Path(run["run_dir"]))

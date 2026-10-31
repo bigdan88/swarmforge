@@ -71,7 +71,8 @@ class GitWorkspace:
         self._leases: dict[Path, str] = {}
 
     # ----------------------------------------------------------------- setup
-    def prepare(self, source: str, issue_number: int | None, base_branch: str | None = None) -> None:
+    def prepare(self, source: str, issue_number: int | None, base_branch: str | None = None,
+                git_config: list[str] | None = None) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if self.repo.exists():
             raise GitError(f"{self.repo} already exists; refusing to overwrite")
@@ -82,16 +83,19 @@ class GitWorkspace:
             source = str(src_path.resolve())
         else:
             self.source_dirty = False
-        args = ["clone", "--quiet"]
+        # keep the repository's own line endings (Windows autocrlf would rewrite every file the
+        # agents touch and confuse exact-match edits and diffs)
+        args = ["-c", "core.autocrlf=false", "clone", "--quiet"]
         if base_branch:
             args += ["--branch", base_branch]
-        git(self.run_dir, *args, source, "repo")
+        git(self.run_dir, *(git_config or []), *args, source, "repo")
         rc, _ = git_rc(self.repo, "rev-parse", "--verify", "--quiet", "HEAD")
         if rc != 0:
             raise EmptyRepository(f"{source} has no commits yet")
         git(self.repo, "config", "user.name", "SwarmForge Bot")
         git(self.repo, "config", "user.email", "swarmforge@localhost")
         git(self.repo, "config", "commit.gpgsign", "false")
+        git(self.repo, "config", "core.autocrlf", "false")
         excl = self.repo / ".git" / "info" / "exclude"
         excl.parent.mkdir(parents=True, exist_ok=True)
         with excl.open("a", encoding="utf-8") as f:

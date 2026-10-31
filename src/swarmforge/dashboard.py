@@ -147,8 +147,10 @@ def page_new_run():
         body = st.text_area("Description, requirements and acceptance criteria", height=260, key="nr_body",
                             placeholder="Describe what you want built. Be specific about interfaces and "
                                         "acceptance criteria; the planner turns this into a task graph.")
-        repo = st.text_input("Repository (local folder or git URL)", key="nr_repo",
-                             placeholder=r"C:\Users\you\code\myproject  or  https://github.com/you/repo")
+        repo = st.text_input("Repository", key="nr_repo",
+                             placeholder=r"C:\Users\you\code\myproject   or   owner/repo   or   https://github.com/owner/repo",
+                             help="A local git folder, a GitHub owner/repo, or any GitHub URL of the repo "
+                                  "(…/tree/branch selects that branch).")
 
     c1, c2, c3, c4 = st.columns(4)
     mode = c1.selectbox("Team", ["swarm", "single"], format_func=lambda m: {
@@ -179,18 +181,41 @@ def page_new_run():
                     st.markdown(f"- **{n.title}** · _{n.type}_ · {n.repo or ''} (score {sc})")
 
     if st.button("🚀 Start run", type="primary"):
+        from swarmforge.github import get_token, parse_issue_url
+        from swarmforge.repos import RepoError, normalize_repo, preflight
         try:
+            base = None
             repo_arg = None
+            if source == "GitHub issue":
+                if not (url or "").strip():
+                    raise ValueError("paste the GitHub issue URL (https://github.com/owner/repo/issues/N)")
+                try:
+                    parse_issue_url(url.strip())
+                except Exception:
+                    raise ValueError(f"'{url.strip()}' is not a GitHub issue URL. To work on a repository "
+                                     "without an issue, choose 'Describe it here' and put the repository URL "
+                                     "in the Repository field.")
+                url = url.strip()
+            elif not (title or "").strip() or not (body or "").strip():
+                raise ValueError("give the run a title and a description")
+            from swarmforge.preflight import environment_problems
+            with st.spinner("Checking Docker, keys and the repository…"):
+                problems = environment_problems(cfg, (image or "").strip() or None)
+            if problems:
+                raise ValueError("\n\n".join(problems))
             if repo and repo.strip():
-                repo_arg = repo.strip() if re.match(r"^(https?://|git@)", repo.strip()) else \
-                    str(Path(repo.strip()).expanduser())
-                if not re.match(r"^(https?://|git@)", repo_arg) and not Path(repo_arg).exists():
-                    raise ValueError(f"repository folder not found: {repo_arg}")
+                with st.spinner("Checking the repository…"):
+                    ref = preflight(normalize_repo(repo), get_token(cfg.github))
+                repo_arg, base = ref.source, ref.branch
+                if ref.source != repo.strip():
+                    st.info(f"Using {ref.source}" + (f" (branch {ref.branch})" if ref.branch else ""))
+            elif source != "GitHub issue":
+                raise ValueError("give a repository: a local folder, owner/repo, or a GitHub URL")
             run_id, log = start_run(cfg, repo=repo_arg, issue_url=url, issue_title=title, issue_body=body,
                                     mode=mode, budget=budget, max_cycles=int(cycles), approval=approval,
                                     test_command=(test_cmd or "").strip() or None,
-                                    sandbox_image=(image or "").strip() or None)
-        except ValueError as e:
+                                    sandbox_image=(image or "").strip() or None, base=base)
+        except (ValueError, RepoError) as e:
             st.error(str(e))
             return
         st.session_state.sel_run = run_id
@@ -395,6 +420,21 @@ def run_detail(run_id):
         (st.success if run["state"] == "COMPLETED" else st.error if run["state"] in TERMINAL else st.info)(run["state_reason"])
     if run["pr_url"]:
         st.markdown(f"**Draft pull request:** [{run['pr_url']}]({run['pr_url']})")
+    elif run["state"] == "COMPLETED" and "PR not created" in (run["state_reason"] or "") and cfg:
+        with st.container(border=True):
+            st.markdown("**This run was approved but has no pull request yet.** Add a GitHub token "
+                        f"(`{cfg.github.token_env}=...` in `.env`, or `gh auth login`), restart the dashboard, then:")
+            if st.button("📤 Push branch and open draft PR", key=f"pub_{run_id}"):
+                import asyncio
+                from swarmforge.publish import publish_run
+                with st.spinner("Publishing…"):
+                    rc = asyncio.run(publish_run(cfg, store, run_id, lambda q: True))
+                if rc == 0:
+                    st.success("Draft pull request created.")
+                    st.rerun()
+                else:
+                    st.error("Publishing failed: check that the token has Contents and Pull requests write "
+                             "access to this repository (details in the Events tab).")
     if active and not run["cancel_requested"]:
         if st.button("⏹ Request cancel"):
             store.request_cancel(run_id)

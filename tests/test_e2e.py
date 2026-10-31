@@ -2,6 +2,7 @@
 execution; only the model API is replaced by scripted responses."""
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -197,7 +198,7 @@ async def test_empty_repository_is_blocked_with_guidance(cfg, tmp_path):
     run_id = await orch.execute(issue_file=str(ISSUE), repo=str(empty))
     run = store.get_run(run_id)
     assert run["state"] == "BLOCKED" and "no commits yet" in run["state_reason"]
-    assert "Add a README" in run["state_reason"]
+    assert "git commit" in run["state_reason"]
     assert store.cost_summary(run_id)["calls"] == 0
 
 
@@ -238,3 +239,72 @@ async def test_unbuilt_profile_image_is_blocked(cfg, sample_repo):
     run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
     run = store.get_run(run_id)
     assert run["state"] == "BLOCKED" and "not built" in run["state_reason"]
+
+
+async def test_run_with_repo_given_as_url_with_branch(cfg, sample_repo, tmp_path):
+    # a file:// URL behaves like a remote; the run clones it via the normalized reference
+    store = Store(cfg.db_path)
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport)
+    run_id = await orch.execute(issue_file=str(ISSUE), repo=f"  {sample_repo.resolve().as_uri()}  ")
+    run = store.get_run(run_id)
+    assert run["state"] == "COMPLETED", run["state_reason"]
+    assert run["base_branch"] == "main"
+
+
+async def test_unreachable_repo_is_blocked_not_crashed(cfg, tmp_path):
+    store = Store(cfg.db_path)
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport)
+    run_id = await orch.execute(issue_file=str(ISSUE), repo=(tmp_path / "gone.git").resolve().as_uri())
+    run = store.get_run(run_id)
+    assert run["state"] == "BLOCKED" and "cannot access repository" in run["state_reason"]
+
+
+def _make_wheel(dest: Path) -> Path:
+    """Build a tiny pure-Python wheel by hand (no network, no build backend needed)."""
+    import zipfile
+    whl = dest / "tinydep-1.0-py3-none-any.whl"
+    files = {"tinydep/__init__.py": "VALUE = 42\n",
+             "tinydep-1.0.dist-info/METADATA": "Metadata-Version: 2.1\nName: tinydep\nVersion: 1.0\n",
+             "tinydep-1.0.dist-info/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"}
+    record = "".join(f"{k},,\n" for k in files) + "tinydep-1.0.dist-info/RECORD,,\n"
+    with zipfile.ZipFile(whl, "w") as z:
+        for k, v in files.items():
+            z.writestr(k, v)
+        z.writestr("tinydep-1.0.dist-info/RECORD", record)
+    return whl
+
+
+async def test_project_dependencies_are_installed_for_tests(cfg, sample_repo):
+    vendor = sample_repo / "vendor"
+    vendor.mkdir()
+    _make_wheel(vendor)
+    (sample_repo / "requirements.txt").write_text("./vendor/tinydep-1.0-py3-none-any.whl\n")
+    (sample_repo / "tests" / "test_dep.py").write_text("import tinydep\n\ndef test_dep():\n    assert tinydep.VALUE == 42\n")
+    subprocess.run(["git", "add", "-A"], cwd=sample_repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "dep"], cwd=sample_repo, check=True)
+    import sys
+    cfg.project.test_command = f"{Path(sys.executable).as_posix()} -m pytest -q -p no:cacheprovider"
+    store, run_id, _ = await _run(cfg, sample_repo)
+    run = store.get_run(run_id)
+    base = store.test_runs(run_id)[0]
+    assert base["label"] == "baseline" and base["exit_code"] == 0 and base["passed"] == 14, base
+    assert any(e["kind"] == "deps" and "installed dependencies from requirements.txt" in e["message"]
+               for e in store.events(run_id))
+    assert run["state"] == "COMPLETED", run["state_reason"]
+    # installed packages never end up in commits
+    repo = cfg.workdir / "runs" / run_id / "repo"
+    tracked = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True, text=True).stdout
+    assert ".swarmforge/pydeps" not in tracked
+
+
+async def test_environment_problems_block_before_any_work(cfg, sample_repo, monkeypatch):
+    store = Store(cfg.db_path)
+    monkeypatch.delenv("FAKE_KEY")
+    cfg.sandbox.mode = "docker"
+    cfg.sandbox.docker_binary = "false"   # a "docker" that never answers properly
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport)
+    run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+    run = store.get_run(run_id)
+    assert run["state"] == "BLOCKED"
+    assert "FAKE_KEY" in run["state_reason"] and "Docker is not responding" in run["state_reason"]
+    assert store.cost_summary(run_id)["calls"] == 0

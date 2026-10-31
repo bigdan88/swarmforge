@@ -24,6 +24,8 @@ from pathlib import Path
 from .config import SandboxConfig
 
 MAX_OUTPUT_CHARS = 30_000
+DEPS_DIR = ".swarmforge/pydeps"                 # relative to a worktree; git-excluded
+DEPS_CONTAINER_PATH = "/workspace/.swarmforge/pydeps"
 SECRET_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)", re.I)
 
 
@@ -59,7 +61,8 @@ class Sandbox:
         return None
 
     async def run(self, workspace: Path, command: str, *, timeout_s: int | None = None,
-                  artifacts_dir: Path | None = None) -> CommandResult:
+                  artifacts_dir: Path | None = None, network: str | None = None,
+                  cache_dir: Path | None = None) -> CommandResult:
         raise NotImplementedError
 
     def describe(self) -> str:
@@ -77,11 +80,12 @@ class DockerSandbox(Sandbox):
                 f"pids={c.pids_limit} cap-drop=ALL read-only-rootfs no-new-privileges")
 
     def build_args(self, workspace: Path, command: str, name: str,
-                   artifacts_dir: Path | None = None) -> list[str]:
+                   artifacts_dir: Path | None = None, network: str | None = None,
+                   cache_dir: Path | None = None) -> list[str]:
         c = self.cfg
         args = [
             c.docker_binary, "run", "--rm", "--name", name,
-            "--network", c.network,
+            "--network", network or c.network,
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--pids-limit", str(c.pids_limit),
@@ -92,11 +96,17 @@ class DockerSandbox(Sandbox):
             "-e", "HOME=/tmp",
             "-e", "PYTHONDONTWRITEBYTECODE=1",
             "-e", "PIP_NO_INPUT=1",
+            # project dependencies installed by SwarmForge's install step live inside the worktree
+            "-e", f"PYTHONPATH={DEPS_CONTAINER_PATH}",
             "--mount", f"type=bind,source={workspace.resolve()},target=/workspace",
             "-w", "/workspace",
         ]
         if self.run_label:
             args += ["--label", f"swarmforge.run={self.run_label}"]
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            args += ["--mount", f"type=bind,source={cache_dir.resolve()},target=/pipcache",
+                     "-e", "PIP_CACHE_DIR=/pipcache"]
         if artifacts_dir is not None:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             args += ["--mount", f"type=bind,source={artifacts_dir.resolve()},target=/artifacts"]
@@ -106,10 +116,11 @@ class DockerSandbox(Sandbox):
         return args
 
     async def run(self, workspace: Path, command: str, *, timeout_s: int | None = None,
-                  artifacts_dir: Path | None = None) -> CommandResult:
+                  artifacts_dir: Path | None = None, network: str | None = None,
+                  cache_dir: Path | None = None) -> CommandResult:
         timeout_s = timeout_s or self.cfg.command_timeout_s
         name = f"swarmforge-{uuid.uuid4().hex[:12]}"
-        args = self.build_args(workspace, command, name, artifacts_dir)
+        args = self.build_args(workspace, command, name, artifacts_dir, network, cache_dir)
         start = time.time()
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -169,14 +180,18 @@ class LocalSandbox(Sandbox):
         return "local host execution (UNSANDBOXED; scrubbed env only)"
 
     async def run(self, workspace: Path, command: str, *, timeout_s: int | None = None,
-                  artifacts_dir: Path | None = None) -> CommandResult:
+                  artifacts_dir: Path | None = None, network: str | None = None,
+                  cache_dir: Path | None = None) -> CommandResult:
         timeout_s = timeout_s or self.cfg.command_timeout_s
         env = _scrubbed_env()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        deps = str((workspace / DEPS_DIR).resolve())
+        env["PYTHONPATH"] = deps + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         if artifacts_dir is not None:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             # Commands written for docker use /artifacts; map it for local mode.
             command = command.replace("/artifacts", str(artifacts_dir.resolve()).replace("\\", "/"))
+        command = command.replace(DEPS_CONTAINER_PATH, deps.replace("\\", "/"))
         start = time.time()
         kwargs = {}
         if sys.platform != "win32":

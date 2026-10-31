@@ -93,10 +93,26 @@ Machine-readable output (added by SwarmForge itself in its first self-improvemen
 `integration_branch`, `pr_url`, `repair_cycle`, `interventions` and a `tasks` list. An unknown
 run prints `{"error": "run not found: <id>"}` and exits with status 2.
 
+## Repositories and dependencies
+
+The Repository field and `--repo` accept a local git folder, `owner/repo`, or any GitHub URL of the
+repo: `https://github.com/owner/repo`, `.../tree/<branch>` (selects that branch), `.../blob/...`,
+`.../issues/N`, `git@github.com:owner/repo.git`. Before a run starts, SwarmForge checks that Docker
+answers, the sandbox image exists, the API key is set, and the repository is reachable and has at
+least one commit. Each problem is reported with its fix, and nothing is spent. Private GitHub
+repositories are cloned with your `GITHUB_TOKEN` (or `gh auth login`); the token is never stored in
+the clone.
+
+Project dependencies are installed automatically. Packages from `requirements*.txt` or
+`pyproject.toml` (or an `install_command` in `swarmforge.project.yml`) go into the worktree's
+git-ignored `.swarmforge/pydeps`. This is the only step that gets network access, and it uses a
+shared pip cache. Agents can call `install_dependencies` after adding a package. Tests and agent
+commands stay offline.
+
 ## Per-project settings
 
-A repository can include `swarmforge.project.yml` with `test_command` and `sandbox_image`. These
-are the only settings a repository can set. The dashboard's **Advanced** section and the CLI
+A repository can include `swarmforge.project.yml` with `test_command`, `sandbox_image` and
+`install_command`. These are the only settings a repository can set. The dashboard's **Advanced** section and the CLI
 flags `--test-command` / `--sandbox-image` override them for a single run. SwarmForge's own
 repository uses this to test itself in `swarmforge-dev-sandbox` (`swarmforge sandbox build --dev`).
 

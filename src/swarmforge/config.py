@@ -69,6 +69,9 @@ class SandboxConfig:
     pids_limit: int = 256
     command_timeout_s: int = 300
     docker_binary: str = "docker"
+    dependency_install: bool = True   # install the project's declared packages (network only for that step)
+    install_network: str = "bridge"
+    install_timeout_s: int = 900
 
 
 @dataclass
@@ -215,6 +218,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("limits.max_repair_cycles must be between 0 and 10")
     if cfg.sandbox.mode not in ("docker", "local"):
         raise ConfigError("sandbox.mode must be 'docker' or 'local'")
+    if cfg.sandbox.install_network not in ("none", "bridge"):
+        raise ConfigError("sandbox.install_network must be 'none' or 'bridge'")
     if cfg.sandbox.network not in ("none", "bridge"):
         raise ConfigError("sandbox.network must be 'none' or 'bridge'")
     if not cfg.github.branch_prefix or cfg.github.branch_prefix in ("main", "master"):

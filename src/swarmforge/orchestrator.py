@@ -25,7 +25,10 @@ from .agent.runtime import AgentResult, AgentSpec, run_agent
 from .agent.tools import EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext
 from .config import Config
 from .db import Store
-from .github import GitHubClient, GitHubError, Issue, load_issue_file, parse_issue_url, push_branch
+from .github import GitHubClient, GitHubError, Issue, get_token, load_issue_file, parse_issue_url, push_branch
+from .deps import ensure_deps
+from .preflight import environment_problems
+from .repos import RepoError, _redact, auth_args, normalize_repo, preflight
 from .knowledge import NOTES_JSON_SCHEMA, Vault, render_for_prompt, validate_notes, write_distilled
 from .llm import Budget, BudgetExceeded, LLMClient
 from .plan import (PLAN_JSON_SCHEMA, REVIEW_JSON_SCHEMA, TEST_REPORT_JSON_SCHEMA, Criterion, Plan,
@@ -163,15 +166,42 @@ class Orchestrator:
 
         # -------------------------------------------------- inspection
         self.sm.transition(RunState.REPOSITORY_INSPECTION)
+        # Accept anything reasonable ("owner/repo", GitHub web URLs like .../tree/main, local paths)
+        # and verify it is reachable and non-empty before doing anything else.
+        token = get_token(self.cfg.github)
+        try:
+            ref = normalize_repo(str(source))
+            if base_branch:
+                ref.branch = base_branch
+            ref = await asyncio.to_thread(preflight, ref, token)
+        except RepoError as e:
+            raise RunAborted(RunState.BLOCKED, str(e))
+        self.ref = ref
+        if ref.source != str(source):
+            self.log("repo", f"repository '{source}' resolved to {ref.source}"
+                             + (f" (branch {ref.branch})" if ref.branch else ""))
+        source = ref.source
+        base_branch = ref.branch
+        if ref.full_name and not issue.full_repo:
+            self.repo_key = ref.full_name
+            self.store.update_run(self.run_id, repo=ref.full_name)
+        if self._sandbox_override is None:
+            problems = await asyncio.to_thread(environment_problems, self.cfg, self._override_image)
+            if problems:
+                raise RunAborted(RunState.BLOCKED, " ".join(problems))
         self.ws = GitWorkspace(self.run_dir, self.run_id, self.cfg.github.branch_prefix)
         self.source = str(source)
         try:
-            await asyncio.to_thread(self.ws.prepare, str(source), issue.number, base_branch)
+            await asyncio.to_thread(self.ws.prepare, str(source), issue.number, base_branch,
+                                    ["-c", "credential.helper=",
+                                     *(auth_args(str(source), token) if ref.use_auth else [])])
         except EmptyRepository:
             raise RunAborted(RunState.BLOCKED, (
                 f"the repository {source} has no commits yet. SwarmForge needs a base commit to branch "
                 "from and to open a pull request against. On GitHub, open the repository page and click "
                 "'Add a README' (or push any initial commit), then start the run again."))
+        except GitError as e:
+            raise RunAborted(RunState.BLOCKED, f"could not clone {source}: {_redact(str(e), token)}")
         self._apply_project_profile()
         if getattr(self.ws, "source_dirty", False):
             self.log("repo", "source checkout has uncommitted changes; they are NOT included (only "
@@ -269,10 +299,14 @@ class Orchestrator:
             if p.is_file():
                 readme = p.read_text(encoding="utf-8", errors="replace")[:3000]
                 break
+        await self._ensure_deps(self.ws.repo, "repo")
         ev = await run_tests(self.sandbox, self.ws.repo, self.cfg.project.test_command, self.artifacts,
                              "baseline", self.cfg.sandbox.command_timeout_s)
         self._record_tests(ev, cycle=-1)
-        self.log("test", f"baseline tests before any change: {ev.short()}")
+        if ev.junit_found and ev.total == 0:
+            self.log("test", "baseline: the repository has no tests yet (new project); the team must add them")
+        else:
+            self.log("test", f"baseline tests before any change: {ev.short()}")
         if ev.exit_code != 0 and not ev.junit_found and ev.total == 0:
             self.log("test", "baseline test command did not produce a JUnit report; check "
                              "project.test_command and the sandbox image", level="warn")
@@ -427,6 +461,7 @@ class Orchestrator:
 
     async def _execute_task(self, task: Task, cycle: int) -> bool:
         path, branch = await asyncio.to_thread(self.ws.create_worktree, task.id)
+        await self._ensure_deps(path, task.id)
         self.store.upsert_task(self.run_id, task.id, branch=branch, worktree=str(path))
         self.log("task", f"worktree {path.name} on branch {branch} ({self.cfg.roles[task.role].model})",
                  task_key=task.id, role=task.role)
@@ -435,7 +470,7 @@ class Orchestrator:
         attempts = 1 + max(0, self.cfg.limits.task_retries)
         for attempt in range(1, attempts + 1):
             self.store.upsert_task(self.run_id, task.id, attempts=attempt)
-            ctx = ToolContext(workspace=path, sandbox=self.sandbox,
+            ctx = ToolContext(workspace=path, sandbox=self.sandbox, installer=self._tool_installer(),
                               command_timeout_s=self.cfg.sandbox.command_timeout_s,
                               artifacts_dir=self.artifacts / f"task-{task.id}")
             res = await self._agent(task.role, task.id, prompts.DEVELOPER_SYSTEM,
@@ -479,13 +514,14 @@ class Orchestrator:
             key = f"{task.id}-merge"
             rpath, rbranch, conflicts = await asyncio.to_thread(
                 self.ws.start_conflict_resolution, key, branch)
+            await self._ensure_deps(rpath, key)
             user = "\n\n".join([
                 prompts.render_issue(self.issue.title, self.issue.body),
                 f"Task being integrated: {task.id} {task.title}\n{task.description}",
                 "Conflicted files:\n" + "\n".join(f"- {c}" for c in conflicts),
                 f"Test command: `{self.cfg.project.test_command}`",
             ])
-            ctx = ToolContext(workspace=rpath, sandbox=self.sandbox,
+            ctx = ToolContext(workspace=rpath, sandbox=self.sandbox, installer=self._tool_installer(),
                               command_timeout_s=self.cfg.sandbox.command_timeout_s,
                               artifacts_dir=self.artifacts / f"merge-{task.id}")
             res = await self._agent(task.role, key, prompts.CONFLICT_SYSTEM, user,
@@ -517,6 +553,7 @@ class Orchestrator:
         tester_report = None
         if self.mode == "swarm":
             tester_report = await self._run_tester(cycle)
+        await self._ensure_deps(self.ws.repo, "repo")
         ev = await run_tests(self.sandbox, self.ws.repo, self.cfg.project.test_command, self.artifacts,
                              f"cycle{cycle}", self.cfg.sandbox.command_timeout_s)
         self._record_tests(ev, cycle)
@@ -542,6 +579,7 @@ class Orchestrator:
     async def _run_tester(self, cycle: int) -> dict | None:
         key = f"tester-c{cycle}"
         path, branch = await asyncio.to_thread(self.ws.create_worktree, key)
+        await self._ensure_deps(path, key)
         crit = "\n".join(f"- {c.id}: {c.text}" for c in self.plan.acceptance_criteria)
         user = "\n\n".join([
             prompts.render_issue(self.issue.title, self.issue.body),
@@ -551,7 +589,7 @@ class Orchestrator:
             "This is a re-test after corrective work; update existing acceptance tests if needed."
             if cycle else "",
         ])
-        ctx = ToolContext(workspace=path, sandbox=self.sandbox, command_timeout_s=self.cfg.sandbox.command_timeout_s,
+        ctx = ToolContext(workspace=path, sandbox=self.sandbox, installer=self._tool_installer(), command_timeout_s=self.cfg.sandbox.command_timeout_s,
                           artifacts_dir=self.artifacts / key)
         self.store.upsert_task(self.run_id, key, cycle=cycle, kind="test", title="Acceptance testing",
                                role="tester", model=self.cfg.roles["tester"].model, state="RUNNING", attempts=1,
@@ -657,7 +695,9 @@ class Orchestrator:
         if self.mode == "single":
             self.sm.transition(RunState.COMPLETED, "single-agent run finished (no independent review, so no PR is created)")
             return
-        if not issue.owner:
+        owner = issue.owner or (self.ref.owner if getattr(self, "ref", None) else None)
+        name = issue.repo or (self.ref.name if getattr(self, "ref", None) else None)
+        if not owner:
             src = Path(self.source)
             if src.is_dir() and (src / ".git").exists():
                 try:
@@ -675,23 +715,25 @@ class Orchestrator:
             self.sm.transition(RunState.COMPLETED, "approved; PR creation disabled in config")
             return
         gh = GitHubClient(self.cfg.github)
-        if not gh.token or not await asyncio.to_thread(gh.can_push, issue.owner, issue.repo):
+        full = f"{owner}/{name}"
+        if not gh.token or not await asyncio.to_thread(gh.can_push, owner, name):
             step = (f"Set {self.cfg.github.token_env} to a token with contents:write and pull_requests:write "
-                    f"on {issue.full_repo}, then run: swarmforge publish {self.run_id}")
-            self.log("pr", f"cannot publish: no push access to {issue.full_repo}. Remaining step: {step}", level="warn")
+                    f"on {full} (or run `gh auth login`), then run: swarmforge publish {self.run_id}")
+            self.log("pr", f"cannot publish: no push access to {full}. Remaining step: {step}", level="warn")
             self.sm.transition(RunState.COMPLETED, f"approved; PR not created (no push access). {step}")
             return
         self.sm.transition(RunState.PULL_REQUEST_CREATION)
-        url = await self.publish(gh)
+        url = await self.publish(gh, owner, name)
         if url:
             self.sm.transition(RunState.COMPLETED, f"draft PR created: {url}")
         else:
             self.sm.transition(RunState.COMPLETED, "approved; push declined by user, PR not created")
 
-    async def publish(self, gh: GitHubClient) -> str | None:
+    async def publish(self, gh: GitHubClient, owner: str, name: str) -> str | None:
         issue, ws = self.issue, self.ws
+        full = f"{owner}/{name}"
         if self.cfg.github.require_push_approval:
-            q = (f"Push branch '{ws.integration_branch}' to {issue.full_repo} and open a DRAFT pull request "
+            q = (f"Push branch '{ws.integration_branch}' to {full} and open a DRAFT pull request "
                  f"against '{ws.base_branch}'?")
             self.log("pr", f"waiting for human approval: {q}")
             approved = bool(self.approve and await asyncio.to_thread(self.approve, q))
@@ -699,12 +741,13 @@ class Orchestrator:
                                            f"{'approved' if approved else 'declined'}: {q}")
             if not approved:
                 return None
-        await asyncio.to_thread(push_branch, ws.repo, issue.owner, issue.repo, ws.integration_branch,
+        await asyncio.to_thread(push_branch, ws.repo, owner, name, ws.integration_branch,
                                 gh.token, ws.base_branch, self.cfg.github.branch_prefix)
-        self.log("pr", f"pushed {ws.integration_branch} to {issue.full_repo}")
+        self.log("pr", f"pushed {ws.integration_branch} to {full}")
         body = build_pr_body(self.store, self.run_id)
-        url = await asyncio.to_thread(gh.create_draft_pr, issue.owner, issue.repo, ws.integration_branch,
-                                      ws.base_branch, f"[SwarmForge] {issue.title} (#{issue.number})", body)
+        title = f"[SwarmForge] {issue.title}" + (f" (#{issue.number})" if issue.number else "")
+        url = await asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
+                                      ws.base_branch, title, body)
         self.store.update_run(self.run_id, pr_url=url)
         self.log("pr", f"draft pull request: {url}")
         return url
@@ -723,9 +766,14 @@ class Orchestrator:
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} is not valid YAML: {e}")
             if not isinstance(prof, dict):
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} must be a mapping")
-            unknown = set(prof) - {"test_command", "sandbox_image", "description"}
+            unknown = set(prof) - {"test_command", "sandbox_image", "install_command", "description"}
             if unknown:
                 self.log("project", f"ignoring unsupported keys in {PROJECT_FILE}: {sorted(unknown)}", level="warn")
+        inst = prof.get("install_command")
+        if inst is not None:
+            if not isinstance(inst, str) or not inst.strip():
+                raise RunAborted(RunState.BLOCKED, "install_command must be a non-empty string")
+            self.install_command = inst.strip()
         test_cmd = self._override_test_command or prof.get("test_command")
         image = self._override_image or prof.get("sandbox_image")
         if test_cmd:
@@ -748,6 +796,42 @@ class Orchestrator:
             self.log("project", f"project profile: test command `{self.cfg.project.test_command}`, "
                                 f"sandbox image `{self.cfg.sandbox.image}`"
                                 + (f" (from {PROJECT_FILE})" if prof else " (run override)"))
+
+    async def _ensure_deps(self, path: Path, key: str) -> str:
+        """Install declared project dependencies into the worktree (network only for this step)."""
+        if not self.cfg.sandbox.dependency_install:
+            return "disabled"
+        status, res, plan = await ensure_deps(
+            self.sandbox, path, network=self.cfg.sandbox.install_network,
+            timeout_s=self.cfg.sandbox.install_timeout_s, cache_dir=self.cfg.workdir / "pipcache",
+            install_command=getattr(self, "install_command", None))
+        if status == "installed":
+            self.log("deps", f"installed dependencies from {', '.join(plan.sources)} in {res.duration_s:.0f}s",
+                     task_key=key if key != "repo" else None)
+        elif status == "failed":
+            self.log("deps", f"dependency install from {', '.join(plan.sources)} failed (exit {res.exit_code}); "
+                             f"tests may fail with import errors:\n{res.output[-1500:]}", level="warn",
+                     task_key=key if key != "repo" else None)
+        return status
+
+    def _tool_installer(self):
+        if not self.cfg.sandbox.dependency_install:
+            return None
+
+        async def install(path: Path) -> str:
+            status, res, plan = await ensure_deps(
+                self.sandbox, path, network=self.cfg.sandbox.install_network,
+                timeout_s=self.cfg.sandbox.install_timeout_s, cache_dir=self.cfg.workdir / "pipcache",
+                install_command=getattr(self, "install_command", None))
+            if status == "none":
+                return ("No dependency files found. Declare packages in requirements.txt (one per line) "
+                        "or in pyproject.toml [project].dependencies, then call this again.")
+            if status == "current":
+                return f"Dependencies from {', '.join(plan.sources)} are already installed and unchanged."
+            out = res.summary(4000) if res else ""
+            return (f"Dependency install {'succeeded' if status == 'installed' else 'FAILED'} "
+                    f"(sources: {', '.join(plan.sources)}).\n{out}")
+        return install
 
     def _retrieve_knowledge(self) -> None:
         if not self.cfg.knowledge.enabled:

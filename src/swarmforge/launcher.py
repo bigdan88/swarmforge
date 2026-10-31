@@ -19,7 +19,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
               issue_title: str | None = None, issue_body: str | None = None,
               mode: str = "swarm", budget: float | None = None, max_cycles: int | None = None,
               approval: str = "dashboard", single_role: str | None = None,
-              test_command: str | None = None, sandbox_image: str | None = None) -> tuple[str, Path]:
+              test_command: str | None = None, sandbox_image: str | None = None,
+              base: str | None = None) -> tuple[str, Path]:
     if not issue_url and not (issue_title and issue_body):
         raise ValueError("give a GitHub issue URL, or a title and description")
     if not issue_url and not repo:
@@ -49,6 +50,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args += ["--budget", str(budget)]
     if max_cycles is not None:
         args += ["--max-cycles", str(max_cycles)]
+    if base:
+        args += ["--base", base]
     if test_command:
         args += ["--test-command", test_command]
     if sandbox_image:

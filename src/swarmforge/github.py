@@ -77,6 +77,13 @@ class GitHubClient:
     def fetch_issue(self, url: str) -> Issue:
         owner, repo, num = parse_issue_url(url)
         r = self._client.get(f"/repos/{owner}/{repo}/issues/{num}")
+        if r.status_code in (401, 403) and self.token:
+            # stale/insufficient token: public issues are still readable anonymously
+            req = self._client.build_request("GET", f"/repos/{owner}/{repo}/issues/{num}")
+            req.headers.pop("Authorization", None)
+            r2 = self._client.send(req)
+            if r2.status_code == 200 or r.status_code == 401:
+                r = r2
         if r.status_code == 404:
             raise GitHubError(f"issue not found or not accessible: {url}"
                               + ("" if self.token else " (no GitHub token set; private repos need one)"))

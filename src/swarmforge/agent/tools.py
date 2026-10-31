@@ -29,6 +29,7 @@ class ToolContext:
     artifacts_dir: Path | None = None
     files_written: set[str] = field(default_factory=set)
     commands_run: list[dict] = field(default_factory=list)
+    installer: Callable[[Path], Awaitable[str]] | None = None   # dependency install step
 
     def resolve(self, rel: str, must_exist: bool = False) -> Path:
         if rel is None or rel == "":
@@ -190,6 +191,11 @@ TOOL_SCHEMAS = {
     "edit_file": _fn("edit_file", "Replace one exact, unique occurrence of old_text with new_text in a file.",
                      {"path": S, "old_text": S, "new_text": S}, ["path", "old_text", "new_text"]),
     "delete_file": _fn("delete_file", "Delete a file in the repository.", {"path": S}, ["path"]),
+    "install_dependencies": _fn(
+        "install_dependencies",
+        "Install the project's third-party packages declared in requirements*.txt or pyproject.toml "
+        "(the only step with internet access). Call it after adding or changing a dependency; "
+        "installed packages are importable in later run_command calls.", {}, []),
     "run_command": _fn("run_command",
                        "Run a shell command in an isolated sandbox container at the repository root "
                        "(no network access). Use it to run tests, e.g. `python -m pytest -q`.",
@@ -200,11 +206,18 @@ SYNC_IMPLS: dict[str, Callable[..., str]] = {
     "list_files": list_files, "read_file": read_file, "search": search,
     "write_file": write_file, "edit_file": edit_file, "delete_file": delete_file,
 }
-ASYNC_IMPLS: dict[str, Callable[..., Awaitable[str]]] = {"run_command": run_command}
+async def install_dependencies(ctx: ToolContext) -> str:
+    if ctx.installer is None:
+        raise ToolError("dependency installation is disabled in this SwarmForge configuration")
+    return await ctx.installer(ctx.workspace)
+
+
+ASYNC_IMPLS: dict[str, Callable[..., Awaitable[str]]] = {"run_command": run_command,
+                                                        "install_dependencies": install_dependencies}
 
 READ_TOOLS = ["list_files", "read_file", "search"]
 WRITE_TOOLS = ["write_file", "edit_file", "delete_file"]
-EXEC_TOOLS = ["run_command"]
+EXEC_TOOLS = ["run_command", "install_dependencies"]
 
 
 @dataclass

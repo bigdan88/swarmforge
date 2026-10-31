@@ -3,8 +3,10 @@
 ## 0. Prerequisites
 
 * Python 3.11+, Git, Docker Desktop (running), a DeepInfra key.
-* Optional for PRs: a fine-grained GitHub token for the target repo (see docs/SECURITY.md) or
-  `gh auth login`.
+* For pull requests: either install the GitHub CLI and log in once
+  (`winget install GitHub.cli`, then `gh auth login`), or put a fine-grained token in `.env` as
+  `GITHUB_TOKEN=...` (Contents + Pull requests: read and write on the repo; see docs/SECURITY.md).
+  Public repositories can be read without any token.
 
 ## 1. Install and configure
 

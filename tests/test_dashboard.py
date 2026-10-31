@@ -115,3 +115,22 @@ def test_start_run_button_switches_to_runs(tmp_path, monkeypatch, sample_repo):
         if r["state"] in ("FAILED", "COMPLETED") and not pid_alive(r["pid"]):
             break
         time.sleep(0.5)
+
+
+def test_new_run_form_validates_before_starting(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    at.sidebar.radio[0].set_value("New run").run()
+    at.text_input(key="nr_title").input("Add export")
+    at.text_area(key="nr_body").input("Add CSV export with tests.")
+    at.text_input(key="nr_repo").input(str(tmp_path / "missing-folder"))
+    next(b for b in at.button if "Start run" in b.label).click().run()
+    assert not at.exception
+    assert any("neither an existing folder" in e.value for e in at.error)
+    assert Store(cfg.db_path).list_runs() == []
+    at.radio(key="nr_source").set_value("GitHub issue").run()
+    at.text_input(key="nr_url").input("https://github.com/bigdan88/commander_forge/tree/main")
+    next(b for b in at.button if "Start run" in b.label).click().run()
+    assert any("is not a GitHub issue URL" in e.value for e in at.error)
+    assert Store(cfg.db_path).list_runs() == []

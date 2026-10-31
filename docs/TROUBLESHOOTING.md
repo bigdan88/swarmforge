@@ -31,3 +31,8 @@ test logs in `<workdir>/runs/<run>/artifacts/`.
 | `BLOCKED: the repository … has no commits yet` | Brand-new empty repo. On GitHub click "Add a README" (or push an initial commit), then start the run again. |
 | `BLOCKED: sandbox image '…' is not built` | The repo's `swarmforge.project.yml` (or the run settings) asks for an image you haven't built. For SwarmForge itself: `swarmforge sandbox build --dev`. |
 | `could not deliver branch … already exists` | A branch with that name is already in your local repo; the result stays in `~/.swarmforge/runs/<id>/repo`. |
+| `BLOCKED: Docker is not responding` | Start Docker Desktop and wait for "Engine running". If it says running but this persists: quit it, `wsl --shutdown`, start it again. |
+| `BLOCKED: The API key for provider … is missing` | Add the key to `.env` next to `swarmforge.yaml`, then restart the dashboard. |
+| `BLOCKED: cannot access repository …` | Check the spelling (`owner/repo` or the GitHub URL). Private repo? Add `GITHUB_TOKEN` to `.env` or run `gh auth login`. |
+| `BLOCKED: '…' is not a git repository` | In that folder: `git init -b main`, `git add -A`, `git commit -m "initial commit"`. |
+| `dependency install … failed` (warning) | Check the package names in requirements.txt. Behind a corporate proxy, pip in the container may need your proxy settings; use `install_command` in `swarmforge.project.yml` or a custom image. |
