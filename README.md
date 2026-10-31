@@ -123,6 +123,21 @@ process in it when the agent finishes. The tools need the rebuilt sandbox image
 500 MB to the image. In `sandbox.mode: local`, install them with `pip install -e ".[tools]"` and
 `python -m playwright install chromium`. Turn them off with `sandbox.dev_tools: false`.
 
+## When a run finishes
+
+* **GitHub repository:** after the gates pass, SwarmForge asks for approval (the *Approval needed* box in
+  the dashboard; it auto-declines after `approval.timeout_s`), pushes a `swarmforge/*` branch and opens
+  a **draft** pull request. It never merges: you review and merge the PR on GitHub. Queue items set to
+  approve automatically skip the question.
+* **Local repository:** the result is delivered as a new branch in your repository; merge it yourself.
+* Every run gets a **summary** (dashboard: *Task & summary*; file: `<run dir>/summary.md`): the request
+  as you wrote it, what was done (approach, work items, files changed, tests, acceptance criteria,
+  review), what you need to do next, and the lessons recorded in the knowledge base. The PR body starts
+  with the request too.
+* **Lessons** go to the knowledge base automatically: the librarian writes pitfall/review-lesson notes
+  whenever a run failed, needed repairs or had problems; failed runs also get a post-mortem note; and
+  every run gets a run-log note containing its request and summary.
+
 ## Speed
 
 Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.

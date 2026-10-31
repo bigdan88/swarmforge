@@ -189,6 +189,10 @@ def build_pr_body(store, run_id: str) -> str:
          "SwarmForge never merges.", ""]
     if run["issue_number"]:
         L += [f"Addresses #{run['issue_number']}", ""]
+    req = request_text(run)
+    if req:
+        L += ["## Task", "", f"**{run['issue_title'] or ''}**", "",
+              req if len(req) <= 3000 else req[:3000] + "\n\n…(truncated)", ""]
     plan = json.loads(run["plan_json"]) if run["plan_json"] else {}
     if plan.get("summary"):
         L += ["## Approach", plan["summary"], ""]
@@ -218,3 +222,155 @@ def build_pr_body(store, run_id: str) -> str:
     L += [f"- Human interventions: {len(inter)}", "", f"Run id: `{run_id}`"]
     body = "\n".join(L)
     return body[:60_000]
+
+
+# ------------------------------------------------------------------ summary
+TERMINAL_STATES = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
+
+
+def request_text(run: dict) -> str:
+    """The task as the user wrote it: stored body, else the local issue file it came from."""
+    body = run.get("issue_body")
+    if not body and run.get("issue_url") and not str(run["issue_url"]).startswith("http"):
+        try:
+            text = Path(run["issue_url"]).read_text(encoding="utf-8")
+            lines = text.splitlines()
+            body = "\n".join(lines[1:]).strip() if lines and lines[0].startswith("# ") else text
+        except OSError:
+            body = None
+    return (body or "").strip()
+
+
+def changed_files(run: dict) -> list[str] | None:
+    """`git diff --stat` lines of the result branch against its base (None if the clone is gone)."""
+    import subprocess
+    repo = Path(run.get("run_dir") or "") / "repo"
+    if not (run.get("integration_branch") and run.get("base_branch") and (repo / ".git").exists()):
+        return None
+    p = subprocess.run(["git", "diff", "--stat=120", f"{run['base_branch']}...{run['integration_branch']}"],
+                       cwd=str(repo), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        return None
+    return [ln.rstrip() for ln in p.stdout.splitlines() if ln.strip()]
+
+
+def lessons_recorded(store, run_id: str) -> list[str]:
+    """Knowledge-base notes this run produced (librarian notes + the post-mortem lesson)."""
+    out = []
+    for e in store.events(run_id):
+        if e["kind"] == "knowledge" and e.get("data"):
+            try:
+                for n in json.loads(e["data"]):
+                    if n.get("type") != "run-log":
+                        out.append(f"[{n.get('type')}] {n.get('title')}")
+            except (TypeError, ValueError, AttributeError):
+                continue
+    fail = store.failure(run_id) if hasattr(store, "failure") else None
+    if fail and fail.get("lesson"):
+        out.append(f"[failure] {fail['lesson']}")
+    return out
+
+
+def next_step(store, run: dict) -> str:
+    state, reason = run["state"], run.get("state_reason") or ""
+    if state not in TERMINAL_STATES:
+        if store.pending_approvals(run["id"]):
+            return "**Waiting for you:** approve or decline the push in the *Approval needed* box above."
+        return "Still running; nothing to do yet."
+    if store.pending_approvals(run["id"]):
+        return "**Waiting for you:** approve or decline the push in the *Approval needed* box above."
+    if run.get("pr_url"):
+        return (f"**Review and merge the draft pull request yourself:** {run['pr_url']} "
+                "(SwarmForge never merges). Close it instead if you don't want the change.")
+    if state == "COMPLETED":
+        if "delivered to branch" in reason:
+            m = reason.split("delivered to branch", 1)[1].strip()
+            branch = m.split(" in ", 1)[0]
+            return (f"**Review and merge it yourself:** the result is branch `{branch}` in your local repository "
+                    f"(`git diff {run.get('base_branch') or 'main'}...{branch}`, then merge).")
+        if "PR not created" in reason:
+            return ("**Not published yet:** the work passed the gates but no pull request was opened "
+                    f"({reason}). Use *Push branch and open draft PR* or `swarmforge publish {run['id']}`.")
+        if run.get("mode") == "single":
+            return (f"Single-agent run: the result is branch `{run.get('integration_branch')}` in the run's clone "
+                    f"(`{Path(run.get('run_dir') or '') / 'repo'}`); no PR is created for single runs.")
+        return f"The result is branch `{run.get('integration_branch')}` in `{Path(run.get('run_dir') or '') / 'repo'}`."
+    if state == "CANCELLED":
+        return "Cancelled; nothing was published."
+    fail = store.failure(run["id"]) if hasattr(store, "failure") else None
+    if fail and fail.get("heal_run_id"):
+        return f"Self-healing started a new attempt: run `{fail['heal_run_id']}`."
+    if fail and fail.get("fix"):
+        return f"**Needs a decision:** {fail['fix']} Then restart it (Failures page or *Restart this task*)."
+    return "Did not finish; nothing was published. See *Why it failed* and restart it when ready."
+
+
+def build_summary(store, run_id: str, *, lessons: bool = True) -> str:
+    """Short, human summary: what was asked, what was done, what you need to do, lessons learned."""
+    run = store.get_run(run_id)
+    if not run:
+        raise KeyError(run_id)
+    tasks = store.tasks(run_id)
+    tests = store.test_runs(run_id)
+    acc = store.acceptance(run_id)
+    findings = store.findings(run_id)
+    plan = json.loads(run["plan_json"]) if run.get("plan_json") else {}
+    req = request_text(run)
+    L = ["### What you asked for", "", f"**{run.get('issue_title') or '(untitled)'}**", ""]
+    if req:
+        L += [req if len(req) <= 4000 else req[:4000] + "\n\n…(truncated)", ""]
+    elif run.get("issue_url"):
+        L += [f"Source: {run['issue_url']}", ""]
+
+    L += ["### What was done", ""]
+    finished = run["state"] in TERMINAL_STATES
+    outcome = {"COMPLETED": "✅ Completed", "FAILED": "❌ Failed", "BLOCKED": "⛔ Blocked",
+               "CANCELLED": "⏹ Cancelled", "BUDGET_EXCEEDED": "💸 Ran out of budget"}.get(run["state"], "⏳ In progress")
+    elapsed = _dur(run["created_at"], run.get("finished_at") or run.get("updated_at"))
+    cost = store.cost_summary(run_id).get("total") or 0
+    L.append(f"- **Outcome:** {outcome}" + (f": {run['state_reason']}" if run.get("state_reason") else "")
+             + f" · {elapsed} · ${cost:.2f}")
+    if plan.get("summary"):
+        L.append(f"- **Approach:** {plan['summary'].strip()[:800]}")
+    work = [t for t in tasks if t["kind"] in ("implement", "fix")]
+    if work:
+        L.append("- **Work items:**")
+        for t in work:
+            icon = {"INTEGRATED": "✅", "SUCCEEDED": "✅", "FAILED": "❌", "BLOCKED": "⛔"}.get(t["state"], "•")
+            summ = (t.get("summary") or t.get("error") or "").replace("\n", " ").strip()
+            L.append(f"  - {icon} {t['task_key']} {t.get('title') or ''}" + (f": {summ[:300]}" if summ else ""))
+    files = changed_files(run) if finished else None
+    if files:
+        L.append("- **Files changed:** " + (files[-1] if files else ""))
+        L += [f"  - `{f.strip()}`" for f in files[:-1][:25]]
+    real = [t for t in tests if t["label"] != "baseline"]
+    if real:
+        tr = real[-1]
+        L.append(f"- **Tests (run by the orchestrator):** {tr['passed']} passed, {tr['failed']} failed, "
+                 f"{tr['errors']} errors")
+    if acc:
+        lc = max(a["cycle"] for a in acc)
+        cur = [a for a in acc if a["cycle"] == lc]
+        ok = sum(1 for a in cur if a["status"] == "satisfied")
+        L.append(f"- **Acceptance criteria:** {ok}/{len(cur)} satisfied")
+        L += [f"  - {a['criterion_id']} {a['status']}: {a['text'][:120]}" for a in cur if a["status"] != "satisfied"]
+    cur_f = [f for f in findings if f["cycle"] == run["repair_cycle"] and f["source"] == "reviewer"]
+    if cur_f or run["repair_cycle"]:
+        blocking = sum(1 for f in cur_f if f["severity"] in ("critical", "major"))
+        L.append(f"- **Review:** {len(cur_f)} finding(s) in the final review ({blocking} blocking) after "
+                 f"{run['repair_cycle']} repair cycle(s)")
+    L += ["", "### What you need to do", "", next_step(store, run), ""]
+    if lessons:
+        les = lessons_recorded(store, run_id)
+        L += ["### Lessons recorded in the knowledge base", ""]
+        L += [f"- {x}" for x in les] if les else (
+            ["- None yet (written when the run finishes)."] if not finished else ["- None recorded for this run."])
+        L.append("")
+    return "\n".join(L)
+
+
+def write_summary(store, run_id: str, run_dir: Path) -> Path:
+    path = run_dir / "summary.md"
+    run = store.get_run(run_id)
+    path.write_text(f"# {run.get('issue_title') or run_id}\n\n" + build_summary(store, run_id), encoding="utf-8")
+    return path

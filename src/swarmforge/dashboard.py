@@ -580,6 +580,14 @@ def run_detail(run_id, header=True):
                     st.error("Publishing failed: check that the token has Contents and Pull requests write "
                              "access to this repository (details in the Events tab).")
 
+    with st.expander("📋 Task & summary: what was asked, what was done, what you need to do",
+                     expanded=run["state"] in TERMINAL):
+        try:
+            from swarmforge.report import build_summary
+            st.markdown(build_summary(store, run_id))
+        except Exception as e:  # the summary must never break the page
+            st.caption(f"summary unavailable: {e}")
+
     visited = [json.loads(e["data"])["to"] for e in events if e["kind"] == "state" and e["data"]]
     chips = [("🔵" if s == run["state"] else "🟢" if s in visited else "⚪") + f" {s}" for s in FLOW]
     if run["state"] in TERMINAL and run["state"] != "COMPLETED":

@@ -223,6 +223,7 @@ class Store:
         ("runs", "max_repair_cycles", "INTEGER"),
         ("runs", "heal_of", "TEXT"),
         ("runs", "heal_attempt", "INTEGER"),
+        ("runs", "issue_body", "TEXT"),
         ("queue_items", "heal_attempts", "INTEGER"),
     ]
 

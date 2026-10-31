@@ -33,7 +33,7 @@ from .knowledge import NOTES_JSON_SCHEMA, Vault, render_for_prompt, validate_not
 from .llm import Budget, BudgetExceeded, LLMClient
 from .plan import (PLAN_JSON_SCHEMA, REVIEW_JSON_SCHEMA, TEST_REPORT_JSON_SCHEMA, Criterion, Plan,
                    PlanValidationError, Task, validate_plan, validate_review, validate_test_report)
-from .report import build_pr_body, write_report
+from .report import build_pr_body, build_summary, write_report, write_summary
 from .sandbox import Sandbox, make_sandbox
 from .scheduler import Scheduler
 from .state import RunAborted, RunState, StateMachine, TaskState
@@ -173,6 +173,11 @@ class Orchestrator:
                                                     transport=self._llm_transport), timeout=600)
                 except Exception as e:  # the post-mortem must never change the run outcome
                     self.log("postmortem", f"post-mortem failed: {type(e).__name__}: {e}", level="warn")
+            try:
+                path = write_summary(self.store, self.run_id, self.run_dir)
+                self.log("report", f"summary written to {path}")
+            except Exception as e:
+                self.log("error", f"failed to write summary: {e}", level="warn")
         return self.run_id
 
     def _apply_live_settings(self) -> None:
@@ -219,6 +224,8 @@ class Orchestrator:
         issue, source = await asyncio.to_thread(self._load_issue, issue_url, issue_file, repo)
         self.issue = issue
         self.repo_key = repo_key(issue, str(source))
+        # the request exactly as the user wrote it (before continue/self-healing context is appended)
+        self.store.update_run(self.run_id, issue_title=issue.title, issue_body=(issue.body or "")[:20000])
         if self.seed_run_id:
             ctx = continue_context(self.store, self.seed_run_id)
             if ctx is None:
@@ -1034,6 +1041,10 @@ class Orchestrator:
             body += ["## Notes distilled from this run"] + [f"- [[{n.stem}|{n.title}]]" for n in written] + [""]
         if self.knowledge_used:
             body += ["## Notes this run started from"] + [f"- [[{s}]]" for s in self.knowledge_used] + [""]
+        try:
+            body += ["## Request and summary", "", build_summary(self.store, self.run_id, lessons=False), ""]
+        except Exception as e:  # never let the summary break knowledge capture
+            self.log("knowledge", f"could not add the summary to the run log: {e}", level="warn")
         body += ["## Digest", "```", digest[:6000], "```"]
         log_note = vault.write(f"Run {self.run_id} - {self.issue.title}", "\n".join(body), type="run-log",
                                tags=["run-log", run["state"].lower()], repo=self.repo_key, run=self.run_id,

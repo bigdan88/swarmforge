@@ -403,3 +403,20 @@ async def test_failed_run_gets_postmortem_and_heals_itself(cfg, sample_repo):
     assert store.failure(first)["heal_run_id"] == last
     assert store.failure(first)["outcome"] == "fixed itself on attempt 1"
     assert store.failure(last) is None
+
+
+async def test_finished_run_has_request_summary_and_knowledge_log(cfg, sample_repo):
+    store, run_id, _ = await _run(cfg, sample_repo)
+    run = store.get_run(run_id)
+    assert run["state"] == "COMPLETED"
+    assert run["issue_body"].startswith("Users need to get their inventory out")
+    summary = (cfg.workdir / "runs" / run_id / "summary.md").read_text(encoding="utf-8")
+    assert "### What you asked for" in summary and "Add CSV and JSON export functionality" in summary
+    assert "Users need to get their inventory out" in summary
+    assert "✅ Completed" in summary and "Acceptance criteria:** 3/3 satisfied" in summary
+    assert "Files changed:" in summary and "exporters.py" in summary
+    assert "### What you need to do" in summary and "merge it yourself" in summary   # local delivery
+    assert "### Lessons recorded in the knowledge base" in summary
+    logs = [p for p in cfg.vault_path.rglob("*.md") if run_id in p.read_text(encoding="utf-8")
+            and "Request and summary" in p.read_text(encoding="utf-8")]
+    assert logs, "run-log note should include the request and summary"

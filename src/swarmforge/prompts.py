@@ -151,7 +151,11 @@ From the run digest, extract only knowledge that will help FUTURE work. Good not
 - actionable: say when the note applies and what to do.
 Note types: decision, pitfall, pattern, repo-fact, review-lesson, model-behavior.
 Do not restate the issue, do not log routine events, do not duplicate an existing note (link to it
-instead). Link related notes by putting their exact titles in `links`. Writing zero notes is fine
-when nothing durable was learned. You may read repository files to verify facts.
+instead). Link related notes by putting their exact titles in `links`. You may read repository files
+to verify facts.
+Lessons learned are the most valuable notes. Whenever the run failed, needed repair cycles, had a task
+fail or retry, hit a time/budget limit, or a reviewer/tester found a real problem, write at least one
+pitfall or review-lesson note saying what went wrong, why, and what future runs should do instead.
+Writing zero notes is fine only for a smooth run that taught nothing new.
 Call `submit_notes` with your notes.
 """

@@ -58,6 +58,9 @@ async def test_dashboard_pages_render(tmp_path, monkeypatch, sample_repo):
     assert any("Planner" in g.proto.spec for g in at.get("graphviz_chart"))
     assert any("Brief handed to this agent" in m.value for m in at.markdown)
     assert any("Click a task to open it" in c.value for c in at.caption)
+    # the request and the summary of what was done are shown on the run
+    assert any("Task & summary" in e.label for e in at.expander)
+    assert any("What you asked for" in m.value and "What you need to do" in m.value for m in at.markdown)
     for page in ("Knowledge", "New task", "Benchmarks"):
         _go(at, page)
         assert not at.exception, (page, [e.value for e in at.exception])
