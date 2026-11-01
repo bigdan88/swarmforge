@@ -84,10 +84,11 @@ def environment_problems(cfg: Config, image: str | None = None, *, docker_timeou
 
 def environment_check_results(cfg: Config, image: str | None = None, *,
                               docker_timeout_s: int = 20) -> list[dict]:
-    """Structured rows ({'name','status','message','fix'}, status 'ok'|'fail') for the same probes.
+    """Structured rows ({'name','status','message','fix'}, status 'ok'|'fail'|'skipped')
+    for the same probes. 'skipped' means the check could not be performed.
 
     In local mode no docker/image rows are emitted, so callers can show the
-    'not used (sandbox.mode: local)' note themselves."""
+    'not checked (sandbox.mode: local)' note themselves."""
     rows: list[dict] = []
     keys = _missing_key_problems(cfg)
     rows.append({"name": "Provider API keys",
@@ -101,9 +102,13 @@ def environment_check_results(cfg: Config, image: str | None = None, *,
         d = _docker_problem(cfg, docker_timeout_s)
         rows.append({"name": "Docker running", "status": "fail" if d else "ok",
                      "message": d[0] if d else "", "fix": d[1] if d else ""})
-        imgs = [] if d else _image_problems(cfg, image)
-        rows.append({"name": "Sandbox image built",
-                     "status": "fail" if imgs else "ok",
-                     "message": "; ".join(m for m, _ in imgs),
-                     "fix": "; ".join(f for _, f in imgs)})
+        if d:
+            rows.append({"name": "Sandbox image built", "status": "skipped",
+                         "message": "not checked (Docker is not responding)", "fix": d[1]})
+        else:
+            imgs = _image_problems(cfg, image)
+            rows.append({"name": "Sandbox image built",
+                         "status": "fail" if imgs else "ok",
+                         "message": "; ".join(m for m, _ in imgs),
+                         "fix": "; ".join(f for _, f in imgs)})
     return rows

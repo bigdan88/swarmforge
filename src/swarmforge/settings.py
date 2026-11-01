@@ -56,7 +56,13 @@ def get_health_checks(cfg: Config) -> list[dict]:
         name = str(r.get("name", ""))
         if name in indexed:
             prev = indexed[name]
-            prev["status"] = "fail" if "fail" in (prev["status"], r.get("status")) else "ok"
+            prev_status, cur = prev["status"], r.get("status")
+            if "fail" in (prev_status, cur):
+                prev["status"] = "fail"
+            elif "ok" in (prev_status, cur):
+                prev["status"] = "ok"
+            else:
+                prev["status"] = "skipped"
             prev["message"] = "; ".join(x for x in (prev["message"], r.get("message", "")) if x)
             prev["fix"] = "; ".join(x for x in (prev["fix"], r.get("fix", "")) if x)
         else:
@@ -72,8 +78,8 @@ def get_health_checks(cfg: Config) -> list[dict]:
             rows.append({"name": name, "status": r["status"], "message": r["message"],
                          "fix": r["fix"], "optional": optional})
         elif docker_optional and name in ("Docker running", "Sandbox image built"):
-            rows.append({"name": name, "status": "ok",
-                         "message": "not used (sandbox.mode: local)", "fix": "",
+            rows.append({"name": name, "status": "skipped",
+                         "message": "not checked (sandbox.mode: local)", "fix": "",
                          "optional": True})
     for r in indexed.values():  # unknown names pass through verbatim
         rows.append({"name": r["name"], "status": r["status"], "message": r["message"],
@@ -396,8 +402,10 @@ def render(cfg) -> None:
         st.error(f"Health checks failed: {exc}")
         rows = []
     for row in rows:
-        ok = row.get("status") == "ok"
-        line = f"{'✅' if ok else '❌'} **{row['name']}**"
+        status = row.get("status")
+        ok = status == "ok"
+        icon = "✅" if ok else "⏭️" if status == "skipped" else "❌"
+        line = f"{icon} **{row['name']}**"
         if not ok and row.get("optional"):
             line += " (optional)"
         if row.get("message"):
