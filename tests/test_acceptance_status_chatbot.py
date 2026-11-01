@@ -83,7 +83,7 @@ def test_ask_answers_through_configured_chat_role(rich_store, tmp_path, monkeypa
                                                     "content": "1 run failed: tests failed"}})
     res = ask(cfg, rich_store, "what happened?", transport=fake.transport)
     assert res == {"answer": "1 run failed: tests failed", "role": "chat",
-                   "model": "chat-fake", "question": "what happened?"}
+                   "model": "chat-fake", "question": "what happened?", "actions": {"tasks": [], "fixes": []}}
     # the request really went to the chat role's model with the snapshot attached
     assert fake.requests[0]["model"] == "chat-fake"
     sys_msg = fake.requests[0]["messages"][0]

@@ -179,6 +179,15 @@ def cmd_ask(args, cfg) -> int:
         }))
     else:
         print(result["answer"])
+        acts = result.get("actions") or {}
+        for t in acts.get("tasks") or []:
+            print(f"\n💡 suggested task: {t['title']} (size {t['size']})\n   {t['why']}")
+        for f in acts.get("fixes") or []:
+            print(f"\n🩺 {f['run_id']}: {f['summary']}")
+            for o in f["options"]:
+                print(f"   - {o['label']}: {o['instructions'][:160]}")
+        if acts.get("tasks") or acts.get("fixes"):
+            print("\nOpen the dashboard's Chat page to launch these with one click.")
     return 0
 
 

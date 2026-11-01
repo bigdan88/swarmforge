@@ -250,6 +250,25 @@ Time spent waiting doesn't count against a run's time limit. `serial` restores o
 * After a restart the dashboard runs in the background (no terminal window). Its log is in
   `<workdir>/logs/dashboard-restart.log`; stop it with the `Stop-Process` one-liner or by restarting your PC.
 
+## Chat: improve SwarmForge and fix failed tasks
+
+The **Chat** page answers questions about runs and is the place to drive self-improvement:
+
+* **💡 What should we improve next?** The chatbot looks at recent runs, failure categories, slowness,
+  lessons in the knowledge base, the platform's README/modules, and what's already queued, then suggests
+  2–5 small, independent tasks, each with acceptance criteria and the evidence behind it. Tick the ones
+  you want (edit the descriptions if you like), pick a queue or "start each now", and press
+  **🚀 Launch** once.
+* **🩺 Review my failed tasks** (it shows how many are waiting). For each failed task it explains what went
+  wrong and offers 2–4 ways to fix it (more time, smaller scope, a specific fix, continue from the code
+  already written). Pick one or write your own instructions, adjust time/budget/repair cycles, and press
+  **🔁 Retry with this fix**: the task is queued again (or restarted) with your guidance added, or
+  **Dismiss** it.
+* **⚡ Why are runs slow or expensive?** plus any free-form question.
+
+The conversation and its buttons survive dashboard restarts. `swarmforge ask "..."` prints the same
+suggestions in a terminal.
+
 ## Speed
 
 Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.

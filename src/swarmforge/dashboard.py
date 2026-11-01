@@ -1879,39 +1879,187 @@ def page_failures():
 
 
 # ================================================================= CHAT page
+QUICK_PROMPTS = {
+    "💡 What should we improve next?": "Looking at recent runs, failures, slowness and lessons learned, what are "
+                                       "the most valuable improvements to SwarmForge right now? Suggest tasks.",
+    "🩺 Review my failed tasks": "Go through the failed tasks that need my decision. For each, explain briefly "
+                                "what went wrong and suggest ways to fix it.",
+    "⚡ Why are runs slow or expensive?": "Where do runs spend their time and money, and what tasks would make "
+                                         "them faster or cheaper?",
+}
+CHAT_KV = "chat_history_v1"
+
+
+def _chat_save(history: list, actions: dict) -> None:
+    try:
+        store.kv_set(CHAT_KV, json.dumps({"history": history[-40:], "actions": {
+            str(k): v for k, v in actions.items() if int(k) >= len(history) - 40}}))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _chat_load() -> tuple[list, dict]:
+    if "chat_history" not in st.session_state:
+        try:
+            d = json.loads(store.kv_get(CHAT_KV) or "{}")
+        except json.JSONDecodeError:
+            d = {}
+        st.session_state.chat_history = list(d.get("history") or [])
+        st.session_state.chat_actions = {int(k): v for k, v in (d.get("actions") or {}).items()}
+    return st.session_state.chat_history, st.session_state.setdefault("chat_actions", {})
+
+
+def _chat_note(key: str, msg: str, ok: bool = True) -> None:
+    st.session_state.setdefault("chat_done", {})[key] = (ok, msg)
+
+
+def render_task_actions(i: int, tasks: list[dict]) -> None:
+    from swarmforge import chat_actions as CA
+    done = st.session_state.setdefault("chat_done", {})
+    with st.container(border=True):
+        st.markdown(f"**💡 {len(tasks)} suggested task(s)** — tick the ones you want, then launch them in one go.")
+        c1, c2, c3 = st.columns([2, 2, 1.6])
+        repo = c1.text_input("Repository", value=tasks[0].get("repo") or CA.default_repo(store) or "",
+                             key=f"ct_repo_{i}")
+        how = c3.radio("How", ["queue", "now"], key=f"ct_how_{i}", horizontal=False,
+                       format_func={"queue": "Add to a queue", "now": "Start each now"}.get)
+        lane = queue_picker(c2, f"ct_q_{i}", st.session_state.get("last_queue") or "self-improvement")
+        chosen = []
+        for j, t in enumerate(tasks):
+            key = f"t{i}_{j}"
+            row = st.columns([0.35, 6])
+            if key in done:
+                row[0].markdown("✅" if done[key][0] else "⚠️")
+                row[1].markdown(f"**{t['title']}** — {done[key][1]}")
+                continue
+            if row[0].checkbox("pick", value=True, key=f"ct_pick_{i}_{j}", label_visibility="collapsed"):
+                chosen.append(j)
+            row[1].markdown(f"**{t['title']}** · size {t.get('size', 'M')}")
+            if t.get("why"):
+                row[1].caption(t["why"])
+            with row[1].expander("Description (edit before launching if you like)"):
+                st.text_area("Description", t["description"], height=220, key=f"ct_desc_{i}_{j}",
+                             label_visibility="collapsed")
+        if chosen and st.button(f"🚀 Launch {len(chosen)} task(s)", type="primary", key=f"ct_go_{i}"):
+            for j in chosen:
+                t = {**tasks[j], "description": st.session_state.get(f"ct_desc_{i}_{j}", tasks[j]["description"])}
+                try:
+                    _chat_note(f"t{i}_{j}", CA.launch_task(cfg, store, t, how=how, repo=repo, queue=lane))
+                except Exception as e:  # noqa: BLE001
+                    _chat_note(f"t{i}_{j}", f"not launched: {e}", ok=False)
+            st.session_state.last_queue = lane
+            st.rerun()
+
+
+def render_fix_actions(i: int, fixes: list[dict]) -> None:
+    from swarmforge import chat_actions as CA
+    from swarmforge.postmortem import resumable
+    done = st.session_state.setdefault("chat_done", {})
+    for j, fx in enumerate(fixes):
+        run = store.get_run(fx["run_id"]) or {}
+        key = f"f{i}_{j}"
+        with st.container(border=True):
+            st.markdown(f"**🩺 {run.get('issue_title') or fx['run_id']}**  \n`{fx['run_id']}` · {fx.get('summary', '')}")
+            if key in done:
+                (st.success if done[key][0] else st.error)(done[key][1])
+                continue
+            labels = [o["label"] for o in fx["options"]] + ["✍️ Write my own answer"]
+            pick = st.radio("How should the next attempt fix it?", range(len(labels)), key=f"cf_pick_{i}_{j}",
+                            format_func=lambda n: labels[n])
+            opt = fx["options"][pick] if pick < len(fx["options"]) else {}
+            text = st.text_area("Instructions for the next attempt (edit freely)", opt.get("instructions", ""),
+                                height=110, key=f"cf_txt_{i}_{j}_{pick}",
+                                placeholder="e.g. Only change dashboard.py; skip the slow tests; keep the API as is")
+            a, b, c, d = st.columns(4)
+            hours = a.number_input("Time limit (h)", 0.1, 72.0, float(opt.get("time_limit_h") or
+                                   max(1.0, (run.get("max_runtime_s") or 0) / 3600 or 3.0)), 0.5,
+                                   key=f"cf_h_{i}_{j}_{pick}")
+            budget = b.number_input("Budget ($)", 0.5, 500.0, float(opt.get("budget_usd") or run.get("budget_usd") or 10),
+                                    0.5, key=f"cf_b_{i}_{j}_{pick}")
+            cycles = c.number_input("Repair cycles", 0, 10, int(opt.get("max_cycles") if opt.get("max_cycles") is not None
+                                                             else (run.get("max_repair_cycles") or 2)),
+                                    key=f"cf_c_{i}_{j}_{pick}")
+            can_continue = resumable(store, fx["run_id"])
+            cont = d.checkbox("Keep its code (continue)", value=bool(opt.get("continue_code")) and can_continue,
+                              disabled=not can_continue, key=f"cf_k_{i}_{j}_{pick}",
+                              help="Start from the code the failed run already wrote" if can_continue
+                              else "Nothing reusable was integrated in that run")
+            x, y, _ = st.columns([1.4, 1, 3])
+            if x.button("🔁 Retry with this fix", type="primary", key=f"cf_go_{i}_{j}"):
+                try:
+                    _chat_note(key, CA.retry_failure(cfg, store, fx["run_id"], text, time_limit_h=hours, budget=budget,
+                                                     max_cycles=int(cycles), continue_code=cont))
+                except Exception as e:  # noqa: BLE001
+                    _chat_note(key, f"not restarted: {e}", ok=False)
+                st.rerun()
+            if y.button("Dismiss", key=f"cf_no_{i}_{j}", help="Don't retry; stop suggesting it"):
+                _chat_note(key, CA.dismiss_failure(store, fx["run_id"]))
+                st.rerun()
+
+
+def render_message_actions(i: int, actions: dict | None) -> None:
+    if not actions:
+        return
+    if actions.get("fixes"):
+        render_fix_actions(i, actions["fixes"])
+    if actions.get("tasks"):
+        render_task_actions(i, actions["tasks"])
+
+
 def page_chat():
     if cfg is None:
         st.error("Configuration not loaded; the chatbot needs a configured model role.")
         return
     from swarmforge import chatbot
-    st.header("Chat: ask about runs and swarm statuses")
-    st.caption("Answers are built from the SwarmForge store (runs, per-task swarm statuses, failures, "
-               "queue and pending approvals) and written by the configured `chat` role — or the planner "
-               "model if no chat role is set. CLI: `swarmforge ask \"…\"`.")
-    history = st.session_state.setdefault("chat_history", [])
-    if st.button("Reset conversation", key="chat_reset"):
+    st.header("Chat: improve SwarmForge and fix failed tasks")
+    st.caption("Ask about runs and statuses, ask what to improve, or review failed tasks. Suggestions come with "
+               "buttons: launch tasks in one click, or pick (or write) how a failed task should be fixed. "
+               "Answers use the run store, failures, lessons in the knowledge base and the platform's own code "
+               "layout. CLI: `swarmforge ask \"…\"`.")
+    history, actions = _chat_load()
+    needs = chatbot.failures_needing_attention(store)
+    q1, q2, q3, q4 = st.columns([1.4, 1.4, 1.5, 0.8])
+    pending = None
+    for col, key, (label, prompt_text) in zip((q1, q2, q3), ("improve", "failures", "slow"), QUICK_PROMPTS.items()):
+        lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
+        if col.button(lab, key="chat_q_" + key, width="stretch"):
+            pending = prompt_text
+    if q4.button("Reset conversation", key="chat_reset"):
         history.clear()
-    for m in history:
+        actions.clear()
+        st.session_state.pop("chat_done", None)
+        _chat_save(history, actions)
+    if needs and not history:
+        st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. Press **Review my failed tasks**.")
+    for n, m in enumerate(history):
         with st.chat_message(m["role"]):
             if m["role"] == "assistant":
                 st.markdown(m["content"])
+                render_message_actions(n, actions.get(n))
             else:
                 st.write(m["content"])
-    prompt = st.chat_input("Ask about runs, swarms, failures... e.g. which runs failed and why?")
+    typed = st.chat_input("Ask about runs, failures, or what to improve…")
+    prompt = typed or pending
     if not prompt:
         return
     history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
     try:
-        res = chatbot.ask(cfg, store, prompt, history=history[:-1])
+        with st.spinner("Thinking…"):
+            res = chatbot.ask(cfg, store, prompt, history=history[:-1])
     except chatbot.ChatError as e:
         st.error(f"Chatbot: {e}")
+        _chat_save(history, actions)
         return
     history.append({"role": "assistant", "content": res["answer"]})
+    if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
+        actions[len(history) - 1] = res["actions"]
+    _chat_save(history, actions)
     with st.chat_message("assistant"):
         st.markdown(res["answer"])
         st.caption(f"answered by **{res['role']}** · `{res['model']}`")
+        render_message_actions(len(history) - 1, actions.get(len(history) - 1))
 
 
 # ============================================================ NEW TASK page

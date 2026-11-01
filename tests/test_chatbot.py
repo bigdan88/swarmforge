@@ -109,7 +109,7 @@ def test_answer_sends_snapshot_and_history(seeded_store, tmp_path, monkeypatch):
     fake = _fake()
     res = ask(cfg, seeded_store, "How many runs?", transport=fake.transport)
     assert res == {"answer": "2 runs: 1 completed, 1 failed", "role": "planner",
-                   "model": "qwen-fake", "question": "How many runs?"}
+                   "model": "qwen-fake", "question": "How many runs?", "actions": {"tasks": [], "fixes": []}}
     msgs = fake.requests[0]["messages"]
     assert "<status>" in msgs[0]["content"] and "run-comp" in msgs[0]["content"]
     assert msgs[-1] == {"role": "user", "content": "How many runs?"}
