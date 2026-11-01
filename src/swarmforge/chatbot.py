@@ -4,6 +4,14 @@ Builds a deterministic plain-text snapshot of the SQLite store (the same data th
 dashboard and `swarmforge status` show) and sends it as system context to a
 configured role (the optional `chat` role, falling back to the self-heal
 diagnosis role or `planner`) through the existing LLMClient.
+
+Each conversation carries its OWN context window: when a conversation id is
+given, the prompt is built from the latest <status> snapshot plus only that
+conversation's stored messages (never another thread's), deterministically
+truncated to the newest `chat.context_max_messages` messages and then to the
+`chat.context_max_tokens` estimated-token budget (the newest message is always
+kept). LLM calls are recorded with run_id "chat:<conversation_id>" so
+Store.cost_summary attributes usage and cost per conversation.
 """
 from __future__ import annotations
 
@@ -20,6 +28,34 @@ from .db import Store
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
 
 MAX_SNAPSHOT_CHARS = 14_000
+
+CHAT_RUN_PREFIX = "chat:"
+"""llm_calls for a conversation are recorded under this prefix + conversation id,
+so Store.cost_summary attributes usage and cost per conversation."""
+
+
+def estimate_tokens(messages: list[dict]) -> int:
+    """Rough token estimate: ~4 characters per token, at least 1 per message."""
+    return sum(max(1, len(str(m.get("content") or "")) // 4) for m in messages)
+
+
+def truncate_context(messages: list[dict], max_messages: int,
+                      max_tokens: int | None = None, *, reserved_tokens: int = 0) -> list[dict]:
+    """Deterministically keep the newest messages: drop from the front until
+    len(kept) <= max_messages, then (while over the token budget and more than
+    one message remains) drop the oldest. The budget covers the ENTIRE request:
+    `reserved_tokens` (the fixed system context) plus the thread. When the
+    combined estimate exceeds `max_tokens`, the oldest thread messages are
+    dropped until it fits or only the newest remains. The newest message is
+    ALWAYS kept, even if it alone exceeds the budget. Never mutates the input;
+    preserves chronological order."""
+    kept = list(messages)
+    while len(kept) > max_messages:
+        kept.pop(0)
+    if max_tokens is not None:
+        while len(kept) > 1 and reserved_tokens + estimate_tokens(kept) > max_tokens:
+            kept.pop(0)
+    return kept
 
 
 class ChatError(RuntimeError):
@@ -149,9 +185,16 @@ def status_snapshot(store: Store, max_runs: int = 12) -> str:
 
 
 async def answer(cfg: Config, store: Store, question: str,
-                 history: list[dict] | None = None, *, transport: httpx.AsyncBaseTransport | None = None,
-                 max_runs: int = 12) -> dict:
-    """Ask the status chatbot a question; returns {answer, role, model, question}."""
+                 history: list[dict] | None = None, *, conversation: str | None = None,
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 max_runs: int = 12, budget=None) -> dict:
+    """Ask the status chatbot a question; returns {answer, role, model, question}.
+
+    With `conversation` set, the question and reply are persisted to that
+    conversation, the prompt context comes only from that conversation's stored
+    messages (truncated to the configured window; `history` is ignored), and the
+    result additionally carries "conversation" and "usage" (per-conversation
+    cost summary)."""
     from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 
     role = resolve_role(cfg)
@@ -159,6 +202,28 @@ async def answer(cfg: Config, store: Store, question: str,
                  "content": SYSTEM_PROMPT + "\n" + IMPROVE_PROMPT + "\n\n<status>\n" + status_snapshot(store, max_runs)
                  + "\n</status>\n\n<improvement_context>\n" + improvement_context(cfg, store)
                  + "\n</improvement_context>"}]
+    if conversation:
+        store.conversation_append(conversation, "user", question)
+        msgs = store.conversation_messages(conversation)
+        reserved = estimate_tokens(messages)
+        context = truncate_context(msgs, cfg.chat.context_max_messages,
+                                   cfg.chat.context_max_tokens, reserved_tokens=reserved)
+        for m in context:
+            messages.append({"role": m["role"], "content": m["content"]})
+        run_id = CHAT_RUN_PREFIX + conversation
+        llm_budget = budget if budget is not None else Budget(
+            max(2.0, cfg.limits.budget_usd), store.cost_summary(run_id)["total"])
+        try:
+            llm = LLMClient(cfg, store=store, run_id=run_id, budget=llm_budget, transport=transport,
+                          record_errors=False)
+            res = await llm.chat(role, messages, task_key="chatbot")
+        except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
+            raise ChatError(str(e)) from e
+        text, actions = parse_actions(res.content or "", store)
+        store.conversation_append(conversation, "assistant", text)
+        return {"answer": text, "role": role, "model": cfg.roles[role].model, "question": question,
+                "actions": actions, "conversation": conversation,
+                "usage": store.cost_summary(run_id)}
     for m in (history or []):
         if m.get("role") in ("user", "assistant") and m.get("content"):
             messages.append({"role": m["role"], "content": str(m["content"])})
@@ -174,9 +239,11 @@ async def answer(cfg: Config, store: Store, question: str,
 
 
 def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = None, *,
-        transport: httpx.AsyncBaseTransport | None = None, max_runs: int = 12) -> dict:
+        conversation: str | None = None, transport: httpx.AsyncBaseTransport | None = None,
+        max_runs: int = 12) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
-    return asyncio.run(answer(cfg, store, question, history, transport=transport, max_runs=max_runs))
+    return asyncio.run(answer(cfg, store, question, history, conversation=conversation,
+                               transport=transport, max_runs=max_runs))
 
 
 # ======================================================== conversation persistence

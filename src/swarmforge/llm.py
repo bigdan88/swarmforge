@@ -156,7 +156,8 @@ class _ModelUnavailable(Exception):
 class LLMClient:
     def __init__(self, config: Config, store=None, run_id: str | None = None,
                  budget: Budget | None = None, transport: httpx.AsyncBaseTransport | None = None,
-                 max_retries: int = 4, busy_wait_s: float | None = None):
+                 max_retries: int = 4, busy_wait_s: float | None = None,
+                 record_errors: bool = True):
         self.config = config
         self.busy_wait_s = busy_wait_s
         self.store = store
@@ -164,6 +165,7 @@ class LLMClient:
         self.budget = budget or Budget(config.limits.budget_usd)
         self.prices = PriceTable()
         self.max_retries = max_retries
+        self.record_errors = record_errors
         self._transport = transport
 
     async def chat(self, role: str, messages: list[dict], *, tools: list[dict] | None = None,
@@ -281,6 +283,11 @@ class LLMClient:
 
     def _record(self, role, model, pc, task_key, started, usage: Usage, status, error):
         if not self.store or not self.run_id:
+            return
+        if status != "ok" and not self.record_errors:
+            # Failed calls are still visible as events, but don't count toward
+            # cost summaries (used by per-conversation chat attribution).
+            self._event(f"llm call failed ({status}): {error}", task_key, role, level="error")
             return
         self.store.record_llm_call(
             self.run_id, task_key=task_key, role=role, provider=pc.name, model=model,
