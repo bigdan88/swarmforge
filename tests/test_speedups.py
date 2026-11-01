@@ -68,8 +68,10 @@ async def test_run_waits_for_earlier_run_on_same_repo(cfg, tmp_path):
     await asyncio.sleep(0.3)
     assert not waiter.done()
     assert any("waiting: run(s) first" in e["message"] for e in st.events("second"))
+    assert st.get_run("second")["state_reason"].startswith("waiting for the repository: run(s) first")
     st.update_run("first", state="COMPLETED")
     await asyncio.wait_for(waiter, 5)
+    assert st.get_run("second")["state_reason"] is None
     assert any("repository is free" in e["message"] for e in st.events("second"))
 
 

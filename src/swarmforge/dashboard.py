@@ -862,6 +862,8 @@ def _run_status(r: dict, approvals: set) -> tuple[str, str, str]:
     if r["state"] not in TERMINAL:
         if r["pid"] and not pid_alive(r["pid"]):
             return "failed", "⚠️", "Stopped unexpectedly"
+        if (r.get("state_reason") or "").startswith("waiting for the repository"):
+            return "active", "⏸️", "Waiting for the repo"
         if r.get("heal_attempt"):
             return "active", "🩹", f"Self-healing (attempt {r['heal_attempt']})"
         return "active", "🟢", "Running"
@@ -993,7 +995,9 @@ WORK_CSS = """<style>
 def _cells(w: dict) -> dict:
     r, i = w["run"], w["item"]
     now = ""
-    if w["group"] == "active" and r:
+    if w["group"] == "active" and r and (r["state_reason"] or "").startswith("waiting for the repository"):
+        now = r["state_reason"][:120]
+    elif w["group"] == "active" and r:
         now = r["state"].replace("_", " ").title() + (f" · repair cycle {r['repair_cycle']}" if r["repair_cycle"] else "")
     elif r and r["state_reason"]:
         now = r["state_reason"][:120]

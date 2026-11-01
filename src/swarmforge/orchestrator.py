@@ -139,6 +139,7 @@ class Orchestrator:
                         f"sandbox: {self.sandbox.describe()})")
         self._started = time.monotonic()
         self._timed_out = False
+        self._issue_file_hint = issue_file
         try:
             await self._wait_for_repo(repo, issue_url)
             self._started = time.monotonic()
@@ -1090,8 +1091,17 @@ class Orchestrator:
         key = lock_key(repo, issue_url)
         if not key:
             return
-        if not (self.store.get_run(self.run_id) or {}).get("repo"):
+        row = self.store.get_run(self.run_id) or {}
+        if not row.get("repo"):
             self.store.update_run(self.run_id, repo=repo or key)
+        hint = getattr(self, "_issue_file_hint", None)
+        if not row.get("issue_title") and hint:   # show a real title while waiting
+            try:
+                first = Path(hint).read_text(encoding="utf-8").splitlines()[0]
+                if first.startswith("# "):
+                    self.store.update_run(self.run_id, issue_title=first[2:].strip()[:200])
+            except (OSError, IndexError):
+                pass
         waited, announced = 0.0, None
         while True:
             blockers = await asyncio.to_thread(blocking_runs, self.store, self.run_id, key)
@@ -1101,12 +1111,15 @@ class Orchestrator:
             if ids != announced:
                 self.log("queue", f"waiting: run(s) {ids} are already working on this repository; this run "
                                   "starts when they finish (the time limit starts then)")
+                self.store.update_run(self.run_id, state_reason=f"waiting for the repository: run(s) {ids} "
+                                                                "are working on it")
                 announced = ids
             if self._should_cancel():
                 raise RunAborted(RunState.CANCELLED, "cancelled while waiting for the repository")
             await asyncio.sleep(self._repo_poll_s)
             waited += self._repo_poll_s
         if announced:
+            self.store.update_run(self.run_id, state_reason=None)
             self.log("queue", f"repository is free after {waited / 60:.0f} min; starting")
 
     async def _run_pi(self, spec: AgentSpec, rc) -> AgentResult:
