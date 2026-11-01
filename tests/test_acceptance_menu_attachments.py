@@ -40,15 +40,15 @@ def test_ac1_nav_hidden_until_password_gate_passed(tmp_path, monkeypatch):
     at = _app().run()
     # gate is up: password input shown, script stopped before the sidebar
     assert at.text_input(key="_pw") is not None
-    assert not [b for b in at.button if (b.proto.key or "").startswith("nav_")]
+    assert not [b for b in at.button if (b.key or "").startswith("nav_")]
     # wrong password: error, still no navigation
     at.text_input(key="_pw").set_value("wrong").run()
     assert any("Wrong password" in e.value for e in at.error)
-    assert not [b for b in at.button if (b.proto.key or "").startswith("nav_")]
+    assert not [b for b in at.button if (b.key or "").startswith("nav_")]
     # right password: menu renders with the preserved nav_<slug> keys
     at.text_input(key="_pw").set_value("s3cret").run()
     assert not at.exception, [e.value for e in at.exception]
-    keys = {(b.proto.key or "") for b in at.button}
+    keys = {(b.key or "") for b in at.button}
     assert ALL_NAV <= keys
 
 
