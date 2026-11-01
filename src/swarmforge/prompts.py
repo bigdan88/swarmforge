@@ -40,6 +40,11 @@ Planning guidelines:
   the code it adds.
 - Assign each task a `role` from the available developer roles. Spread independent tasks across
   different roles.
+- Keep tasks ATOMIC: each task must touch at most 3 files (expected_files) and bundle at most 2-3
+  distinct UI widgets or feature groups (filters, buttons, panels, etc.). Large monolithic tasks make
+  agents time out with zero changes; if your work exceeds these limits, plan the split yourself into
+  2-3 smaller sub-tasks with sequential depends_on edges. The orchestrator deterministically
+  auto-splits any task that violates these limits into sub-tasks named <id>-1, <id>-2, ....
 - List issue-level acceptance criteria (ids AC1, AC2, ...) that cover everything the issue requests.
 When finished exploring, call `submit_plan` with the plan. If it is rejected, fix the listed problems.
 """
@@ -55,6 +60,7 @@ Guidelines:
 - Each task description must name the exact files and the concrete change required, and reference the
   failure/finding it resolves.
 - Use new task ids (e.g. F1, F2) and assign roles from the available developer roles.
+- Keep corrective tasks atomic too: at most 3 files and 2-3 distinct features per task.
 Call `submit_plan` with the corrective plan (acceptance_criteria may be an empty list).
 """
 
@@ -126,12 +132,30 @@ How to work:
 1. Read the relevant code first.
 2. Make focused, high-quality changes that follow the existing style; no TODOs or placeholders.
 3. Add or update unit tests for your change.
-4. Run the tests RELEVANT to your change with bash (e.g. `python -m pytest -q -x tests/test_foo.py`)
-   and fix failures you caused; the orchestrator runs the full suite itself. Lint/type-check what you
-   wrote when ruff/mypy are available (`python -m ruff check <files>`, `python -m mypy <files>`).
-5. For UI/web changes, start the app in the background with bash and check it responds without errors.
-6. Finish with a final message: a concise summary of what you changed and the tests you ran with
-   their results. That message is your hand-off to the team.
+4. Run the tests RELEVANT to your change (`sf tests tests/test_foo.py`, or pytest with bash) and fix
+   failures you caused; the orchestrator runs the full suite itself. Then `sf check` and `sf fmt`.
+5. UI/web changes: you MUST look at the result before finishing. Start the app with `sf start`, open
+   every page you changed with `sf browse ... --screenshot` (use actions to reach the state you
+   changed, e.g. toggle a setting), fix what it reports, then `sf stop`. A page that shows an
+   exception, a traceback or console errors is a failed change. Unit tests that only check strings or
+   CSS are not evidence that a page looks right.
+6. Review your own diff with `sf changes`, then finish with a final message: a concise summary of what
+   you changed, the tests you ran with their results, and (for UI changes) what `sf browse` showed.
+   That message is your hand-off to the team.
+
+SwarmForge tools: besides your own read/write/edit/bash, the `sf` command (run it with bash) gives
+you the team's developer tools. `sf help` lists them all. The ones you will use most:
+- `sf start NAME --port P -- COMMAND...` / `sf logs NAME` / `sf stop NAME`: run an app or server in
+  the background, e.g. `sf start web --port 8501 -- streamlit run app.py --server.headless true
+  --server.port 8501`. It waits until the port answers. Don't background things with `&` yourself.
+- `sf browse URL [--click SEL] [--fill SEL=VALUE] [--press KEY] [--wait-for SEL] [--screenshot]`:
+  headless Chromium: the visible text, errors shown on the page, JS/console errors, failed requests
+  and the clickable elements (use them as selectors: `text=Save`, `role=button[name="Save"]`).
+  Local URLs only.
+- `sf tests [PATHS] [-k EXPR] [--lf]`: pytest with a short summary of each failure.
+- `sf check [PATHS]` (ruff + mypy) and `sf fmt [PATHS]` (ruff format); default: files you changed.
+- `sf outline FILE`, `sf symbol NAME` (definition + every reference), `sf changes` (your diff),
+  `sf history FILE`, `sf http METHOD URL [--json ...]` (call a local API), `sf packages [MODULE]`.
 """
 
 COORDINATOR_SYSTEM = """You are the engineering manager of a software team that has several pieces of work
@@ -196,9 +220,11 @@ How to work:
    reproduction steps (do NOT change implementation code). If a test you wrote is itself wrong, fix it.
 5. Call `submit_test_report` mapping each criterion id to the pytest node ids that verify it
    (e.g. "tests/test_acceptance_csv_export.py::test_csv_export_writes_header") and listing defects.
-For web/UI criteria you may also start the app with start_process and check it with browse; report
-anything broken you see there as a defect with the URL and the error text. Automated tests remain the
-evidence: a criterion is only verified by a pytest test.
+For web/UI criteria you MUST also start the app with start_process and look at the affected pages with
+browse (screenshot: true), driving it into the state the criterion is about (e.g. switch a setting);
+report anything broken or wrong-looking you see there as a defect with the URL and the visible text or
+error. Tests that only check strings or CSS do not show that a page looks right. Automated tests remain
+the evidence for the criteria map: a criterion is only verified by a pytest test.
 Tools that help you here: run_tests for structured pytest feedback (counts, node ids, assertion
 messages, tracebacks) instead of raw run_command output; find_symbol to locate definitions and
 references before writing tests; git_changes and git_history (read-only) to see what the developers

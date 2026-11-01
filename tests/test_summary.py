@@ -77,3 +77,19 @@ def test_pr_body_includes_the_task(tmp_path):
     _run(st)
     body = build_pr_body(st, "r1")
     assert "## Task" in body and "Please add CSV export." in body
+
+
+def test_non_blocking_majors_are_listed_as_known_limitations(tmp_path):
+    st = _store(tmp_path)
+    _run(st, config_json=json.dumps({"review": {"blocking_severities": ["critical"]}}))
+    st.record_finding("r1", cycle=0, source="reviewer", severity="major", file="a.py", line=None,
+                      title="Race in add_message", description="d", recommendation="r")
+    st.record_finding("r1", cycle=0, source="reviewer", severity="minor", file="b.py", line=None,
+                      title="Naming", description="d", recommendation="r")
+    body = build_pr_body(st, "r1")
+    assert "(0 blocking)" in body
+    assert body.index("**[major]** `a.py`: Race in add_message") < body.index("**[minor]** `b.py`: Naming")
+    _run(st, "r2", config_json=None)                      # older runs: critical + major blocked
+    st.record_finding("r2", cycle=0, source="reviewer", severity="major", file="a.py", line=None,
+                      title="X", description="d", recommendation="r")
+    assert "(1 blocking)" in build_pr_body(st, "r2") and "Known limitations" not in build_pr_body(st, "r2")

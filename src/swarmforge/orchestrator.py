@@ -38,7 +38,7 @@ from .plan import (PLAN_JSON_SCHEMA, REVIEW_JSON_SCHEMA, TEST_REPORT_JSON_SCHEMA
 from .report import build_pr_body, build_summary, write_report, write_summary
 from .sandbox import Sandbox, make_sandbox
 from .scheduler import Scheduler
-from .state import RunAborted, RunState, StateMachine, TaskState
+from .state import RunAborted, RunState, StateMachine, TaskState, repair_tasks_from_findings
 from .testing import TestEvidence, evaluate_criteria, run_tests
 from .repolock import blocking_runs, repo_key as lock_key
 from .workspace import EmptyRepository, GitError, GitWorkspace, StaleSeed, git
@@ -418,12 +418,20 @@ class Orchestrator:
                                  + "; ".join(p["summary"] for p in problems)[:800])
             cycle += 1
             self.store.update_run(self.run_id, repair_cycle=cycle)
+            blocking = set(self.cfg.review.blocking_severities)
+            repair_tasks = repair_tasks_from_findings((review or {}).get("findings") or [],
+                                                      self.cfg.developer_roles, cycle, blocking)
+            if repair_tasks:
+                self._register_tasks(repair_tasks, cycle=cycle, kind="fix")
+                self.log("plan", f"cycle {cycle}: {len(repair_tasks)} mandatory repair task(s) "
+                         "created from reviewer findings",
+                         data=[asdict(t) for t in repair_tasks])
             fix_plan = await self._make_fix_plan(cycle, problems, done_ids)
             self.sm.transition(RunState.TASK_VALIDATION)
             self._register_tasks(fix_plan.tasks, cycle=cycle, kind="fix")
             self.log("plan", f"repair cycle {cycle}: {len(fix_plan.tasks)} corrective task(s)",
                      data=fix_plan.to_dict())
-            tasks = fix_plan.tasks
+            tasks = repair_tasks + fix_plan.tasks
 
         await self._deliver()
 
