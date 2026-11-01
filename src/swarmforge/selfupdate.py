@@ -154,7 +154,9 @@ def restart_dashboard(config_path: str | None, log_dir: Path, pid: int | None = 
 
 def _kill(pid: int) -> None:
     if sys.platform == "win32":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+        # NOT /T: this helper was started by the dashboard process, so killing the dashboard's process
+        # tree would kill the helper too, and nothing would start the new dashboard
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
     else:
         import signal
         try:
@@ -172,8 +174,9 @@ def _port_free(port: int) -> bool:
 
 def run_restart(config_path: str | None, old_pid: int, opts: dict, *, launch=None, sleep=time.sleep) -> int:
     """Body of `swarmforge restart-dashboard`: wait a moment (so the page can show the message), stop
-    the old dashboard, wait for its port, start a new one with the same options."""
+    the old dashboard, wait for its port, start a new one with the same options (and check it's up)."""
     from .launcher import pid_alive
+    print(f"{time.strftime('%H:%M:%S')} restart requested: stopping dashboard pid {old_pid}", flush=True)
     sleep(2.0)
     _kill(old_pid)
     for _ in range(60):
@@ -196,8 +199,20 @@ def run_restart(config_path: str | None, old_pid: int, opts: dict, *, launch=Non
         kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
         kw["start_new_session"] = True
-    print(f"{time.strftime('%H:%M:%S')} restarting dashboard: {' '.join(cmd)}", flush=True)
-    return subprocess.Popen(cmd, **kw).pid
+    for attempt in (1, 2):
+        print(f"{time.strftime('%H:%M:%S')} starting dashboard (attempt {attempt}): {' '.join(cmd)}", flush=True)
+        proc = subprocess.Popen(cmd, **kw)
+        for _ in range(90):                      # wait up to ~45 s for it to answer on its port
+            sleep(0.5)
+            if not _port_free(port):
+                print(f"{time.strftime('%H:%M:%S')} dashboard is up on port {port} (pid {proc.pid})", flush=True)
+                return proc.pid
+            if proc.poll() is not None:
+                print(f"{time.strftime('%H:%M:%S')} dashboard exited with code {proc.returncode}", flush=True)
+                break
+    print(f"{time.strftime('%H:%M:%S')} could not start the dashboard; run `swarmforge dashboard` yourself",
+          flush=True)
+    return 0
 
 
 def request_worker_restart(store) -> str:

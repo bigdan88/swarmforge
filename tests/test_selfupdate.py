@@ -111,3 +111,12 @@ async def test_worker_finishes_then_restarts_with_new_code(cfg, monkeypatch):
     assert await rq.work(cfg, st, echo=None, poll_s=0.01) == 0
     assert started == [True] and st.kv_get(su.RESTART_KEY) is None
     assert su.request_worker_restart(st).startswith("The queue worker isn't running")
+
+
+def test_windows_kill_spares_the_helper(monkeypatch):
+    """taskkill /T would also kill the restart helper (a child of the dashboard), so nothing restarts."""
+    calls = []
+    monkeypatch.setattr(su.sys, "platform", "win32")
+    monkeypatch.setattr(su.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    su._kill(1234)
+    assert calls == [["taskkill", "/F", "/PID", "1234"]] and "/T" not in calls[0]
