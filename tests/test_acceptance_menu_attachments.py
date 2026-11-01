@@ -12,10 +12,11 @@ with the criteria points those files do not directly assert:
 * AC4 - `swarmforge run --attachment PATH` (repeatable) is expanded to absolute paths
   and forwarded to Orchestrator.execute by cmd_run.
 """
+import re
+
 import pytest
 
 pytest.importorskip("streamlit")
-from streamlit.testing.v1 import AppTest  # noqa: E402
 
 import swarmforge.orchestrator as orch_mod  # noqa: E402
 from swarmforge.attachments import MAX_INLINE_BYTES  # noqa: E402
@@ -26,12 +27,30 @@ from swarmforge.github import Issue  # noqa: E402
 from swarmforge.repos import RepoError  # noqa: E402
 
 from tests.conftest import base_raw  # noqa: E402
-from tests.test_dashboard_menu import PAGES, _app, _slug, _write_cfg  # noqa: E402
+from tests.test_dashboard_menu import APP, PAGES, _app, _slug, _write_cfg  # noqa: E402
 
 ALL_NAV = {_slug(p) for p in PAGES}
 
 
+def _uploader(at, key):
+    ups = [u for u in (list(getattr(at, "file_uploader", None) or [])) if u.key == key]
+    return ups[0] if ups else None
+
+
 # ------------------------------------------------------------------ AC1: menu
+def test_ac1_nav_buttons_live_in_the_native_sidebar(tmp_path, monkeypatch):
+    """The redesigned menu renders inside st.sidebar, so Streamlit's own sidebar
+    collapse control stays available in addition to the ☰ icon-rail toggle."""
+    _write_cfg(tmp_path, monkeypatch)
+    at = _app().run()
+    assert not at.exception, [e.value for e in at.exception]
+    sidebar_keys = {b.key for b in at.sidebar.button}
+    assert ALL_NAV <= sidebar_keys
+    assert "nav_toggle" in sidebar_keys
+    # the page config must not pin the sidebar state (default 'auto' keeps the native collapse)
+    cfg_call = re.search(r"st\.set_page_config\([^)]*\)", APP.read_text(encoding="utf-8"))
+    assert cfg_call and "initial_sidebar_state" not in cfg_call.group(0)
+
 def test_ac1_nav_hidden_until_password_gate_passed(tmp_path, monkeypatch):
     """No nav_* button may render while the password gate is showing; after the
     correct password the full menu appears."""
@@ -74,6 +93,23 @@ def test_ac1_pill_css_icons_and_active_page(tmp_path, monkeypatch):
     # section captions (grouping) are present
     caps = {c.value for c in at.caption}
     assert {"WORKFLOW", "INSIGHTS", "SYSTEM"} <= caps
+
+
+def test_ac2_ac3_uploaders_accept_any_file_type(tmp_path, monkeypatch):
+    """Both the 'Start run' uploader (nr_files) and the queue uploader (qa_files) accept
+    multiple files with no extension filter (proto.type == [] means any file type)."""
+    _write_cfg(tmp_path, monkeypatch)
+    at = _app().run()
+    at.button(key=_slug("New task")).click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    up = _uploader(at, "nr_files")
+    assert up is not None
+    assert up.proto.multiple_files and list(up.proto.type) == []
+    at.radio(key="nt_how").set_value("Add to the queue").run()
+    assert not at.exception, [e.value for e in at.exception]
+    q_up = _uploader(at, "qa_files")
+    assert q_up is not None
+    assert q_up.proto.multiple_files and list(q_up.proto.type) == []
 
 
 @pytest.mark.parametrize("page", PAGES)
