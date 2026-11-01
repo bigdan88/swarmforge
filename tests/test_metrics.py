@@ -41,6 +41,8 @@ def _store_with_run(tmp_path):
              "'end: timeout after 27 step(s), 44 tool call(s), 1200s - Pi exceeded 1200s')")
     st._exec("INSERT INTO events (run_id, ts, level, kind, message) VALUES ('r1', 3001, 'warn', 'task', "
              "'attempt 1 failed: Pi exceeded 1200s')")
+    for msg in ('sf browse: {"url": "http://localhost:8501"}', "sf run_tests: {}", "browse: http://localhost:1"):
+        st._exec("INSERT INTO events (run_id, ts, level, kind, message) VALUES ('r1', 3100, 'info', 'agent', ?)", (msg,))
     return st
 
 
@@ -53,6 +55,7 @@ def test_run_metrics_splits_time_into_phases(tmp_path):
     assert p["testing"] == 600 and p["review"] == 600 and p["delivery"] == 300
     assert sum(p.values()) == m["total_s"] and m["work_s"] == 3300
     assert m["approval_wait_s"] == 210 and m["agent_timeouts"] == 1
+    assert m["sf_calls"] == 2 and m["browse_calls"] == 2
     assert m["roles"]["developer_backend"]["retries"] == 1 and m["roles"]["developer_backend"]["time_s"] == 1200
     assert m["roles"]["reviewer"]["time_s"] == 180 and round(m["cost_usd"], 2) == 0.3   # no task row: call time
     assert m["settings"] == "be=GLM-5.3/45 rev=Kimi-K2.6/15 cycles=1 block=critical tester=once"

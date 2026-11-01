@@ -214,6 +214,23 @@ reviewer and librarian keep the built-in loop because they return structured rep
   `pi: {relay_host: 0.0.0.0}`.
 * In `sandbox.mode: local`, install Pi on the host: `npm install -g @earendil-works/pi-coding-agent`.
 
+**SwarmForge's developer tools in Pi (`sf`).** Pi developers also get the tools built-in agents have,
+as a shell command they run with bash. `sf` calls back to SwarmForge through the same relay, with the
+agent's own one-off token, so the tools run exactly as for built-in agents (same sandbox session,
+artifacts and base commit) and need no extra network access:
+
+```bash
+sf start web --port 8501 -- streamlit run app.py --server.headless true --server.port 8501
+sf browse http://localhost:8501 --click 'text=Settings' --screenshot   # headless Chromium
+sf stop web
+sf tests tests/test_x.py     sf check     sf fmt     sf changes
+sf outline FILE     sf symbol NAME     sf http GET http://localhost:8000/api     sf help
+```
+
+For any UI change the developer must open the pages it changed with `sf browse` (screenshots go to the
+run's artifacts) before finishing; the tester must do the same for UI acceptance criteria. Tool use is
+counted on the **Speed** page (`sf_calls`, `browse_calls`).
+
 ## Several queues (one per project)
 
 Every queued task belongs to a **queue** ("pile"); pick it when you add the task (dashboard: *Queue
