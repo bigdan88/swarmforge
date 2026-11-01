@@ -67,7 +67,7 @@ def _open_settings(tmp_path, monkeypatch, *, unset_key: bool = False, **patches)
 # ------------------------------------------------------------------ AC1
 def test_health_rows_cover_every_check_plus_github(tmp_path, monkeypatch):
     """AC1: get_health_checks returns exactly one row per preflight check plus GitHub access."""
-    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [])
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     cfg = parse_config(base_raw(tmp_path / "work"))
     rows = settings.get_health_checks(cfg)
@@ -113,7 +113,7 @@ def test_health_section_renders_one_row_per_check(tmp_path, monkeypatch):
     _, at = _open_settings(
         tmp_path, monkeypatch,
         get_health_checks=settings.get_health_checks,
-        environment_problems=lambda cfg: [],
+        environment_check_results=lambda cfg: [],
         github_access=lambda cfg: (True, ""),
     )
     md = " ".join(m.value for m in at.markdown)

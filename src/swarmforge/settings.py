@@ -13,10 +13,10 @@ import yaml
 from .config import Config, ConfigError, parse_config
 
 
-def environment_problems(cfg: Config) -> list[str]:
-    """Thin wrapper over preflight.environment_problems (monkeypatchable in tests)."""
+def environment_check_results(cfg: Config) -> list[dict]:
+    """Thin wrapper over preflight.environment_check_results (monkeypatchable in tests)."""
     from . import preflight
-    return preflight.environment_problems(cfg)
+    return preflight.environment_check_results(cfg)
 
 
 def github_access(cfg: Config) -> tuple[bool, str]:
@@ -36,60 +36,51 @@ def github_access(cfg: Config) -> tuple[bool, str]:
         return False, f"GitHub not reachable ({exc}); check network or github.api_url"
 
 
-# canonical row name -> substring used to find the matching problem string
-CHECK_SPECS: list[tuple[str, str]] = [
-    ("Provider API keys", "API key"),
-    ("Provider base_url", "base_url"),
-    ("GitHub CLI", "gh CLI"),
-    ("Git", "git is not installed"),
-    ("Docker running", "Docker"),
-    ("Sandbox image built", "sandbox image"),
-]
-
-
-def _split_problem(text: str) -> tuple[str, str]:
-    """Split a preflight problem string into (message, fix)."""
-    if " Fix:" in text:
-        msg, _, fix = text.partition(" Fix:")
-        return msg.strip(), fix.strip()
-    if "Fix:" in text:
-        msg, _, fix = text.partition("Fix:")
-        return msg.strip(), fix.strip()
-    return text.strip(), ""
+# canonical health-row names, in display order
+CANONICAL_CHECKS = ["Provider API keys", "Provider base_url", "GitHub CLI", "Git",
+                   "Docker running", "Sandbox image built"]
 
 
 def get_health_checks(cfg: Config) -> list[dict]:
-    """One structured row per preflight check plus GitHub access. Never raises."""
-    rows: list[dict] = []
+    """One structured row per preflight check plus GitHub access. Never raises.
+
+    Rows from environment_check_results are mapped by exact canonical name (no prose parsing);
+    unknown names pass through as extra rows."""
     try:
-        problems = list(environment_problems(cfg))
+        results = list(environment_check_results(cfg))
     except Exception as exc:  # noqa: BLE001
-        problems = [f"Environment check failed: {exc}"]
-    matched: set[int] = set()
+        results = [{"name": "Environment checks", "status": "fail",
+                    "message": f"Environment check failed: {exc}", "fix": ""}]
+    indexed: dict[str, dict] = {}
+    for r in results:
+        name = str(r.get("name", ""))
+        if name in indexed:
+            prev = indexed[name]
+            prev["status"] = "fail" if "fail" in (prev["status"], r.get("status")) else "ok"
+            prev["message"] = "; ".join(x for x in (prev["message"], r.get("message", "")) if x)
+            prev["fix"] = "; ".join(x for x in (prev["fix"], r.get("fix", "")) if x)
+        else:
+            indexed[name] = {"name": name, "status": r.get("status", "ok"),
+                             "message": r.get("message", ""), "fix": r.get("fix", "")}
     docker_optional = cfg.sandbox.mode != "docker"
-    for name, needle in CHECK_SPECS:
-        hit = next((i for i, p in enumerate(problems) if needle.lower() in p.lower()), None)
-        if hit is None:
-            if docker_optional and name in ("Docker running", "Sandbox image built"):
-                rows.append({"name": name, "status": "ok",
-                             "message": "not used (sandbox.mode: local)", "fix": "",
-                             "optional": True})
-            else:
-                rows.append({"name": name, "status": "ok", "message": "", "fix": "",
-                             "optional": name in ("GitHub CLI", "Git")})
-            continue
-        matched.add(hit)
-        msg, fix = _split_problem(problems[hit])
-        optional = name in ("GitHub CLI", "Git") or (docker_optional and name in
-                                                     ("Docker running", "Sandbox image built"))
-        rows.append({"name": name, "status": "fail", "message": msg, "fix": fix,
-                     "optional": optional})
-    for i, p in enumerate(problems):
-        if i in matched:
-            continue
-        msg, fix = _split_problem(p)
-        rows.append({"name": msg.split(".")[0].strip(), "status": "fail", "message": msg,
-                     "fix": fix, "optional": False})
+    rows: list[dict] = []
+    for name in CANONICAL_CHECKS:
+        optional = name in ("GitHub CLI", "Git") or \
+            (docker_optional and name in ("Docker running", "Sandbox image built"))
+        if name in indexed:
+            r = indexed.pop(name)
+            rows.append({"name": name, "status": r["status"], "message": r["message"],
+                         "fix": r["fix"], "optional": optional})
+        elif docker_optional and name in ("Docker running", "Sandbox image built"):
+            rows.append({"name": name, "status": "ok",
+                         "message": "not used (sandbox.mode: local)", "fix": "",
+                         "optional": True})
+        else:
+            rows.append({"name": name, "status": "ok", "message": "", "fix": "",
+                         "optional": optional})
+    for r in indexed.values():  # unknown names pass through verbatim
+        rows.append({"name": r["name"], "status": r["status"], "message": r["message"],
+                     "fix": r["fix"], "optional": False})
     try:
         gh_ok, gh_fix = github_access(cfg)
     except Exception as exc:  # noqa: BLE001

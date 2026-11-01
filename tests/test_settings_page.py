@@ -19,11 +19,12 @@ def make_cfg(tmp_path, sandbox_mode="local"):
 
 
 def test_get_health_checks_missing_api_key_and_dead_docker(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [
-        ("You are missing the API key for provider 'fake' (environment variable FAKE_KEY is not set). "
-         "Fix: put FAKE_KEY=... in the .env file next to the config."),
-        ("Docker is not reachable (is Docker Desktop running?). Fix: start Docker Desktop and wait "
-         "until `docker info` succeeds.")])
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": "Provider API keys", "status": "fail",
+         "message": "The API key for provider 'fake' is missing",
+         "fix": "add FAKE_KEY=... to the .env file next to the config and restart the dashboard"},
+        {"name": "Docker running", "status": "fail", "message": "Docker is not responding.",
+         "fix": "Start Docker Desktop and wait until `docker info` succeeds."}])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (False, "set GITHUB_TOKEN"))
     cfg = make_cfg(tmp_path)
     rows = settings.get_health_checks(cfg)
@@ -40,14 +41,14 @@ def test_get_health_checks_missing_api_key_and_dead_docker(tmp_path, monkeypatch
 
 
 def test_get_health_checks_all_ok(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [])
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path))
     assert rows and all(r["status"] == "ok" for r in rows)
 
 
 def test_get_health_checks_local_mode_marks_docker_optional(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [])
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path, "local"))
     by_name = {r["name"]: r for r in rows}
@@ -56,9 +57,10 @@ def test_get_health_checks_local_mode_marks_docker_optional(tmp_path, monkeypatc
     assert "local" in by_name["Docker running"]["message"]
 
 
-def test_get_health_checks_unmatched_problem_becomes_extra_row(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [
-        "Something else is wrong. Fix: do the thing."])
+def test_get_health_checks_unmatched_row_becomes_extra_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": "Something else is wrong", "status": "fail",
+         "message": "Something else is wrong.", "fix": "do the thing."}])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path))
     extra = [r for r in rows if r["name"] == "Something else is wrong"]
@@ -68,18 +70,18 @@ def test_get_health_checks_unmatched_problem_becomes_extra_row(tmp_path, monkeyp
 
 
 def test_get_health_checks_git_problem_matches_canonical_row(tmp_path, monkeypatch):
-    """Regression: the real preflight git prose (lowercase) must map to the 'Git' row."""
-    git_problem = ("git is not installed or not on PATH. "
-                   "Install Git for Windows and reopen the terminal.")
-    # exact string preflight emits (preflight.py:23); a future prose change breaks this test
-    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [git_problem])
+    """A structured 'Git' fail row maps to the canonical 'Git' row by name."""
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": "Git", "status": "fail",
+         "message": "git is not installed or not on PATH.",
+         "fix": "Install Git for Windows and reopen the terminal."}])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path))
     by_name = {r["name"]: r for r in rows}
     git_row = by_name["Git"]
     assert git_row["status"] == "fail"
     assert "git is not installed" in git_row["message"].lower()
-    assert "Install Git" in git_row["message"]
+    assert "Install Git" in git_row["fix"]
     # no duplicate/unmatched row carrying the git prose
     assert "git is not installed or not on PATH" not in by_name
     git_rows = [r for r in rows if "git" in r["message"].lower()]
@@ -89,15 +91,93 @@ def test_get_health_checks_git_problem_matches_canonical_row(tmp_path, monkeypat
         assert name in by_name
 
 
-def test_get_health_checks_matching_is_case_insensitive(tmp_path, monkeypatch):
-    """Even if preflight prose casing changes, the canonical row still matches."""
-    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [
-        "GIT IS NOT INSTALLED or not on PATH. Fix: install Git."])
+def test_get_health_checks_maps_rows_purely_by_name(tmp_path, monkeypatch):
+    """Rows are mapped by exact name only: an unknown name passes through verbatim as an extra
+    row — no substring matching, no 'Fix:' prose parsing."""
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": "Whatever", "status": "fail", "message": "GIT IS NOT INSTALLED or not on PATH.",
+         "fix": "install Git."}])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path))
     by_name = {r["name"]: r for r in rows}
-    assert by_name["Git"]["status"] == "fail"
+    assert by_name["Git"]["status"] == "ok"  # no substring match on the message
+    extra = by_name["Whatever"]
+    assert extra["status"] == "fail"
+    assert extra["fix"] == "install Git."  # verbatim, no 'Fix:' splitting
     assert "GIT IS NOT INSTALLED" not in by_name
+
+
+# ------------------------------------------------- preflight structured results
+def test_environment_check_results_git_fail_and_docker_rows(tmp_path, monkeypatch):
+    from swarmforge import preflight
+    monkeypatch.setattr(preflight.shutil, "which", lambda n: None if n == "git" else "/bin/docker")
+    monkeypatch.delenv("FAKE_KEY", raising=False)
+    monkeypatch.setenv("FAKE_KEY", "test-key")
+
+    # local mode: no docker/image rows
+    cfg = make_cfg(tmp_path, "local")
+    names = [r["name"] for r in preflight.environment_check_results(cfg)]
+    assert names == ["Provider API keys", "Git"]
+
+    # docker mode with failing probes: both docker rows present and failing
+    cfg = make_cfg(tmp_path, "docker")
+    monkeypatch.setattr(preflight, "_docker_problem",
+                        lambda c, t: ("Docker is not responding.", "Start Docker Desktop."))
+    monkeypatch.setattr(preflight, "_image_problems", lambda c, i: [])
+    rows = preflight.environment_check_results(cfg)
+    by_name = {r["name"]: r for r in rows}
+    assert set(by_name) == {"Provider API keys", "Git", "Docker running", "Sandbox image built"}
+    assert by_name["Git"]["status"] == "fail"
+    assert "git is not installed" in by_name["Git"]["message"]
+    assert by_name["Docker running"]["status"] == "fail"
+    assert by_name["Sandbox image built"]["status"] == "ok"  # not probed when docker is down
+
+    # docker ok but image missing
+    monkeypatch.setattr(preflight, "_docker_problem", lambda c, t: None)
+    monkeypatch.setattr(preflight, "_image_problems",
+                        lambda c, i: [("The sandbox image 'x' is not built yet.",
+                                       "swarmforge sandbox build")])
+    rows = preflight.environment_check_results(cfg)
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["Docker running"]["status"] == "ok"
+    assert by_name["Sandbox image built"]["status"] == "fail"
+    assert by_name["Sandbox image built"]["fix"] == "swarmforge sandbox build"
+
+
+def test_environment_check_results_missing_key_row(tmp_path, monkeypatch):
+    from swarmforge import preflight
+    monkeypatch.delenv("FAKE_KEY", raising=False)
+    cfg = make_cfg(tmp_path)
+    rows = preflight.environment_check_results(cfg)
+    key_row = next(r for r in rows if r["name"] == "Provider API keys")
+    assert key_row["status"] == "fail"
+    assert "FAKE_KEY" in key_row["fix"]
+    assert "fake" in key_row["message"]
+    assert all(set(r) == {"name", "status", "message", "fix"} for r in rows)
+    assert all(r["status"] in ("ok", "fail") for r in rows)
+
+
+def test_environment_problems_prose_unchanged(tmp_path, monkeypatch):
+    """Regression: environment_problems keeps the exact prose substrings other code relies on."""
+    from swarmforge import preflight
+    monkeypatch.delenv("FAKE_KEY", raising=False)
+    monkeypatch.setattr(preflight.shutil, "which", lambda n: None if n == "git" else "/bin/docker")
+    cfg = make_cfg(tmp_path, "docker")
+    monkeypatch.setattr(preflight, "_docker_problem",
+                        lambda c, t: ("Docker is not responding (no answer).", "Start Docker Desktop."))
+    problems = preflight.environment_problems(cfg)
+    text = " ".join(problems)
+    assert "The API key for provider" in text
+    assert "git is not installed or not on PATH" in text
+    assert "Docker is not responding" in text
+    # image problem prose (docker ok, image missing)
+    monkeypatch.setattr(preflight, "_docker_problem", lambda c, t: None)
+    monkeypatch.setattr(preflight, "_image_problems",
+                        lambda c, i: [("The sandbox image 'dev-sandbox' is not built yet.",
+                                       "swarmforge sandbox build --dev")])
+    text = " ".join(preflight.environment_problems(cfg))
+    assert "is not built yet. Run" in text
+    assert "swarmforge sandbox build --dev" in text
 
 
 def test_github_access_no_token(tmp_path, monkeypatch):
@@ -255,15 +335,16 @@ def test_health_rows_render_status(tmp_path, monkeypatch):
 
 
 def test_health_rows_render_via_preflight_mapping(tmp_path, monkeypatch):
-    """AC1 variant: the real get_health_checks maps preflight problems + github_access to rows."""
+    """AC1 variant: the real get_health_checks maps structured preflight rows + github_access."""
     _, at = _open_settings(
         tmp_path, monkeypatch,
         get_health_checks=settings.get_health_checks,  # keep the real mapping
-        environment_problems=lambda cfg: [
-            "You are missing the API key for provider 'fake' (environment variable FAKE_KEY is not "
-            "set). Fix: put FAKE_KEY=... in the .env file next to the config.",
-            "Docker is not reachable (is Docker Desktop running?). Fix: start Docker Desktop and "
-            "wait until `docker info` succeeds."],
+        environment_check_results=lambda cfg: [
+            {"name": "Provider API keys", "status": "fail",
+             "message": "The API key for provider 'fake' is missing",
+             "fix": "add FAKE_KEY=... to the .env file next to the config and restart the dashboard"},
+            {"name": "Docker running", "status": "fail", "message": "Docker is not responding.",
+             "fix": "start Docker Desktop and wait until `docker info` succeeds."}],
         github_access=lambda cfg: (False, "set GITHUB_TOKEN in .env"),
     )
     text = _page_text(at)
