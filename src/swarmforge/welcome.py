@@ -69,27 +69,7 @@ def github_logged_in(cfg: Config) -> bool:
         return False
 
 
-def _settings_health_checks(cfg: Config) -> list[CheckItem] | None:
-    """Reuse the Settings page health checks if the structured API is available."""
-    try:
-        import importlib
-
-        settings = importlib.import_module("swarmforge.settings")
-        fn = getattr(settings, "get_health_checks", None)
-        if fn is None:
-            return None
-        rows = fn(cfg)
-        return [CheckItem(name=r["name"], ok=r["status"] == "ok",
-                          optional=bool(r.get("optional", False)),
-                          fix=r.get("fix", "")) for r in rows]
-    except (ImportError, AttributeError, TypeError):
-        return None
-
-
 def health_checks(cfg: Config) -> list[CheckItem]:
-    reused = _settings_health_checks(cfg)
-    if reused is not None:
-        return reused
     items: list[CheckItem] = []
 
     def add(name: str, fn, fix: str, optional: bool = False) -> None:
