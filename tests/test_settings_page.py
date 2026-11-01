@@ -67,6 +67,39 @@ def test_get_health_checks_unmatched_problem_becomes_extra_row(tmp_path, monkeyp
     assert extra[0]["fix"] == "do the thing."
 
 
+def test_get_health_checks_git_problem_matches_canonical_row(tmp_path, monkeypatch):
+    """Regression: the real preflight git prose (lowercase) must map to the 'Git' row."""
+    git_problem = ("git is not installed or not on PATH. "
+                   "Install Git for Windows and reopen the terminal.")
+    # exact string preflight emits (preflight.py:23); a future prose change breaks this test
+    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [git_problem])
+    monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
+    rows = settings.get_health_checks(make_cfg(tmp_path))
+    by_name = {r["name"]: r for r in rows}
+    git_row = by_name["Git"]
+    assert git_row["status"] == "fail"
+    assert "git is not installed" in git_row["message"].lower()
+    assert "Install Git" in git_row["message"]
+    # no duplicate/unmatched row carrying the git prose
+    assert "git is not installed or not on PATH" not in by_name
+    git_rows = [r for r in rows if "git" in r["message"].lower()]
+    assert len(git_rows) == 1
+    # other canonical rows unchanged
+    for name in ("Provider API keys", "Docker running", "Sandbox image built"):
+        assert name in by_name
+
+
+def test_get_health_checks_matching_is_case_insensitive(tmp_path, monkeypatch):
+    """Even if preflight prose casing changes, the canonical row still matches."""
+    monkeypatch.setattr(settings, "environment_problems", lambda cfg: [
+        "GIT IS NOT INSTALLED or not on PATH. Fix: install Git."])
+    monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
+    rows = settings.get_health_checks(make_cfg(tmp_path))
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["Git"]["status"] == "fail"
+    assert "GIT IS NOT INSTALLED" not in by_name
+
+
 def test_github_access_no_token(tmp_path, monkeypatch):
     from swarmforge import github
     monkeypatch.setattr(github, "get_token", lambda gh_cfg: None)
