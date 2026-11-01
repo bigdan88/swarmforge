@@ -66,7 +66,9 @@ def get_health_checks(cfg: Config) -> list[dict]:
             prev["message"] = "; ".join(x for x in (prev["message"], r.get("message", "")) if x)
             prev["fix"] = "; ".join(x for x in (prev["fix"], r.get("fix", "")) if x)
         else:
-            indexed[name] = {"name": name, "status": r.get("status", "ok"),
+            # a row without an explicit status means the probe result is unknown ->
+            # report it as skipped, never as a fabricated 'ok'
+            indexed[name] = {"name": name, "status": r.get("status") or "skipped",
                              "message": r.get("message", ""), "fix": r.get("fix", "")}
     docker_optional = cfg.sandbox.mode != "docker"
     rows: list[dict] = []
