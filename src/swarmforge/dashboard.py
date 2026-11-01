@@ -2336,8 +2336,8 @@ def page_speed():
     c[0].download_button("Download runs (CSV)", mx.to_csv(rows), "swarmforge-runs.csv", "text/csv", key="speed_csv")
     c[1].download_button("Download agent sessions (CSV)", mx.to_csv(agents), "swarmforge-agents.csv", "text/csv",
                          key="speed_csv_agents")
-    with st.expander("Counters per run (timeouts, step limits, busy models)"):
-        st.dataframe(df[["run_id", "title", "agent_timeouts", "step_limit_hits", "model_busy_waits", "test_runs",
+    with st.expander("Counters per run (timeouts, step limits, busy models, tool use)"):
+        st.dataframe(df[["run_id", "title", "agent_timeouts", "step_limit_hits", "model_busy_waits", "sf_calls", "browse_calls", "test_runs",
                          "test_suite_min", "approval_wait_min"]], hide_index=True, width="stretch")
 
 
