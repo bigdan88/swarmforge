@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,7 +79,7 @@ def _git(args: list[str], cwd: Path | None = None, timeout: int = 45) -> tuple[i
         env = {k: v for k, v in os.environ.items()
                if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
         env["GIT_TERMINAL_PROMPT"] = "0"
-        p = subprocess.run(["git", *args], cwd=str(cwd) if cwd else None, capture_output=True, text=True,
+        p = subprocess.run(["git", *args], cwd=str(cwd) if cwd else tempfile.gettempdir(), capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout, env=env)
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired:
