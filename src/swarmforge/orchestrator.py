@@ -109,7 +109,9 @@ class Orchestrator:
     # ================================================================== entry
     async def execute(self, *, issue_url: str | None = None, issue_file: str | None = None,
                       repo: str | None = None, base_branch: str | None = None,
-                      run_id: str | None = None) -> str:
+                      run_id: str | None = None,
+                      attachments: list[str] | None = None) -> str:
+        self.attachments = [str(a) for a in (attachments or [])]
         self.run_id = run_id or new_run_id()
         self.run_dir = self.cfg.workdir / "runs" / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -242,6 +244,12 @@ class Orchestrator:
         issue, source = await asyncio.to_thread(self._load_issue, issue_url, issue_file, repo)
         self.issue = issue
         self.repo_key = repo_key(issue, str(source))
+        if self.attachments:
+            from .attachments import render_section
+            sec = render_section(self.attachments)
+            if sec:
+                issue.body = (issue.body or "").rstrip() + "\n\n" + sec
+                self.log("issue", f"{len(self.attachments)} attachment(s) added to the task")
         # the request exactly as the user wrote it (before continue/self-healing context is appended)
         self.store.update_run(self.run_id, issue_title=issue.title, issue_body=(issue.body or "")[:20000])
         if self.seed_run_id:

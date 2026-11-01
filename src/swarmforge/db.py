@@ -240,6 +240,7 @@ class Store:
         ("queue_items", "issue_url", "TEXT"),
         ("queue_items", "heal_attempts", "INTEGER"),
         ("runs", "archived", "INTEGER NOT NULL DEFAULT 0"),
+        ("queue_items", "attachments", "TEXT"),
     ]
 
     def _migrate(self) -> None:
@@ -468,7 +469,8 @@ class Store:
     # ------------------------------------------------------------------ queue
     QUEUE_FIELDS = ("title", "body", "repo", "mode", "budget", "max_cycles", "chain", "approval",
                     "status", "run_id", "base_branch", "result_branch", "note", "started_at",
-                    "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts")
+                    "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts",
+                    "attachments")
 
     def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
         row = self._one("SELECT MAX(position) AS m FROM queue_items")
