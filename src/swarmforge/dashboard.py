@@ -439,8 +439,8 @@ def page_new_run():
     c1, c2, c3, c4, c5 = st.columns(5)
     mode = c1.selectbox("Team", ["swarm", "single"], format_func=lambda m: {
         "swarm": "Swarm (5 roles)", "single": "Single agent (baseline)"}[m])
-    budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(cfg.limits.budget_usd), 0.5)
-    cycles = c3.number_input("Max repair cycles", 0, 10, int(cfg.limits.max_repair_cycles))
+    budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(cfg.limits.budget_usd), 0.5, key="nr_budget")
+    cycles = c3.number_input("Max repair cycles", 0, 10, int(cfg.limits.max_repair_cycles), key="nr_cycles")
     hours = c4.number_input("Time limit (hours)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s), 0.5,
                             help="The whole run stops after this long. Default from swarmforge.yaml "
                                  "(limits.max_runtime_s).")
@@ -717,6 +717,66 @@ def restart_panel(run: dict) -> None:
             st.caption("Continue is available when the run integrated some work and its workspace still exists.")
 
 
+# Lines of an explanation action that are shell commands (shown in st.code so they can be copied).
+_CMD_PREFIXES = ("git ", "swarmforge ", "docker ", "pip ", "python ", "wsl ", "export ", "cd ", "make ")
+
+
+def _prefill_new_run(run: dict) -> None:
+    """Copy a finished run's settings into the New task form (page_new_run reads these keys)."""
+    try:
+        limits = json.loads(run.get("config_json") or "{}").get("limits") or {}
+    except Exception:  # noqa: BLE001 - a corrupt config must not block a retry
+        limits = {}
+    if (run.get("issue_url") or "").startswith("http"):
+        st.session_state.nr_source = "GitHub issue"
+        st.session_state.nr_url = run["issue_url"]
+    else:
+        st.session_state.nr_source = "Describe it here"
+        st.session_state.nr_title = run.get("issue_title") or ""
+        st.session_state.nr_body = run.get("issue_body") or ""
+        if run.get("repo"):
+            store.remember_repo(str(run["repo"]))  # so the repository selectbox offers it
+            st.session_state.nr_repo = run["repo"]
+    budget = run.get("budget_usd")
+    if budget is None:
+        budget = cfg.limits.budget_usd if cfg else 5.0
+    cycles = limits.get("max_repair_cycles")
+    if cycles is None:
+        cycles = cfg.limits.max_repair_cycles if cfg else 2
+    st.session_state.nr_budget = min(500.0, max(0.5, float(budget)))   # widget ranges
+    st.session_state.nr_cycles = min(10, max(0, int(cycles)))
+
+
+def _explain_card(run: dict, events: list[dict], run_id: str) -> None:
+    """Status card above the metrics: the outcome in plain language plus what to do next."""
+    try:
+        from swarmforge.explain import explain_run
+        exp = explain_run(run, events)
+    except Exception as e:  # noqa: BLE001 - an explanation bug must never break the page
+        st.caption(f"explanation unavailable: {e}")
+        return
+    with st.container(border=True):
+        box = {"success": st.success, "info": st.info, "warning": st.warning,
+               "error": st.error}.get(exp.severity, st.info)
+        box(f"**{exp.headline}**")
+        st.write(exp.detail)
+        prev = ""
+        for action in exp.actions:
+            for line in str(action).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.lower().startswith(_CMD_PREFIXES) or prev.endswith(":"):
+                    st.code(line, language=None)  # copyable command
+                else:
+                    st.markdown(f"- {line}")
+                prev = line
+        if (run["state"] in ("FAILED", "BLOCKED", "CANCELLED")
+                and st.button("🔁 Run again with the same settings", key=f"again_{run_id}")):
+            _prefill_new_run(run)
+            st.session_state.goto = "New task"
+            st.rerun()
+
 
 def run_detail(run_id, header=True):
     run = store.get_run(run_id)
@@ -750,6 +810,7 @@ def run_detail(run_id, header=True):
     if active and run["pid"] and not pid_alive(run["pid"]):
         st.error("The process running this run has exited without finishing (crash, reboot or killed). "
                  "See the Console tab for its output.")
+    _explain_card(run, events, run_id)  # plain-language outcome + next steps, above the metrics
     c = st.columns([2.2, 1, 1, 1, 1.2, 1, 1.2])
     c[0].metric("State", run["state"].replace("_", " ").title())
     c[1].metric("Elapsed", fmt_dur(elapsed))
