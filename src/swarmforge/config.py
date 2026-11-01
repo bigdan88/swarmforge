@@ -109,6 +109,10 @@ class WatchConfig:
 class ProjectConfig:
     test_command: str = "python -m pytest -q"
     agent_test_command: str | None = None  # quicker suite agents run while working (optional)
+    # extra environment for the AGENTS' sandbox only (not the orchestrator's evidence runs), e.g.
+    # PYTEST_ADDOPTS: "-m 'not slow'" so every pytest an agent starts skips the slow tests
+    agent_env: dict = field(default_factory=dict)
+    reuse_baseline: bool = True   # skip the baseline test run when the same commit passed it before
     setup_command: str | None = None
 
 

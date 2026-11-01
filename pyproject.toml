@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dashboard = ["streamlit>=1.50", "pandas>=2.0"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-xdist>=3.5"]
 # agent developer tools in `sandbox.mode: local` (the Docker sandbox image already has them);
 # after installing, run `python -m playwright install chromium`
 tools = ["ruff>=0.6", "mypy>=1.11", "playwright>=1.45"]

@@ -77,6 +77,8 @@ class DockerSession(Session):
         args = self.sb.build_args(self.workspace, f"sleep {SESSION_LIFETIME_S}", self.name, self.artifacts_dir,
                                   network=self.network)
         extra = ["--add-host", "host.docker.internal:host-gateway"] if self.network not in (None, "none") else []
+        for k, v in (getattr(self.sb, "agent_env", None) or {}).items():   # agent-only env (e.g. PYTEST_ADDOPTS)
+            extra += ["-e", f"{k}={v}"]
         return [args[0], "run", "-d", *extra, *args[2:]]
 
     async def _ensure(self) -> None:
@@ -182,6 +184,7 @@ class LocalSession(Session):
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         deps = str((self.workspace / DEPS_DIR).resolve())
         env["PYTHONPATH"] = deps + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env.update(getattr(self.sb, "agent_env", None) or {})
         env.update(extra or {})
         return env
 

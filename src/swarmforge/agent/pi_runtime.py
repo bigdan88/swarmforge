@@ -298,6 +298,7 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
             (home / ".pi" / "agent" / "models.json").write_text(
                 json.dumps(models_json(f"http://127.0.0.1:{relay.port}/v1", model_id, max_tokens)), encoding="utf-8")
             env = _scrubbed_env()
+            env.update(getattr(ctx.sandbox, "agent_env", None) or {})
             env.update({"SF_RELAY_TOKEN": token, "HOME": str(home), "USERPROFILE": str(home), "PI_OFFLINE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "PYTHONPATH": str((ctx.workspace / DEPS_DIR).resolve())})

@@ -417,8 +417,25 @@ class Orchestrator:
                 readme = p.read_text(encoding="utf-8", errors="replace")[:3000]
                 break
         await self._ensure_deps(self.ws.repo, "repo")
-        ev = await run_tests(self.sandbox, self.ws.repo, self.cfg.project.test_command, self.artifacts,
-                             "baseline", self.cfg.sandbox.command_timeout_s)
+        import hashlib
+        cache_key = "baseline:" + hashlib.sha1("|".join([
+            self.ws.base_sha or "", self.cfg.project.test_command, self.cfg.sandbox.image]).encode()).hexdigest()[:20]
+        cached = self.store.kv_get(cache_key) if self.cfg.project.reuse_baseline else None
+        if cached:
+            d = json.loads(cached)
+            ev = TestEvidence(label="baseline", command=d["command"], exit_code=0, timed_out=False, duration_s=0.0,
+                              passed=d["passed"], failed=d["failed"], errors=d["errors"], skipped=d["skipped"],
+                              junit_found=d["junit_found"], log_path=d.get("log_path"))
+            self.log("test", f"baseline reused from run {d['run_id']} (same commit {(self.ws.base_sha or '')[:8]}, "
+                             "same test command); skipped re-running it")
+        else:
+            ev = await run_tests(self.sandbox, self.ws.repo, self.cfg.project.test_command, self.artifacts,
+                                 "baseline", self.cfg.sandbox.command_timeout_s)
+            if ev.exit_code == 0 and not ev.timed_out:
+                self.store.kv_set(cache_key, json.dumps({
+                    "run_id": self.run_id, "command": ev.command, "passed": ev.passed, "failed": ev.failed,
+                    "errors": ev.errors, "skipped": ev.skipped, "junit_found": ev.junit_found,
+                    "log_path": ev.log_path}))
         self._record_tests(ev, cycle=-1)
         if ev.junit_found and ev.total == 0:
             self.log("test", "baseline: the repository has no tests yet (new project); the team must add them")
@@ -883,8 +900,8 @@ class Orchestrator:
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} is not valid YAML: {e}")
             if not isinstance(prof, dict):
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} must be a mapping")
-            unknown = set(prof) - {"test_command", "agent_test_command", "sandbox_image", "install_command",
-                                   "description"}
+            unknown = set(prof) - {"test_command", "agent_test_command", "agent_env", "sandbox_image",
+                                   "install_command", "description"}
             if unknown:
                 self.log("project", f"ignoring unsupported keys in {PROJECT_FILE}: {sorted(unknown)}", level="warn")
         inst = prof.get("install_command")
@@ -893,6 +910,17 @@ class Orchestrator:
                 raise RunAborted(RunState.BLOCKED, "install_command must be a non-empty string")
             self.install_command = inst.strip()
         test_cmd = self._override_test_command or prof.get("test_command")
+        env = prof.get("agent_env")
+        if env is not None:
+            if not isinstance(env, dict) or not all(
+                    isinstance(k, str) and re.fullmatch(r"[A-Z_][A-Z0-9_]{0,63}", k)
+                    and not re.search(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH|^LD_|^DYLD_|^PATH$", k)
+                    and isinstance(v, (str, int, float)) for k, v in env.items()):
+                raise RunAborted(RunState.BLOCKED, "agent_env must map plain UPPER_CASE names to text values")
+            if not self._override_test_command:
+                self.cfg.project.agent_env = {k: str(v) for k, v in env.items()}
+        if self.cfg.project.agent_env:
+            self.sandbox.agent_env = dict(self.cfg.project.agent_env)
         quick = prof.get("agent_test_command")
         if quick is not None and not self._override_test_command:
             if not isinstance(quick, str) or not quick.strip():
@@ -1075,7 +1103,10 @@ class Orchestrator:
     # ================================================================= helpers
     def _test_hint(self) -> str:
         quick = self.cfg.project.agent_test_command
+        skip = self.cfg.project.agent_env.get("PYTEST_ADDOPTS")
         return "\n".join([
+            *([f"In your sandbox pytest runs with PYTEST_ADDOPTS={skip!r} (slow tests are skipped there; the "
+               "orchestrator still runs everything)."] if skip else []),
             f"Full test suite (the orchestrator runs it independently as the evidence): "
             f"`{self.cfg.project.test_command}`",
             "While you work, run only the tests relevant to your change (e.g. "

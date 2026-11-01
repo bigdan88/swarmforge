@@ -134,3 +134,41 @@ def test_agents_are_told_to_run_targeted_tests(cfg, tmp_path):
     assert o.cfg.project.test_command in hint and "relevant to your change" in hint and "at most once" in hint
     o.cfg.project.agent_test_command = 'pytest -m "not slow"'
     assert 'quick suite `pytest -m "not slow"`' in o._test_hint()
+
+
+def test_agent_env_reaches_agent_sessions_only(tmp_path):
+    from swarmforge.agent.devtools import DockerSession, LocalSession
+    from swarmforge.sandbox import LocalSandbox
+    sb = DockerSandbox(SandboxConfig())
+    sb.agent_env = {"PYTEST_ADDOPTS": "-m 'not slow'"}
+    args = DockerSession(sb, tmp_path, None).run_args()
+    assert "PYTEST_ADDOPTS=-m 'not slow'" in args
+    assert "PYTEST_ADDOPTS" not in " ".join(sb.build_args(tmp_path, "pytest", "x"))   # evidence runs: full suite
+    lsb = LocalSandbox(SandboxConfig(mode="local"))
+    lsb.agent_env = {"PYTEST_ADDOPTS": "-q"}
+    assert LocalSession(lsb, tmp_path, None)._env()["PYTEST_ADDOPTS"] == "-q"
+
+
+
+@pytest.mark.slow
+async def test_profile_agent_env_and_baseline_is_reused_for_the_same_commit(cfg, sample_repo):
+    import subprocess
+    from tests.conftest import ISSUE
+    from tests.test_e2e import _provider
+    (sample_repo / "swarmforge.project.yml").write_text('agent_env:\n  PYTEST_ADDOPTS: "-p no:randomly"\n')
+    subprocess.run(["git", "add", "-A"], cwd=sample_repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "profile"],
+                   cwd=sample_repo, check=True)
+    st = Store(cfg.db_path)
+    ids = []
+    for _ in range(2):
+        fake = _provider()
+        o = Orchestrator(cfg, st, echo=None, llm_transport=fake.transport)
+        ids.append(await o.execute(issue_file=str(ISSUE), repo=str(sample_repo)))
+        assert o.sandbox.agent_env == {"PYTEST_ADDOPTS": "-p no:randomly"}
+    first, second = ids
+    assert st.get_run(second)["state"] == "COMPLETED"
+    b1 = [t for t in st.test_runs(first) if t["label"] == "baseline"][0]
+    b2 = [t for t in st.test_runs(second) if t["label"] == "baseline"][0]
+    assert b1["duration_s"] > 0 and b2["duration_s"] == 0 and b2["passed"] == b1["passed"]
+    assert any("baseline reused from run " + first in e["message"] for e in st.events(second))
