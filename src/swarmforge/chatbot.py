@@ -240,6 +240,21 @@ def get_messages(store: Store, conversation_id: str, limit: int | None = None) -
     return list(reversed(rows))
 
 
+def clear_messages(store: Store, conversation_id: str) -> int:
+    """Delete every message of a conversation, keeping the conversation row itself.
+
+    Returns the number of deleted messages. Raises ChatError for an unknown id.
+    Does NOT bump conversations.updated_at (sidebar order must not change).
+    """
+    if get_conversation(store, conversation_id) is None:
+        raise ChatError(f"unknown conversation {conversation_id}")
+    with store._lock:
+        cur = store.conn.execute(
+            "DELETE FROM chat_messages WHERE conversation_id = ?", (conversation_id,))
+        store.conn.commit()
+        return cur.rowcount
+
+
 def rename_conversation(store: Store, conversation_id: str, title: str) -> dict:
     """Rename a conversation; bumps updated_at."""
     if get_conversation(store, conversation_id) is None:
