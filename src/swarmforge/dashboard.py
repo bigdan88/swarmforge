@@ -890,13 +890,21 @@ def work_items() -> list[dict]:
     approvals = {a["run_id"] for a in store.pending_approvals()}
     out, used = [], set()
     queue = store.queue_items()
-    waiting_pos = {i["id"]: n for n, i in enumerate([q for q in queue if q["status"] == "queued"], 1)}
+    from swarmforge.runqueue import lane as _lane
+    waiting_pos: dict[int, int] = {}
+    per_lane: dict[str, int] = {}
+    for q in queue:
+        if q["status"] == "queued":
+            per_lane[_lane(q)] = per_lane.get(_lane(q), 0) + 1
+            waiting_pos[q["id"]] = per_lane[_lane(q)]
+    multi = len({_lane(q) for q in queue if q["status"] in ("queued", "running")}) > 1
     for i in queue:
         r = by_id.get(i["run_id"]) if i["run_id"] else None
         if r:
             used.add(r["id"])
         if i["status"] == "queued":
-            grp, icon, label = "waiting", "⏳", f"Waiting (#{waiting_pos[i['id']]} in line)"
+            grp, icon, label = "waiting", "⏳", (f"Waiting (#{waiting_pos[i['id']]} in {_lane(i)})" if multi
+                                                 else f"Waiting (#{waiting_pos[i['id']]} in line)")
         elif _restarted_as(i):
             grp, icon, label = "failed", "↻", f"Restarted as #{_restarted_as(i)}"
         elif r:
@@ -924,6 +932,20 @@ def work_items() -> list[dict]:
     return out
 
 
+def queue_picker(col, key: str, value: str | None = None) -> str:
+    """Pick an existing queue ("pile") or name a new one. Works inside forms (no rerun needed)."""
+    names = store.queue_names()
+    default = value or st.session_state.get("last_queue") or names[0]
+    if default not in names:
+        names = [default] + names
+    a, b = col.columns(2)
+    pick = a.selectbox("Queue (pile)", names, index=names.index(default), key=f"{key}_pick",
+                       help="Each queue runs one task at a time, in order. Different queues run side by side, "
+                            "so use one queue per project.")
+    new = b.text_input("…or a new queue", key=f"{key}_new", placeholder="e.g. commanderforge")
+    return (new.strip() or pick).strip() or "main"
+
+
 def queue_bar() -> None:
     from swarmforge import runqueue as rq
     items = store.queue_items()
@@ -942,6 +964,7 @@ def queue_bar() -> None:
                         + (f" · {len(queued)} waiting" if queued else ""))
         if not pid:
             if c2.button("▶ Start queue", type="primary", disabled=not queued or not cfg, key="qb_start"):
+                rq.resume_all(store)
                 rq.start_worker(cfg, store)
                 time.sleep(1.5)
                 st.rerun(scope="app")
@@ -951,7 +974,7 @@ def queue_bar() -> None:
                 st.rerun(scope="app")
         else:
             if c2.button("▶ Keep going", key="qb_resume"):
-                store.kv_set(rq.PAUSED_KEY, "0")
+                rq.resume_all(store)
                 st.rerun(scope="app")
         if any(i["status"] in ("done", "failed", "cancelled", "skipped") for i in items):
             if c3.button("🧹 Clear finished", key="qb_clear", help="Removes finished queue entries from the "
@@ -960,7 +983,7 @@ def queue_bar() -> None:
                 st.rerun(scope="app")
         policy = store.kv_get(rq.POLICY_KEY) or "stop"
         new_policy = c4.selectbox("If a task fails", ["stop", "continue"], index=["stop", "continue"].index(policy),
-                                  key="qb_policy", format_func=lambda p: {"stop": "If a task fails: pause the queue",
+                                  key="qb_policy", format_func=lambda p: {"stop": "If a task fails: pause its queue",
                                                          "continue": "If a task fails: continue"}[p],
                                   label_visibility="collapsed")
         if new_policy != policy:
@@ -968,6 +991,28 @@ def queue_bar() -> None:
         done = sum(1 for i in items if i["status"] == "done")
         st.progress(done / len(items), text=f"{done} of {len(items)} queue tasks done · {len(running)} running "
                                              f"· {len(queued)} waiting")
+        lanes = [n for n in store.queue_names() if any(rq.lane(i) == n for i in items)]
+        if len(lanes) > 1 or any(rq.lane_paused(store, n) for n in lanes):
+            limit = cfg.limits.max_parallel_queues if cfg else 3
+            st.caption(f"Queues run side by side (up to {limit} at once); each runs its own tasks in order.")
+            for n in lanes:
+                mine = [i for i in items if rq.lane(i) == n]
+                run_ = [i for i in mine if i["status"] == "running"]
+                wait_ = [i for i in mine if i["status"] == "queued"]
+                lp = rq.lane_paused(store, n)
+                q1, q2 = st.columns([5, 1.3])
+                q1.markdown(f"🗂 **{n}** — " + ("⏸ paused · " if lp else "")
+                            + (f"running: {run_[0]['title'][:60]}" if run_ else "idle")
+                            + (f" · {len(wait_)} waiting" if wait_ else ""))
+                if lp and q2.button("▶ Resume", key=f"qb_lane_res_{n}"):
+                    rq.set_lane_paused(store, n, False)
+                    if not pid and cfg:
+                        rq.start_worker(cfg, store)
+                    st.rerun(scope="app")
+                if not lp and wait_ and q2.button("⏸ Pause", key=f"qb_lane_pause_{n}",
+                                                  help="Start nothing new in this queue (the running task finishes)."):
+                    rq.set_lane_paused(store, n, True)
+                    st.rerun(scope="app")
 
 
 def select_item(key: str | None) -> None:
@@ -1209,7 +1254,9 @@ def waiting_editor(i: dict) -> None:
     """Everything about a not-yet-started queue task can be changed."""
     b1, b2, b3, b4, _ = st.columns([1, 0.7, 0.8, 0.9, 5])
     if b1.button("⏫ Run next", key=f"q_top_{i['id']}", help="Move to the front of the waiting line."):
-        waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != i["id"]]
+        from swarmforge.runqueue import lane as _lane
+        waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != i["id"]
+                   and _lane(q) == _lane(i)]
         if waiting:
             store.queue_update(i["id"], position=waiting[0]["position"] - 0.5)
         st.rerun()
@@ -1247,13 +1294,14 @@ def waiting_editor(i: dict) -> None:
         heal = heal_input(h1, f"qe_hl_{i['id']}", i.get("heal_attempts"))
         chain = h2.checkbox("Chain: start from the previous task's result on this repository", bool(i["chain"]),
                             key=f"qe_ch_{i['id']}")
+        lane = queue_picker(st, f"qe_q_{i['id']}", i.get("queue") or "main")
         if st.form_submit_button("💾 Save changes", type="primary"):
             if not title.strip() or not body.strip() or not repo.strip():
                 st.error("Title, description and repository can't be empty.")
             else:
                 store.queue_update(i["id"], title=title.strip(), body=body.strip(), repo=repo.strip(), mode=mode,
                                    budget=float(budget), max_cycles=int(cycles), max_runtime_s=int(hours * 3600),
-                                   approval=approval, chain=int(chain), heal_attempts=heal)
+                                   approval=approval, chain=int(chain), heal_attempts=heal, queue=lane)
                 st.session_state.flash = f"Saved “{title.strip()}”."
                 st.rerun()
 
@@ -1369,7 +1417,7 @@ def item_detail(w: dict, every) -> None:
     i, r = w["item"], w["run"]
     bits = [w["status"]]
     if i:
-        bits.append(f"queue task #{i['id']}")
+        bits.append(f"queue task #{i['id']} in 🗂 {i.get('queue') or 'main'}")
     if r:
         bits.append(f"run `{r['id']}`")
     bits.append(f"repo `{w['repo']}`")
@@ -1506,7 +1554,8 @@ def page_failures():
 # ============================================================ NEW TASK page
 def queue_forms() -> None:
     from swarmforge import runqueue as rq
-    st.caption("Queued tasks run one after another. With **chaining**, each task starts from the previous "
+    st.caption("Each queue (pile) runs its tasks one after another; different queues run side by side, so use "
+               "one queue per project. With **chaining**, each task starts from the previous "
                "task's result on the same repository, so improvements build on each other. Nothing is ever "
                "merged into your main branch.")
 
@@ -1525,7 +1574,8 @@ def queue_forms() -> None:
         heal = heal_input(h1, f"{prefix}_heal")
         chain = h2.checkbox("Chain: start from the previous task's result on this repository", value=True,
                             key=f"{prefix}_chain")
-        return mode, budget, cycles, approval, chain, int(hours * 3600), heal
+        lane = queue_picker(st, f"{prefix}_queue")
+        return mode, budget, cycles, approval, chain, int(hours * 3600), heal, lane
 
     def checked_repo(repo):
         from swarmforge.repos import normalize_repo, preflight
@@ -1537,7 +1587,7 @@ def queue_forms() -> None:
         title = st.text_input("Title", key="qa_title")
         body = st.text_area("Description with acceptance criteria", height=200, key="qa_body")
         repo = repo_picker("Repository", "qa_repo")
-        mode, budget, cycles, approval, chain, runtime, heal = common("qa")
+        mode, budget, cycles, approval, chain, runtime, heal, lane = common("qa")
         if st.button("Add to queue", type="primary"):
             try:
                 if not title.strip() or not body.strip():
@@ -1545,9 +1595,10 @@ def queue_forms() -> None:
                 src = checked_repo(repo)
                 new_id = store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget,
                                          max_cycles=int(cycles), chain=int(chain), approval=approval,
-                                         max_runtime_s=runtime, heal_attempts=heal)
+                                         max_runtime_s=runtime, heal_attempts=heal, queue=lane)
                 store.remember_repo(src)
-                st.session_state.flash = f"Queued: {title.strip()}. Press ▶ Start queue when you're ready."
+                st.session_state.last_queue = lane
+                st.session_state.flash = f"Queued in “{lane}”: {title.strip()}. Press ▶ Start queue when you're ready."
                 select_item(f"q:{new_id}")
                 st.session_state.goto = "Work"
                 st.rerun()
@@ -1559,7 +1610,7 @@ def queue_forms() -> None:
         path = st.text_input("Backlog file (Markdown with **Title:** / **Description:** sections)", value=default,
                              key="qi_path")
         repo_i = repo_picker("Repository for all imported tasks", "qi_repo")
-        mode, budget, cycles, approval, chain, runtime, heal = common("qi")
+        mode, budget, cycles, approval, chain, runtime, heal, lane = common("qi")
         found = []
         if path and Path(path).is_file():
             found = rq.parse_backlog(Path(path).read_text(encoding="utf-8"))
@@ -1572,8 +1623,9 @@ def queue_forms() -> None:
                 for f in found:
                     store.queue_add(f.title, f.body, src, mode=mode, budget=budget, max_cycles=int(cycles),
                                     chain=int(chain), approval=approval, max_runtime_s=runtime,
-                                    heal_attempts=heal)
+                                    heal_attempts=heal, queue=lane)
                 store.remember_repo(src)
+                st.session_state.last_queue = lane
                 st.session_state.flash = f"Imported {len(found)} task(s). Press ▶ Start queue when you're ready."
                 select_item(None)
                 st.session_state.goto = "Work"
@@ -1589,7 +1641,7 @@ def page_new_task():
         return
     how = st.radio("How should it run?", ["Start now", "Add to the queue"], horizontal=True, key="nt_how",
                    captions=["Runs right away in the background.",
-                             "Waits its turn; tasks run one after another."])
+                             "Waits its turn in a queue; queues for different projects run side by side."])
     st.divider()
     if how == "Start now":
         page_new_run()

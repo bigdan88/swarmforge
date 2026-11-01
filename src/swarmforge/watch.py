@@ -61,7 +61,7 @@ def poll_once(cfg: Config, store: Store, gh: GitHubClient, echo: Callable[[str],
             item_id = store.queue_add(
                 issue.title, issue.body or "(no description)", f"https://github.com/{owner}/{name}",
                 issue_url=issue.url or f"https://github.com/{owner}/{name}/issues/{issue.number}",
-                approval=w.approval, chain=0, budget=w.budget_usd, max_cycles=w.max_cycles)
+                approval=w.approval, chain=0, budget=w.budget_usd, max_cycles=w.max_cycles, queue=w.queue)
             store.kv_set(key, str(item_id))
             added.append(item_id)
             if echo:

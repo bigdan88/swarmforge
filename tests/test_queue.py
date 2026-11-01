@@ -73,10 +73,10 @@ async def test_queue_pauses_on_failure(cfg, sample_repo, tmp_path):
     assert n == 1
     assert store.queue_item(bad)["status"] == "failed"
     assert store.queue_item(nxt)["status"] == "queued"
-    assert store.kv_get(rq.PAUSED_KEY) == "1"
+    assert rq.lane_paused(store, "main") and store.kv_get(rq.PAUSED_KEY) != "1"   # only its own queue pauses
     # with policy=continue the next item would run
     store.kv_set(rq.POLICY_KEY, "continue")
-    store.kv_set(rq.PAUSED_KEY, "0")
+    rq.resume_all(store)
     store.queue_update(nxt, status="skipped")
     assert await rq.work(cfg, store, echo=None, llm_transport=_provider().transport) == 0
 
@@ -122,7 +122,7 @@ async def test_queue_item_continue_uses_seed_and_runtime(cfg, sample_repo):
     await rq.work(cfg, store, echo=None, llm_transport=_provider().transport)
     i1 = store.queue_item(first)
     assert i1["status"] == "failed"
-    store.kv_set(rq.PAUSED_KEY, "0")
+    rq.resume_all(store)
     again = store.queue_add("Export", body, str(sample_repo.resolve()), max_cycles=2,
                             seed_run_id=i1["run_id"], max_runtime_s=7200)
     await rq.work(cfg, store, echo=None, llm_transport=_provider().transport)
@@ -144,3 +144,60 @@ async def test_queue_item_heals_itself(cfg, sample_repo):
     assert run["heal_attempt"] == 1 and run["state"] == "COMPLETED"
     assert store.failure(run["heal_of"])["outcome"] == "fixed itself on attempt 1"
     assert "after self-healing attempt 1" in item["note"]
+
+
+async def test_queues_run_side_by_side_but_in_order_within_each(cfg, tmp_path, monkeypatch):
+    """Two piles: their first items start together; a pile's second item waits for its first."""
+    import asyncio
+    store = Store(cfg.db_path)
+    log, gate = [], {}
+
+    async def fake_run_item(c, st, item, **kw):
+        st.queue_update(item["id"], status="running")
+        log.append(("start", item["title"]))
+        gate[item["title"]] = asyncio.Event()
+        await gate[item["title"]].wait()
+        st.queue_update(item["id"], status="failed" if item["title"] == "B1" else "done")
+        log.append(("end", item["title"]))
+        return st.queue_item(item["id"])
+    monkeypatch.setattr(rq, "run_item", fake_run_item)
+    a1 = store.queue_add("A1", "x", "repoA", queue="alpha")
+    store.queue_add("A2", "x", "repoA", queue="alpha")
+    store.queue_add("B1", "x", "repoB", queue="beta")
+    b2 = store.queue_add("B2", "x", "repoB", queue="beta")
+    store.queue_add("M1", "x", "repoC")                       # default queue "main"
+    cfg.limits.max_parallel_queues = 2
+    worker = asyncio.ensure_future(rq.work(cfg, store, echo=None, poll_s=0.05))
+
+    async def until(cond):
+        for _ in range(200):
+            if cond():
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError(log)
+    await until(lambda: len(log) == 2)
+    assert set(log) == {("start", "A1"), ("start", "B1")}       # two piles at once, limit 2
+    gate["B1"].set()                                            # B1 fails -> beta pauses (policy stop)
+    await until(lambda: ("start", "M1") in log)                 # its slot goes to the main pile
+    assert ("start", "B2") not in log and rq.lane_paused(store, "beta")
+    gate["A1"].set()
+    await until(lambda: ("start", "A2") in log)                 # alpha continues in order
+    gate["A2"].set()
+    gate["M1"].set()
+    assert await asyncio.wait_for(worker, 5) == 4
+    assert store.queue_item(b2)["status"] == "queued" and store.queue_item(a1)["status"] == "done"
+    assert store.queue_names()[0] in ("alpha", "beta", "main") and set(store.queue_names()) >= {"alpha", "beta", "main"}
+
+
+def test_moves_and_requeue_stay_inside_their_queue(tmp_path):
+    s = Store(tmp_path / "db.sqlite")
+    a = s.queue_add("A", "a", "r", queue="alpha")
+    m = s.queue_add("M", "m", "r")
+    b = s.queue_add("B", "b", "r", queue="alpha")
+    s.queue_move(b, -1)                                         # jumps over A (same queue), not M
+    alpha = [i["id"] for i in s.queue_items() if rq.lane(i) == "alpha"]
+    assert alpha == [b, a] and s.queue_item(m)["queue"] == "main"
+    s.queue_update(a, status="failed")
+    new, created = rq.requeue(s, s.queue_item(a), mode="swarm")
+    assert created and s.queue_item(new)["queue"] == "alpha"
+    assert [i["id"] for i in s.queue_items() if rq.lane(i) == "alpha" and i["status"] == "queued"][0] == new

@@ -411,11 +411,13 @@ def cmd_queue(args, cfg) -> int:
         if not items:
             print("queue is empty")
         for i in items:
-            print(f"#{i['id']:<4} {i['status']:9} {(i['title'] or '')[:60]:60} {i['repo'][:40]:40} "
-                  f"{i['run_id'] or ''}")
+            print(f"#{i['id']:<4} {rq.lane(i)[:14]:14} {i['status']:9} {(i['title'] or '')[:50]:50} "
+                  f"{i['repo'][:36]:36} {i['run_id'] or ''}")
         pid = rq.worker_pid(store)
+        lanes = [n for n in store.queue_names() if rq.lane_paused(store, n)]
         print(f"\nworker: {'running (pid %d)' % pid if pid else 'stopped'}; "
-              f"paused={store.kv_get(rq.PAUSED_KEY) == '1'}; on failure: {store.kv_get(rq.POLICY_KEY) or 'stop'}")
+              f"paused={store.kv_get(rq.PAUSED_KEY) == '1'}; paused queues: {', '.join(lanes) or 'none'}; "
+              f"on failure: {store.kv_get(rq.POLICY_KEY) or 'stop'}")
         return 0
     if a == "add":
         body = Path(args.file).read_text(encoding="utf-8") if args.file else (args.body or "")
@@ -424,15 +426,17 @@ def cmd_queue(args, cfg) -> int:
             return 2
         iid = store.queue_add(args.title, body, norm(args.repo), mode=args.mode, budget=args.budget,
                               max_cycles=args.max_cycles, chain=0 if args.no_chain else 1,
-                              approval=args.approval, max_runtime_s=_hours(args.max_runtime_hours))
-        print(f"queued #{iid}")
+                              approval=args.approval, max_runtime_s=_hours(args.max_runtime_hours),
+                              queue=args.queue)
+        print(f"queued #{iid} in queue '{args.queue}'")
         return 0
     if a == "import":
         items = rq.parse_backlog(Path(args.file).read_text(encoding="utf-8"))
         for it in items:
             iid = store.queue_add(it.title, it.body, norm(args.repo), mode=args.mode, budget=args.budget,
                                   max_cycles=args.max_cycles, chain=0 if args.no_chain else 1,
-                                  approval=args.approval, max_runtime_s=_hours(args.max_runtime_hours))
+                                  approval=args.approval, max_runtime_s=_hours(args.max_runtime_hours),
+                                  queue=args.queue)
             print(f"queued #{iid} {it.title}")
         print(f"{len(items)} item(s) imported")
         return 0
@@ -443,11 +447,19 @@ def cmd_queue(args, cfg) -> int:
         print(f"removed {store.queue_clear_finished()} finished item(s)")
         return 0
     if a == "pause":
-        store.kv_set(rq.PAUSED_KEY, "1")
-        print("queue will pause after the current run")
+        if getattr(args, "queue", None):
+            rq.set_lane_paused(store, args.queue, True)
+            print(f"queue '{args.queue}' will start nothing new (its current run finishes)")
+        else:
+            store.kv_set(rq.PAUSED_KEY, "1")
+            print("all queues will pause after their current runs")
         return 0
     if a == "resume":
-        store.kv_set(rq.PAUSED_KEY, "0")
+        if getattr(args, "queue", None):
+            rq.set_lane_paused(store, args.queue, False)
+            store.kv_set(rq.PAUSED_KEY, "0")
+        else:
+            rq.resume_all(store)
         pid = rq.start_worker(cfg, store)
         print(f"queue worker running (pid {pid})")
         return 0
@@ -455,7 +467,7 @@ def cmd_queue(args, cfg) -> int:
         store.kv_set(rq.POLICY_KEY, args.policy)
         return 0
     if a == "work":
-        store.kv_set(rq.PAUSED_KEY, "0")
+        rq.resume_all(store)
         n = asyncio.run(rq.work(cfg, store))
         print(f"queue worker finished: {n} item(s) processed")
         return 0
@@ -560,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--label", default="")
     s.add_argument("--max-cycles", type=int)
     s.set_defaults(fn=cmd_bench)
-    q = sub.add_parser("queue", help="queue tasks and run them one after another")
+    q = sub.add_parser("queue", help="queue tasks; each queue runs in order, different queues side by side")
     qs = q.add_subparsers(dest="qcmd", required=True)
     qs.add_parser("list", help="show the queue")
     for name, hlp in (("add", "add one task"), ("import", "add every task from a backlog Markdown file")):
@@ -579,11 +591,14 @@ def build_parser() -> argparse.ArgumentParser:
         x.add_argument("--no-chain", action="store_true", help="start from the default branch, not the previous result")
         x.add_argument("--approval", choices=["yes", "dashboard"], default="yes",
                        help="GitHub repos: open draft PRs without asking (yes) or ask in the dashboard")
+        x.add_argument("--queue", default="main", help="which queue (pile) to add to, e.g. one per project")
     x = qs.add_parser("remove")
     x.add_argument("id", type=int)
     qs.add_parser("clear", help="remove finished items")
-    qs.add_parser("pause", help="stop after the current run")
-    qs.add_parser("resume", help="start the background worker")
+    x = qs.add_parser("pause", help="start nothing new (running tasks finish); --queue for one queue only")
+    x.add_argument("--queue")
+    x = qs.add_parser("resume", help="un-pause and start the background worker; --queue for one queue only")
+    x.add_argument("--queue")
     x = qs.add_parser("policy", help="what to do when an item fails")
     x.add_argument("policy", choices=["stop", "continue"])
     qs.add_parser("work", help="run the queue in this terminal (the dashboard starts it in the background)")

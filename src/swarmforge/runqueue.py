@@ -1,7 +1,8 @@
-"""Run queue: line up tasks and let SwarmForge work through them one after another.
+"""Run queues: line up tasks and let SwarmForge work through them.
 
-* Items run strictly in order, one at a time, by a single background worker process
-  (`swarmforge queue work`, started from the dashboard's Queue page).
+* There can be several queues ("piles"), e.g. one per project. Each queue runs its items strictly in
+  order, one at a time; different queues run side by side (up to `limits.max_parallel_queues`), all
+  in one background worker process (`swarmforge queue work`, started from the dashboard).
 * Chaining (default on): an item starts from the RESULT of the previous item on the same
   repository, so a series of improvements builds up without you merging in between:
     - local repository: the previous run delivered branch `swarmforge/task-…` into your repo;
@@ -10,8 +11,8 @@
       from it and its draft PR targets that branch (stacked PRs).
   Nothing is ever merged into your main branch; you review and merge the final branch (which
   contains every step) or each step separately.
-* On failure the queue pauses (default) so later items don't build on a broken result; choose
-  "continue" to run independent items anyway.
+* On failure that queue pauses (default) so later items don't build on a broken result; the other
+  queues keep going. Choose "continue" to run independent items anyway.
 """
 from __future__ import annotations
 
@@ -29,6 +30,8 @@ from .db import Store
 WORKER_KEY = "queue_worker_pid"
 PAUSED_KEY = "queue_paused"
 POLICY_KEY = "queue_on_failure"  # "stop" | "continue"
+LANE_PAUSED = "queue_paused:{}"   # per queue ("pile")
+DEFAULT_QUEUE = "main"
 
 
 # ------------------------------------------------------------------ backlog files
@@ -95,11 +98,13 @@ def requeue(store: Store, item: dict, **kw) -> tuple[int, bool]:
         if q["id"] != item["id"] and q["status"] in ("queued", "running") and \
                 q["title"] == item["title"] and q["body"] == item["body"] and q["repo"] == item["repo"]:
             return q["id"], False
-    extra = {k: item.get(k) for k in ("issue_url",) if item.get(k)}
+    extra = {k: item.get(k) for k in ("issue_url", "queue") if item.get(k) and k not in kw}
     new_id = store.queue_add(item["title"], item["body"], item["repo"], **extra, **kw)
-    waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != new_id]
+    mine = lane(store.queue_item(new_id))
+    waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != new_id and lane(q) == mine]
     if waiting:
         store.queue_update(new_id, position=waiting[0]["position"] - 0.5)
+    set_lane_paused(store, mine, False)
     note = (item.get("note") or "").split(" · " + RESTARTED)[0]
     store.queue_update(item["id"], note=f"{note} · {RESTARTED}{new_id}".lstrip(" ·"))
     store.kv_set(PAUSED_KEY, "0")
@@ -179,16 +184,46 @@ def _hook(name: str, *args, echo=None) -> None:
             echo(f"watch: could not update the GitHub issue ({name}): {type(e).__name__}: {e}")
 
 
+def lane(item: dict) -> str:
+    return (item.get("queue") or DEFAULT_QUEUE).strip() or DEFAULT_QUEUE
+
+
+def lane_paused(store: Store, name: str) -> bool:
+    return store.kv_get(LANE_PAUSED.format(name)) == "1"
+
+
+def set_lane_paused(store: Store, name: str, paused: bool) -> None:
+    store.kv_set(LANE_PAUSED.format(name), "1" if paused else None)
+
+
+def resume_all(store: Store) -> None:
+    store.kv_set(PAUSED_KEY, "0")
+    for name in store.queue_names():
+        set_lane_paused(store, name, False)
+
+
+async def _run_safe(cfg, store, item, *, echo, llm_transport, sandbox) -> dict:
+    try:
+        return await run_item(cfg, store, item, echo=echo, llm_transport=llm_transport, sandbox=sandbox)
+    except Exception as e:  # never let one item kill the worker silently
+        store.queue_update(item["id"], status="failed", finished_at=time.time(),
+                           note=f"worker error: {type(e).__name__}: {e}")
+        return store.queue_item(item["id"])
+
+
 async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, sandbox=None,
-               max_items: int | None = None) -> int:
-    """Process queued items in order until the queue is empty or paused. Returns items processed."""
+               max_items: int | None = None, poll_s: float = 2.0) -> int:
+    """Work through every queue ("pile"). Each queue runs its items strictly in order, one at a time;
+    different queues run side by side (at most `limits.max_parallel_queues`). Returns items processed.
+    The global pause stops new starts everywhere; a failed item (policy "stop") pauses only its queue."""
     other = worker_pid(store)
     if other and other != os.getpid():
         if echo:
             echo(f"another queue worker is already running (pid {other})")
         return 0
     store.kv_set(WORKER_KEY, str(os.getpid()))
-    done = 0
+    done = started = 0
+    running: dict[str, tuple[dict, asyncio.Task]] = {}
     try:
         # recover items left 'running' by a crashed worker
         for i in store.queue_items(include_finished=False):
@@ -199,32 +234,51 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                 if run and run["state"] not in ("COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"):
                     store.update_run(run["id"], state="FAILED", finished_at=time.time(),
                                      state_reason="the queue worker stopped while this run was going")
+        limit = max(1, int(getattr(cfg.limits, "max_parallel_queues", 3) or 1))
         while True:
-            if store.kv_get(PAUSED_KEY) == "1":
+            for name, (item, task) in list(running.items()):
+                if not task.done():
+                    continue
+                del running[name]
+                result = task.result()
+                done += 1
                 if echo:
+                    echo(f"queue[{name}]: #{item['id']} -> {result['status']}")
+                if result["status"] != "done" and (store.kv_get(POLICY_KEY) or "stop") == "stop":
+                    set_lane_paused(store, name, True)
+                    if echo:
+                        echo(f"queue[{name}] paused because #{item['id']} did not complete (policy: stop on failure)")
+            paused = store.kv_get(PAUSED_KEY) == "1"
+            can_start = not paused and (max_items is None or started < max_items)
+            startable = []
+            if can_start:
+                seen = set(running)
+                for item in store.queue_items(include_finished=False):
+                    name = lane(item)
+                    if item["status"] != "queued" or name in seen or lane_paused(store, name):
+                        continue
+                    seen.add(name)
+                    startable.append(item)
+                for item in startable:
+                    if len(running) >= limit or (max_items is not None and started >= max_items):
+                        break
+                    name = lane(item)
+                    if echo:
+                        echo(f"queue[{name}]: starting #{item['id']} {item['title']}")
+                    running[name] = (item, asyncio.ensure_future(_run_safe(
+                        cfg, store, item, echo=echo, llm_transport=llm_transport, sandbox=sandbox)))
+                    started += 1
+            if not running:
+                if paused and echo:
                     echo("queue paused")
-                break
-            pending = [i for i in store.queue_items(include_finished=False) if i["status"] == "queued"]
-            if not pending or (max_items is not None and done >= max_items):
-                break
-            item = pending[0]
-            if echo:
-                echo(f"queue: starting #{item['id']} {item['title']}")
-            try:
-                result = await run_item(cfg, store, item, echo=echo, llm_transport=llm_transport, sandbox=sandbox)
-            except Exception as e:  # never let one item kill the worker silently
-                store.queue_update(item["id"], status="failed", finished_at=time.time(),
-                                   note=f"worker error: {type(e).__name__}: {e}")
-                result = store.queue_item(item["id"])
-            done += 1
-            if echo:
-                echo(f"queue: #{item['id']} -> {result['status']}")
-            if result["status"] != "done" and (store.kv_get(POLICY_KEY) or "stop") == "stop":
-                store.kv_set(PAUSED_KEY, "1")
-                if echo:
-                    echo("queue paused because an item did not complete (policy: stop on failure)")
-                break
+                if paused or not startable or (max_items is not None and started >= max_items):
+                    break
+                continue
+            await asyncio.wait([t for _, t in running.values()], timeout=poll_s,
+                               return_when=asyncio.FIRST_COMPLETED)
     finally:
+        for _, task in running.values():          # worker cancelled (Ctrl+C): stop the runs it owns
+            task.cancel()
         if store.kv_get(WORKER_KEY) == str(os.getpid()):
             store.kv_set(WORKER_KEY, None)
     return done

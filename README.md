@@ -201,6 +201,16 @@ reviewer and librarian keep the built-in loop because they return structured rep
   `pi: {relay_host: 0.0.0.0}`.
 * In `sandbox.mode: local`, install Pi on the host: `npm install -g @earendil-works/pi-coding-agent`.
 
+## Several queues (one per project)
+
+Every queued task belongs to a **queue** ("pile"); pick it when you add the task (dashboard: *Queue
+(pile)*, or type a new name; CLI: `swarmforge queue add ... --queue commanderforge`). Each queue runs
+its tasks strictly in order, one at a time; **different queues run side by side** in the same worker
+(`limits.max_parallel_queues`, default 3). A failed task (policy "stop") pauses only its own queue;
+the others keep going. Pause/resume a single queue from the queue bar or with
+`swarmforge queue pause|resume --queue NAME`. Issues from `swarmforge watch` go to the `github` queue
+(`watch.queue`). Two queues working on the same repository still take turns (one active run per repo).
+
 ## Speed
 
 Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.

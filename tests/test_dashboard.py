@@ -253,11 +253,11 @@ def test_background_queue_worker_processes_and_exits(tmp_path, monkeypatch, samp
     it = Store(cfg.db_path).queue_item(iid)
     # the fake provider is unreachable, so the run fails at planning and the queue pauses (policy: stop)
     assert it["status"] == "failed" and it["run_id"], it
-    assert Store(cfg.db_path).kv_get(rq.PAUSED_KEY) == "1"
+    assert rq.lane_paused(Store(cfg.db_path), "main")
     assert [i["status"] for i in Store(cfg.db_path).queue_items()][1] == "queued"
     assert not pid_alive(pid)
     log = (cfg.workdir / "logs" / "queue-worker.log").read_text()
-    assert "queue: starting #" in log and "queue paused" in log
+    assert "queue[main]: starting #" in log and "queue[main] paused" in log
 
 
 async def test_failed_run_offers_start_again_and_continue(tmp_path, monkeypatch, sample_repo):

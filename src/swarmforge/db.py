@@ -235,6 +235,7 @@ class Store:
         ("runs", "issue_body", "TEXT"),
         ("runs", "variant_id", "TEXT"),
         ("queue_items", "issue_url", "TEXT"),
+        ("queue_items", "queue", "TEXT"),
         ("queue_items", "heal_attempts", "INTEGER"),
     ]
 
@@ -461,12 +462,14 @@ class Store:
     # ------------------------------------------------------------------ queue
     QUEUE_FIELDS = ("title", "body", "repo", "mode", "budget", "max_cycles", "chain", "approval",
                     "status", "run_id", "base_branch", "result_branch", "note", "started_at",
-                    "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts")
+                    "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts", "issue_url",
+                    "queue")
 
     def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
         row = self._one("SELECT MAX(position) AS m FROM queue_items")
         pos = (row["m"] or 0) + 1
         fields = {"mode": "swarm", "chain": 1, "approval": "yes", **fields}
+        fields["queue"] = (fields.get("queue") or "main").strip() or "main"
         cols = ", ".join(["position", "title", "body", "repo", "created_at", *fields])
         qs = ", ".join(["?"] * (5 + len(fields)))
         return self._exec(f"INSERT INTO queue_items ({cols}) VALUES ({qs})",
@@ -476,6 +479,13 @@ class Store:
         if include_finished:
             return self._all("SELECT * FROM queue_items ORDER BY position")
         return self._all("SELECT * FROM queue_items WHERE status IN ('queued','running') ORDER BY position")
+
+    def queue_names(self) -> list[str]:
+        """Every queue ("pile") that has items, plus 'main'; most recently used first."""
+        rows = self._all("SELECT COALESCE(queue, 'main') AS q, MAX(created_at) AS t FROM queue_items GROUP BY q "
+                         "ORDER BY t DESC")
+        names = [r["q"] for r in rows]
+        return names if "main" in names else names + ["main"]
 
     def queue_item(self, item_id: int) -> dict | None:
         return self._one("SELECT * FROM queue_items WHERE id = ?", (item_id,))
@@ -530,8 +540,10 @@ class Store:
         self._exec("DELETE FROM queue_items WHERE id = ? AND status != 'running'", (item_id,))
 
     def queue_move(self, item_id: int, direction: int) -> None:
-        """Swap an item with its neighbour among not-yet-started items (direction -1 up, +1 down)."""
-        items = [i for i in self.queue_items() if i["status"] == "queued"]
+        """Swap an item with its neighbour among not-yet-started items of the same queue (-1 up, +1 down)."""
+        me = self.queue_item(item_id)
+        lane = (me or {}).get("queue") or "main"
+        items = [i for i in self.queue_items() if i["status"] == "queued" and (i.get("queue") or "main") == lane]
         idx = next((n for n, i in enumerate(items) if i["id"] == item_id), None)
         if idx is None:
             return

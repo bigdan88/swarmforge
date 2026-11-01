@@ -59,6 +59,7 @@ class Limits:
     busy_wait_s: int = 900         # keep retrying a busy/rate-limited model this long before falling back
     max_concurrent_agents: int = 2
     one_run_per_repo: bool = True     # a run waits while an earlier run on the same repository is active
+    max_parallel_queues: int = 3      # queues ("piles") the worker runs side by side
     max_repair_cycles: int = 3
     max_tasks: int = 8
     max_conflict_resolutions: int = 3
@@ -103,6 +104,7 @@ class WatchConfig:
     budget_usd: float | None = None
     max_cycles: int | None = None
     comment: bool = True                        # comment on the issue when queued / finished
+    queue: str = "github"                       # which queue ("pile") labelled issues go to
 
 
 @dataclass
