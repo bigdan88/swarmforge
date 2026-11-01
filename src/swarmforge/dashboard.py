@@ -35,9 +35,11 @@ DARK_CSS = """<style>
    not internal CSS variable names, which shift between Streamlit versions. */
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
     background-color: #0e1117; color: #fafafa; }
-[data-testid="stSidebar"] { background-color: #16181d; }
+[data-testid="stSidebar"] { background-color: #16181d; color: #fafafa; }
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
 [data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #fafafa; }
+[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover,
+[data-testid="stSidebar"] .stButton button:hover { background: #16181d; color: #fafafa; }
 h1, h2, h3, h4, h5, h6, p, li, label, span { color: #fafafa; }
 [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
 [data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
@@ -47,6 +49,8 @@ h1, h2, h3, h4, h5, h6, p, li, label, span { color: #fafafa; }
 [data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
     background-color: #16181d; color: #fafafa; border-color: #33343d; }
 [data-testid="stButton"] button { color: #fafafa; }
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #fafafa; }
+[data-testid="stCaptionContainer"] { color: #fafafa; }
 [data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
     background-color: #262730; color: #fafafa; }
 [data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
@@ -58,12 +62,16 @@ a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
 </style>"""
 
 LIGHT_CSS = """<style>
-/* Native light palette pinned, so switching back from a dark launch base works too. */
+/* Native light palette pinned, so switching back from a dark launch base works too. Every selector
+   DARK_CSS touches has a reset here: the dark block is replaced wholesale on toggle-back, and this
+   block re-pins the light values even when the launch base theme was dark. */
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
     background-color: #ffffff; color: #31333f; }
-[data-testid="stSidebar"] { background-color: #f0f2f6; }
+[data-testid="stSidebar"] { background-color: #f0f2f6; color: #31333f; }
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
 [data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #31333f; }
+[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover,
+[data-testid="stSidebar"] .stButton button:hover { background: #ffffff; color: #31333f; }
 h1, h2, h3, h4, h5, h6, p, li, label, span { color: #31333f; }
 [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
 [data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
@@ -73,12 +81,20 @@ h1, h2, h3, h4, h5, h6, p, li, label, span { color: #31333f; }
 [data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
     background-color: #ffffff; color: #31333f; border-color: #d5d8e0; }
 [data-testid="stButton"] button { color: #31333f; }
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #31333f; }
+[data-testid="stCaptionContainer"] { color: #31333f; }
 [data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
     background-color: #f0f2f6; color: #31333f; }
 [data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
     background-color: #ff4b4b; color: #ffffff; }
 a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
+/* status boxes keep their own tinted backgrounds: let them pick their own text colour again */
+[data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] span,
+[data-testid="stNotification"] p { color: inherit; }
 </style>"""
+
+# Every dark-palette colour DARK_CSS sets: none of these may appear in LIGHT_CSS (tests scan with it).
+DARK_CSS_COLORS = ("#0e1117", "#16181d", "#1a1c22", "#262730", "#33343d", "#e6e6e6", "#fafafa")
 
 
 def theme_css(mode: str) -> str:
@@ -96,15 +112,31 @@ def effective_theme(sel: str, launch: str) -> str:
 
 
 def apply_chart_theme(mode: str) -> None:
-    """Match the Altair chart theme to the palette; an unknown theme name must never break the page."""
+    """Match the Altair chart theme to the palette; an unknown theme name must never break the page.
+
+    Uses the modern ``alt.theme`` API (Altair >= 5.5, no deprecation warning). On older Altair there
+    is no safe global switch, so this is a no-op and every chart is styled per-chart by theme_chart().
+    """
     name = "dark" if mode == "dark" else "default"
     try:
         if hasattr(alt, "theme") and hasattr(alt.theme, "enable"):   # Altair >= 5.5
             alt.theme.enable(name)
-        else:                                                       # older Altair
-            alt.themes.enable(name if name == "dark" else "vox")
     except Exception:  # noqa: BLE001 - chart styling is decoration
         pass
+
+
+def theme_chart(chart, mode: str):
+    """Per-chart dark styling so charts follow the palette even without the global Altair theme.
+
+    Light mode returns the chart untouched (the default light theme applies); dark mode layers
+    axis/legend/title/view colours from the dark palette on top of the chart's own config.
+    """
+    if mode != "dark":
+        return chart  # default light theme
+    return (chart.configure_view(strokeWidth=0)
+                 .configure_axis(labelColor="#fafafa", titleColor="#fafafa", gridColor="#262730")
+                 .configure_legend(labelColor="#fafafa", titleColor="#fafafa")
+                 .configure_title(color="#fafafa"))
 
 
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
@@ -169,10 +201,15 @@ if "theme_mode" not in st.session_state:
     st.session_state["theme_mode"] = saved if saved in THEME_CHOICES else (
         LAUNCH_THEME if LAUNCH_THEME in THEME_CHOICES else "auto")
 theme_mode = st.session_state.get("theme_mode") or LAUNCH_THEME
-apply_chart_theme(effective_theme(theme_mode, LAUNCH_THEME))
+eff_theme = effective_theme(theme_mode, LAUNCH_THEME)
+apply_chart_theme(eff_theme)
 css = theme_css(theme_mode)
-if css:  # injected before the sidebar so it covers every page and every rerun
-    st.markdown(css, unsafe_allow_html=True)
+st.session_state["theme_css"] = css  # the active override, inspectable in tests
+if css:  # one keyed element: toggling modes replaces the previous block wholesale, never stacks
+    try:
+        st.markdown(css, key="sf_theme_css", unsafe_allow_html=True)
+    except TypeError:  # Streamlit without keyed markdown: one plain element still replaces the old block
+        st.markdown(css, unsafe_allow_html=True)
 
 
 HEAL_HELP = ("If the task fails, SwarmForge asks a model why, then automatically retries this many times, "
@@ -916,7 +953,7 @@ def run_detail(run_id, header=True):
                 x=alt.X("start:T", title=None), x2="end:T", y=alt.Y("task:N", sort=None, title=None),
                 color=alt.Color("model:N"), tooltip=["task", "model", "state", "start", "end"]
             ).properties(height=36 * len(rows) + 40)
-            st.altair_chart(ch, width="stretch")
+            st.altair_chart(theme_chart(ch, eff_theme), width="stretch")
         st.dataframe(pd.DataFrame([{
             "task": t["task_key"], "cycle": t["cycle"], "kind": t["kind"], "title": t["title"], "role": t["role"],
             "model": t["model"], "depends_on": ", ".join(t["depends_on"]), "state": t["state"],
@@ -984,16 +1021,17 @@ def run_detail(run_id, header=True):
         br = pd.DataFrame(store.cost_by_role(run_id))
         if not br.empty:
             st.dataframe(br, width="stretch", hide_index=True)
-            st.altair_chart(alt.Chart(br).mark_bar().encode(
+            st.altair_chart(theme_chart(alt.Chart(br).mark_bar().encode(
                 x=alt.X("cost_usd:Q", title="USD"), y=alt.Y("role:N", sort="-x"), tooltip=list(br.columns)),
-                width="stretch")
+                eff_theme), width="stretch")
         calls = store.llm_calls(run_id)
         if calls:
             cdf = pd.DataFrame(calls)
             cdf["t"] = pd.to_datetime(cdf["ended_at"], unit="s")
             cdf["cumulative_cost"] = cdf["cost_usd"].fillna(0).cumsum()
-            st.altair_chart(alt.Chart(cdf).mark_line(point=True).encode(
-                x=alt.X("t:T", title=None), y=alt.Y("cumulative_cost:Q", title="cumulative USD")), width="stretch")
+            st.altair_chart(theme_chart(alt.Chart(cdf).mark_line(point=True).encode(
+                x=alt.X("t:T", title=None), y=alt.Y("cumulative_cost:Q", title="cumulative USD")),
+                eff_theme), width="stretch")
 
     with tabs[7]:
         log = cfg.workdir / "logs" / f"{run_id}.log" if cfg else None
@@ -1898,9 +1936,9 @@ def page_failures():
     m[1].metric("Fixed themselves", fixed)
     m[2].metric("Need you", needs)
     chart = pd.DataFrame({"cause": [CATEGORIES.get(c, c) for c in cats.index], "failures": cats.values})
-    st.altair_chart(alt.Chart(chart).mark_bar(color="#e45756").encode(
+    st.altair_chart(theme_chart(alt.Chart(chart).mark_bar(color="#e45756").encode(
         x=alt.X("failures:Q", title=None, axis=alt.Axis(tickMinStep=1)), y=alt.Y("cause:N", sort="-x", title=None),
-        tooltip=["cause", "failures"]).properties(height=max(60, 28 * len(chart))), width="stretch")
+        tooltip=["cause", "failures"]).properties(height=max(60, 28 * len(chart))), eff_theme), width="stretch")
     pick = st.multiselect("Cause", list(cats.index), format_func=lambda c: CATEGORIES.get(c, c), key="f_cat",
                           placeholder="All causes")
     shown = [f for f in fails if not pick or f["category"] in pick]
