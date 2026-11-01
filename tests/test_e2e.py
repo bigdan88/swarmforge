@@ -66,6 +66,9 @@ async def test_full_swarm_cycle_local(cfg, sample_repo):
     assert (repo / "tests" / "test_acceptance_swarmforge.py").exists()
     acc = [a for a in store.acceptance(run_id) if a["cycle"] == 1]
     assert {a["criterion_id"]: a["status"] for a in acc} == {"AC1": "satisfied", "AC2": "satisfied", "AC3": "satisfied"}
+    # the tester agent wrote tests once; the repair cycle only re-ran them
+    assert [k for k in tasks if k.startswith("tester-")] == ["tester-c0"]
+    assert any("without the tester agent" in e["message"] for e in store.events(run_id))
 
     # the result branch really contains the work, and the user's source repo is untouched
     log = subprocess.run(["git", "log", "--oneline", run["integration_branch"]], cwd=repo,

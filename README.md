@@ -300,6 +300,30 @@ These settings (all on by default) keep that down:
 * **Faster developer models.** `swarmforge.yaml` uses Flash models for the developers, with the
   previous models as fallbacks. Compare with `swarmforge bench` and switch back if quality drops.
 
+* **Tester agent once per run** (`limits.tester_every_cycle: false`). It writes the acceptance tests in
+  the first cycle; repair cycles just re-run the suite with them (about 10 minutes saved per cycle).
+
+### Measuring it
+
+Every finished run records where its time went. The **Speed** page and `swarmforge metrics` show it:
+
+* **Phases**: waiting (in line for the repository), setup, planning, coding, testing, review and delivery
+  (including waiting for your push approval).
+* **Agents by role and model**: sessions, median minutes, seconds per model call, retries; this is how
+  you spot a slow model.
+* **Counters**: agent timeouts, step-limit hits, busy-model (429) waits, test-suite minutes.
+* **By settings**: each run is tagged with a fingerprint of the speed-relevant settings (models and max
+  steps per role, repair cycles, blocking severities, tester once/every cycle). Change one setting, let a
+  few runs finish, and compare the medians of the two groups.
+
+```bash
+swarmforge metrics                       # medians over the last 50 finished runs, grouped by settings
+swarmforge metrics RUN_ID                # one run in detail
+swarmforge metrics --csv runs.csv        # runs.csv + runs-agents.csv for a spreadsheet or notebook
+```
+
+Each run folder also gets a `metrics.json`, and the breakdown is printed in the run's log.
+
 ## Failures and self-healing
 
 Every run that fails gets a **post-mortem**. SwarmForge sorts the failure into a cause (time limit,

@@ -604,6 +604,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--theme", choices=["auto", "light", "dark"], default="auto",
                    help="dashboard color theme; 'dark' = dark mode (you can also switch live from the sidebar)")
     s.set_defaults(fn=cmd_dashboard)
+    s = sub.add_parser("metrics", help="where the time went: per-phase timings for one run, or medians "
+                                       "over recent runs grouped by settings")
+    s.add_argument("run_id", nargs="?")
+    s.add_argument("--last", type=int, default=50, help="how many recent finished runs (default 50)")
+    s.add_argument("--csv", help="write runs (and a -agents.csv with one row per agent session) to this file")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_metrics)
     s = sub.add_parser("update", help="pull the latest SwarmForge code (merged PRs) and restart the queue worker")
     s.set_defaults(fn=cmd_update)
     s = sub.add_parser("restart-dashboard", help=argparse.SUPPRESS)
@@ -792,6 +799,42 @@ def cmd_variants(args, cfg) -> int:
               "Restart the dashboard and queue worker to apply it.")
         return 0
     return 2
+
+
+def cmd_metrics(args, cfg) -> int:
+    """Where the time went: one run in detail, or medians over recent runs grouped by settings."""
+    from . import metrics as mx
+    store = _store(cfg)
+    if args.run_id:
+        m = mx.run_metrics(store, args.run_id)
+        if not m:
+            print(f"no run {args.run_id}")
+            return 1
+        print(json.dumps(m, indent=2, default=str) if args.json else mx.format_run(m))
+        return 0
+    rows = mx.collect(store, args.last)
+    if args.csv:
+        Path(args.csv).write_text(mx.to_csv(rows), encoding="utf-8")
+        agents = Path(args.csv).with_name(Path(args.csv).stem + "-agents.csv")
+        agents.write_text(mx.to_csv(mx.agent_rows(store, args.last)), encoding="utf-8")
+        print(f"wrote {len(rows)} run(s) to {args.csv} and agent sessions to {agents}")
+        return 0
+    summ = mx.summarize(rows)
+    if args.json:
+        print(json.dumps({"runs": rows, "summary": summ}, indent=2, default=str))
+        return 0
+    if not rows:
+        print("no finished runs yet")
+        return 0
+    def line(name, s):
+        ph = "  ".join(f"{p} {s[p + '_min']:.0f}" for p in mx.PHASES if s.get(p + "_min"))
+        return f"{name}\n  {s['runs']} run(s), median {s['total_min']:.0f} min (work {s['work_min']:.0f}): {ph}"
+    print(line(f"last {len(rows)} finished runs", summ["all"]))
+    if len(summ["by_settings"]) > 1:
+        print("\nby settings (medians, minutes):")
+        for k, s in summ["by_settings"].items():
+            print(line(k, s))
+    return 0
 
 
 def cmd_update(args, cfg) -> int:

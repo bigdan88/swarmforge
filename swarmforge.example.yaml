@@ -82,6 +82,7 @@ limits:
                               # works on its own branch, is updated with main before its PR (or: serial | parallel)
   max_concurrent_agents: 2    # coding agents running at the same time
   max_repair_cycles: 3        # test/review -> fix iterations
+  tester_every_cycle: false   # repair cycles re-run the tests but skip the tester agent (saves ~10 min/cycle)
   max_tasks: 8
   max_conflict_resolutions: 3
   task_retries: 1

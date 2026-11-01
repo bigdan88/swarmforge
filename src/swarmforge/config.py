@@ -65,6 +65,7 @@ class Limits:
     same_repo: str = "coordinate"
     max_parallel_queues: int = 3      # queues ("piles") the worker runs side by side
     max_repair_cycles: int = 3
+    tester_every_cycle: bool = False   # repair cycles re-run the tests but skip the tester agent
     max_tasks: int = 8
     max_conflict_resolutions: int = 3
     task_retries: int = 1          # extra attempts for a coding task whose agent failed

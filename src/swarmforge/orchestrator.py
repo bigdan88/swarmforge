@@ -188,6 +188,14 @@ class Orchestrator:
                 self.log("report", f"execution report written to {path}")
             except Exception as e:
                 self.log("error", f"failed to write report: {e}", level="error")
+            try:
+                from .metrics import format_run, run_metrics, write_run_metrics
+                write_run_metrics(self.store, self.run_id, self.run_dir)
+                m = run_metrics(self.store, self.run_id)
+                if m:
+                    self.log("metrics", "where the time went:\n" + format_run(m))
+            except Exception as e:  # metrics are for study; never change the outcome
+                self.log("metrics", f"could not compute metrics: {e}", level="warn")
             if self.store.get_run(self.run_id)["state"] not in ("COMPLETED", "CANCELLED"):
                 try:
                     from .postmortem import diagnose
@@ -714,7 +722,17 @@ class Orchestrator:
     async def _testing(self, cycle: int) -> tuple[TestEvidence, dict | None]:
         tester_report = None
         if self.mode == "swarm":
-            tester_report = await self._run_tester(cycle)
+            if cycle == 0 or getattr(self.cfg.limits, "tester_every_cycle", False) \
+                    or getattr(self, "_first_tester_report", None) is None:
+                tester_report = await self._run_tester(cycle)
+                if tester_report and getattr(self, "_first_tester_report", None) is None:
+                    self._first_tester_report = tester_report
+            else:
+                # Repair cycle: the acceptance tests from the first cycle still apply; just re-run the
+                # suite (minutes) instead of having the tester agent write more tests (~10 min/cycle).
+                self.log("test", "repair cycle: re-running the existing tests without the tester agent "
+                                 "(limits.tester_every_cycle: true brings it back)")
+                tester_report = {**self._first_tester_report, "defects": []}
         await self._ensure_deps(self.ws.repo, "repo")
         ev = await run_tests(self.sandbox, self.ws.repo, self.cfg.project.test_command, self.artifacts,
                              f"cycle{cycle}", self.cfg.sandbox.command_timeout_s)
@@ -1529,4 +1547,5 @@ def _config_snapshot(cfg: Config) -> dict:
         "limits": asdict(cfg.limits),
         "sandbox": {"mode": cfg.sandbox.mode, "image": cfg.sandbox.image, "network": cfg.sandbox.network},
         "test_command": cfg.project.test_command,
+        "review": {"blocking_severities": list(cfg.review.blocking_severities)},
     }

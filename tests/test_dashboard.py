@@ -62,9 +62,11 @@ async def test_dashboard_pages_render(tmp_path, monkeypatch, sample_repo):
     # the request and the summary of what was done are shown on the run
     assert any("Task & summary" in e.label for e in at.expander)
     assert any("What you asked for" in m.value and "What you need to do" in m.value for m in at.markdown)
-    for page in ("Knowledge", "New task", "Benchmarks"):
+    for page in ("Knowledge", "New task", "Benchmarks", "Speed"):
         _go(at, page)
         assert not at.exception, (page, [e.value for e in at.exception])
+    _go(at, "Speed")   # the scripted run above lasts seconds, below the 1-minute floor for speed stats
+    assert any("No finished runs yet" in i.value for i in at.info)
     _go(at, "Knowledge")
     assert any("Exporters must wrap every OSError" in m.value for m in at.markdown)
 

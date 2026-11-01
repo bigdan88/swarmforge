@@ -272,11 +272,12 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "Pull requests", "New task", "Failures", "Chat", "Knowledge", "Benchmarks", "Settings"]
+PAGES = ["Work", "Pull requests", "New task", "Failures", "Speed", "Chat", "Knowledge", "Benchmarks", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
             "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
 NAV_ICON["Settings"] = ":material/settings:"
 NAV_ICON["Pull requests"] = ":material/merge:"
+NAV_ICON["Speed"] = ":material/speed:"
 SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
@@ -2267,6 +2268,79 @@ def page_new_task():
 
 
 # =========================================================== BENCHMARKS page
+def page_speed():
+    """Where the time goes, per run and per agent; compare settings before/after a change."""
+    from swarmforge import metrics as mx
+    st.header("Speed")
+    st.caption("Where each finished run's time went. Change a setting, let a few runs finish, then compare the "
+               "groups under **By settings**. `swarmforge metrics --csv FILE` exports the same data.")
+    n = st.select_slider("Runs to include", [10, 20, 30, 50, 100, 200], value=30, key="speed_n")
+    try:
+        rows = mx.collect(store, n)
+        agents = mx.agent_rows(store, n)
+    except Exception as e:  # noqa: BLE001 - a bad row must not break the page
+        st.error(f"Could not compute metrics: {e}")
+        return
+    if not rows:
+        st.info("No finished runs yet. Metrics appear here once a run completes or fails.")
+        return
+    summ = mx.summarize(rows)["all"]
+    k = st.columns(4)
+    k[0].metric("Median run", f"{summ['total_min']:.0f} min")
+    k[1].metric("Median working time", f"{summ['work_min']:.0f} min", help="run time minus waiting in line")
+    k[2].metric("Median repair cycles", f"{summ['repair_cycles']:g}")
+    k[3].metric("Median cost", f"${summ['cost_usd']:.2f}")
+
+    st.subheader("Where the time goes")
+    long = pd.DataFrame([{"run": f"{r['title'][:38]} · {r['run_id'][-6:]}", "phase": p, "minutes": r[f"{p}_min"],
+                          "order": mx.PHASES.index(p), "started": r["started"]}
+                         for r in rows for p in mx.PHASES if r[f"{p}_min"] > 0.05])
+    runs_order = [f"{r['title'][:38]} · {r['run_id'][-6:]}" for r in rows]
+    st.altair_chart(theme_chart(alt.Chart(long).mark_bar().encode(
+        x=alt.X("sum(minutes):Q", title="minutes"), y=alt.Y("run:N", sort=runs_order, title=None),
+        color=alt.Color("phase:N", sort=mx.PHASES, scale=alt.Scale(domain=mx.PHASES)),
+        order=alt.Order("order:Q"), tooltip=["run", "phase", alt.Tooltip("minutes:Q", format=".1f")]
+    ).properties(height=max(120, 26 * len(rows))), eff_theme), width="stretch")
+    med = pd.DataFrame([{"phase": p, "median minutes": summ.get(f"{p}_min") or 0, "what it is": mx.PHASE_HELP[p]}
+                        for p in mx.PHASES])
+    st.dataframe(med, hide_index=True, width="stretch",
+                 column_config={"median minutes": st.column_config.NumberColumn(format="%.1f")})
+
+    st.subheader("By settings")
+    st.caption("Medians per settings fingerprint: developer/reviewer/tester model and max steps, repair cycles, "
+               "blocking severities, tester every cycle or once.")
+    bys = mx.summarize(rows)["by_settings"]
+    st.dataframe(pd.DataFrame([{"settings": k2, **v} for k2, v in bys.items()]), hide_index=True, width="stretch",
+                 column_config={c: st.column_config.NumberColumn(format="%.1f")
+                                for c in ["total_min", "work_min", *[f"{p}_min" for p in mx.PHASES], "repair_cycles"]}
+                 | {"cost_usd": st.column_config.NumberColumn(format="$%.2f")})
+
+    st.subheader("Agents by role and model")
+    if agents:
+        adf = pd.DataFrame(agents)
+        g = adf.groupby(["role", "model"]).agg(sessions=("task", "count"), median_min=("minutes", "median"),
+                                               max_min=("minutes", "max"), median_sec_per_call=("sec_per_call", "median"),
+                                               retries=("retries", "sum")).reset_index().sort_values("median_min",
+                                                                                                    ascending=False)
+        st.dataframe(g, hide_index=True, width="stretch",
+                     column_config={c: st.column_config.NumberColumn(format="%.1f")
+                                    for c in ["median_min", "max_min", "median_sec_per_call"]})
+    else:
+        st.caption("No agent sessions recorded.")
+
+    st.subheader("Runs")
+    df = pd.DataFrame(rows).drop(columns=["started"])
+    st.dataframe(df, hide_index=True, width="stretch",
+                 column_config={c: st.column_config.NumberColumn(format="%.1f") for c in df.columns if c.endswith("_min")})
+    c = st.columns(2)
+    c[0].download_button("Download runs (CSV)", mx.to_csv(rows), "swarmforge-runs.csv", "text/csv", key="speed_csv")
+    c[1].download_button("Download agent sessions (CSV)", mx.to_csv(agents), "swarmforge-agents.csv", "text/csv",
+                         key="speed_csv_agents")
+    with st.expander("Counters per run (timeouts, step limits, busy models)"):
+        st.dataframe(df[["run_id", "title", "agent_timeouts", "step_limit_hits", "model_busy_waits", "test_runs",
+                         "test_suite_min", "approval_wait_min"]], hide_index=True, width="stretch")
+
+
 def page_benchmarks():
     st.header("Benchmarks: single agent vs swarm")
     b = store.benchmarks()
@@ -2398,5 +2472,5 @@ def page_settings():
     settings.render(cfg)
 
 
-{"Work": page_work, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Chat": page_chat,
+{"Work": page_work, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Speed": page_speed, "Chat": page_chat,
  "Knowledge": page_knowledge, "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()
