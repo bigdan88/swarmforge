@@ -1,6 +1,7 @@
 """Settings & health page tests."""
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import pytest
@@ -455,3 +456,166 @@ def test_build_sandbox_streams_output(tmp_path, monkeypatch):
     assert any("Sandbox build output" in e.label for e in at.expander)
     assert "Successfully built deadbeef" in " ".join(c.value for c in at.code)
     assert any("Sandbox image built" in s.value for s in at.success)
+
+
+# ============================================== comment-preserving save (F3)
+
+COMMENTED_YAML = """\
+# SwarmForge configuration
+# Edit roles and limits; comments survive dashboard saves.
+
+providers:
+  fake:
+    base_url: https://fake.test/v1
+    api_key_env: FAKE_KEY  # never put the key itself here
+
+roles:
+  planner:
+    provider: fake
+    model: qwen-fake
+    max_steps: 15
+  developer_backend:
+    provider: fake
+    model: deepseek-fake
+    max_steps: 15
+  developer_frontend:
+    provider: fake
+    model: kimi-fake
+    max_steps: 15
+  reviewer:
+    provider: fake
+    model: glm-fake
+    max_steps: 10
+  tester:
+    provider: fake
+    model: minimax-fake
+    max_steps: 15
+
+developer_roles: [developer_backend, developer_frontend]
+
+limits:
+  budget_usd: 5  # monthly cap
+  max_runtime_s: 300
+  max_concurrent_agents: 2
+  max_repair_cycles: 2
+
+sandbox:
+  mode: local
+  command_timeout_s: 120
+project:
+  test_command: python -m pytest -q
+workdir: .
+knowledge:
+  vault: ./knowledge
+self_heal:
+  max_attempts: 0
+"""
+
+
+def test_save_preserves_comments_and_layout(tmp_path):
+    p = tmp_path / "swarmforge.yaml"
+    p.write_text(COMMENTED_YAML, encoding="utf-8")
+    original_bytes = p.read_bytes()
+    raw = yaml.safe_load(COMMENTED_YAML)
+    raw["workdir"] = str(tmp_path / "work")
+    raw["knowledge"]["vault"] = str(tmp_path / "work" / "knowledge")
+    raw["project"]["test_command"] = "python -m pytest -q -p no:cacheprovider"
+    edited = settings.apply_edits(
+        raw, {"reviewer": {"model": "glm-fake-2", "temperature": 0.2, "max_steps": 12}},
+        {"budget_usd": 9})
+    backup = settings.save_config_with_backup(p, edited)
+    assert backup.read_bytes() == original_bytes  # .bak is a byte-identical copy
+    saved_text = p.read_text(encoding="utf-8")
+    # comments, blank line and key order survive
+    assert "# SwarmForge configuration" in saved_text
+    assert "# Edit roles and limits; comments survive dashboard saves." in saved_text
+    assert "api_key_env: FAKE_KEY  # never put the key itself here" in saved_text
+    assert "budget_usd: 9  # monthly cap" in saved_text
+    assert "roles:" in saved_text and "limits:" in saved_text
+    assert saved_text.index("providers:") < saved_text.index("roles:")
+    assert saved_text.index("roles:") < saved_text.index("limits:")
+    assert saved_text.index("limits:") < saved_text.index("sandbox:")
+    assert "\n\nlimits:" in saved_text
+    # changed values updated
+    assert "glm-fake-2" in saved_text
+    assert "budget_usd: 9" in saved_text
+    saved = yaml.safe_load(saved_text)
+    assert saved["roles"]["reviewer"]["model"] == "glm-fake-2"
+    assert saved["roles"]["reviewer"]["temperature"] == 0.2
+    assert saved["roles"]["reviewer"]["max_steps"] == 12
+    assert saved["limits"]["budget_usd"] == 9
+    assert saved["limits"]["max_runtime_s"] == 300
+    assert saved["providers"] == edited["providers"]
+
+
+def test_save_inserts_missing_key(tmp_path):
+    text = COMMENTED_YAML.replace("  max_runtime_s: 300\n", "")
+    p = tmp_path / "swarmforge.yaml"
+    p.write_text(text, encoding="utf-8")
+    raw = yaml.safe_load(text)
+    raw["workdir"] = str(tmp_path / "work")
+    raw["knowledge"]["vault"] = str(tmp_path / "work" / "knowledge")
+    raw["project"]["test_command"] = "python -m pytest -q -p no:cacheprovider"
+    edited = settings.apply_edits(raw, {}, {"max_runtime_s": 600})
+    settings.save_config_with_backup(p, edited)
+    saved_text = p.read_text(encoding="utf-8")
+    # the new key lands inside the limits block, after `limits:` and before `sandbox:`
+    assert "max_runtime_s: 600" in saved_text
+    assert saved_text.index("limits:") < saved_text.index("max_runtime_s: 600")
+    assert saved_text.index("max_runtime_s: 600") < saved_text.index("sandbox:")
+    assert "# monthly cap" in saved_text  # comments still survive
+    saved = yaml.safe_load(saved_text)
+    assert saved["limits"]["max_runtime_s"] == 600
+    assert saved["limits"]["budget_usd"] == 5
+
+
+def test_save_fallback_on_unparseable_original(tmp_path):
+    p = tmp_path / "swarmforge.yaml"
+    p.write_text("providers: [unclosed\n  bad yaml: {{{\n", encoding="utf-8")
+    original_bytes = p.read_bytes()
+    raw = base_raw(tmp_path / "work")
+    backup = settings.save_config_with_backup(p, raw)
+    assert backup.read_bytes() == original_bytes
+    saved = yaml.safe_load(p.read_text(encoding="utf-8"))
+    assert saved == raw
+
+
+def test_save_fallback_on_unexpected_layout(tmp_path):
+    # a change involving a container (list) falls back to a full dump without raising
+    p = tmp_path / "swarmforge.yaml"
+    raw = base_raw(tmp_path / "work")
+    p.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    changed = copy.deepcopy(raw)
+    changed["developer_roles"] = ["developer_backend"]
+    settings.save_config_with_backup(p, changed)
+    assert yaml.safe_load(p.read_text(encoding="utf-8"))["developer_roles"] == ["developer_backend"]
+
+
+def test_patch_config_text_quoting():
+    text = "a: old\nb: 1\nc: yes\nd: something\n"
+    old = {"a": "old", "b": 1, "c": True, "d": "something"}
+    new = {"a": "new value", "b": 2, "c": False, "d": None}
+    patched = settings.patch_config_text(text, old, new)
+    assert patched is not None
+    lines = patched.splitlines()
+    assert lines[0] == "a: new value"  # plain strings stay single-line scalars
+    assert lines[1] == "b: 2"  # ints stay bare
+    assert lines[2] == "c: false"  # bools become true/false
+    assert lines[3] == "d: null"  # None becomes null
+    assert yaml.safe_load(patched) == new
+    # values that would be misread as another type stay quoted
+    patched = settings.patch_config_text("a: old\n", {"a": "old"}, {"a": "yes"})
+    assert patched is not None
+    assert patched.splitlines()[0] != "a: yes"
+    assert yaml.safe_load(patched)["a"] == "yes"
+
+
+def test_patch_config_text_inserts_missing_section():
+    text = "providers:\n  fake:\n    base_url: https://x.test\n"
+    old = yaml.safe_load(text)
+    new = {"providers": old["providers"], "limits": {"budget_usd": 3}}
+    patched = settings.patch_config_text(text, old, new)
+    assert patched is not None
+    assert "limits:" in patched
+    assert "budget_usd: 3" in patched
+    assert yaml.safe_load(patched) == new
