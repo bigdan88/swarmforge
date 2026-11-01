@@ -169,11 +169,19 @@ class ApprovalConfig:
 
 
 @dataclass
+class ChatConfig:
+    """Chatbot per-conversation context window."""
+    context_max_messages: int = 12
+    context_max_tokens: int = 4000
+
+
+@dataclass
 class Config:
     providers: dict[str, ProviderConfig]
     roles: dict[str, RoleConfig]
     developer_roles: list[str]
     limits: Limits = field(default_factory=Limits)
+    chat: ChatConfig = field(default_factory=ChatConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
@@ -255,6 +263,7 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         roles=roles,
         developer_roles=dev_roles,
         limits=_build(Limits, raw.get("limits"), "limits"),
+        chat=_build(ChatConfig, raw.get("chat"), "chat"),
         sandbox=_build(SandboxConfig, raw.get("sandbox"), "sandbox"),
         project=_build(ProjectConfig, raw.get("project"), "project"),
         github=_build(GitHubConfig, raw.get("github"), "github"),
@@ -299,6 +308,10 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("limits.max_concurrent_agents must be >= 1")
     if not 0 <= lim.max_repair_cycles <= 10:
         raise ConfigError("limits.max_repair_cycles must be between 0 and 10")
+    if not 1 <= cfg.chat.context_max_messages <= 200:
+        raise ConfigError("chat.context_max_messages must be between 1 and 200")
+    if not 256 <= cfg.chat.context_max_tokens <= 200000:
+        raise ConfigError("chat.context_max_tokens must be between 256 and 200000")
     sh = cfg.self_heal
     if not 0 <= sh.max_attempts <= 5:
         raise ConfigError("self_heal.max_attempts must be between 0 and 5")

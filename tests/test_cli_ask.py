@@ -38,9 +38,10 @@ def test_ask_prints_answer_and_forwards_kwargs(tmp_path, monkeypatch):
     p = _write_cfg(tmp_path, monkeypatch)
     recorded = {}
 
-    def fake_ask(cfg, store, question, history=None, *, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
         recorded["question"] = question
         recorded["max_runs"] = max_runs
+        recorded["conversation"] = conversation
         return {"answer": "All good.", "role": "chat", "model": "m1",
                 "question": question}
 
@@ -51,12 +52,27 @@ def test_ask_prints_answer_and_forwards_kwargs(tmp_path, monkeypatch):
     assert err == ""
     assert recorded["question"] == "how are runs doing?"
     assert recorded["max_runs"] == 12
+    assert recorded["conversation"] == "cli"  # default conversation id
+
+
+def test_ask_forwards_conversation_flag(tmp_path, monkeypatch):
+    p = _write_cfg(tmp_path, monkeypatch)
+    recorded = {}
+
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
+        recorded["conversation"] = conversation
+        return {"answer": "ok", "role": "chat", "model": "m1", "question": question}
+
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    _out, _err, code = _capture(["--config", str(p), "ask", "q", "--conversation", "thread-42"])
+    assert code == 0
+    assert recorded["conversation"] == "thread-42"
 
 
 def test_ask_json_output(tmp_path, monkeypatch):
     p = _write_cfg(tmp_path, monkeypatch)
 
-    def fake_ask(cfg, store, question, history=None, *, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
         return {"answer": "2 failed.", "role": "chat", "model": "m1",
                 "question": question}
 
@@ -73,7 +89,7 @@ def test_ask_max_runs_forwarded(tmp_path, monkeypatch):
     p = _write_cfg(tmp_path, monkeypatch)
     recorded = {}
 
-    def fake_ask(cfg, store, question, history=None, *, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
         recorded["max_runs"] = max_runs
         return {"answer": "ok", "role": "chat", "model": "m1", "question": question}
 
@@ -86,7 +102,7 @@ def test_ask_max_runs_forwarded(tmp_path, monkeypatch):
 def test_ask_chat_error_returns_2(tmp_path, monkeypatch):
     p = _write_cfg(tmp_path, monkeypatch)
 
-    def fake_ask(cfg, store, question, history=None, *, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
         raise chatbot.ChatError("DEEPINFRA_API_KEY is not set")
 
     monkeypatch.setattr(chatbot, "ask", fake_ask)
@@ -101,3 +117,10 @@ def test_ask_help_mentions_max_runs(capsys):
         main(["ask", "--help"])
     assert exc.value.code == 0
     assert "--max-runs" in capsys.readouterr().out
+
+
+def test_ask_help_mentions_conversation(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["ask", "--help"])
+    assert exc.value.code == 0
+    assert "--conversation" in capsys.readouterr().out

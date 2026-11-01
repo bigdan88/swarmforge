@@ -11,6 +11,7 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -2260,6 +2261,7 @@ def page_chat():
             history.clear()
             actions.clear()
             st.session_state.pop("chat_done", None)
+            st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
             _chat_save(actions, active_id)
         if needs and not history:
             st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. Press **Review my failed tasks**.")
@@ -2278,9 +2280,10 @@ def page_chat():
     chatbot.add_message(store, active_id, "user", prompt)
     with st.chat_message("user"):
         st.write(prompt)
+    conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
     try:
         with st.spinner("Thinking…"):
-            res = chatbot.ask(cfg, store, prompt, history=history[:-1])
+            res = chatbot.ask(cfg, store, prompt, history=history[:-1], conversation=conv)
     except chatbot.ChatError as e:
         st.error(f"Chatbot: {e}")
         _chat_save(actions, active_id)
@@ -2293,6 +2296,8 @@ def page_chat():
     with st.chat_message("assistant"):
         st.markdown(res["answer"])
         st.caption(f"answered by **{res['role']}** · `{res['model']}`")
+        st.caption(f"conversation {res.get('conversation', conv)} · "
+                   f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
         render_message_actions(len(history) - 1, actions.get(len(history) - 1))
 
 
