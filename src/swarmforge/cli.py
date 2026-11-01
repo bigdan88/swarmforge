@@ -338,7 +338,10 @@ def cmd_dashboard(args, cfg) -> int:
         threading.Timer(2.5, lambda: webbrowser.open(url)).start()
     return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
                             "--server.address", address, "--server.headless", "true", "--browser.gatherUsageStats", "false",
-                            "--client.toolbarMode", "minimal", "--theme.base", theme], env=env)
+                            "--client.toolbarMode", "minimal",
+                            # Streamlit only accepts light/dark here (anything else is read as a theme FILE);
+                            # "auto" = leave it unset so Streamlit follows the system setting
+                            *(["--theme.base", theme] if theme in ("light", "dark") else [])], env=env)
 
 
 def _lan_ips() -> list[str]:

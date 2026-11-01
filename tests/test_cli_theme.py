@@ -40,7 +40,7 @@ def test_dashboard_theme_default_auto(tmp_path, monkeypatch):
     rc = cmd_dashboard(_ns(), _cfg(tmp_path, monkeypatch))
     assert rc == 0
     cmd, env = calls[0]
-    assert cmd[cmd.index("--theme.base") + 1] == "auto"
+    assert "--theme.base" not in cmd    # "auto" must not be passed: Streamlit would look for a theme file "auto"
     assert env["SWARMFORGE_DASH_THEME"] == "auto"
     # existing flags preserved
     assert "--server.port" in cmd and cmd[cmd.index("--server.port") + 1] == "8501"
@@ -63,7 +63,7 @@ def test_dashboard_theme_missing_attr_defaults_auto(tmp_path, monkeypatch):
     rc = cmd_dashboard(ns, _cfg(tmp_path, monkeypatch))
     assert rc == 0
     cmd, env = calls[0]
-    assert cmd[cmd.index("--theme.base") + 1] == "auto"
+    assert "--theme.base" not in cmd
     assert env["SWARMFORGE_DASH_THEME"] == "auto"
 
 

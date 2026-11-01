@@ -156,7 +156,10 @@ def test_ac3_cmd_dashboard_forwards_theme_base_and_env(tmp_path, monkeypatch):
         ns = argparse.Namespace(port=8501, lan=False, no_browser=True, theme=theme)
         assert cmd_dashboard(ns, cfg) == 0
         cmd, env = calls[0]
-        assert "--theme.base" in cmd and cmd[cmd.index("--theme.base") + 1] == theme
+        if theme == "auto":   # Streamlit reads any other --theme.base value as a theme FILE path
+            assert "--theme.base" not in cmd
+        else:
+            assert "--theme.base" in cmd and cmd[cmd.index("--theme.base") + 1] == theme
         assert env["SWARMFORGE_DASH_THEME"] == theme
         # streamlit run of the dashboard app is preserved
         assert cmd[:4] == ["python", "-m", "streamlit", "run"] or cmd[1:4] == ["-m", "streamlit", "run"]
