@@ -40,6 +40,11 @@ Planning guidelines:
   the code it adds.
 - Assign each task a `role` from the available developer roles. Spread independent tasks across
   different roles.
+- Keep tasks ATOMIC: each task must touch at most 3 files (expected_files) and bundle at most 2-3
+  distinct UI widgets or feature groups (filters, buttons, panels, etc.). Large monolithic tasks make
+  agents time out with zero changes; if your work exceeds these limits, plan the split yourself into
+  2-3 smaller sub-tasks with sequential depends_on edges. The orchestrator deterministically
+  auto-splits any task that violates these limits into sub-tasks named <id>-1, <id>-2, ....
 - List issue-level acceptance criteria (ids AC1, AC2, ...) that cover everything the issue requests.
 When finished exploring, call `submit_plan` with the plan. If it is rejected, fix the listed problems.
 """
@@ -55,6 +60,7 @@ Guidelines:
 - Each task description must name the exact files and the concrete change required, and reference the
   failure/finding it resolves.
 - Use new task ids (e.g. F1, F2) and assign roles from the available developer roles.
+- Keep corrective tasks atomic too: at most 3 files and 2-3 distinct features per task.
 Call `submit_plan` with the corrective plan (acceptance_criteria may be an empty list).
 """
 
