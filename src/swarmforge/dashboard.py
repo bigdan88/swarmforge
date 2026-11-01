@@ -22,6 +22,87 @@ from swarmforge.config import ConfigError, load_config
 from swarmforge.db import Store
 from swarmforge.knowledge import NOTE_TYPES, Vault, WIKILINK_RE
 
+# --------------------------------------------------------------------- theme
+# Streamlit cannot change its base theme mid-session, so `swarmforge dashboard --theme` launches the
+# subprocess with a base theme and exports SWARMFORGE_DASH_THEME; the sidebar control below injects
+# the other palette as CSS on top of it and persists the user's choice under THEME_KEY in the kv store.
+THEME_KEY = "dash_theme"
+THEME_CHOICES = ("auto", "light", "dark")
+LAUNCH_THEME = os.environ.get("SWARMFORGE_DASH_THEME", "auto")  # set by `swarmforge dashboard --theme`
+
+DARK_CSS = """<style>
+/* Dark palette over Streamlit's base theme. Selectors target data-testids (stable across releases),
+   not internal CSS variable names, which shift between Streamlit versions. */
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+    background-color: #0e1117; color: #fafafa; }
+[data-testid="stSidebar"] { background-color: #16181d; }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #fafafa; }
+h1, h2, h3, h4, h5, h6, p, li, label, span { color: #fafafa; }
+[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
+    background-color: #262730; color: #fafafa; border-color: #444; }
+[data-testid="stCode"], pre, code { background-color: #1a1c22; color: #e6e6e6; }
+[data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"],
+[data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
+    background-color: #16181d; color: #fafafa; border-color: #33343d; }
+[data-testid="stButton"] button { color: #fafafa; }
+[data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
+    background-color: #262730; color: #fafafa; }
+[data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background-color: #ff4b4b; color: #ffffff; }
+a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
+/* status boxes keep their own light backgrounds when the base theme is light: dark text there */
+[data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] span,
+[data-testid="stNotification"] p { color: inherit; }
+</style>"""
+
+LIGHT_CSS = """<style>
+/* Native light palette pinned, so switching back from a dark launch base works too. */
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+    background-color: #ffffff; color: #31333f; }
+[data-testid="stSidebar"] { background-color: #f0f2f6; }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #31333f; }
+h1, h2, h3, h4, h5, h6, p, li, label, span { color: #31333f; }
+[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
+    background-color: #f8f9fa; color: #31333f; border-color: #d5d8e0; }
+[data-testid="stCode"], pre, code { background-color: #f0f2f6; color: #31333f; }
+[data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"],
+[data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
+    background-color: #ffffff; color: #31333f; border-color: #d5d8e0; }
+[data-testid="stButton"] button { color: #31333f; }
+[data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
+    background-color: #f0f2f6; color: #31333f; }
+[data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background-color: #ff4b4b; color: #ffffff; }
+a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
+</style>"""
+
+
+def theme_css(mode: str) -> str:
+    """CSS override for an explicit mode; "auto" follows the Streamlit base theme (no override)."""
+    if mode == "dark":
+        return DARK_CSS
+    if mode == "light":
+        return LIGHT_CSS
+    return ""
+
+
+def effective_theme(sel: str, launch: str) -> str:
+    """The palette actually shown: an explicit choice wins, "auto" follows what the CLI launched."""
+    return "dark" if sel == "dark" or (sel == "auto" and launch == "dark") else "light"
+
+
+def apply_chart_theme(mode: str) -> None:
+    """Match the Altair chart theme to the palette; an unknown theme name must never break the page."""
+    try:
+        alt.themes.enable("dark" if mode == "dark" else "vox")
+    except Exception:  # noqa: BLE001 - chart styling is decoration
+        pass
+
+
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
 STATE_COLORS = {"PENDING": "#d0d4dc", "RUNNING": "#4c8bf5", "SUCCEEDED": "#7cc47f", "INTEGRATED": "#2e9e5b",
                 "FAILED": "#e05252", "BLOCKED": "#f0a35e", "CANCELLED": "#999999"}
@@ -77,6 +158,17 @@ db_path = os.environ.get("SWARMFORGE_DB") or (str(cfg.db_path) if cfg else
                                               str(Path("~/.swarmforge/swarmforge.db").expanduser()))
 store = get_store(db_path)
 vault = Vault(cfg.vault_path) if cfg else None
+
+# theme: the persisted choice wins, else what `swarmforge dashboard --theme` launched with
+if "theme_mode" not in st.session_state:
+    saved = store.kv_get(THEME_KEY)
+    st.session_state["theme_mode"] = saved if saved in THEME_CHOICES else (
+        LAUNCH_THEME if LAUNCH_THEME in THEME_CHOICES else "auto")
+theme_mode = st.session_state.get("theme_mode") or LAUNCH_THEME
+apply_chart_theme(effective_theme(theme_mode, LAUNCH_THEME))
+css = theme_css(theme_mode)
+if css:  # injected before the sidebar so it covers every page and every rerun
+    st.markdown(css, unsafe_allow_html=True)
 
 
 HEAL_HELP = ("If the task fails, SwarmForge asks a model why, then automatically retries this many times, "
@@ -149,6 +241,14 @@ page = st.session_state.page
 pending_all = store.pending_approvals()
 
 
+def _theme_changed() -> None:
+    """Persist the sidebar Theme choice so it survives restarts and other browser sessions."""
+    value = st.session_state.get("theme_mode")
+    if value in THEME_CHOICES and value != store.kv_get(THEME_KEY):
+        store.kv_set(THEME_KEY, value)
+    st.rerun(scope="app")
+
+
 def _nav_badges() -> dict:
     out = {}
     try:
@@ -198,6 +298,9 @@ with st.sidebar:
     st.divider()
     auto = st.toggle("Live refresh (3 s)", value=os.environ.get("SWARMFORGE_DASH_AUTOREFRESH", "1") == "1",
                      help="Refreshes the Work list and the open task while something is running.")
+    st.segmented_control("Theme", list(THEME_CHOICES), key="theme_mode",
+                         default=LAUNCH_THEME if "theme_mode" not in st.session_state else None,
+                         on_change=_theme_changed, help="Dark mode for the whole dashboard")
     if cfg:
         with st.expander("Setup", icon=":material/settings:"):
             st.caption(f"Config: `{cfg.source_path}`")
