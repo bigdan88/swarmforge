@@ -78,3 +78,9 @@ class FakeProvider:
     @property
     def transport(self):
         return httpx.MockTransport(self)
+
+
+@pytest.fixture(autouse=True)
+def _no_update_check(monkeypatch):
+    """Dashboards rendered in tests must not contact GitHub to look for SwarmForge updates."""
+    monkeypatch.setenv("SWARMFORGE_DASH_UPDATE_CHECK", "0")

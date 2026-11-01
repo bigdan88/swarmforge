@@ -233,6 +233,23 @@ the way a human team does it:
 Time spent waiting doesn't count against a run's time limit. `serial` restores one run per repository;
 `parallel` skips all checks.
 
+## Pull requests page and Update & restart
+
+* **Pull requests** (dashboard page): every open PR on the GitHub repositories SwarmForge works on, with
+  its status (ready, draft, behind, conflicts), size, and "What the swarm did" for PRs a run opened.
+  Tick *I've reviewed these changes*, then **Merge** one or **Merge all ready** (oldest first; drafts
+  are marked ready, branches that are only behind main are updated first, PRs that conflict are
+  skipped). Choose squash / merge commit / rebase, and whether to delete the `swarmforge/*` branch.
+* **⬆️ Update & restart** (sidebar, shown when GitHub has new commits; checked every 5 minutes): pulls
+  the merged work into your SwarmForge checkout, installs new Python dependencies if `pyproject.toml`
+  changed, restarts the dashboard with the same options (the page reconnects by itself), and restarts
+  the queue worker as soon as its running tasks finish. It refuses, without changing anything, if you
+  have uncommitted edits or your own commits conflict. If the sandbox Dockerfiles changed it tells you
+  to rebuild the images. After merging PRs on SwarmForge itself, the Pull requests page offers the same
+  button. From a terminal: `swarmforge update`.
+* After a restart the dashboard runs in the background (no terminal window). Its log is in
+  `<workdir>/logs/dashboard-restart.log`; stop it with the `Stop-Process` one-liner or by restarting your PC.
+
 ## Speed
 
 Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.

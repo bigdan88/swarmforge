@@ -40,6 +40,7 @@ def _write_cfg(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_KEY", "test-key")
     monkeypatch.setenv("SWARMFORGE_CONFIG", str(p))
     monkeypatch.setenv("SWARMFORGE_DASH_AUTOREFRESH", "0")
+    monkeypatch.setenv("SWARMFORGE_DASH_UPDATE_CHECK", "0")
     monkeypatch.delenv("SWARMFORGE_DB", raising=False)
     return load_config(str(p))
 

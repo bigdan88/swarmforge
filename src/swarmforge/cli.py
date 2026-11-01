@@ -318,7 +318,8 @@ def cmd_dashboard(args, cfg) -> int:
         return 2
     theme = getattr(args, "theme", "auto")
     env = dict(os.environ, SWARMFORGE_DB=str(cfg.db_path), SWARMFORGE_CONFIG=str(cfg.source_path),
-               SWARMFORGE_DASH_THEME=theme)
+               SWARMFORGE_DASH_THEME=theme,
+               SWARMFORGE_DASH_ARGS=json.dumps({"port": args.port, "lan": bool(args.lan), "theme": theme}))
     url = f"http://localhost:{args.port}"
     address = "127.0.0.1"
     if args.lan:
@@ -578,6 +579,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--theme", choices=["auto", "light", "dark"], default="auto",
                    help="dashboard color theme; 'dark' = dark mode (you can also switch live from the sidebar)")
     s.set_defaults(fn=cmd_dashboard)
+    s = sub.add_parser("update", help="pull the latest SwarmForge code (merged PRs) and restart the queue worker")
+    s.set_defaults(fn=cmd_update)
+    s = sub.add_parser("restart-dashboard", help=argparse.SUPPRESS)
+    s.add_argument("--pid", type=int, required=True)
+    s.add_argument("--args", default="{}")
+    s.set_defaults(fn=cmd_restart_dashboard)
 
     s = sub.add_parser("check", help="validate config, tools and provider connectivity")
     s.add_argument("--live", action="store_true", help="also send a tiny tool-calling request to each role's model")
@@ -760,6 +767,32 @@ def cmd_variants(args, cfg) -> int:
               "Restart the dashboard and queue worker to apply it.")
         return 0
     return 2
+
+
+def cmd_update(args, cfg) -> int:
+    from . import selfupdate as su
+    try:
+        res = su.update()
+    except su.UpdateError as e:
+        print(f"not updated: {e}")
+        return 1
+    print(res["message"])
+    for c in res["commits"][:30]:
+        print(f"  {c}")
+    if res.get("deps"):
+        print(f"dependencies: {res['deps']}")
+    if res["images_stale"]:
+        print("the sandbox images changed: run `swarmforge sandbox build` and `swarmforge sandbox build --dev`")
+    if res["behind"]:
+        print(su.request_worker_restart(_store(cfg)))
+        print("Restart the dashboard to use the new code (or use the dashboard's Update & restart button).")
+    return 0
+
+
+def cmd_restart_dashboard(args, cfg) -> int:
+    from . import selfupdate as su
+    return 0 if su.run_restart(str(cfg.source_path) if cfg.source_path else None, args.pid,
+                               json.loads(args.args or "{}")) else 1
 
 
 def main(argv: list[str] | None = None) -> int:

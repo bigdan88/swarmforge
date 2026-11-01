@@ -31,6 +31,7 @@ WORKER_KEY = "queue_worker_pid"
 PAUSED_KEY = "queue_paused"
 POLICY_KEY = "queue_on_failure"  # "stop" | "continue"
 LANE_PAUSED = "queue_paused:{}"   # per queue ("pile")
+RESTART_KEY = "queue_worker_restart"   # set by the dashboard's "Update & restart"
 DEFAULT_QUEUE = "main"
 
 
@@ -249,7 +250,16 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                     if echo:
                         echo(f"queue[{name}] paused because #{item['id']} did not complete (policy: stop on failure)")
             paused = store.kv_get(PAUSED_KEY) == "1"
-            can_start = not paused and (max_items is None or started < max_items)
+            restart = store.kv_get(RESTART_KEY) == "1"      # new code was installed: finish, then restart
+            if restart and not running:
+                store.kv_set(RESTART_KEY, None)
+                store.kv_set(WORKER_KEY, None)
+                if echo:
+                    echo("queue worker restarting with the updated code")
+                if any(i["status"] == "queued" for i in store.queue_items(include_finished=False)):
+                    start_worker(cfg, store, keep_pause=True)
+                break
+            can_start = not paused and not restart and (max_items is None or started < max_items)
             startable = []
             if can_start:
                 seen = set(running)
@@ -269,6 +279,8 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                         cfg, store, item, echo=echo, llm_transport=llm_transport, sandbox=sandbox)))
                     started += 1
             if not running:
+                if restart:
+                    continue
                 if paused and echo:
                     echo("queue paused")
                 if paused or not startable or (max_items is not None and started >= max_items):
@@ -284,14 +296,15 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
     return done
 
 
-def start_worker(cfg: Config, store: Store) -> int | None:
+def start_worker(cfg: Config, store: Store, keep_pause: bool = False) -> int | None:
     """Start the background worker process (no-op if one is running). Returns its pid."""
     import subprocess
     import sys
     pid = worker_pid(store)
     if pid:
         return pid
-    store.kv_set(PAUSED_KEY, "0")
+    if not keep_pause:
+        store.kv_set(PAUSED_KEY, "0")
     logs = cfg.workdir / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     log = open(logs / "queue-worker.log", "a", encoding="utf-8")

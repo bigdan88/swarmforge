@@ -228,10 +228,11 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "New task", "Failures", "Chat", "Knowledge", "Benchmarks", "Settings"]
+PAGES = ["Work", "Pull requests", "New task", "Failures", "Chat", "Knowledge", "Benchmarks", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
             "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
 NAV_ICON["Settings"] = ":material/settings:"
+NAV_ICON["Pull requests"] = ":material/merge:"
 SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
@@ -264,6 +265,78 @@ def _nav_badges() -> dict:
     except Exception:  # noqa: BLE001 - badges are decoration
         pass
     return out
+
+
+# ------------------------------------------------------------ self-update
+def _update_status(force: bool = False) -> dict:
+    from swarmforge import selfupdate as su
+    if os.environ.get("SWARMFORGE_DASH_UPDATE_CHECK", "1") == "0":
+        return {"ok": False}
+    cache = st.session_state.get("upd_status")
+    if force or not cache or time.time() - cache["t"] > 300:   # check GitHub at most every 5 minutes
+        try:
+            s = su.status(fetch=True)
+        except Exception as e:  # noqa: BLE001
+            s = {"ok": False, "error": str(e)}
+        cache = {"t": time.time(), "s": s}
+        st.session_state.upd_status = cache
+    return cache["s"]
+
+
+def do_update_and_restart() -> None:
+    """Pull the latest SwarmForge code, restart the queue worker when it's free, restart this dashboard."""
+    from swarmforge import selfupdate as su
+    with st.status("Updating SwarmForge…", expanded=True) as box:
+        try:
+            res = su.update()
+        except su.UpdateError as e:
+            box.update(label="Not updated", state="error")
+            st.error(str(e))
+            return
+        st.write(res["message"])
+        for c in res["commits"][:15]:
+            st.caption(c)
+        if res.get("deps"):
+            st.write(f"Python packages: {res['deps']}")
+        if res["images_stale"]:
+            st.warning("The sandbox images changed. In a terminal run `swarmforge sandbox build` and "
+                       "`swarmforge sandbox build --dev` before the next run.")
+        st.write(su.request_worker_restart(store))
+        if not res["behind"]:
+            box.update(label="Already up to date", state="complete")
+            st.session_state.upd_status = None
+            return
+        su.restart_dashboard(str(cfg.source_path) if cfg and cfg.source_path else None,
+                             (cfg.workdir if cfg else Path.home() / ".swarmforge") / "logs")
+        box.update(label="Updated — restarting the dashboard…", state="complete")
+    st.success("The dashboard is restarting with the new code. This page reconnects by itself in about "
+               "10–20 seconds (refresh it if it doesn't).")
+    st.stop()
+
+
+def update_box() -> None:
+    s = _update_status()
+    if not s.get("ok"):
+        return
+    if s.get("behind"):
+        st.info(f"⬆️ **{s['behind']} update(s) available** from GitHub")
+        with st.expander("What's new"):
+            for c in s.get("incoming", [])[:20]:
+                st.caption(c)
+        if s.get("dirty"):
+            st.caption("⚠️ You have uncommitted changes in: " + ", ".join(s["dirty"][:5])
+                       + ". Commit them first, or the update stops (nothing is lost).")
+        if st.button("⬆️ Update & restart", type="primary", key="upd_go", width="stretch",
+                     help="Pulls the merged work from GitHub, restarts the dashboard, and restarts the queue "
+                          "worker as soon as its running tasks finish."):
+            do_update_and_restart()
+    else:
+        c1, c2 = st.columns([3, 1])
+        c1.caption(f"✅ Up to date ({s.get('head')})" + (f" · {s['ahead']} local commit(s) not on GitHub"
+                                                        if s.get("ahead") else ""))
+        if c2.button("↻", key="upd_check", help="Check GitHub for updates now"):
+            _update_status(force=True)
+            st.rerun()
 
 
 st.markdown(f"""<style>
@@ -301,6 +374,7 @@ with st.sidebar:
     st.segmented_control("Theme", list(THEME_CHOICES), key="theme_mode",
                          default=LAUNCH_THEME if "theme_mode" not in st.session_state else None,
                          on_change=_theme_changed, help="Dark mode for the whole dashboard")
+    update_box()
     if cfg:
         with st.expander("Setup", icon=":material/settings:"):
             st.caption(f"Config: `{cfg.source_path}`")
@@ -1950,6 +2024,119 @@ def page_benchmarks():
         st.dataframe(df.astype(str), width="stretch")
 
 
+# ======================================================== PULL REQUESTS page
+def page_prs():
+    from swarmforge import prs as P
+    from swarmforge import selfupdate as su
+    from swarmforge.github import GitHubClient, GitHubError
+    st.header("Pull requests")
+    if not cfg:
+        st.error("Configuration not loaded.")
+        return
+    gh = GitHubClient(cfg.github)
+    if not gh.token:
+        st.warning(f"No GitHub token: add `{cfg.github.token_env}=...` to `.env` (or run `gh auth login`) and "
+                   "restart the dashboard. Merging needs Contents + Pull requests: write.")
+    repos = P.known_repos(cfg, store)
+    if not repos:
+        st.info("No GitHub repositories yet: pull requests appear here once a run opens one.")
+        return
+    c1, c2, c3 = st.columns([3, 2, 1])
+    chosen = c1.multiselect("Repositories", repos, default=repos, key="pr_repos")
+    method = c2.selectbox("How to merge", ["squash", "merge", "rebase"], key="pr_method",
+                          format_func={"squash": "Squash (one commit per PR)", "merge": "Merge commit",
+                                       "rebase": "Rebase"}.get)
+    if c3.button("🔄 Refresh", key="pr_refresh"):
+        st.session_state.pop("pr_cache", None)
+    delete = st.checkbox("Delete the swarmforge/* branch after merging", value=True, key="pr_delete")
+    cache = st.session_state.get("pr_cache")
+    if not cache or time.time() - cache["t"] > 60 or cache["repos"] != chosen:
+        data, errors = {}, {}
+        with st.spinner("Loading pull requests from GitHub…"):
+            for repo in chosen:
+                try:
+                    data[repo] = P.list_prs(gh, repo, store)
+                except (GitHubError, Exception) as e:  # noqa: BLE001
+                    errors[repo] = str(e)
+        cache = {"t": time.time(), "repos": chosen, "data": data, "errors": errors}
+        st.session_state.pr_cache = cache
+    for repo, err in cache["errors"].items():
+        st.warning(f"{repo}: {err}")
+    all_prs = [pr for prs in cache["data"].values() for pr in prs]
+    flash = st.session_state.pop("pr_flash", None)
+    if flash:
+        for ok, msg in flash["results"]:
+            (st.success if ok else st.error)(msg)
+        own = su.own_repo()
+        if own and any(ok and own.lower() in msg.lower() for ok, msg in flash["results"]):
+            with st.container(border=True):
+                st.markdown("**You merged changes to SwarmForge itself.** Update now to start using them.")
+                if st.button("⬆️ Update & restart SwarmForge now", type="primary", key="pr_update"):
+                    st.session_state.upd_status = None
+                    do_update_and_restart()
+    if not all_prs:
+        st.success("No open pull requests. 🎉")
+        return
+    ready = [pr for pr in all_prs if pr.ready]
+    with st.container(border=True):
+        a, b = st.columns([3, 2])
+        a.markdown(f"**{len(all_prs)} open** · **{len(ready)} ready to merge** · "
+                   f"{sum(1 for p in all_prs if p.state == 'dirty')} with conflicts")
+        sure = a.checkbox("I've reviewed these changes", key="pr_sure",
+                          help="Merging changes the main branch on GitHub. Draft PRs are marked ready first.")
+        if b.button(f"Merge all ready ({len(ready)})", type="primary", disabled=not ready or not sure,
+                    key="pr_merge_all", width="stretch"):
+            with st.spinner("Merging, oldest first…"):
+                res = P.merge_all(gh, ready, method, delete)
+            st.session_state.pr_flash = {"results": [
+                (ok, f"{pr.repo} #{pr.number} {pr.title}: {msg}") for pr, ok, msg in res]}
+            st.session_state.pop("pr_cache", None)
+            st.session_state.upd_status = None
+            st.rerun()
+    for repo, prs in cache["data"].items():
+        if not prs:
+            continue
+        st.subheader(repo)
+        for pr in prs:
+            icon, text = pr.label
+            with st.container(border=True):
+                h1, h2 = st.columns([5, 2])
+                h1.markdown(f"**[#{pr.number} {pr.title}]({pr.url})**  \n"
+                            f"`{pr.head}` → `{pr.base}` · by {pr.author} · {pr.created_at[:10]} · "
+                            f"+{pr.additions} −{pr.deletions} in {pr.changed_files} file(s)")
+                h2.markdown(f"{icon} {text}")
+                b1, b2, b3 = st.columns([1.2, 1.4, 3])
+                if b1.button("Merge", key=f"pr_m_{repo}_{pr.number}", type="primary", disabled=not pr.ready or not sure,
+                             help="Tick “I've reviewed these changes” above first." if not sure else None):
+                    try:
+                        P.merge(gh, pr, method, delete)
+                        st.session_state.pr_flash = {"results": [(True, f"{repo} #{pr.number} {pr.title}: merged")]}
+                    except GitHubError as e:
+                        st.session_state.pr_flash = {"results": [(False, str(e))]}
+                    st.session_state.pop("pr_cache", None)
+                    st.session_state.upd_status = None
+                    st.rerun()
+                if pr.state == "behind" and b2.button("↻ Update branch", key=f"pr_u_{repo}_{pr.number}",
+                                                      help="Merge the latest main into this PR (no conflicts)."):
+                    try:
+                        P.update_branch(gh, pr)
+                        st.session_state.pr_flash = {"results": [(True, f"#{pr.number}: branch updated")]}
+                    except GitHubError as e:
+                        st.session_state.pr_flash = {"results": [(False, str(e))]}
+                    st.session_state.pop("pr_cache", None)
+                    st.rerun()
+                if pr.state == "dirty":
+                    b2.caption("Resolve on GitHub, or restart its task so it rebuilds on the latest main.")
+                if pr.run_id:
+                    with b3.expander("What the swarm did"):
+                        try:
+                            from swarmforge.report import build_summary
+                            st.markdown(build_summary(store, pr.run_id).split("### What you need to do")[0])
+                        except Exception as e:  # noqa: BLE001
+                            st.caption(f"summary unavailable: {e}")
+                        open_run_button("Open the run", pr.run_id, key=f"pr_o_{repo}_{pr.number}")
+
+
 # =========================================================== SETTINGS page
 def page_settings():
     st.caption("Edit swarmforge.yaml, run health checks and test models.")
@@ -1957,5 +2144,5 @@ def page_settings():
     settings.render(cfg)
 
 
-{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Chat": page_chat,
+{"Work": page_work, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Chat": page_chat,
  "Knowledge": page_knowledge, "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()
