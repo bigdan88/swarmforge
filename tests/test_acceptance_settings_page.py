@@ -2,9 +2,12 @@
 
 Complements tests/test_settings_page.py with coverage of the remaining acceptance-criteria
 details: full canonical health-row set + GitHub /user validity (AC1), the Test models helper
-capping busy_wait_s and rendering fail/cost-unavailable rows (AC4), and the Models/Limits
-editing behaviour: selectbox populated from provider_models when reachable, free text when
-not, and temperature/max_steps/limits edits actually persisted on save (AC5)."""
+capping busy_wait_s, rendering fail/cost-unavailable rows, sending the identical tiny request
+as checks.run_checks(live=True) and the Re-check button re-running the checks (AC4), the
+provider name + env var + set/MISSING indicator (AC3), and the Models/Limits editing
+behaviour: selectbox populated from provider_models when reachable with accept_new_options
+(free text), free text when unreachable, and temperature/max_steps/limits edits actually
+persisted on save (AC5)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -38,9 +41,11 @@ def _write_cfg(tmp_path, monkeypatch) -> Path:
     return p
 
 
-def _open_settings(tmp_path, monkeypatch, **patches):
+def _open_settings(tmp_path, monkeypatch, *, unset_key: bool = False, **patches):
     """Write the config, patch every network/subprocess helper, open the Settings page."""
     p = _write_cfg(tmp_path, monkeypatch)
+    if unset_key:
+        monkeypatch.delenv("FAKE_KEY", raising=False)
     monkeypatch.setattr(welcome, "health_checks", lambda cfg: [])
     defaults = {
         "get_health_checks": lambda cfg: [],
@@ -231,3 +236,102 @@ def test_save_persists_model_temp_steps_and_limits(tmp_path, monkeypatch):
     text = " ".join(str(m.value) for m in at.markdown)
     assert "sentinel-secret-xyz" not in text
     assert "sentinel-secret-xyz" not in p.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------ AC3
+def test_api_key_row_shows_set_indicator_not_the_value(tmp_path, monkeypatch):
+    """AC3: a provider row shows provider name + env var name + 'set' — never the value."""
+    _, at = _open_settings(tmp_path, monkeypatch)
+    md = " ".join(m.value for m in at.markdown)
+    assert "Provider **fake**" in md
+    assert "FAKE_KEY" in md
+    assert "set ✅" in md
+    assert "MISSING" not in md  # the key IS set in this scenario
+    assert "sentinel-secret-xyz" not in md
+
+
+def test_api_key_row_shows_missing_when_env_unset(tmp_path, monkeypatch):
+    """AC3: with the env var unset the row flips to the not-set indicator."""
+    _, at = _open_settings(tmp_path, monkeypatch, unset_key=True)
+    md = " ".join(m.value for m in at.markdown)
+    assert "FAKE_KEY" in md
+    assert "MISSING ❌" in md
+
+
+# ------------------------------------------------------------------ AC4
+def test_recheck_button_reruns_health_checks(tmp_path, monkeypatch):
+    """AC4: 'Re-check' re-runs the health checks (get_health_checks called again)."""
+    calls: list[int] = []
+
+    def counting(cfg):
+        calls.append(1)
+        return []
+
+    _, at = _open_settings(tmp_path, monkeypatch, get_health_checks=counting)
+    before = len(calls)
+    assert before >= 1
+    next(b for b in at.button if b.label == "Re-check").click()
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(calls) > before, "Re-check must re-run the environment/GitHub checks"
+
+
+def test_test_models_sends_the_same_request_as_checks_live(tmp_path, monkeypatch):
+    """AC4: settings.test_models sends the identical tiny tool-calling request per role as
+    checks.run_checks(live=True): same system/user messages and same tool definition."""
+    import asyncio
+    import copy as _copy
+    from types import SimpleNamespace
+
+    from swarmforge import checks, llm
+
+    captured: dict[str, list] = {"settings": [], "checks": []}
+
+    def make_fake(bucket: list):
+        class FakeLLM:
+            def __init__(self, config, budget=None, max_retries=None, busy_wait_s=None, **kw):
+                bucket.append({"init_busy_wait_s": busy_wait_s})
+
+            async def chat(self, role, messages, tools=None, **kw):
+                bucket.append({"role": role, "messages": _copy.deepcopy(messages),
+                               "tools": _copy.deepcopy(tools)})
+                return SimpleNamespace(
+                    tool_calls=[{"function": {"name": "report_status",
+                                              "arguments": '{"status": "ready"}'}}],
+                    content="", usage=SimpleNamespace(total_tokens=7, cost_usd=0.0,
+                                                      cost_source="test"))
+        return FakeLLM
+
+    # settings.test_models imports LLMClient from swarmforge.llm at call time;
+    # checks.py holds a module-level reference — patch both namespaces.
+    monkeypatch.setattr(llm, "LLMClient", make_fake(captured["settings"]))
+    monkeypatch.setattr(checks, "LLMClient", make_fake(captured["checks"]))
+    monkeypatch.setattr(checks, "get_token", lambda gh_cfg: None)  # no network in run_checks
+    monkeypatch.setenv("FAKE_KEY", "test-key")
+    cfg = parse_config(base_raw(tmp_path / "work"))
+
+    rows = settings.test_models(cfg, roles=["planner", "reviewer"])
+    assert [r["role"] for r in rows] == ["planner", "reviewer"]
+    assert all(r["ok"] for r in rows)
+
+    asyncio.run(checks.run_checks(cfg, live=True, roles=["planner", "reviewer"]))
+
+    req_settings = [c for c in captured["settings"] if "messages" in c]
+    req_checks = [c for c in captured["checks"] if "messages" in c]
+    assert req_settings and len(req_settings) == len(req_checks) == 2
+    assert req_settings == req_checks, (
+        "test_models must send the same tiny tool-calling request as run_checks(live=True)")
+    # busy_wait_s capped in the live test (checks.run_checks uses the client default)
+    init = next(c for c in captured["settings"] if "init_busy_wait_s" in c)
+    assert init["init_busy_wait_s"] is not None and init["init_busy_wait_s"] <= 5.0
+
+
+# ------------------------------------------------------------------ AC5
+def test_model_selectbox_accepts_new_options_when_reachable(tmp_path, monkeypatch):
+    """AC5: with a reachable provider the model selectbox is populated from provider_models
+    AND accepts free text (accept_new_options=True)."""
+    _, at = _open_settings(tmp_path, monkeypatch, provider_models=lambda cfg, name: MODELS)
+    for role in ("planner", "developer_backend", "developer_frontend", "reviewer", "tester"):
+        sb = at.selectbox(key=f"set_model_{role}")
+        assert list(sb.options) == MODELS
+        assert sb.proto.accept_new_options is True, role
