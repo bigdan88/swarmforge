@@ -117,6 +117,17 @@ Developers, the conflict resolver and the test engineer get, besides files and `
 | `start_process` / `read_process_output` / `stop_process` | Run a server or app in the background (e.g. `streamlit run app.py --server.headless true --server.port 8501`), wait until a port or log line says it's ready, read its output, stop it. |
 | `browse` | Open `http://localhost:<port>` in headless Chromium: visible text, errors shown on the page (Streamlit exceptions, tracebacks, `role=alert`), uncaught JS errors, console errors, failed requests and the clickable elements. Optional actions (click, fill, press, select, wait) run first; optional screenshot to the run's artifacts. Local URLs only. |
 | `check_code` | `ruff` + `mypy` on the changed files (or given paths), returned as `file:line:col code message`. Respects the project's own ruff/mypy config. |
+| `run_tests` | Runs the project's test command with pytest JUnit output and returns a structured summary: pass/fail counts, then each failure's node id, assertion message and the last ~15 traceback lines. Optional paths, `-k` keyword and `--lf`. |
+| `outline` | Lists a file's structure with line numbers: classes, functions and methods with signatures (Python, via `ast`), Markdown headings, or the top-level keys of JSON/YAML. |
+| `find_symbol` | Finds where a function, class or variable is defined and every reference to it across the repo's Python files (real `ast` analysis, so strings/comments containing the name are not reported) as `file:line` plus the source line. |
+| `git_changes` | Read-only diff of the agent's worktree against the run's base commit: files changed (including untracked), then the diff, capped in size. |
+| `git_history` | Read-only `git log` for one file (hash, date, subject), optionally `git blame` for a line range. |
+| `http_request` | Sends a request to a local app started with `start_process` (localhost/127.0.0.1 only, like `browse`) and returns the status, headers and a truncated body (pretty-printed when JSON). |
+| `format_code` | Runs `ruff format` on the given files, or by default on the Python files the agent changed, and reports which files were reformatted. |
+| `list_packages` | Lists the packages installed in the sandbox with versions, or checks whether one module is importable and from where. |
+
+The reviewer and the planner additionally get the read-only subset `outline`, `find_symbol`,
+`git_changes` and `git_history` (no execution, HTTP or formatting tools).
 
 They run where `run_command` runs, with the same isolation: in Docker, one long-lived session
 container per agent (no network, read-only root, dropped capabilities), which is killed with every

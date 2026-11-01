@@ -24,6 +24,9 @@ precise implementation plan as a dependency graph of small tasks for developer a
 
 Planning guidelines:
 - Explore first: read the README, the package layout, the modules you will change and existing tests.
+  The read-only inspection tools speed this up: outline (a file's classes/functions with line
+  numbers), find_symbol (definitions and references across the repo), git_changes (diff of the
+  worktree against the run's base commit) and git_history (read-only log/blame for a file).
 - Prefer 2-4 tasks; never split work that touches the same file across tasks. Each task should be a
   meaningful chunk one developer completes in one focused session (typically 1-3 source files plus
   their tests). Every extra task costs a hand-off, a merge and a cold start, so fewer, larger tasks
@@ -79,6 +82,22 @@ Developer tools (use them like a human engineer would):
   errors shown on the page, JS/console errors, and clickable elements; actions can click and type.
   For any UI or web change, start the app and browse the pages you changed before finishing; a page
   that shows an exception or traceback is a failed change. Only local URLs work (no internet).
+- run_tests: run the project's tests and get structured feedback (counts, then each failure's node
+  id, assertion message and last traceback lines). Prefer it over raw run_command pytest output.
+- outline: the classes, functions and methods of a file with signatures and line numbers (Markdown
+  headings / top-level JSON or YAML keys too). Call it before reading a whole file top to bottom.
+- find_symbol: find where a function, class or variable is defined and every reference to it across
+  the repo's Python files (ast-based, so strings/comments containing the name are not reported).
+- git_changes: the diff of your worktree against the run's base commit (files changed, then the
+  diff). Use it to review your own work before calling `finish`.
+- git_history: read-only git log for a file (hash, date, subject), optionally git blame for a line
+  range. Use it to understand why code looks the way it does before changing it.
+- http_request: call a LOCAL app you started with start_process (localhost/127.0.0.1 only, like
+  browse) and get the status, headers and body (pretty-printed when JSON) - test your API endpoints.
+- format_code: ruff format the files you changed (or the given paths) and report which files were
+  reformatted. Run it before `finish`, then re-run check_code if needed.
+- list_packages: list the packages installed in the sandbox with versions, or check whether one
+  module is importable and from where. Use it instead of guessing what is available.
 """
 
 PI_NOTE = """
@@ -152,6 +171,9 @@ Severity guide:
 Be concrete: give the file, the line when possible, what is wrong, and an actionable recommendation.
 Do not invent problems; verify by reading the code with the tools. Do not report formatting nitpicks
 as major. Use verdict "approve" only if there are no critical or major findings.
+You may also use the read-only inspection tools - outline (a file's structure with line numbers),
+find_symbol (definitions and references across the repo), git_changes (diff against the run's base
+commit) and git_history (log/blame for a file) - to inspect the repository; they cannot change it.
 Call `submit_review` with your structured review.
 """
 
@@ -177,6 +199,11 @@ How to work:
 For web/UI criteria you may also start the app with start_process and check it with browse; report
 anything broken you see there as a defect with the URL and the error text. Automated tests remain the
 evidence: a criterion is only verified by a pytest test.
+Tools that help you here: run_tests for structured pytest feedback (counts, node ids, assertion
+messages, tracebacks) instead of raw run_command output; find_symbol to locate definitions and
+references before writing tests; git_changes and git_history (read-only) to see what the developers
+changed and why; http_request to exercise a local API you started with start_process; format_code to
+keep your test files ruff-formatted; list_packages to see what is installed in the sandbox.
 """
 
 
