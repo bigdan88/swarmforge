@@ -51,7 +51,11 @@ def test_preflight_local_messages(tmp_path):
     assert preflight(normalize_repo(str(plain))).local
 
 
-def test_preflight_remote_empty_and_branch_resolution(tmp_path):
+def test_preflight_remote_empty_and_branch_resolution(tmp_path, monkeypatch):
+    # Run from a neutral cwd: `preflight` shells out to `git ls-remote` without an explicit
+    # cwd, so a broken .git pointer in the pytest invocation directory (as in CI worktree
+    # checkouts) would otherwise fail every remote check before git even reaches the URL.
+    monkeypatch.chdir(tmp_path)
     bare = tmp_path / "remote.git"
     _git(tmp_path, "init", "-q", "--bare", str(bare))
     url = bare.resolve().as_uri()
@@ -75,6 +79,7 @@ def test_preflight_remote_empty_and_branch_resolution(tmp_path):
 
 def test_public_repo_works_with_a_bad_token(tmp_path, monkeypatch):
     # A stale token must not break anonymous access (file:// stands in for a public remote).
+    monkeypatch.chdir(tmp_path)  # neutral cwd, see test_preflight_remote_empty_and_branch_resolution
     bare = tmp_path / "pub.git"
     _git(tmp_path, "init", "-q", "--bare", str(bare))
     work = tmp_path / "w"
