@@ -485,8 +485,7 @@ async def format_code(ctx: ToolContext, paths: list[str] | None = None) -> str:
     quoted = " ".join(shlex.quote(t) for t in targets)
     py = _py(ctx)
     probe = await _exec(ctx, f"{py} -m ruff --version", 60)
-    if probe.exit_code != 0 or "No module named" in probe.output or "command not found" in probe.output \
-            or probe.exit_code == 127:
+    if probe.exit_code != 0 or "No module named" in probe.output or "command not found" in probe.output:
         raise ToolError("ruff is not available in this sandbox. Rebuild the image with "
                         "`swarmforge sandbox build`, or in local mode run `pip install -e \".[tools]\"`.")
     check = await _exec(ctx, f"{py} -m ruff format --check {quoted}", 120)
