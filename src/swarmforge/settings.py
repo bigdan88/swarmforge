@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -191,12 +192,183 @@ def validate_for_save(raw: dict, path) -> list[str]:
         return [str(e)]
 
 
+_KEY_LINE_RE = re.compile(r"^(\s*)(\S[^:#]*?)\s*:(\s.*)?$")
+
+
+def _serialize_scalar(value) -> str | None:
+    """Serialize a scalar to a single-line YAML value, or None if it cannot be done."""
+    text = yaml.safe_dump(value, default_flow_style=False)
+    lines = [ln for ln in text.splitlines() if ln != "..."]
+    if len(lines) != 1:
+        return None
+    return lines[0]
+
+
+def _split_trailing_comment(value_part: str) -> tuple[str, str]:
+    """Split `' # comment'` off a value part, ignoring '#' inside quoted strings."""
+    idx = value_part.find(" #")
+    while idx != -1:
+        before = value_part[:idx]
+        if before.count('"') % 2 == 0 and before.count("'") % 2 == 0:
+            return before, value_part[idx:]
+        idx = value_part.find(" #", idx + 1)
+    return value_part, ""
+
+
+def _changed_scalar_paths(old, new, prefix=()):
+    """Leaf paths whose value differs between old and new (dicts descended into).
+
+    Returns a list of (path, new_value) or None when a change involves a container
+    (dict/list) on either side, or a key removal — callers fall back to a full dump.
+    """
+    changes: list[tuple[tuple, object]] = []
+    for key, value in new.items():
+        if isinstance(value, dict):
+            sub = old.get(key)
+            if not isinstance(sub, dict):
+                return None
+            sub_changes = _changed_scalar_paths(sub, value, prefix + (key,))
+            if sub_changes is None:
+                return None
+            changes.extend(sub_changes)
+        elif isinstance(value, (list, tuple)):
+            if old.get(key) != value:
+                return None  # changed container: fall back
+        else:
+            if old.get(key) != value:
+                changes.append((prefix + (key,), value))
+    for key in old:
+        if key not in new:
+            return None
+    return changes
+
+
+def _parse_key_lines(lines: list[str]) -> dict:
+    """Map key-path tuples to {'line', 'indent', 'value'} using an indent stack."""
+    parsed: dict[tuple, dict] = {}
+    stack: list[tuple[int, tuple]] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = _KEY_LINE_RE.match(line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = (stack[-1][1] + (m.group(2),)) if stack else (m.group(2),)
+        parsed[path] = {"line": i, "indent": indent, "value": m.group(3) or ""}
+        stack.append((indent, path))
+    return parsed
+
+
+def _block_extents(parsed: dict) -> dict:
+    extents = {path: info["line"] for path, info in parsed.items()}
+    for path, info in parsed.items():
+        for depth in range(1, len(path)):
+            ancestor = path[:depth]
+            if ancestor in extents:
+                extents[ancestor] = max(extents[ancestor], info["line"])
+    return extents
+
+
+def patch_config_text(original_text: str, old: dict, new: dict) -> str | None:
+    """Return original_text with only the changed scalar values edited.
+
+    Preserves comments, blank lines, indentation style and key order. Returns None
+    when the layout cannot be matched (or a change involves containers); the caller
+    then falls back to a full yaml.safe_dump.
+    """
+    try:
+        lines = original_text.splitlines()
+        # Whole top-level dict sections missing from the original are appended at the end.
+        section_inserts: dict[tuple, dict] = {}
+        for key, value in new.items():
+            if isinstance(value, dict):
+                if key not in old or old[key] is None:
+                    section_inserts[(key,)] = value
+                elif not isinstance(old[key], dict):
+                    return None
+        walk_new = {k: v for k, v in new.items() if (k,) not in section_inserts}
+        walk_old = {k: v for k, v in old.items() if (k,) not in section_inserts}
+        changes = _changed_scalar_paths(walk_old, walk_new)
+        if changes is None:
+            return None
+
+        parsed = _parse_key_lines(lines)
+        replacements = [(p, v) for p, v in changes if p in parsed]
+        insertions = [(p, v) for p, v in changes if p not in parsed]
+
+        # In-place value replacements keep line numbers valid.
+        for path, value in replacements:
+            info = parsed[path]
+            m = _KEY_LINE_RE.match(lines[info["line"]])
+            if m is None:
+                return None
+            value_part = m.group(3) or ""
+            if value_part.strip().startswith(("|", ">")):
+                return None  # block scalar: cannot patch in place safely
+            _body, comment = _split_trailing_comment(value_part)
+            serialized = _serialize_scalar(value)
+            if serialized is None:
+                return None
+            lines[info["line"]] = (m.group(1) + m.group(2) + ": " + serialized
+                                    + ((" " + comment) if comment else ""))
+
+        # Insertions shift line numbers: re-parse between each one.
+        for path, value in insertions:
+            parsed = _parse_key_lines(lines)
+            extents = _block_extents(parsed)
+            parent = path[:-1]
+            key = path[-1]
+            if parent not in parsed:
+                return None
+            pinfo = parsed[parent]
+            child_indents = [q_info["indent"] for q, q_info in parsed.items()
+                             if q[:-1] == parent]
+            indent = min(child_indents) if child_indents else pinfo["indent"] + 2
+            serialized = _serialize_scalar(value)
+            if serialized is None:
+                return None
+            lines.insert(extents[parent] + 1, " " * indent + f"{key}: {serialized}")
+
+        for (key,), subtree in section_inserts.items():
+            if not lines or lines[-1].strip():
+                lines.append("")
+            lines.append(yaml.safe_dump({key: subtree}, sort_keys=False).strip("\n"))
+        return "\n".join(lines) + ("\n" if original_text.endswith("\n") else "")
+    except Exception:  # noqa: BLE001 - any layout surprise falls back to a full dump
+        return None
+
+
 def save_config_with_backup(path, raw: dict) -> Path:
+    """Write raw to path, backing up the previous file first.
+
+    When the file already exists, only the changed values are edited in the original
+    text so comments and formatting survive; unparseable/unexpected YAML falls back
+    to a full yaml.safe_dump. Returns the backup path (backup only written if the
+    file existed)."""
     p = Path(path)
     backup = p.with_name(p.name + ".bak")
     if p.exists():
-        backup.write_bytes(p.read_bytes())
-    p.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        shutil.copy2(p, backup)
+        text = p.read_text(encoding="utf-8")
+        patched = None
+        try:
+            old = yaml.safe_load(text)
+            if old is None:
+                old = {}
+            if isinstance(old, dict):
+                patched = patch_config_text(text, old, raw)
+        except Exception:  # noqa: BLE001 - unparseable original falls back to a full dump
+            patched = None
+        if patched is not None:
+            p.write_text(patched, encoding="utf-8")
+        else:
+            p.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    else:
+        p.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return backup
 
 
@@ -321,7 +493,8 @@ def render(cfg) -> None:
 
     # --------------------------------------------------------------- save
     st.caption("Saving validates the edited values first and only then writes swarmforge.yaml "
-               "(keeping swarmforge.yaml.bak). API keys are never stored in the YAML.")
+               "(keeping a swarmforge.yaml.bak backup; comments and formatting in the original "
+               "file are preserved). API keys are never stored in the YAML.")
     if st.button("Save settings", type="primary", key="set_save"):
         if cfg.source_path is None:
             st.error("This config has no source file; nothing to save.")
