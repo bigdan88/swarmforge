@@ -161,6 +161,27 @@ def cmd_diagnose(args, cfg) -> int:
     return 0
 
 
+def cmd_ask(args, cfg) -> int:
+    from .chatbot import ChatError, ask
+
+    store = _store(cfg)
+    try:
+        result = ask(cfg, store, args.question, max_runs=args.max_runs)
+    except (ChatError, ConfigError) as e:
+        print(f"chatbot: {e}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({
+            "question": args.question,
+            "answer": result["answer"],
+            "role": result["role"],
+            "model": result["model"],
+        }))
+    else:
+        print(result["answer"])
+    return 0
+
+
 def cmd_status(args, cfg) -> int:
     store = _store(cfg)
     run = store.get_run(args.run_id)
@@ -295,7 +316,9 @@ def cmd_dashboard(args, cfg) -> int:
     if not shutil.which("streamlit") and not _has_module("streamlit"):
         print("streamlit is not installed: pip install 'swarmforge[dashboard]'")
         return 2
-    env = dict(os.environ, SWARMFORGE_DB=str(cfg.db_path), SWARMFORGE_CONFIG=str(cfg.source_path))
+    theme = getattr(args, "theme", "auto")
+    env = dict(os.environ, SWARMFORGE_DB=str(cfg.db_path), SWARMFORGE_CONFIG=str(cfg.source_path),
+               SWARMFORGE_DASH_THEME=theme)
     url = f"http://localhost:{args.port}"
     address = "127.0.0.1"
     if args.lan:
@@ -315,7 +338,7 @@ def cmd_dashboard(args, cfg) -> int:
         threading.Timer(2.5, lambda: webbrowser.open(url)).start()
     return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
                             "--server.address", address, "--server.headless", "true", "--browser.gatherUsageStats", "false",
-                            "--client.toolbarMode", "minimal"], env=env)
+                            "--client.toolbarMode", "minimal", "--theme.base", theme], env=env)
 
 
 def _lan_ips() -> list[str]:
@@ -517,6 +540,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_diagnose)
 
+    s = sub.add_parser("ask", help="ask the chatbot about runs and swarm statuses")
+    s.add_argument("question")
+    s.add_argument("--json", action="store_true", help="output machine-readable JSON")
+    s.add_argument("--max-runs", type=int, default=12)
+    s.set_defaults(fn=cmd_ask)
+
     s = sub.add_parser("status", help="show run status")
     s.add_argument("run_id", nargs="?", default="latest")
     s.add_argument("--json", action="store_true", help="output machine-readable JSON")
@@ -543,6 +572,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--lan", action="store_true",
                    help="also serve to other devices (iPad, phone; works over Tailscale too); "
                         "requires SWARMFORGE_DASH_PASSWORD in .env")
+    s.add_argument("--theme", choices=["auto", "light", "dark"], default="auto",
+                   help="dashboard color theme; 'dark' = dark mode (you can also switch live from the sidebar)")
     s.set_defaults(fn=cmd_dashboard)
 
     s = sub.add_parser("check", help="validate config, tools and provider connectivity")

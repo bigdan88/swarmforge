@@ -22,6 +22,87 @@ from swarmforge.config import ConfigError, load_config
 from swarmforge.db import Store
 from swarmforge.knowledge import NOTE_TYPES, Vault, WIKILINK_RE
 
+# --------------------------------------------------------------------- theme
+# Streamlit cannot change its base theme mid-session, so `swarmforge dashboard --theme` launches the
+# subprocess with a base theme and exports SWARMFORGE_DASH_THEME; the sidebar control below injects
+# the other palette as CSS on top of it and persists the user's choice under THEME_KEY in the kv store.
+THEME_KEY = "dash_theme"
+THEME_CHOICES = ("auto", "light", "dark")
+LAUNCH_THEME = os.environ.get("SWARMFORGE_DASH_THEME", "auto")  # set by `swarmforge dashboard --theme`
+
+DARK_CSS = """<style>
+/* Dark palette over Streamlit's base theme. Selectors target data-testids (stable across releases),
+   not internal CSS variable names, which shift between Streamlit versions. */
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+    background-color: #0e1117; color: #fafafa; }
+[data-testid="stSidebar"] { background-color: #16181d; }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #fafafa; }
+h1, h2, h3, h4, h5, h6, p, li, label, span { color: #fafafa; }
+[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
+    background-color: #262730; color: #fafafa; border-color: #444; }
+[data-testid="stCode"], pre, code { background-color: #1a1c22; color: #e6e6e6; }
+[data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"],
+[data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
+    background-color: #16181d; color: #fafafa; border-color: #33343d; }
+[data-testid="stButton"] button { color: #fafafa; }
+[data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
+    background-color: #262730; color: #fafafa; }
+[data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background-color: #ff4b4b; color: #ffffff; }
+a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
+/* status boxes keep their own light backgrounds when the base theme is light: dark text there */
+[data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] span,
+[data-testid="stNotification"] p { color: inherit; }
+</style>"""
+
+LIGHT_CSS = """<style>
+/* Native light palette pinned, so switching back from a dark launch base works too. */
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+    background-color: #ffffff; color: #31333f; }
+[data-testid="stSidebar"] { background-color: #f0f2f6; }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #31333f; }
+h1, h2, h3, h4, h5, h6, p, li, label, span { color: #31333f; }
+[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
+    background-color: #f8f9fa; color: #31333f; border-color: #d5d8e0; }
+[data-testid="stCode"], pre, code { background-color: #f0f2f6; color: #31333f; }
+[data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"],
+[data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
+    background-color: #ffffff; color: #31333f; border-color: #d5d8e0; }
+[data-testid="stButton"] button { color: #31333f; }
+[data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
+    background-color: #f0f2f6; color: #31333f; }
+[data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background-color: #ff4b4b; color: #ffffff; }
+a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
+</style>"""
+
+
+def theme_css(mode: str) -> str:
+    """CSS override for an explicit mode; "auto" follows the Streamlit base theme (no override)."""
+    if mode == "dark":
+        return DARK_CSS
+    if mode == "light":
+        return LIGHT_CSS
+    return ""
+
+
+def effective_theme(sel: str, launch: str) -> str:
+    """The palette actually shown: an explicit choice wins, "auto" follows what the CLI launched."""
+    return "dark" if sel == "dark" or (sel == "auto" and launch == "dark") else "light"
+
+
+def apply_chart_theme(mode: str) -> None:
+    """Match the Altair chart theme to the palette; an unknown theme name must never break the page."""
+    try:
+        alt.themes.enable("dark" if mode == "dark" else "vox")
+    except Exception:  # noqa: BLE001 - chart styling is decoration
+        pass
+
+
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
 STATE_COLORS = {"PENDING": "#d0d4dc", "RUNNING": "#4c8bf5", "SUCCEEDED": "#7cc47f", "INTEGRATED": "#2e9e5b",
                 "FAILED": "#e05252", "BLOCKED": "#f0a35e", "CANCELLED": "#999999"}
@@ -77,6 +158,17 @@ db_path = os.environ.get("SWARMFORGE_DB") or (str(cfg.db_path) if cfg else
                                               str(Path("~/.swarmforge/swarmforge.db").expanduser()))
 store = get_store(db_path)
 vault = Vault(cfg.vault_path) if cfg else None
+
+# theme: the persisted choice wins, else what `swarmforge dashboard --theme` launched with
+if "theme_mode" not in st.session_state:
+    saved = store.kv_get(THEME_KEY)
+    st.session_state["theme_mode"] = saved if saved in THEME_CHOICES else (
+        LAUNCH_THEME if LAUNCH_THEME in THEME_CHOICES else "auto")
+theme_mode = st.session_state.get("theme_mode") or LAUNCH_THEME
+apply_chart_theme(effective_theme(theme_mode, LAUNCH_THEME))
+css = theme_css(theme_mode)
+if css:  # injected before the sidebar so it covers every page and every rerun
+    st.markdown(css, unsafe_allow_html=True)
 
 
 HEAL_HELP = ("If the task fails, SwarmForge asks a model why, then automatically retries this many times, "
@@ -136,9 +228,10 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "New task", "Failures", "Knowledge", "Benchmarks"]
+PAGES = ["Work", "New task", "Failures", "Chat", "Knowledge", "Benchmarks", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
-            "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
+            "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
+NAV_ICON["Settings"] = ":material/settings:"
 SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
@@ -146,6 +239,14 @@ if "goto" in st.session_state:  # navigation requested by a button on the previo
     st.session_state.page = st.session_state.pop("goto")
 page = st.session_state.page
 pending_all = store.pending_approvals()
+
+
+def _theme_changed() -> None:
+    """Persist the sidebar Theme choice so it survives restarts and other browser sessions."""
+    value = st.session_state.get("theme_mode")
+    if value in THEME_CHOICES and value != store.kv_get(THEME_KEY):
+        store.kv_set(THEME_KEY, value)
+    st.rerun(scope="app")
 
 
 def _nav_badges() -> dict:
@@ -186,12 +287,20 @@ with st.sidebar:
         if st.button(label, icon=NAV_ICON[p], key=f"nav_{SLUG[p]}", type="tertiary", width="stretch"):
             st.session_state.page = p
             st.rerun()
+    if st.button("Getting started", icon=":material/help:", key="nav_getting_started", type="tertiary",
+                 width="stretch"):
+        st.session_state.show_welcome = True
+        st.session_state.goto = "Work"
+        st.rerun()
     st.write("")
     if pending_all:
         st.warning(f"🔔 {len(pending_all)} approval(s) waiting on the Work page")
     st.divider()
     auto = st.toggle("Live refresh (3 s)", value=os.environ.get("SWARMFORGE_DASH_AUTOREFRESH", "1") == "1",
                      help="Refreshes the Work list and the open task while something is running.")
+    st.segmented_control("Theme", list(THEME_CHOICES), key="theme_mode",
+                         default=LAUNCH_THEME if "theme_mode" not in st.session_state else None,
+                         on_change=_theme_changed, help="Dark mode for the whole dashboard")
     if cfg:
         with st.expander("Setup", icon=":material/settings:"):
             st.caption(f"Config: `{cfg.source_path}`")
@@ -918,7 +1027,8 @@ def work_items() -> list[dict]:
         out.append({"key": f"q:{i['id']}", "group": grp, "icon": icon, "status": label, "title": i["title"],
                     "repo": i["repo"], "item": i, "run": r,
                     "when": (r["created_at"] if r else i.get("created_at")) or 0,
-                    "order": waiting_pos.get(i["id"], 0), "hidden": False})
+                    "order": waiting_pos.get(i["id"], 0), "hidden": False,
+                    "archived": bool(r.get("archived")) if r else False})
     for r in runs:
         if r["id"] in used:
             continue
@@ -926,7 +1036,7 @@ def work_items() -> list[dict]:
         out.append({"key": f"r:{r['id']}", "group": grp, "icon": icon, "status": label,
                     "title": r["issue_title"] or r["issue_url"] or r["id"], "repo": r["repo"] or "",
                     "item": None, "run": r, "when": r["created_at"] or 0, "order": 0,
-                    "hidden": r["id"] in healed})
+                    "hidden": r["id"] in healed, "archived": bool(r.get("archived"))})
     rank = {"active": 0, "waiting": 1}
     out.sort(key=lambda w: (rank.get(w["group"], 2), w["order"] if w["group"] == "waiting" else -w["when"]))
     return out
@@ -1193,7 +1303,8 @@ def work_row(w: dict) -> None:
         c = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
         c[0].checkbox("select", key=f"ck_{k}", label_visibility="collapsed")
         c[1].markdown(w["icon"])
-        c[2].markdown(f"{'▾' if is_open else '▸'} **{w['title'] or '(untitled)'}**")
+        c[2].markdown(f"{'▾' if is_open else '▸'} {'📦 ' if w.get('archived') else ''}"
+                      f"**{w['title'] or '(untitled)'}**")
         c[3].markdown(w["status"])
         c[4].markdown(cells["now"] or " ")
         c[5].markdown(_short_repo(w["repo"]))
@@ -1202,6 +1313,13 @@ def work_row(w: dict) -> None:
         if c[7].button("open", key=f"op_{k}", help="Show / hide details"):
             select_item(None if is_open else w["key"])
             st.rerun(scope="app")
+
+
+def _item_mode(w: dict) -> str | None:
+    """The mode of a work item: the run's when there is one, else the queue task's."""
+    if w["run"]:
+        return w["run"].get("mode")
+    return w["item"].get("mode") if w["item"] else None
 
 
 def work_list(items: list[dict], every) -> None:
@@ -1219,8 +1337,26 @@ def work_list(items: list[dict], every) -> None:
                                 label_visibility="collapsed", default="All") or "All"
     query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
                           label_visibility="collapsed").strip().lower()
-    shown = [w for w in visible if (FILTERS[filt] is None or w["group"] in FILTERS[filt])
-             and (not query or query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower())]
+    # filters above the table; options come from the full list so they stay stable while narrowing it
+    g1, g2, g3, g4 = st.columns([1.5, 1.5, 1.1, 1.1])
+    states = g1.multiselect("State", sorted({w["run"]["state"] for w in items if w["run"]}),
+                            key="w_state", placeholder="All states")
+    repo_sel = g2.selectbox("Repository", ["All repos"] + sorted({w["repo"] for w in items if w["repo"]}),
+                            key="w_repo")
+    mode_sel = g3.selectbox("Mode", ["All modes", "swarm", "single"], key="w_mode")
+    show_arch = g4.checkbox("Show archived", key="w_arch",
+                            help="Archived runs stay in the database but are hidden from this list.")
+    base = visible if show_arch else [w for w in visible if not w["archived"]]
+    shown = [w for w in base if FILTERS[filt] is None or w["group"] in FILTERS[filt]]
+    if states:
+        shown = [w for w in shown if w["run"] and w["run"]["state"] in states]
+    if repo_sel and repo_sel != "All repos":
+        shown = [w for w in shown if w["repo"] == repo_sel]
+    if mode_sel and mode_sel != "All modes":
+        shown = [w for w in shown if _item_mode(w) == mode_sel]
+    if query:
+        shown = [w for w in shown
+                 if query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower()]
     if not shown:
         st.caption("No tasks match.")
         return
@@ -1448,7 +1584,115 @@ def item_detail(w: dict, every) -> None:
         if i and i["status"] != "queued":
             st.markdown(i["body"][:3000])
         return
+    if r.get("archived"):
+        if st.button("📂 Unarchive", key=f"unarch_{r['id']}",
+                     help="Show this run in the Work list again."):
+            store.set_archived(r["id"], False)
+            st.rerun()
+    elif st.button("📦 Archive", key=f"arch_{r['id']}",
+                   help="Hide this run from the Work list. Its history, report and transcripts stay."):
+        store.set_archived(r["id"], True)
+        select_item(None)  # it leaves the list, so close it too
+        st.rerun()
+    free_disk_panel(r, w)
     run_detail(r["id"], header=False)
+
+
+def free_disk_panel(r: dict, w: dict) -> None:
+    """Reclaim the disk a finished run's clone and worktrees use.
+
+    Only ``repo`` and ``worktrees`` are removed: the database row, the report,
+    the transcripts and the logs stay. Active runs are never offered the action."""
+    from swarmforge.db import free_run_disk
+
+    rid = r["id"]
+    if w["group"] == "active":
+        st.caption("🧹 Free disk space is available once the run finishes.")
+        return
+    st.checkbox("Confirm: delete this run's repo and worktrees from disk", key=f"fd_ok_{rid}",
+                help="Frees disk space by removing the clone and the worktrees. The run's history, "
+                     "report, transcripts and logs are kept.")
+    if st.button("🧹 Free disk space", key=f"fd_{rid}",
+                 help="Deletes this run's repo and worktrees folders from the workdir."):
+        if not st.session_state.get(f"fd_ok_{rid}"):
+            st.warning("Tick the confirmation box first.")
+            return
+        rd = Path(r["run_dir"]) if r.get("run_dir") else (cfg.workdir / "runs" / rid if cfg else None)
+        if rd is None:
+            st.warning("This run has no work folder to clean up.")
+            return
+        freed = free_run_disk(rd)
+        store.event(rid, "disk", f"freed {freed} bytes")
+        _workdir_bytes.clear()  # the usage figure above must reflect the cleanup
+        st.success(f"Freed {freed / 1e6:.1f} MB from disk.")
+
+
+def welcome_panel(cfg, empty: bool = False) -> None:
+    """First-run welcome: setup checklist, the sample run and how a run works.
+
+    ``empty`` adds the Work page's "nothing here yet" hint; only a fresh database shows it.
+    Checks and the sample run go through ``swarmforge.welcome`` module attributes so tests can
+    monkeypatch them (AppTest runs the script in this process, but functions defined here could
+    not be patched from outside)."""
+    from swarmforge import welcome
+
+    st.header("Welcome to SwarmForge")
+    st.caption("SwarmForge turns an issue into a reviewed branch: plan it, build it in parallel, "
+               "test it, review it, repair it, then prepare a draft pull request.")
+    if empty:
+        st.info("Nothing here yet. Go to **New task** to start a run or find an issue to fix.")
+    st.subheader("Getting started")
+    try:
+        for item in welcome.health_checks(cfg):
+            if item.ok:
+                st.markdown(f"✅ {item.name}")
+            else:
+                st.markdown(f"{'⬜' if item.optional else '❌'} {item.name}"
+                            f"{' (optional)' if item.optional else ''}")
+                if item.fix:
+                    st.code(item.fix, language=None)
+    except Exception as e:  # noqa: BLE001 - a broken check must never blank the page
+        st.caption(f"Setup checks unavailable: {e}")
+    st.caption("Creates ~/swarmforge-sample and runs the bundled CSV/JSON export issue with 1 repair "
+               "cycle and a $3 budget.")
+    if st.button("🧪 Try the sample (about $0.40, 15 minutes)", type="primary", key="ws_sample"):
+        if not cfg:
+            st.error("Configuration not loaded; cannot start the sample run.")
+            return
+        try:
+            with st.spinner("Preparing the sample…"):
+                run_id = welcome.start_sample_run(cfg, store)
+        except Exception as e:  # noqa: BLE001 - show it, keep the page alive
+            st.error(f"Could not start the sample run: {e}")
+            return
+        st.session_state.flash = "Sample run started — watch it below."
+        select_item(f"r:{run_id}")
+        st.session_state.goto = "Work"
+        st.rerun()
+    st.subheader("How SwarmForge works")
+    st.markdown("The planner breaks the issue down → two developers work **in parallel** on separate "
+                "branches → the branches are merged → the tester runs the suite → the reviewer checks "
+                "the result → blocking problems go back for a **repair cycle** → an approved change "
+                "becomes a draft **PR**.")
+    st.graphviz_chart("""digraph swarmforge {
+  rankdir=LR;
+  Issue -> Planner;
+  Planner -> Backend;
+  Planner -> Frontend;
+  Backend -> Merge;
+  Frontend -> Merge;
+  Merge -> Tester;
+  Tester -> Reviewer;
+  Reviewer -> Planner [style=dashed, label="blocking problems (repair cycle)"];
+  Reviewer -> PR [label="approved"];
+}""")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _workdir_bytes(path: str) -> int:
+    """Total size of the workdir in bytes; cached briefly because it can hold many clones."""
+    from swarmforge.db import dir_size_bytes
+    return dir_size_bytes(Path(path))
 
 
 def page_work():
@@ -1460,7 +1704,16 @@ def page_work():
     if h2.button("New task", icon=":material/add:", type="primary", width="stretch"):
         st.session_state.goto = "New task"
         st.rerun()
+    if cfg is not None:
+        st.caption(f"💽 Workdir usage: {_workdir_bytes(str(cfg.workdir)) / 1e6:.1f} MB · `{cfg.workdir}`")
     items = work_items()
+    show = st.session_state.pop("show_welcome", False)
+    if not items or show:  # first run (or "Getting started" in the sidebar): welcome instead of an empty table
+        welcome_panel(cfg, empty=not items)
+        if items:
+            st.divider()
+    if not items:
+        return
     busy = any(w["group"] == "active" for w in items) or bool(rq.worker_pid(store))
     open_w = next((w for w in items if w["key"] == st.session_state.get("sel_item")), None)
     editing = bool(open_w and (open_w["group"] != "active" or st.session_state.get("confirm_delete")))
@@ -1549,6 +1802,42 @@ def page_failures():
     if cfg and b[2].button("↻ Diagnose again", key=f"fd_{f['run_id']}"):
         diagnose_now(f["run_id"])
         st.rerun()
+
+
+# ================================================================= CHAT page
+def page_chat():
+    if cfg is None:
+        st.error("Configuration not loaded; the chatbot needs a configured model role.")
+        return
+    from swarmforge import chatbot
+    st.header("Chat: ask about runs and swarm statuses")
+    st.caption("Answers are built from the SwarmForge store (runs, per-task swarm statuses, failures, "
+               "queue and pending approvals) and written by the configured `chat` role — or the planner "
+               "model if no chat role is set. CLI: `swarmforge ask \"…\"`.")
+    history = st.session_state.setdefault("chat_history", [])
+    if st.button("Reset conversation", key="chat_reset"):
+        history.clear()
+    for m in history:
+        with st.chat_message(m["role"]):
+            if m["role"] == "assistant":
+                st.markdown(m["content"])
+            else:
+                st.write(m["content"])
+    prompt = st.chat_input("Ask about runs, swarms, failures... e.g. which runs failed and why?")
+    if not prompt:
+        return
+    history.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.write(prompt)
+    try:
+        res = chatbot.ask(cfg, store, prompt, history=history[:-1])
+    except chatbot.ChatError as e:
+        st.error(f"Chatbot: {e}")
+        return
+    history.append({"role": "assistant", "content": res["answer"]})
+    with st.chat_message("assistant"):
+        st.markdown(res["answer"])
+        st.caption(f"answered by **{res['role']}** · `{res['model']}`")
 
 
 # ============================================================ NEW TASK page
@@ -1661,5 +1950,12 @@ def page_benchmarks():
         st.dataframe(df.astype(str), width="stretch")
 
 
-{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Knowledge": page_knowledge,
- "Benchmarks": page_benchmarks}[page]()
+# =========================================================== SETTINGS page
+def page_settings():
+    st.caption("Edit swarmforge.yaml, run health checks and test models.")
+    from swarmforge import settings
+    settings.render(cfg)
+
+
+{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Chat": page_chat,
+ "Knowledge": page_knowledge, "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()

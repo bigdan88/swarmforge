@@ -243,8 +243,9 @@ async def test_unbuilt_profile_image_is_blocked(cfg, sample_repo):
     assert run["state"] == "BLOCKED" and "not built" in run["state_reason"]
 
 
-async def test_run_with_repo_given_as_url_with_branch(cfg, sample_repo, tmp_path):
+async def test_run_with_repo_given_as_url_with_branch(cfg, sample_repo, tmp_path, monkeypatch):
     # a file:// URL behaves like a remote; the run clones it via the normalized reference
+    monkeypatch.chdir(tmp_path)  # preflight's `git ls-remote` inherits the cwd; keep it neutral
     store = Store(cfg.db_path)
     orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport)
     run_id = await orch.execute(issue_file=str(ISSUE), repo=f"  {sample_repo.resolve().as_uri()}  ")
