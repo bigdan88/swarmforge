@@ -41,7 +41,7 @@ CHECK_SPECS: list[tuple[str, str]] = [
     ("Provider API keys", "API key"),
     ("Provider base_url", "base_url"),
     ("GitHub CLI", "gh CLI"),
-    ("Git", "Git is not installed"),
+    ("Git", "git is not installed"),
     ("Docker running", "Docker"),
     ("Sandbox image built", "sandbox image"),
 ]
@@ -68,7 +68,7 @@ def get_health_checks(cfg: Config) -> list[dict]:
     matched: set[int] = set()
     docker_optional = cfg.sandbox.mode != "docker"
     for name, needle in CHECK_SPECS:
-        hit = next((i for i, p in enumerate(problems) if needle in p), None)
+        hit = next((i for i, p in enumerate(problems) if needle.lower() in p.lower()), None)
         if hit is None:
             if docker_optional and name in ("Docker running", "Sandbox image built"):
                 rows.append({"name": name, "status": "ok",
