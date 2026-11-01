@@ -87,6 +87,7 @@ swarmforge dashboard          # opens http://localhost:8501
   `docs/SELF_IMPROVEMENT_BACKLOG.md`). Runs are background processes and keep going if you close
   the browser.
 * Every page has its own address (`?page=work`, `?page=failures`, …), handy for bookmarks on an iPad.
+* **Chat**: ask the assistant about run and swarm statuses.
 * **Knowledge**: the Zettelkasten. Browse, search, edit and link notes, view the note graph,
   and write your own notes for the agents to use.
 * **Benchmarks**: single agent vs swarm comparisons.
@@ -96,6 +97,7 @@ Everything is also available from the CLI:
 ```bash
 swarmforge run https://github.com/OWNER/REPO/issues/N        # or --issue-file F --repo PATH
 swarmforge runs | status [RUN] | logs -f [RUN] | cancel RUN | report [RUN]
+swarmforge ask "which runs failed and why?"                       # chatbot answers from run data
 swarmforge publish RUN                                        # push + draft PR later
 swarmforge bench ISSUE --repo PATH --acceptance DIR           # single agent vs swarm
 ```

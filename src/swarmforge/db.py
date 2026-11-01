@@ -7,7 +7,10 @@ inspectable.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
+import stat
 import threading
 import time
 from pathlib import Path
@@ -236,6 +239,7 @@ class Store:
         ("runs", "variant_id", "TEXT"),
         ("queue_items", "issue_url", "TEXT"),
         ("queue_items", "heal_attempts", "INTEGER"),
+        ("runs", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ]
 
     def _migrate(self) -> None:
@@ -288,6 +292,9 @@ class Store:
 
     def list_runs(self, limit: int = 20) -> list[dict]:
         return self._all("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))
+
+    def set_archived(self, run_id: str, archived: bool) -> None:
+        self.update_run(run_id, archived=1 if archived else 0)
 
     def request_cancel(self, run_id: str) -> None:
         self.update_run(run_id, cancel_requested=1)
@@ -589,6 +596,43 @@ class Store:
         for r in rows:
             r["results"] = json.loads(r.pop("results_json") or "null")
         return rows
+
+
+def _unlock_readonly(func, path, _exc):  # git objects are read-only on Windows
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass
+
+
+def dir_size_bytes(path: Path) -> int:
+    """Recursive sum of file sizes under path; missing path -> 0; never raises."""
+    total = 0
+    try:
+        for p in Path(path).rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def free_run_disk(run_dir: Path) -> int:
+    """Delete <run_dir>/repo and <run_dir>/worktrees, keep everything else.
+
+    Returns the number of bytes freed (0 if nothing was there)."""
+    run_dir = Path(run_dir)
+    freed = 0
+    for name in ("repo", "worktrees"):
+        target = run_dir / name
+        if target.is_dir():
+            freed += dir_size_bytes(target)
+            shutil.rmtree(target, onerror=_unlock_readonly)
+    return freed
 
 
 def _variant_row(row: dict) -> dict:

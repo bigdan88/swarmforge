@@ -161,6 +161,27 @@ def cmd_diagnose(args, cfg) -> int:
     return 0
 
 
+def cmd_ask(args, cfg) -> int:
+    from .chatbot import ChatError, ask
+
+    store = _store(cfg)
+    try:
+        result = ask(cfg, store, args.question, max_runs=args.max_runs)
+    except (ChatError, ConfigError) as e:
+        print(f"chatbot: {e}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({
+            "question": args.question,
+            "answer": result["answer"],
+            "role": result["role"],
+            "model": result["model"],
+        }))
+    else:
+        print(result["answer"])
+    return 0
+
+
 def cmd_status(args, cfg) -> int:
     store = _store(cfg)
     run = store.get_run(args.run_id)
@@ -504,6 +525,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("diagnose", help="(re)write the post-mortem of a failed run")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_diagnose)
+
+    s = sub.add_parser("ask", help="ask the chatbot about runs and swarm statuses")
+    s.add_argument("question")
+    s.add_argument("--json", action="store_true", help="output machine-readable JSON")
+    s.add_argument("--max-runs", type=int, default=12)
+    s.set_defaults(fn=cmd_ask)
 
     s = sub.add_parser("status", help="show run status")
     s.add_argument("run_id", nargs="?", default="latest")
