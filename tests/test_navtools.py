@@ -3,6 +3,7 @@
 Everything runs against LocalSandbox in a tmp_path workspace: no Docker, no network.
 Covers AC1-AC9 of the issue "Add a second batch of agent developer tools".
 """
+import ast
 import re
 import socket
 import subprocess
@@ -301,6 +302,128 @@ def test_nav_tools_absent_when_dev_tools_disabled(tmp_path):
     assert tools == EXEC_TOOLS
 
 
+def _agent_call_segments():
+    """Source segment of every ``self._agent(...)`` call in the orchestrator."""
+    src = (REPO_ROOT / "src" / "swarmforge" / "orchestrator.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_agent"):
+            out.append((src, tree, ast.get_source_segment(src, node) or ""))
+    return out
+
+
+def test_orchestrator_passes_shared_tool_lists_at_each_role_call_site():
+    """AC6: the tools each role is actually offered come from the shared accessors.
+
+    Developers, the conflict resolver and the tester must be dispatched with
+    ``self._exec_tools()`` (all eight nav tools); the reviewer with
+    ``self._review_tools()`` and both planners with ``self._plan_tools()``
+    (read-only subset only)."""
+    expect = {"prompts.DEVELOPER_SYSTEM": "_exec_tools",
+              "prompts.CONFLICT_SYSTEM": "_exec_tools",
+              "prompts.TESTER_SYSTEM": "_exec_tools",
+              "prompts.REVIEWER_SYSTEM": "_review_tools",
+              "prompts.PLANNER_SYSTEM": "_plan_tools",
+              "prompts.FIX_PLANNER_SYSTEM": "_plan_tools"}
+    seen = set()
+    for _src, _tree, seg in _agent_call_segments():
+        for marker, accessor in expect.items():
+            if marker in seg:
+                assert f"self.{accessor}()" in seg, \
+                    f"call site for {marker} must pass self.{accessor}():\n{seg}"
+                seen.add(marker)
+    assert seen == set(expect), f"missing role call sites: {set(expect) - seen}"
+
+
+def test_nav_tool_lists_defined_in_one_place_in_orchestrator():
+    """AC6: NAV_TOOLS / NAV_READONLY are referenced only inside the three shared
+    accessors - no role call site builds its own nav tool list."""
+    src = (REPO_ROOT / "src" / "swarmforge" / "orchestrator.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    methods = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods[node.name] = ast.get_source_segment(src, node) or ""
+    holders = {name for name, body in methods.items()
+               if "NAV_TOOLS" in body or "NAV_READONLY" in body}
+    assert holders == {"_exec_tools", "_review_tools", "_plan_tools"}
+    assert "_exec_tools" in methods and "NAV_TOOLS" in methods["_exec_tools"]
+    assert "NAV_READONLY" in methods["_review_tools"]
+    assert "NAV_READONLY" in methods["_plan_tools"]
+
+
+def test_exec_role_contexts_wire_sandbox_test_command_and_base_sha():
+    """AC2/AC4 wiring: run_tests needs ctx.sandbox + ctx.test_command and git_changes
+    needs ctx.base_sha, so every ToolContext built for a role that gets the eight
+    tools must set all three; read-only call sites must at least set base_sha."""
+    exec_ctxs = []
+    src = (REPO_ROOT / "src" / "swarmforge" / "orchestrator.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "ToolContext"):
+            kws = {kw.arg for kw in node.keywords}
+            if "sandbox" in kws:
+                exec_ctxs.append(kws)
+    # read-only roles: planner/reviewer _agent call sites construct ToolContext inline
+    for _src, _tree, seg in _agent_call_segments():
+        if "self._review_tools()" in seg or "self._plan_tools()" in seg:
+            assert "base_sha" in seg, \
+                f"read-only role context must set base_sha for git_changes:\n{seg}"
+    assert len(exec_ctxs) >= 4, f"expected a wired ToolContext per exec role, got {len(exec_ctxs)}"
+    for kws in exec_ctxs:
+        assert {"test_command", "base_sha", "installer", "artifacts_dir"} <= kws, \
+            f"exec-role ToolContext missing fields: {kws}"
+
+
+async def test_run_tests_callable_through_agent_runtime_dispatch(tmp_path, monkeypatch):
+    """AC1: a sandbox-executing navtool (run_tests) also works through the real
+    agent runtime dispatch, not just outline."""
+    import os
+
+    from swarmforge.agent.runtime import AgentSpec, TerminalTool, run_agent
+    from swarmforge.llm import LLMClient
+
+    from .conftest import FakeProvider
+
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    os.environ["FAKE_KEY"] = "k"
+    cfg = parse_config(base_raw(tmp_path))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "test_demo.py").write_text("def test_ok():\n    assert True\n\n\n"
+                                     "def test_bad():\n    assert 1 == 2\n")
+
+    asked = {"once": False}
+
+    def model(body):
+        names = [t["function"]["name"] for t in body["tools"]]
+        assert "run_tests" in names  # the navtool was offered through the runtime
+        if not asked["once"]:
+            asked["once"] = True
+            return {"content": "", "tool_calls": [tool_call("run_tests", {})]}
+        return {"content": "", "tool_calls": [tool_call("finish", {"summary": "done"})]}
+
+    fake = FakeProvider({"deepseek-fake": model})
+    llm = LLMClient(cfg, transport=fake.transport)
+    term = TerminalTool("finish", "done", {"type": "object", "properties": {"summary": {"type": "string"}}},
+                        lambda a: (a, None))
+    ctx = ToolContext(workspace=ws, sandbox=LocalSandbox(cfg.sandbox),
+                      command_timeout_s=cfg.sandbox.command_timeout_s,
+                      test_command=cfg.project.test_command, artifacts_dir=ws / ".swarmforge")
+    res = await run_agent(llm, AgentSpec(role="developer_backend", task_key="T1",
+                                         system_prompt="s", user_prompt="u",
+                                         tools=READ_TOOLS + ["run_tests"], terminal=term,
+                                         ctx=ctx, max_steps=5, timeout_s=120))
+    assert res.ok and res.value["summary"] == "done"
+    tool_msgs = [m for m in fake.requests[-1]["messages"] if m["role"] == "tool"]
+    assert any("1 failed" in m.get("content", "") and "test_bad" in m.get("content", "")
+               for m in tool_msgs), "run_tests summary not delivered back to the model"
+    assert not any("ERROR:" in m.get("content", "") for m in tool_msgs)
+
+
 
 # --------------------------------------------------------------------- AC8
 async def test_format_code_clear_error_when_ruff_missing(ctx, monkeypatch):
@@ -335,10 +458,12 @@ def test_dockerfile_sandbox_installs_ruff():
     ), "ruff must be installed via pip install, not merely referenced"
 
 
+_RUFF_OK = subprocess.run([sys.executable, "-m", "ruff", "--version"],
+                          capture_output=True, text=True, check=False).returncode == 0
+
+
 async def test_format_code_reformats_and_reports_files(ctx):
-    probe = subprocess.run([sys.executable, "-m", "ruff", "--version"],
-                           capture_output=True, text=True)
-    if probe.returncode != 0:
+    if not _RUFF_OK:
         pytest.skip("ruff not installed in this environment")
     (ctx.workspace / "m.py").write_text("def  f(a,b):\n    return a+b\n")
     out = await navtools.format_code(ctx, paths=["m.py"])
