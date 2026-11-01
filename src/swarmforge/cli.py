@@ -166,7 +166,7 @@ def cmd_ask(args, cfg) -> int:
 
     store = _store(cfg)
     try:
-        result = ask(cfg, store, args.question, max_runs=args.max_runs)
+        result = ask(cfg, store, args.question, max_runs=args.max_runs, conversation=args.conversation)
     except (ChatError, ConfigError) as e:
         print(f"chatbot: {e}", file=sys.stderr)
         return 2
@@ -573,6 +573,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("question")
     s.add_argument("--json", action="store_true", help="output machine-readable JSON")
     s.add_argument("--max-runs", type=int, default=12)
+    s.add_argument("--conversation", default="cli",
+                   help="conversation thread id for context and cost attribution (default: cli)")
     s.set_defaults(fn=cmd_ask)
 
     s = sub.add_parser("status", help="show run status")
