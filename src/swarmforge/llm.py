@@ -197,6 +197,9 @@ class LLMClient:
             "max_tokens": rc.max_output_tokens,
             **rc.extra_body,
         }
+        effort = rc.reasoning_effort or self.config.reasoning_effort
+        if effort and "reasoning_effort" not in rc.extra_body:
+            body["reasoning_effort"] = effort      # DeepInfra: none|low|medium|high (default for reasoning models: high)
         if tools:
             body["tools"] = tools
             if tool_choice is not None:

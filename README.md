@@ -182,6 +182,25 @@ Score = share of hidden acceptance tests passed on the suite's cases (`bench/sui
 and use `--runs 2+` because single runs are noisy). SWE-bench results recorded with `swebench eval`
 appear on the variant too. Nothing changes for real runs until you `use` a variant.
 
+## Pi (pi.dev) as the developer harness
+
+Set `runtime: pi` on a developer role (your `swarmforge.yaml` does this for both developers) to run
+the [Pi coding agent](https://pi.dev) instead of SwarmForge's built-in tool loop. Planner, tester,
+reviewer and librarian keep the built-in loop because they return structured reports.
+
+* Pi runs **inside the agent's sandbox container** with its own read/write/edit/bash tools; the image
+  (`swarmforge sandbox build`) includes Node.js and Pi (`PI_VERSION` build arg, default 1.4.0).
+* Pi never talks to DeepInfra and never sees the API key. It talks to a **model relay** SwarmForge
+  runs on the host, which forwards every call through SwarmForge's own client: role model, fallbacks,
+  busy retries, thinking level, budget, per-task cost metering and the step limit all still apply, and
+  the relay writes the transcript the dashboard shows.
+* Pi starts with project-local extensions, skills, MCP, prompt templates and sessions disabled, so a
+  repository can't load code into the harness.
+* **Trade-off:** Pi's container uses the `bridge` network (`pi.network`) so it can reach the relay;
+  built-in agents keep `--network none`. If Pi can't reach the relay on Docker Desktop, set
+  `pi: {relay_host: 0.0.0.0}`.
+* In `sandbox.mode: local`, install Pi on the host: `npm install -g @earendil-works/pi-coding-agent`.
+
 ## Speed
 
 Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.

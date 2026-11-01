@@ -31,6 +31,7 @@ class ToolContext:
     commands_run: list[dict] = field(default_factory=list)
     installer: Callable[[Path], Awaitable[str]] | None = None   # dependency install step
     session: Any = None                                        # devtools.Session (processes/browser)
+    session_network: str | None = None                         # network of the session container (Pi: bridge)
     processes: dict[str, str] = field(default_factory=dict)    # name -> command (start_process)
     browse_count: int = 0
 

@@ -9,6 +9,7 @@ import asyncio
 import copy
 import json
 import re
+import sys
 import os
 import secrets
 import time
@@ -169,6 +170,9 @@ class Orchestrator:
                 await self.sandbox.kill_all()
             except Exception:
                 pass
+            if getattr(self, "_relay", None) is not None:
+                await self._relay.stop()
+                self._relay = None
             if self.cfg.knowledge.enabled and self.issue is not None:
                 try:
                     await asyncio.wait_for(self._capture_knowledge(), timeout=900)
@@ -1105,6 +1109,30 @@ class Orchestrator:
         if announced:
             self.log("queue", f"repository is free after {waited / 60:.0f} min; starting")
 
+    async def _run_pi(self, spec: AgentSpec, rc) -> AgentResult:
+        from .agent.pi_runtime import THINKING, ModelRelay, resolve_local_command, run_pi_agent
+        from .sandbox import DockerSandbox
+        docker = isinstance(spec.ctx.sandbox, DockerSandbox)
+        if getattr(self, "_relay", None) is None:
+            host = self.cfg.pi.relay_host or ("0.0.0.0" if docker and sys.platform.startswith("linux") else "127.0.0.1")
+            self._relay = ModelRelay(self.llm, host=host)
+            await self._relay.start()
+            self.log("agent", f"Pi model relay listening on {host}:{self._relay.port}")
+            if docker and self.cfg.pi.network == "bridge":
+                self.log("agent", "Pi agents' containers use the bridge network so they can reach the model relay "
+                                  "(the API key stays on the host)", level="warn")
+        try:
+            command = self.cfg.pi.command if docker else resolve_local_command(self.cfg.pi.command)
+        except FileNotFoundError as e:
+            return AgentResult(status="error", error=str(e))
+        effort = rc.reasoning_effort or self.cfg.reasoning_effort
+        return await run_pi_agent(
+            relay=self._relay, ctx=spec.ctx, role=spec.role, task_key=spec.task_key, system=spec.system_prompt,
+            prompt=spec.user_prompt, terminal=spec.terminal, max_steps=spec.max_steps, timeout_s=spec.timeout_s,
+            max_tokens=rc.max_output_tokens, thinking=THINKING.get(effort) if effort else None, command=command,
+            network=self.cfg.pi.network, extra_args=list(self.cfg.pi.extra_args), transcript=spec.transcript_path,
+            should_cancel=spec.should_cancel, on_event=spec.on_event)
+
     def _prompt_group(self, role: str) -> str:
         if role in self.cfg.developer_roles:
             return "developer"
@@ -1124,6 +1152,9 @@ class Orchestrator:
                      terminal: TerminalTool, ctx: ToolContext, transcript_suffix: str = "") -> AgentResult:
         rc = self.cfg.roles[role]
         name = f"{key}-{role}" + (f"-{transcript_suffix}" if transcript_suffix else "")
+        use_pi = rc.runtime == "pi" and terminal.name == "finish" and ctx.sandbox is not None
+        if use_pi:   # Pi brings its own tools (read/write/edit/bash): describe the job without ours
+            system = prompts.PI_DEVELOPER_SYSTEM if system == prompts.DEVELOPER_SYSTEM else system + prompts.PI_NOTE
         extra = self.cfg.prompt_addenda.get(self._prompt_group(role))
         if extra:
             system = system + "\n\nAdditional guidance for this role:\n" + extra
@@ -1133,9 +1164,9 @@ class Orchestrator:
             transcript_path=self.run_dir / "transcripts" / f"{name}.jsonl",
             should_cancel=self._should_cancel,
             on_event=lambda kind, msg, data: self.log("agent", msg, task_key=key, role=role, data=data))
-        self.log("agent", f"start ({rc.model})", task_key=key, role=role)
+        self.log("agent", f"start ({rc.model}{', Pi harness' if use_pi else ''})", task_key=key, role=role)
         try:
-            res = await run_agent(self.llm, spec)
+            res = await (self._run_pi(spec, rc) if use_pi else run_agent(self.llm, spec))
         finally:
             await ctx.aclose()   # stop processes/browser session the agent left running
         self.log("agent", f"end: {res.status} after {res.steps} step(s), {res.tool_calls} tool call(s), "
@@ -1214,7 +1245,8 @@ def _revert_non_test_changes(path: Path) -> list[str]:
 def _config_snapshot(cfg: Config) -> dict:
     return {
         "roles": {k: {"provider": v.provider, "model": v.model, "temperature": v.temperature,
-                      "max_steps": v.max_steps} for k, v in cfg.roles.items()},
+                      "max_steps": v.max_steps,
+                      "reasoning_effort": v.reasoning_effort or cfg.reasoning_effort} for k, v in cfg.roles.items()},
         "developer_roles": cfg.developer_roles,
         "limits": asdict(cfg.limits),
         "sandbox": {"mode": cfg.sandbox.mode, "image": cfg.sandbox.image, "network": cfg.sandbox.network},

@@ -40,6 +40,10 @@ class RoleConfig:
     max_steps: int = 40
     timeout_s: int = 900
     max_output_tokens: int = 8192
+    # thinking level for reasoning models: none | low | medium | high (unset = the config-wide default)
+    reasoning_effort: str | None = None
+    # agent harness for roles that edit code (developers, conflict resolution): builtin | pi
+    runtime: str = "builtin"
     # Optional manual price override (USD per 1M tokens) used for estimates.
     price_in_per_mtok: float | None = None
     price_out_per_mtok: float | None = None
@@ -78,6 +82,15 @@ class SandboxConfig:
     install_timeout_s: int = 900
     reuse_container: bool = True      # agents' run_command execs into one long-lived container per agent
     dev_tools: bool = True            # processes, headless browser and check_code for developers/tester
+
+
+@dataclass
+class PiConfig:
+    """Pi (pi.dev) as the harness for roles with `runtime: pi`."""
+    command: str = "pi"                 # inside the sandbox image; on the host in local mode
+    network: str = "bridge"             # the Pi container must reach SwarmForge's model relay on the host
+    relay_host: str | None = None       # relay bind address (default: 127.0.0.1; 0.0.0.0 on Linux+Docker)
+    extra_args: list = field(default_factory=list)
 
 
 @dataclass
@@ -158,6 +171,8 @@ class Config:
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     self_heal: SelfHealConfig = field(default_factory=SelfHealConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
+    pi: PiConfig = field(default_factory=PiConfig)
+    reasoning_effort: str | None = None          # default thinking level for every role (none|low|medium|high)
     active_variant: str | None = None            # variant id from `swarmforge variants` applied to every run
     prompt_addenda: dict = field(default_factory=dict)   # filled from the active variant (role group -> text)
     variant_applied: bool = False                # runtime flag: the variant overlay is already applied
@@ -237,7 +252,9 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         approval=_build(ApprovalConfig, raw.get("approval"), "approval"),
         self_heal=_build(SelfHealConfig, raw.get("self_heal"), "self_heal"),
         watch=_build(WatchConfig, raw.get("watch"), "watch"),
+        pi=_build(PiConfig, raw.get("pi"), "pi"),
         active_variant=(str(raw["active_variant"]) if raw.get("active_variant") else None),
+        reasoning_effort=(str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None),
         workdir=workdir,
         source_path=source_path,
     )
@@ -249,7 +266,19 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
     return cfg
 
 
+EFFORTS = ("none", "low", "medium", "high")
+
+
 def validate_config(cfg: Config) -> None:
+    for where, eff in [("reasoning_effort", cfg.reasoning_effort),
+                       *[(f"roles.{n}.reasoning_effort", r.reasoning_effort) for n, r in cfg.roles.items()]]:
+        if eff is not None and eff not in EFFORTS:
+            raise ConfigError(f"{where} must be one of {', '.join(EFFORTS)}")
+    for n, r in cfg.roles.items():
+        if r.runtime not in ("builtin", "pi"):
+            raise ConfigError(f"roles.{n}.runtime must be 'builtin' or 'pi'")
+    if cfg.pi.network not in ("bridge", "none"):
+        raise ConfigError("pi.network must be 'bridge' (needed to reach the model relay) or 'none'")
     lim = cfg.limits
     if lim.budget_usd <= 0:
         raise ConfigError("limits.budget_usd must be > 0")

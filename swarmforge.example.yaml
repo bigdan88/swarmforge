@@ -64,6 +64,10 @@ roles:
 
 developer_roles: [developer_backend, developer_frontend]
 
+# Thinking level for reasoning models: none | low | medium | high. DeepInfra defaults reasoning
+# models to high (slow, expensive); override per role with roles.<role>.reasoning_effort.
+reasoning_effort: medium
+
 limits:
   budget_usd: 20.0            # hard stop for the whole run (provider-reported + estimated cost)
   max_runtime_s: 21600        # wall clock for the whole run (6 h); also settable per run in the dashboard
@@ -132,6 +136,14 @@ watch:
 
 # Agent variant (from `swarmforge variants`) applied to every run; set with `swarmforge variants use ID`.
 # active_variant: v3
+
+# Pi (pi.dev) harness for roles with `runtime: pi`. Pi runs inside the sandbox container and reaches
+# the models only through SwarmForge's relay on this machine (the API key never enters the container).
+# Set runtime: pi on a developer role to use it.
+pi:
+  command: pi
+  network: bridge         # Pi's container needs to reach the relay; use runtime: builtin for no-network agents
+  # relay_host: 0.0.0.0   # uncomment if Pi can't reach the relay through Docker Desktop
 
 # Where clones, worktrees, transcripts, logs and the SQLite DB live.
 workdir: ~/.swarmforge

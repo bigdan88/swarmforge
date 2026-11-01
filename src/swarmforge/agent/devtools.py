@@ -65,15 +65,19 @@ class Session:
 
 
 class DockerSession(Session):
-    def __init__(self, sandbox: DockerSandbox, workspace: Path, artifacts_dir: Path | None):
+    def __init__(self, sandbox: DockerSandbox, workspace: Path, artifacts_dir: Path | None,
+                 network: str | None = None):
         self.sb, self.workspace, self.artifacts_dir = sandbox, workspace, artifacts_dir
+        self.network = network
         self.name = f"swarmforge-session-{uuid.uuid4().hex[:12]}"
         self.started = False
         self.artifacts_path = "/artifacts" if artifacts_dir is not None else None
 
     def run_args(self) -> list[str]:
-        args = self.sb.build_args(self.workspace, f"sleep {SESSION_LIFETIME_S}", self.name, self.artifacts_dir)
-        return [args[0], "run", "-d", *args[2:]]
+        args = self.sb.build_args(self.workspace, f"sleep {SESSION_LIFETIME_S}", self.name, self.artifacts_dir,
+                                  network=self.network)
+        extra = ["--add-host", "host.docker.internal:host-gateway"] if self.network not in (None, "none") else []
+        return [args[0], "run", "-d", *extra, *args[2:]]
 
     async def _ensure(self) -> None:
         if self.started:
@@ -105,6 +109,25 @@ class DockerSession(Session):
         except asyncio.TimeoutError:
             p.kill()
             return CommandResult(command, 124, "", time.time() - start, timed_out=True)
+
+    async def exec_argv(self, argv: list[str], *, timeout_s: int = 60,
+                        env: dict[str, str] | None = None) -> CommandResult:
+        """Run a program directly (no shell quoting) inside the session container."""
+        await self._ensure()
+        args = [self.sb.cfg.docker_binary, "exec", "-w", "/workspace"]
+        for k, v in (env or {}).items():
+            args += ["-e", f"{k}={v}"]
+        start = time.time()
+        p = await asyncio.create_subprocess_exec(*args, self.name, *argv, stdin=asyncio.subprocess.DEVNULL,
+                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                                                 env=_scrubbed_env())
+        try:
+            out, _ = await asyncio.wait_for(p.communicate(), timeout=timeout_s)
+            return CommandResult(" ".join(argv[:3]), p.returncode, _truncate(out.decode(errors="replace")),
+                                 time.time() - start)
+        except asyncio.TimeoutError:
+            p.kill()
+            return CommandResult(" ".join(argv[:3]), 124, "", time.time() - start, timed_out=True)
 
     async def start(self, name, command):
         # the inner shell records its own pid; under setsid it leads a new process group, so
@@ -223,7 +246,7 @@ def open_session(ctx: ToolContext) -> Session:
         if ctx.sandbox is None:
             raise ToolError("process and browser tools are not available to this role")
         if isinstance(ctx.sandbox, DockerSandbox):
-            ctx.session = DockerSession(ctx.sandbox, ctx.workspace, ctx.artifacts_dir)
+            ctx.session = DockerSession(ctx.sandbox, ctx.workspace, ctx.artifacts_dir, network=ctx.session_network)
         elif isinstance(ctx.sandbox, LocalSandbox):
             ctx.session = LocalSession(ctx.sandbox, ctx.workspace, ctx.artifacts_dir)
         else:

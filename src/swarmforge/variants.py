@@ -30,7 +30,7 @@ from .config import Config, ConfigError, validate_config
 from .db import Store
 
 ROLE_KEYS = {"model": str, "fallback_models": list, "temperature": (int, float), "max_steps": int,
-             "timeout_s": int, "max_output_tokens": int}
+             "timeout_s": int, "max_output_tokens": int, "reasoning_effort": str}
 ROLE_RANGES = {"temperature": (0.0, 1.5), "max_steps": (5, 150), "timeout_s": (120, 7200),
                "max_output_tokens": (1024, 65536)}
 LIMIT_RANGES = {"max_concurrent_agents": (1, 4), "max_repair_cycles": (0, 5), "max_tasks": (1, 8),
@@ -61,6 +61,8 @@ def validate_overlay(overlay: dict, cfg: Config) -> list[str]:
                 errs.append(f"roles.{role}.{k} has the wrong type")
             elif k in ROLE_RANGES and not ROLE_RANGES[k][0] <= v <= ROLE_RANGES[k][1]:
                 errs.append(f"roles.{role}.{k}={v} outside {ROLE_RANGES[k]}")
+            elif k == "reasoning_effort" and v not in ("none", "low", "medium", "high"):
+                errs.append(f"roles.{role}.reasoning_effort must be none, low, medium or high")
             elif k == "fallback_models" and not all(isinstance(m, str) for m in v):
                 errs.append(f"roles.{role}.fallback_models must be a list of model ids")
     for k, v in (overlay.get("limits") or {}).items():
@@ -201,7 +203,8 @@ per-case results and the failure lessons. Prefer small, testable changes: one pr
 paragraph, one model swap, or one limit. Keep everything from the parent that you don't change.
 
 Allowed keys only:
-- roles.<role>.{model, fallback_models, temperature, max_steps, timeout_s, max_output_tokens}
+- roles.<role>.{model, fallback_models, temperature, max_steps, timeout_s, max_output_tokens,
+  reasoning_effort (none|low|medium|high)}
 - limits.{max_concurrent_agents (1-4), max_repair_cycles (0-5), max_tasks (1-8), task_retries (0-3),
   max_planning_attempts (1-4)}
 - prompt_addenda.{planner, developer, tester, reviewer, librarian}: extra instructions (<= 2000 chars)
@@ -216,7 +219,8 @@ def _base_summary(cfg: Config) -> str:
     L = ["Base configuration:"]
     for name, r in cfg.roles.items():
         L.append(f"- roles.{name}: model={r.model} fallback={r.fallback_models} temperature={r.temperature} "
-                 f"max_steps={r.max_steps} timeout_s={r.timeout_s}")
+                 f"max_steps={r.max_steps} timeout_s={r.timeout_s} "
+                 f"reasoning_effort={r.reasoning_effort or cfg.reasoning_effort or 'provider default'}")
     lim = cfg.limits
     L.append(f"- limits: max_concurrent_agents={lim.max_concurrent_agents} max_repair_cycles="
              f"{lim.max_repair_cycles} max_tasks={lim.max_tasks} task_retries={lim.task_retries}")
