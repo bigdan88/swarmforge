@@ -34,6 +34,8 @@ class ToolContext:
     session_network: str | None = None                         # network of the session container (Pi: bridge)
     processes: dict[str, str] = field(default_factory=dict)    # name -> command (start_process)
     browse_count: int = 0
+    test_command: str = "python -m pytest -q"                     # base command used by run_tests
+    base_sha: str | None = None                                  # run's base commit for git_changes
 
     async def aclose(self) -> None:
         """Stop every process and the sandbox session this agent started."""
@@ -236,6 +238,11 @@ from .devtools import DEV_IMPLS, DEV_SCHEMAS, DEV_TOOLS  # noqa: E402  (needs th
 
 TOOL_SCHEMAS.update(DEV_SCHEMAS)
 ASYNC_IMPLS.update(DEV_IMPLS)
+
+from .navtools import NAV_IMPLS, NAV_SCHEMAS  # noqa: E402
+
+TOOL_SCHEMAS.update(NAV_SCHEMAS)
+ASYNC_IMPLS.update(NAV_IMPLS)
 
 READ_TOOLS = ["list_files", "read_file", "search"]
 WRITE_TOOLS = ["write_file", "edit_file", "delete_file"]
