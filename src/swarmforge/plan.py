@@ -183,7 +183,118 @@ def validate_plan(data: Any, developer_roles: list[str], max_tasks: int,
             errors.append(str(e))
     if errors:
         raise PlanValidationError(errors)
-    return Plan(summary=summary.strip(), tasks=tasks, acceptance_criteria=criteria)
+    return auto_split_plan(Plan(summary=summary.strip(), tasks=tasks, acceptance_criteria=criteria))
+
+
+# ------------------------------------------------------- auto-split post-pass
+MAX_FILES_PER_TASK = 3
+WIDGET_SPLIT_THRESHOLD = 3
+
+WIDGET_TERMS: dict[str, tuple[str, ...]] = {
+    "filter": ("filter", "filters", "filtering"),
+    "button": ("button", "buttons"),
+    "panel": ("panel", "panels"),
+    "sidebar": ("sidebar", "sidebars"),
+    "tab": ("tab", "tabs"),
+    "chart": ("chart", "charts"),
+    "table": ("table", "tables"),
+    "form": ("form", "forms"),
+    "menu": ("menu", "menus"),
+    "modal": ("modal", "modals"),
+    "dialog": ("dialog", "dialogs"),
+    "dropdown": ("dropdown", "dropdowns"),
+    "slider": ("slider", "sliders"),
+    "checkbox": ("checkbox", "checkboxes"),
+    "toggle": ("toggle", "toggles"),
+    "search": ("search", "searching"),
+    "metric": ("metric", "metrics"),
+}
+_WIDGET_RE = {cat: re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", re.IGNORECASE)
+               for cat, words in WIDGET_TERMS.items()}
+
+
+def mentioned_widgets(description: str) -> list[str]:
+    """Distinct UI-widget categories mentioned in `description`, sorted alphabetically."""
+    return sorted(cat for cat, rx in _WIDGET_RE.items() if rx.search(description))
+
+
+def needs_split(task: Task) -> bool:
+    """True iff the task touches too many files or bundles too many UI features."""
+    return (len(task.expected_files) > MAX_FILES_PER_TASK
+            or len(mentioned_widgets(task.description)) >= WIDGET_SPLIT_THRESHOLD)
+
+
+def _chunks(items: list[str], parts: int) -> list[list[str]]:
+    """Split `items` into `parts` contiguous groups as evenly as possible."""
+    base, extra = divmod(len(items), parts)
+    out: list[list[str]] = []
+    idx = 0
+    for i in range(parts):
+        n = base + (1 if i < extra else 0)
+        out.append(items[idx:idx + n])
+        idx += n
+    return out
+
+
+def split_task(task: Task, parts: int | None = None) -> list[Task]:
+    """Split an oversized task into 2-3 sequential sub-tasks."""
+    if parts is None:
+        parts = 3 if (len(task.expected_files) > 2 * MAX_FILES_PER_TASK
+                      or len(mentioned_widgets(task.description)) >= 5) else 2
+    parts = max(2, min(3, parts))
+
+    widgets = mentioned_widgets(task.description)
+    if len(task.expected_files) > MAX_FILES_PER_TASK:
+        chunks = _chunks(task.expected_files, parts)
+        scopes = [", ".join(c) for c in chunks]
+    elif widgets:
+        # Widget-driven split: keep the (small) file list whole in every part.
+        chunks = [task.expected_files] * parts
+        scopes = [", ".join(c) for c in _chunks(widgets, parts)]
+    else:
+        chunks = _chunks(task.expected_files, parts)
+        scopes = [", ".join(c) for c in chunks]
+
+    subs: list[Task] = []
+    for i, chunk in enumerate(chunks):
+        subs.append(Task(
+            id=f"{task.id}-{i + 1}",
+            title=f"{task.title} (part {i + 1}/{parts})",
+            description=(f"Part {i + 1} of {parts} split from task '{task.id}'. "
+                         f"Your scope: {scopes[i]}. Implement ONLY this part; do not touch "
+                         f"files or features assigned to the other parts. "
+                         f"Original instructions: {task.description}"),
+            role=task.role,
+            depends_on=list(task.depends_on) if i == 0 else [subs[i - 1].id],
+            acceptance_criteria=list(task.acceptance_criteria),
+            expected_files=list(chunk),
+        ))
+    return subs
+
+
+def auto_split_plan(plan: Plan) -> Plan:
+    """Deterministic post-pass: split oversized tasks into sequential sub-tasks.
+
+    Note: this may produce more tasks than the planner's max_tasks cap — that is
+    intentional, since splitting oversized tasks is the whole point of the pass.
+    The sequential construction guarantees no cycles, so the result still passes
+    topo_waves.
+    """
+    if not any(needs_split(t) for t in plan.tasks):
+        return plan
+    new_tasks: list[Task] = []
+    split_map: dict[str, str] = {}  # original id -> last sub-task id
+    for t in plan.tasks:
+        if needs_split(t):
+            subs = split_task(t)
+            split_map[t.id] = subs[-1].id
+            new_tasks.extend(subs)
+        else:
+            new_tasks.append(t)
+    for t in new_tasks:
+        t.depends_on = [split_map.get(d, d) for d in t.depends_on]
+    plan.tasks = new_tasks
+    return plan
 
 
 # ---------------------------------------------------------------- review data
