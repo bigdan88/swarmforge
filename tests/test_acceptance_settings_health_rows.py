@@ -120,6 +120,7 @@ def test_github_access_uses_token_and_user_call(tmp_path, monkeypatch):
     calls: list = []
     monkeypatch.setattr(preflight, "_docker_problem", lambda c, t: None)
     monkeypatch.setattr(preflight, "_image_problems", lambda c, i: [])
+    monkeypatch.setattr(preflight, "_sandbox_tool_problems", lambda c, i, t: [])
 
     class Resp:
         status_code = 200
@@ -147,7 +148,7 @@ def test_local_mode_never_fabricates_ok_rows_for_unperformed_checks(tmp_path, mo
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path, "local"))
     by = {r["name"]: r for r in rows}
-    for name in ("Docker running", "Sandbox image built"):
+    for name in ("Docker running", "Sandbox image built", "Sandbox tools"):
         assert by[name]["status"] == "skipped", f"{name} must not be fabricated as ok"
         assert "not checked" in by[name]["message"]
         assert "local" in by[name]["message"]
@@ -315,6 +316,7 @@ def test_canonical_checks_equal_preflight_rows_in_docker_mode(tmp_path, monkeypa
     both when Docker answers and when it is down."""
     monkeypatch.setattr(preflight, "_docker_problem", lambda c, t: None)
     monkeypatch.setattr(preflight, "_image_problems", lambda c, i: [])
+    monkeypatch.setattr(preflight, "_sandbox_tool_problems", lambda c, i, t: [])
     monkeypatch.setenv("FAKE_KEY", "test-key")
     cfg = make_cfg(tmp_path, "docker")
     emitted = {r["name"] for r in preflight.environment_check_results(cfg)}
