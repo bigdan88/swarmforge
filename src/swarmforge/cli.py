@@ -62,15 +62,18 @@ def cmd_run(args, cfg) -> int:
         print("note: --yes pre-approves pushing the branch and opening a draft PR (recorded as an intervention)")
     issue_url = args.issue if args.issue and args.issue.startswith("http") else None
     issue_file = args.issue_file or (args.issue if args.issue and not args.issue.startswith("http") else None)
+    attachments = [str(Path(a).expanduser().resolve()) for a in (args.attachment or [])]
 
     async def go():
         from .postmortem import heal
         rid = await make(cfg, seed=args.continue_from).execute(
-            issue_url=issue_url, issue_file=issue_file, repo=args.repo, base_branch=args.base, run_id=args.run_id)
+            issue_url=issue_url, issue_file=issue_file, repo=args.repo, base_branch=args.base,
+            run_id=args.run_id, attachments=attachments)
 
         async def launch(c, seed, ctx, heal_of, attempt):
             return await make(c, seed, ctx, heal_of, attempt).execute(
-                issue_url=issue_url, issue_file=issue_file, repo=args.repo, base_branch=args.base)
+                issue_url=issue_url, issue_file=issue_file, repo=args.repo, base_branch=args.base,
+                attachments=attachments)
         return await heal(cfg, store, rid, launch, attempts=args.heal_attempts, echo=print)
     try:
         run_id = asyncio.run(go())
@@ -510,6 +513,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--role", help="developer role for --single (default: first developer role)")
     r.add_argument("--max-cycles", type=int, help="override limits.max_repair_cycles")
     r.add_argument("--budget", type=float, help="override limits.budget_usd")
+    r.add_argument("--attachment", action="append", metavar="PATH",
+                   help="attach a file to the task (repeatable); small text/log files are inlined "
+                        "into the issue, images and other binaries are saved and referenced")
     r.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("runs", help="list recent runs")

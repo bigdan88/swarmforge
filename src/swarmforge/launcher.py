@@ -22,7 +22,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
               test_command: str | None = None, sandbox_image: str | None = None,
               base: str | None = None, issue_file: str | None = None,
               max_runtime_s: int | None = None, seed_run_id: str | None = None,
-              heal_attempts: int | None = None) -> tuple[str, Path]:
+              heal_attempts: int | None = None,
+              attachments: list[tuple[str, bytes]] | None = None) -> tuple[str, Path]:
     if not issue_url and not issue_file and not (issue_title and issue_body):
         raise ValueError("give a GitHub issue URL, or a title and description")
     if not issue_url and not repo and not issue_file:
@@ -66,6 +67,12 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args += ["--test-command", test_command]
     if sandbox_image:
         args += ["--sandbox-image", sandbox_image]
+    if attachments:
+        from .attachments import MAX_FILES, save_attachments
+        saved = save_attachments(cfg.workdir / "issues" / "attachments" / run_id,
+                                  list(attachments)[:MAX_FILES])
+        for p in saved:
+            args += ["--attachment", str(p)]
 
     log_path = logs / f"{run_id}.log"
     log = open(log_path, "w", encoding="utf-8")
