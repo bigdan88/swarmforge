@@ -63,7 +63,7 @@ a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
 /* Claude-style chat bubbles: calm neutral palette, appended after the generic text rule above so
    the higher specificity wins for bubble text. LIGHT_CSS mirrors these selectors + properties. */
 [data-testid="stChatMessageContent"] { background-color: #16181d; color: #fafafa; border: 1px solid #33343d; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] { background-color: #1a1c22; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { background-color: #1a1c22; }
 </style>"""
 
 LIGHT_CSS = """<style>
@@ -99,7 +99,7 @@ a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
 /* Light reset of the chat bubbles: identical selectors + properties as the dark block, so the
    dark->light toggle leaves no stale dark colours behind. */
 [data-testid="stChatMessageContent"] { background-color: #f5f2ec; color: #31333f; border: 1px solid #dcd3c1; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] { background-color: #e9e4d8; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { background-color: #e9e4d8; }
 </style>"""
 
 # Every dark-palette colour DARK_CSS sets: none of these may appear in LIGHT_CSS (tests scan with it).
@@ -109,10 +109,10 @@ CHAT_CSS = """<style>
 /* Claude-style chat transcript: geometry + typography only. Colours live exclusively in
    DARK_CSS / LIGHT_CSS so every bubble colour is reversible on the dark->light toggle. */
 [data-testid="stChatMessage"] { align-items: flex-start; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { flex-direction: row-reverse; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]), [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) { flex-direction: row-reverse; }
 [data-testid="stChatMessageContent"] { border-radius: 18px; padding: 0.7rem 1.05rem; max-width: 78%; line-height: 1.75; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] { border-bottom-right-radius: 6px; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) [data-testid="stChatMessageContent"] { border-bottom-left-radius: 6px; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { border-bottom-right-radius: 6px; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from assistant"]) [data-testid="stChatMessageContent"] { border-bottom-left-radius: 6px; }
 [data-testid="stChatMessageContent"] h1, [data-testid="stChatMessageContent"] h2, [data-testid="stChatMessageContent"] h3, [data-testid="stChatMessageContent"] h4 { font-family: Georgia, "Times New Roman", serif; font-weight: 600; letter-spacing: 0.01em; line-height: 1.5; }
 </style>"""
 
