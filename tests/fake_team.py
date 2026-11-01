@@ -221,19 +221,23 @@ def developer(body):
     u = _user(body)
     task = re.search(r"## Your task (\w+)", u)
     task = task.group(1) if task else "MERGE"
-    steps = {
-        "T1": [("write_file", {"path": "inventory/exporters.py", "content": EXPORTERS}),
-               ("write_file", {"path": "tests/test_exporters.py", "content": EXPORTER_TESTS})],
-        "T2": [("edit_file", {"path": "README.md", "old_text": "## Development",
-                              "new_text": "## Exporting\n\n```\npython -m inventory export --output items.csv\n```\n\n## Development"})],
-        "T3": [("edit_file", {"path": "inventory/cli.py", "old_text": CLI_PATCH_OLD, "new_text": CLI_PATCH_NEW}),
-               ("edit_file", {"path": "inventory/cli.py", "old_text": CLI_PATCH2_OLD, "new_text": CLI_PATCH2_NEW}),
-               ("edit_file", {"path": "inventory/cli.py", "old_text": "from .store import InventoryStore, StoreError",
-                              "new_text": "from .exporters import ExportError, export_items\nfrom .store import InventoryStore, StoreError"}),
-               ("write_file", {"path": "tests/test_cli_export.py", "content": CLI_TESTS})],
-        "F1": [("edit_file", {"path": "README.md", "old_text": "export --output items.csv",
-                              "new_text": "export --output items.csv\npython -m inventory export --output data.out --format json"})],
-    }[task]
+    if task.startswith("R"):
+        steps = [("write_file", {"path": f"repair/{task}.md",
+                                "content": f"# Repair {task}\n\nAddressed reviewer finding.\n"})]
+    else:
+        steps = {
+            "T1": [("write_file", {"path": "inventory/exporters.py", "content": EXPORTERS}),
+                   ("write_file", {"path": "tests/test_exporters.py", "content": EXPORTER_TESTS})],
+            "T2": [("edit_file", {"path": "README.md", "old_text": "## Development",
+                                  "new_text": "## Exporting\n\n```\npython -m inventory export --output items.csv\n```\n\n## Development"})],
+            "T3": [("edit_file", {"path": "inventory/cli.py", "old_text": CLI_PATCH_OLD, "new_text": CLI_PATCH_NEW}),
+                   ("edit_file", {"path": "inventory/cli.py", "old_text": CLI_PATCH2_OLD, "new_text": CLI_PATCH2_NEW}),
+                   ("edit_file", {"path": "inventory/cli.py", "old_text": "from .store import InventoryStore, StoreError",
+                                  "new_text": "from .exporters import ExportError, export_items\nfrom .store import InventoryStore, StoreError"}),
+                   ("write_file", {"path": "tests/test_cli_export.py", "content": CLI_TESTS})],
+            "F1": [("edit_file", {"path": "README.md", "old_text": "export --output items.csv",
+                                  "new_text": "export --output items.csv\npython -m inventory export --output data.out --format json"})],
+        }[task]
     script = steps + [("run_command", {"command": "python -m pytest -q -p no:cacheprovider"}),
                       ("finish", {"summary": f"{task} done", "tests_run": "pytest"})]
     name, args = script[min(n, len(script) - 1)]
