@@ -136,9 +136,9 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "New task", "Failures", "Knowledge", "Benchmarks", "Settings"]
+PAGES = ["Work", "New task", "Failures", "Chat", "Knowledge", "Benchmarks", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
-            "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
+            "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
 NAV_ICON["Settings"] = ":material/settings:"
 SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
@@ -1653,6 +1653,42 @@ def page_failures():
         st.rerun()
 
 
+# ================================================================= CHAT page
+def page_chat():
+    if cfg is None:
+        st.error("Configuration not loaded; the chatbot needs a configured model role.")
+        return
+    from swarmforge import chatbot
+    st.header("Chat: ask about runs and swarm statuses")
+    st.caption("Answers are built from the SwarmForge store (runs, per-task swarm statuses, failures, "
+               "queue and pending approvals) and written by the configured `chat` role — or the planner "
+               "model if no chat role is set. CLI: `swarmforge ask \"…\"`.")
+    history = st.session_state.setdefault("chat_history", [])
+    if st.button("Reset conversation", key="chat_reset"):
+        history.clear()
+    for m in history:
+        with st.chat_message(m["role"]):
+            if m["role"] == "assistant":
+                st.markdown(m["content"])
+            else:
+                st.write(m["content"])
+    prompt = st.chat_input("Ask about runs, swarms, failures... e.g. which runs failed and why?")
+    if not prompt:
+        return
+    history.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.write(prompt)
+    try:
+        res = chatbot.ask(cfg, store, prompt, history=history[:-1])
+    except chatbot.ChatError as e:
+        st.error(f"Chatbot: {e}")
+        return
+    history.append({"role": "assistant", "content": res["answer"]})
+    with st.chat_message("assistant"):
+        st.markdown(res["answer"])
+        st.caption(f"answered by **{res['role']}** · `{res['model']}`")
+
+
 # ============================================================ NEW TASK page
 def queue_forms() -> None:
     from swarmforge import runqueue as rq
@@ -1766,5 +1802,5 @@ def page_settings():
     settings.render(cfg)
 
 
-{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Knowledge": page_knowledge,
- "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()
+{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Chat": page_chat,
+ "Knowledge": page_knowledge, "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()
