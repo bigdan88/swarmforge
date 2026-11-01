@@ -149,9 +149,17 @@ def _page_text(at: AppTest) -> str:
     parts: list[str] = []
     for kind in ("markdown", "caption", "text", "subheader", "header",
                  "success", "info", "warning", "error"):
-        parts.extend(str(el.value) for el in at.get(kind)
-                     if not str(el.value).lstrip().startswith("<style"))
+        parts.extend(str(getattr(el, "value", "")) for el in at.get(kind)
+                     if not str(getattr(el, "value", "")).lstrip().startswith("<style"))
     return "\n".join(parts)
+
+
+def _search_box(at: AppTest):
+    """The text-search input above the runs table (fails loudly if absent)."""
+    box = next((t for t in at.text_input
+                if (t.key or "") == "w_search" or "search" in (t.label or "").lower()), None)
+    assert box is not None, "no text search input above the runs table"
+    return box
 
 
 def _pick_widget(at: AppTest, needle: str,
@@ -263,14 +271,11 @@ def test_text_search_filters_by_issue_title(tmp_path, monkeypatch) -> None:
     at = _app()
     assert len(_visible_run_ids(at)) == 3
 
-    box = next((t for t in at.text_input
-                if (t.key or "") == "w_search" or "search" in (t.label or "").lower()), None)
-    assert box is not None, "no text search input above the runs table"
+    box = _search_box(at)
     box.set_value("zebra-unicorn").run()
     assert _visible_run_ids(at) == {"r-2"}
 
-    box = at.text_input(key=box.key)
-    box.set_value("rotate").run()
+    _search_box(at).set_value("rotate").run()
     assert _visible_run_ids(at) == {"r-3"}
 
 
@@ -404,17 +409,26 @@ def test_free_disk_space_refused_for_active_run(tmp_path, monkeypatch) -> None:
 
     at = _app()
     _open_run(at, "r-live")
+    # premise: the dashboard really treats the seeded run as active (live settings panel shown)
+    assert any((b.key or "").startswith("cancel_") for b in at.button), \
+        "the seeded run was not treated as active by the dashboard"
+
     btns = _buttons(at, "free disk") or _buttons(at, "free space")
-    if not btns:
-        return  # feature refuses by not offering the action on active runs
-    confirm = _confirm_checkbox(at)
-    if confirm is not None:
-        confirm.check().run()
-        btns = _buttons(at, "free disk") or _buttons(at, "free space")
-    btns[0].click().run()
+    if btns:
+        # if the action is offered anyway, it must refuse to delete anything
+        confirm = _confirm_checkbox(at)
+        if confirm is not None:
+            confirm.check().run()
+            btns = _buttons(at, "free disk") or _buttons(at, "free space")
+        btns[0].click().run()
+    else:
+        # refusal by omission: the panel must explain the action waits for the run to finish
+        assert "free disk space" in _page_text(at).lower(), \
+            "active run detail neither offers nor explains the free-disk-space action"
 
     assert (run_dir / "repo").exists(), "free disk space deleted the clone of an active run"
     assert (run_dir / "worktrees").exists(), "free disk space deleted the worktrees of an active run"
+    assert (run_dir / "report.md").exists()
 
 
 # --------------------------------------------------------------------------- AC4
@@ -432,3 +446,7 @@ def test_work_page_shows_total_workdir_disk_usage(tmp_path, monkeypatch) -> None
     text = _page_text(at)
     assert re.search(r"\d+(?:[.,]\d+)?\s(?:KB|MB|GB|TB|KiB|MiB|GiB|bytes)\b", text), \
         "the Work page does not show the workdir's total disk usage"
+    # the figure must reflect the ~2 MB of files just placed in the workdir, not a placeholder
+    mbs = [float(m.replace(",", ".")) for m in re.findall(r"(\d+(?:[.,]\d+)?)\s*MB", text)]
+    assert any(v >= 2.0 for v in mbs), \
+        f"no shown MB figure accounts for the seeded ~2 MB of workdir files: {mbs}"
