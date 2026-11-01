@@ -265,11 +265,14 @@ def delete_conversation(store: Store, conversation_id: str) -> bool:
 
 
 def ensure_default_conversation(store: Store) -> dict:
-    """Seed a 'General' conversation on first use; else return the most recent one."""
-    convs = list_conversations(store, 1)
-    if not convs:
-        return create_conversation(store, DEFAULT_CONVERSATION_TITLE)
-    return convs[0]
+    """Return the default conversation, seeding it on first use."""
+    conv = store._one(
+        "SELECT * FROM conversations WHERE title = ? ORDER BY id LIMIT ?",
+        (DEFAULT_CONVERSATION_TITLE, 1),
+    )
+    if conv is not None:
+        return conv
+    return create_conversation(store, DEFAULT_CONVERSATION_TITLE)
 
 
 # ====================================================================== self-improvement
