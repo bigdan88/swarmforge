@@ -136,6 +136,20 @@ async def test_run_tests_keyword_filter_and_all_green(ctx, monkeypatch):
     assert "0 selected" not in out
 
 
+async def test_run_tests_uses_configured_test_command_as_base(ctx, monkeypatch):
+    """AC2: the base command is the project's configured test_command, not a hardcoded one."""
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    ctx.test_command = f'{Path(sys.executable).as_posix()} -m pytest -q --no-header'
+    tests = ctx.workspace / "tests"
+    tests.mkdir()
+    (tests / "test_ok.py").write_text("def test_a():\n    assert True\n")
+    out = await navtools.run_tests(ctx)
+    assert "1 passed" in out, out
+    ran = ctx.commands_run[-1]["command"]
+    assert ctx.test_command in ran, f"configured test command not used: {ran}"
+    assert "--junit-xml" in ran, f"JUnit XML output not requested: {ran}"
+
+
 # --------------------------------------------------------------------- AC3
 async def test_find_symbol_definitions_and_references_not_strings(ctx):
     (ctx.workspace / "lib.py").write_text("def compute(a, b):\n    return a + b\n")
@@ -185,6 +199,24 @@ async def test_git_changes_and_history_are_readonly(ctx):
     assert _git(ws, "rev-parse", "HEAD") == head_before
     assert _git(ws, "status", "--porcelain") == status_before
     assert _git(ws, "diff", "--cached", "--name-only") == index_before
+
+
+async def test_git_changes_caps_large_diff(ctx):
+    """AC4: the diff is capped at a size limit instead of flooding the agent context."""
+    ws = ctx.workspace
+    _git(ws, "init", "-q", "-b", "main")
+    _git(ws, "config", "user.name", "t")
+    _git(ws, "config", "user.email", "t@t")
+    (ws / "big.py").write_text("x = 1\n")
+    _git(ws, "add", "-A")
+    _git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init")
+    ctx.base_sha = _git(ws, "rev-parse", "HEAD")
+    # ~20k lines of diff: far beyond MAX_DIFF_CHARS
+    (ws / "big.py").write_text("data = [\n" + "".join(f"    {i},\n" for i in range(20000)) + "]\n")
+    out = await navtools.git_changes(ctx)
+    assert "big.py" in out
+    assert "[truncated" in out, "diff must be capped"
+    assert len(out) <= navtools.MAX_DIFF_CHARS + 2000, f"output exceeds cap: {len(out)}"
 
 
 async def test_git_history_blame_and_missing_file(ctx):
