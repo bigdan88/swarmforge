@@ -1443,7 +1443,37 @@ def item_detail(w: dict, every) -> None:
         store.set_archived(r["id"], True)
         select_item(None)  # it leaves the list, so close it too
         st.rerun()
+    free_disk_panel(r, w)
     run_detail(r["id"], header=False)
+
+
+def free_disk_panel(r: dict, w: dict) -> None:
+    """Reclaim the disk a finished run's clone and worktrees use.
+
+    Only ``repo`` and ``worktrees`` are removed: the database row, the report,
+    the transcripts and the logs stay. Active runs are never offered the action."""
+    from swarmforge.db import free_run_disk
+
+    rid = r["id"]
+    if w["group"] == "active":
+        st.caption("🧹 Free disk space is available once the run finishes.")
+        return
+    st.checkbox("Confirm: delete this run's repo and worktrees from disk", key=f"fd_ok_{rid}",
+                help="Frees disk space by removing the clone and the worktrees. The run's history, "
+                     "report, transcripts and logs are kept.")
+    if st.button("🧹 Free disk space", key=f"fd_{rid}",
+                 help="Deletes this run's repo and worktrees folders from the workdir."):
+        if not st.session_state.get(f"fd_ok_{rid}"):
+            st.warning("Tick the confirmation box first.")
+            return
+        rd = Path(r["run_dir"]) if r.get("run_dir") else (cfg.workdir / "runs" / rid if cfg else None)
+        if rd is None:
+            st.warning("This run has no work folder to clean up.")
+            return
+        freed = free_run_disk(rd)
+        store.event(rid, "disk", f"freed {freed} bytes")
+        _workdir_bytes.clear()  # the usage figure above must reflect the cleanup
+        st.success(f"Freed {freed / 1e6:.1f} MB from disk.")
 
 
 def welcome_panel(cfg, empty: bool = False) -> None:
@@ -1507,6 +1537,13 @@ def welcome_panel(cfg, empty: bool = False) -> None:
 }""")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _workdir_bytes(path: str) -> int:
+    """Total size of the workdir in bytes; cached briefly because it can hold many clones."""
+    from swarmforge.db import dir_size_bytes
+    return dir_size_bytes(Path(path))
+
+
 def page_work():
     from swarmforge import runqueue as rq
     if "flash" in st.session_state:
@@ -1516,6 +1553,8 @@ def page_work():
     if h2.button("New task", icon=":material/add:", type="primary", width="stretch"):
         st.session_state.goto = "New task"
         st.rerun()
+    if cfg is not None:
+        st.caption(f"💽 Workdir usage: {_workdir_bytes(str(cfg.workdir)) / 1e6:.1f} MB · `{cfg.workdir}`")
     items = work_items()
     show = st.session_state.pop("show_welcome", False)
     if not items or show:  # first run (or "Getting started" in the sidebar): welcome instead of an empty table
