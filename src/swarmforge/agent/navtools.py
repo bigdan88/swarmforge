@@ -115,7 +115,7 @@ async def run_tests(ctx: ToolContext, paths: list[str] | None = None, keyword: s
         parts += ["-k", _quote(str(keyword))]
     if last_failed:
         parts.append("--lf")
-    command = " ".join(parts)
+    command = f"mkdir -p .swarmforge && {' '.join(parts)}"
     res = await _exec(ctx, command, min(ctx.command_timeout_s, 600))
     if res.timed_out:
         raise ToolError(f"tests timed out after {res.duration_s:.0f}s\n{_cap(res.output, 4000)}")

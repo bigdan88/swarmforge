@@ -3,6 +3,7 @@
 Everything runs against LocalSandbox in a tmp_path workspace: no Docker, no network.
 Covers AC1-AC9 of the issue "Add a second batch of agent developer tools".
 """
+import re
 import socket
 import subprocess
 import sys
@@ -13,8 +14,14 @@ import pytest
 from swarmforge import prompts
 from swarmforge.agent import navtools
 from swarmforge.agent.devtools import start_process
-from swarmforge.agent.tools import (ASYNC_IMPLS, EXEC_TOOLS, READ_TOOLS, TOOL_SCHEMAS,
-                                    ToolContext, ToolError)
+from swarmforge.agent.tools import (
+    ASYNC_IMPLS,
+    EXEC_TOOLS,
+    READ_TOOLS,
+    TOOL_SCHEMAS,
+    ToolContext,
+    ToolError,
+)
 from swarmforge.config import parse_config
 from swarmforge.sandbox import CommandResult, LocalSandbox
 
@@ -70,6 +77,7 @@ async def test_navtool_callable_through_agent_runtime_dispatch(tmp_path):
 
     from swarmforge.agent.runtime import AgentSpec, TerminalTool, run_agent
     from swarmforge.llm import LLMClient
+
     from .conftest import FakeProvider
 
     os.environ["FAKE_KEY"] = "k"
@@ -282,9 +290,17 @@ async def test_format_code_clear_error_when_ruff_missing(ctx, monkeypatch):
 
 
 def test_dockerfile_sandbox_installs_ruff():
+    """ruff must be installed by an actual RUN command, not just mentioned in a comment."""
     dockerfile = REPO_ROOT / "src" / "swarmforge" / "resources" / "Dockerfile.sandbox"
     text = dockerfile.read_text(encoding="utf-8")
-    assert "ruff" in text, "the default sandbox image must contain ruff"
+    install_lines = [
+        line for line in text.splitlines()
+        if line.strip().upper().startswith("RUN") and "ruff" in line
+    ]
+    assert install_lines, "the sandbox Dockerfile must have a RUN line installing ruff"
+    assert any(
+        re.search(r"pip\s+install.*ruff", line) for line in install_lines
+    ), "ruff must be installed via pip install, not merely referenced"
 
 
 async def test_format_code_reformats_and_reports_files(ctx):
