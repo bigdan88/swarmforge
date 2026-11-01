@@ -120,7 +120,8 @@ def test_health_section_renders_one_row_per_check(tmp_path, monkeypatch):
     )
     md = " ".join(m.value for m in at.markdown)
     for want in ("Provider API keys", "Git",
-                 "Docker running", "Sandbox image built", "GitHub access"):
+                 "Docker running", "Sandbox image built", "Sandbox tools",
+                 "GitHub access"):
         assert f"✅ **{want}**" in md, (want, md)
     assert "Provider base_url" not in md
     assert "GitHub CLI" not in md
