@@ -335,3 +335,81 @@ def test_model_selectbox_accepts_new_options_when_reachable(tmp_path, monkeypatc
         sb = at.selectbox(key=f"set_model_{role}")
         assert list(sb.options) == MODELS
         assert sb.proto.accept_new_options is True, role
+
+
+# ------------------------------------------------- real provider_models / build helper
+def test_provider_models_fetches_sorted_list_or_none(tmp_path, monkeypatch):
+    """AC5: settings.provider_models GETs {base_url}/models and returns the sorted ids;
+    None (free-text fallback) when the provider answers non-200 or is unreachable."""
+    seen: dict = {}
+
+    class Resp:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, headers=None, timeout=None):
+        seen["url"] = url
+        seen["auth"] = (headers or {}).get("Authorization", "")
+        return Resp(200, {"data": [{"id": "zeta-fake"}, {"id": "alpha-fake"}]})
+
+    monkeypatch.setattr(settings.httpx, "get", fake_get)
+    monkeypatch.setenv("FAKE_KEY", "sentinel-secret-xyz")
+    cfg = parse_config(base_raw(tmp_path / "work"))
+    assert settings.provider_models(cfg, "fake") == ["alpha-fake", "zeta-fake"]
+    assert seen["url"] == "https://fake.test/v1/models"
+    # the key is only ever sent as a header, never rendered (AC3)
+    assert seen["auth"] == "Bearer sentinel-secret-xyz"
+
+    monkeypatch.setattr(settings.httpx, "get", lambda *a, **kw: Resp(500))
+    assert settings.provider_models(cfg, "fake") is None
+    monkeypatch.setattr(settings.httpx, "get",
+                        lambda *a, **kw: (_ for _ in ()).throw(OSError("down")))
+    assert settings.provider_models(cfg, "fake") is None
+    assert settings.provider_models(cfg, "no-such-provider") is None
+
+
+def test_build_sandbox_image_streams_output_and_returns_rc(monkeypatch, tmp_path):
+    """AC4: the real build_sandbox_image runs the docker build and streams every output
+    line through on_line, returning the exit code."""
+    captured: dict = {}
+
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            captured["cmd"] = list(cmd)
+            self.stdout = iter(["Step 1/5 : FROM python:3.12-slim\n",
+                                "Successfully built deadbeef\n"])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(settings.shutil, "which", lambda n: "/usr/bin/docker")
+    monkeypatch.setattr(settings.subprocess, "Popen", FakeProc)
+    lines: list[str] = []
+    cfg = parse_config(base_raw(tmp_path / "work"))
+    rc = settings.build_sandbox_image(cfg, on_line=lines.append)
+    assert rc == 0
+    assert lines == ["Step 1/5 : FROM python:3.12-slim", "Successfully built deadbeef"]
+    assert "build" in captured["cmd"] and "-t" in captured["cmd"]
+    assert cfg.sandbox.image in captured["cmd"]
+
+    # non-zero build propagates the exit code
+    class FailProc(FakeProc):
+        def wait(self):
+            return 17
+
+    monkeypatch.setattr(settings.subprocess, "Popen", FailProc)
+    assert settings.build_sandbox_image(cfg, on_line=None) == 17
+
+
+def test_build_sandbox_image_missing_docker_binary(monkeypatch, tmp_path):
+    """AC4: without a docker binary the helper reports it and returns 127 (no subprocess)."""
+    monkeypatch.setattr(settings.shutil, "which", lambda n: None)
+    lines: list[str] = []
+    cfg = parse_config(base_raw(tmp_path / "work"))
+    rc = settings.build_sandbox_image(cfg, on_line=lines.append)
+    assert rc == 127
+    assert lines == ["docker binary not found"]
