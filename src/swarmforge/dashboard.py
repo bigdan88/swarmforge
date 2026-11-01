@@ -136,9 +136,10 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "New task", "Failures", "Knowledge", "Benchmarks"]
+PAGES = ["Work", "New task", "Failures", "Knowledge", "Benchmarks", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
             "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
+NAV_ICON["Settings"] = ":material/settings:"
 SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
@@ -1682,5 +1683,12 @@ def page_benchmarks():
         st.dataframe(df.astype(str), width="stretch")
 
 
+# =========================================================== SETTINGS page
+def page_settings():
+    st.caption("Edit swarmforge.yaml, run health checks and test models.")
+    from swarmforge import settings
+    settings.render(cfg)
+
+
 {"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Knowledge": page_knowledge,
- "Benchmarks": page_benchmarks}[page]()
+ "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()
