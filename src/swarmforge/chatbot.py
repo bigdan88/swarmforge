@@ -213,7 +213,8 @@ async def answer(cfg: Config, store: Store, question: str,
         llm_budget = budget if budget is not None else Budget(
             max(2.0, cfg.limits.budget_usd), store.cost_summary(run_id)["total"])
         try:
-            llm = LLMClient(cfg, store=store, run_id=run_id, budget=llm_budget, transport=transport)
+            llm = LLMClient(cfg, store=store, run_id=run_id, budget=llm_budget, transport=transport,
+                          record_errors=False)
             res = await llm.chat(role, messages, task_key="chatbot")
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e

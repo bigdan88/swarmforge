@@ -137,6 +137,9 @@ def test_failed_call_keeps_user_message_without_assistant(cfg, st_):
         chatbot.ask(cfg, st_, "will fail", conversation="F", transport=fake.transport)
     msgs = st_.conversation_messages("F")
     assert [m["role"] for m in msgs] == ["user"] and msgs[0]["content"] == "will fail"
+    # failed calls must not count toward the conversation's cost summary
+    assert st_.llm_calls("chat:F") == []
+    assert st_.cost_summary("chat:F")["calls"] == 0
 
 
 # ------------------------------------------------- backward compatibility (AC6)
