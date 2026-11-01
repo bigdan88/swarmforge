@@ -135,7 +135,9 @@ def _capture_dashboard_call(monkeypatch):
         calls.append((list(cmd), dict(env or {})))
         return 0
 
-    monkeypatch.setattr("swarmforge.cli.subprocess.call", fake_call)
+    monkeypatch.setattr("swarmforge.cli.subprocess.Popen",
+                        lambda cmd, env=None, **kw: type("P", (), {"pid": 1, "wait": lambda self, timeout=None:
+                                                                   fake_call(cmd, env=env)})())
     return calls
 
 
@@ -172,12 +174,12 @@ def test_ac4_altair_theme_follows_effective_theme(tmp_path, monkeypatch):
     otherwise (including auto+auto and light overrides of a dark launch)."""
     dash = _dash(tmp_path, monkeypatch)
     enabled = []
-    monkeypatch.setattr(alt.themes, "enable", enabled.append)
+    monkeypatch.setattr(alt.theme, "enable", enabled.append)
     for sel, launch, expected in [("dark", "auto", "dark"), ("auto", "dark", "dark"),
-                                  ("auto", "auto", "vox"), ("light", "auto", "vox"),
-                                  ("light", "dark", "vox")]:
+                                  ("auto", "auto", "default"), ("light", "auto", "default"),
+                                  ("light", "dark", "default")]:
         dash.apply_chart_theme(dash.effective_theme(sel, launch))
-    assert enabled == ["dark", "dark", "vox", "vox", "vox"]
+    assert enabled == ["dark", "dark", "default", "default", "default"]
 
 
 def test_ac4_graphviz_and_badge_helpers_do_not_raise_in_either_mode(tmp_path, monkeypatch):

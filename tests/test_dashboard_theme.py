@@ -67,21 +67,16 @@ def test_effective_theme_matrix(tmp_path, monkeypatch):
 def test_apply_chart_theme_switches_altair(tmp_path, monkeypatch):
     _write_cfg(tmp_path, monkeypatch)
     dash = _dashboard()
-    original = alt.themes.active  # restore whatever was active before the test
     seen: list[str] = []
-    monkeypatch.setattr(alt.themes, "enable", seen.append)
-    try:
-        dash.apply_chart_theme("dark")
-        dash.apply_chart_theme("light")
-        dash.apply_chart_theme("auto")
-        assert seen == ["dark", "vox", "vox"]
-    finally:
-        monkeypatch.undo()
-        alt.themes.enable(original)
+    monkeypatch.setattr(alt.theme, "enable", seen.append)   # Altair >= 5.5 API (no deprecation warning)
+    dash.apply_chart_theme("dark")
+    dash.apply_chart_theme("light")
+    dash.apply_chart_theme("auto")
+    assert seen == ["dark", "default", "default"]
     # an unknown/broken theme name must never crash the app
     def boom(_name):
         raise ValueError("no such theme")
-    monkeypatch.setattr(alt.themes, "enable", boom)
+    monkeypatch.setattr(alt.theme, "enable", boom)
     dash.apply_chart_theme("dark")
     dash.apply_chart_theme("light")
 

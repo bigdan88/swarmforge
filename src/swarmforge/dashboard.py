@@ -97,8 +97,12 @@ def effective_theme(sel: str, launch: str) -> str:
 
 def apply_chart_theme(mode: str) -> None:
     """Match the Altair chart theme to the palette; an unknown theme name must never break the page."""
+    name = "dark" if mode == "dark" else "default"
     try:
-        alt.themes.enable("dark" if mode == "dark" else "vox")
+        if hasattr(alt, "theme") and hasattr(alt.theme, "enable"):   # Altair >= 5.5
+            alt.theme.enable(name)
+        else:                                                       # older Altair
+            alt.themes.enable(name if name == "dark" else "vox")
     except Exception:  # noqa: BLE001 - chart styling is decoration
         pass
 
@@ -218,8 +222,11 @@ def short_model(m):
     return (m or "").split("/")[-1]
 
 
+from swarmforge.launcher import pid_alive as _alive  # noqa: E402 - imported once at startup, never inside a
+# fragment: importing lazily from the auto-refresh fragment raced with Streamlit's module reloader
+
+
 def pid_alive(pid):
-    from swarmforge.launcher import pid_alive as _alive
     return _alive(pid)
 
 

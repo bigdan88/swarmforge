@@ -30,7 +30,9 @@ def _capture(monkeypatch):
         calls.append((cmd, env))
         return 0
 
-    monkeypatch.setattr("swarmforge.cli.subprocess.call", fake_call)
+    monkeypatch.setattr("swarmforge.cli.subprocess.Popen",
+                        lambda cmd, env=None, **kw: type("P", (), {"pid": 1, "wait": lambda self, timeout=None:
+                                                                   fake_call(cmd, env=env)})())
     monkeypatch.setattr("swarmforge.cli.shutil.which", lambda name: "streamlit")
     return calls
 

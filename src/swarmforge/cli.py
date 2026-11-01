@@ -346,12 +346,28 @@ def cmd_dashboard(args, cfg) -> int:
         import threading
         import webbrowser
         threading.Timer(2.5, lambda: webbrowser.open(url)).start()
-    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
-                            "--server.address", address, "--server.headless", "true", "--browser.gatherUsageStats", "false",
-                            "--client.toolbarMode", "minimal",
-                            # Streamlit only accepts light/dark here (anything else is read as a theme FILE);
-                            # "auto" = leave it unset so Streamlit follows the system setting
-                            *(["--theme.base", theme] if theme in ("light", "dark") else [])], env=env)
+    cmd = [sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
+           "--server.address", address, "--server.headless", "true", "--browser.gatherUsageStats", "false",
+           "--client.toolbarMode", "minimal",
+           # code changes arrive through Update & restart; Streamlit's file watcher would otherwise unload
+           # SwarmForge modules while a page is running whenever a file changes (e.g. during `git pull`)
+           "--server.fileWatcherType", "none",
+           # Streamlit only accepts light/dark here (anything else is read as a theme FILE);
+           # "auto" = leave it unset so Streamlit follows the system setting
+           *(["--theme.base", theme] if theme in ("light", "dark") else [])]
+    p = subprocess.Popen(cmd, env=env)
+    try:
+        return p.wait()
+    except KeyboardInterrupt:          # Ctrl+C: stop Streamlit quietly and for sure (it can hang at "Stopping...")
+        print("\nstopping the dashboard…")
+        try:
+            p.wait(timeout=5)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+            else:
+                p.kill()
+        return 0
 
 
 def _lan_ips() -> list[str]:
