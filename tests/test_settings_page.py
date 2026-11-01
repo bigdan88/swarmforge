@@ -46,7 +46,10 @@ def test_get_health_checks_all_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path))
-    assert rows and all(r["status"] == "ok" for r in rows)
+    assert rows
+    # local mode: unperformed docker checks are 'skipped', everything actually checked is 'ok'
+    assert all(r["status"] in ("ok", "skipped") for r in rows)
+    assert any(r["name"] == "GitHub access" and r["status"] == "ok" for r in rows)
 
 
 def test_get_health_checks_local_mode_marks_docker_optional(tmp_path, monkeypatch):
@@ -55,7 +58,9 @@ def test_get_health_checks_local_mode_marks_docker_optional(tmp_path, monkeypatc
     rows = settings.get_health_checks(make_cfg(tmp_path, "local"))
     by_name = {r["name"]: r for r in rows}
     assert by_name["Docker running"]["optional"] is True
-    assert by_name["Docker running"]["status"] == "ok"
+    # AC1: never fabricate an 'ok' for a check preflight does not perform -> explicit 'skipped'
+    assert by_name["Docker running"]["status"] == "skipped"
+    assert "not checked" in by_name["Docker running"]["message"]
     assert "local" in by_name["Docker running"]["message"]
 
 
@@ -124,7 +129,7 @@ def test_canonical_checks_are_all_performed_by_preflight(tmp_path, monkeypatch):
 
 
 def test_get_health_checks_never_invents_rows_for_unperformed_checks(tmp_path, monkeypatch):
-    """A canonical check absent from the preflight results produces no row at all."""
+    """A canonical check absent from the preflight results is never reported as 'ok'."""
     monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
         {"name": "Git", "status": "fail", "message": "git is not installed or not on PATH.",
          "fix": "Install Git for Windows and reopen the terminal."}])
@@ -133,10 +138,13 @@ def test_get_health_checks_never_invents_rows_for_unperformed_checks(tmp_path, m
     names = {r["name"] for r in rows}
     assert "Provider API keys" not in names  # not checked -> no fabricated 'ok' row
     by_name = {r["name"]: r for r in rows}
-    assert by_name["Docker running"]["status"] == "ok"
+    assert by_name["Docker running"]["status"] == "skipped"
+    assert "not checked" in by_name["Docker running"]["message"]
     assert "local" in by_name["Docker running"]["message"]
-    assert by_name["Sandbox image built"]["status"] == "ok"
+    assert by_name["Sandbox image built"]["status"] == "skipped"
     assert "local" in by_name["Sandbox image built"]["message"]
+    # the only green 'ok' row is the one actually checked (GitHub access)
+    assert {r["name"] for r in rows if r["status"] == "ok"} == {"GitHub access"}
 
 
 def test_test_models_caps_busy_wait_s(tmp_path, monkeypatch):
@@ -182,7 +190,8 @@ def test_environment_check_results_git_fail_and_docker_rows(tmp_path, monkeypatc
     names = [r["name"] for r in preflight.environment_check_results(cfg)]
     assert names == ["Provider API keys", "Git"]
 
-    # docker mode with failing probes: both docker rows present and failing
+    # docker mode with failing probes: Docker row fails; the image row is 'skipped',
+    # never fabricated as 'ok' (AC1) since the probe cannot run while the daemon is down
     cfg = make_cfg(tmp_path, "docker")
     monkeypatch.setattr(preflight, "_docker_problem",
                         lambda c, t: ("Docker is not responding.", "Start Docker Desktop."))
@@ -193,7 +202,8 @@ def test_environment_check_results_git_fail_and_docker_rows(tmp_path, monkeypatc
     assert by_name["Git"]["status"] == "fail"
     assert "git is not installed" in by_name["Git"]["message"]
     assert by_name["Docker running"]["status"] == "fail"
-    assert by_name["Sandbox image built"]["status"] == "ok"  # not probed when docker is down
+    assert by_name["Sandbox image built"]["status"] == "skipped"  # not ok! check not performed
+    assert "not checked" in by_name["Sandbox image built"]["message"]
 
     # docker ok but image missing
     monkeypatch.setattr(preflight, "_docker_problem", lambda c, t: None)
