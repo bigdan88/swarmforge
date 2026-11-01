@@ -85,6 +85,27 @@ def resolve_base(store: Store, item: dict) -> tuple[str | None, str | None]:
     return None, f"previous item #{last['id']} {last['status']}; this item starts from the default branch"
 
 
+RESTARTED = "restarted as task #"
+
+
+def requeue(store: Store, item: dict, **kw) -> tuple[int, bool]:
+    """Queue a finished/failed item again at the front of the waiting line. Returns (item id, created).
+    If a copy is already waiting or running, that copy is returned instead of adding another one."""
+    for q in store.queue_items(include_finished=False):
+        if q["id"] != item["id"] and q["status"] in ("queued", "running") and \
+                q["title"] == item["title"] and q["body"] == item["body"] and q["repo"] == item["repo"]:
+            return q["id"], False
+    extra = {k: item.get(k) for k in ("issue_url",) if item.get(k)}
+    new_id = store.queue_add(item["title"], item["body"], item["repo"], **extra, **kw)
+    waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != new_id]
+    if waiting:
+        store.queue_update(new_id, position=waiting[0]["position"] - 0.5)
+    note = (item.get("note") or "").split(" · " + RESTARTED)[0]
+    store.queue_update(item["id"], note=f"{note} · {RESTARTED}{new_id}".lstrip(" ·"))
+    store.kv_set(PAUSED_KEY, "0")
+    return new_id, True
+
+
 def result_branch_of(run: dict) -> str | None:
     """A branch later items can start from: delivered to the local repo, or pushed with a PR."""
     if run["state"] != "COMPLETED" or not run["integration_branch"]:
@@ -174,6 +195,10 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
             if i["status"] == "running":
                 store.queue_update(i["id"], status="failed", finished_at=time.time(),
                                    note="worker stopped while this item was running")
+                run = store.get_run(i["run_id"]) if i.get("run_id") else None
+                if run and run["state"] not in ("COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"):
+                    store.update_run(run["id"], state="FAILED", finished_at=time.time(),
+                                     state_reason="the queue worker stopped while this run was going")
         while True:
             if store.kv_get(PAUSED_KEY) == "1":
                 if echo:

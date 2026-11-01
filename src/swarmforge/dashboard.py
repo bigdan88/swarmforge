@@ -462,13 +462,21 @@ def run_resumable(run_id: str) -> bool:
     return resumable(store, run_id)
 
 
-def _requeue_next(item: dict, kw: dict) -> None:
-    """Re-add a queue item right after the items that are already running (front of the waiting line)."""
-    new_id = store.queue_add(item["title"], item["body"], item["repo"], **kw)
-    waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != new_id]
-    if waiting:
-        store.queue_update(new_id, position=waiting[0]["position"] - 0.5)
-    store.kv_set("queue_paused", "0")
+def _requeue_next(item: dict, kw: dict) -> tuple[int, bool]:
+    """Re-add a queue item at the front of the waiting line (never twice)."""
+    from swarmforge.runqueue import requeue
+    return requeue(store, item, **kw)
+
+
+def _restarted_as(item: dict | None) -> int | None:
+    from swarmforge.runqueue import RESTARTED
+    note = (item or {}).get("note") or ""
+    if RESTARTED in note:
+        try:
+            return int(note.rsplit(RESTARTED, 1)[1].split()[0])
+        except ValueError:
+            return None
+    return None
 
 
 def restart_panel(run: dict) -> None:
@@ -889,6 +897,8 @@ def work_items() -> list[dict]:
             used.add(r["id"])
         if i["status"] == "queued":
             grp, icon, label = "waiting", "⏳", f"Waiting (#{waiting_pos[i['id']]} in line)"
+        elif _restarted_as(i):
+            grp, icon, label = "failed", "↻", f"Restarted as #{_restarted_as(i)}"
         elif r:
             grp, icon, label = _run_status(r, approvals)
         elif i["status"] == "running":
@@ -1296,15 +1306,17 @@ def queue_restart(i: dict) -> None:
         kw = dict(mode=i["mode"], budget=i["budget"], max_cycles=i["max_cycles"], chain=i["chain"],
                   approval=i["approval"], max_runtime_s=int(more * 3600), heal_attempts=i.get("heal_attempts"))
         if r1.button("↻ Start again", key=f"q_re_{i['id']}", help="Queue this task again from scratch."):
-            _requeue_next(i, kw)
-            st.session_state.flash = "Queued again. Press ▶ Start queue if the queue is stopped."
+            new_id, created = _requeue_next(i, kw)
+            st.session_state.flash = (f"Queued again as task #{new_id}; it starts when the task ahead of it finishes."
+                                      if created else f"This task is already queued again as task #{new_id}.")
             st.rerun()
         can_continue = bool(i["run_id"]) and run_resumable(i["run_id"])
         if r2.button("⏩ Continue where it stopped", key=f"q_co_{i['id']}", disabled=not can_continue,
                      help="Queue it again starting from the failed run's code, with its unresolved problems "
                           "added to the task."):
-            _requeue_next(i, {**kw, "seed_run_id": i["run_id"]})
-            st.session_state.flash = "Queued to continue. Press ▶ Start queue if the queue is stopped."
+            new_id, created = _requeue_next(i, {**kw, "seed_run_id": i["run_id"]})
+            st.session_state.flash = (f"Queued to continue as task #{new_id}." if created
+                                      else f"This task is already queued again as task #{new_id}.")
             st.rerun()
 
 
@@ -1378,6 +1390,8 @@ def item_detail(w: dict, every) -> None:
         waiting_editor(i)
     elif r and w["group"] == "active":
         live_settings(r)
+    elif i and i["status"] in ("failed", "cancelled", "skipped") and _restarted_as(i):
+        st.info(f"Restarted as task #{_restarted_as(i)} — see it in the waiting line above.")
     elif i and i["status"] in ("failed", "cancelled", "skipped"):
         queue_restart(i)
     elif r and (r["state"] in FAILED_STATES or w["status"] == "Stopped unexpectedly"):
