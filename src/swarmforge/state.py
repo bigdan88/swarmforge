@@ -7,6 +7,75 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from .plan import ID_RE, Task
+
+REPAIR_TASK_PREFIX = "R"
+DEFAULT_BLOCKING_SEVERITIES = ("critical", "major")
+
+
+def repair_tasks_from_findings(findings: list[dict], roles: list[str], cycle: int,
+                               severities: set[str] | None = None) -> list[Task]:
+    """Convert blocking reviewer findings into mandatory developer repair tasks.
+
+    Deterministic, LLM-free: each unique blocking finding becomes one Task with
+    id R<cycle>F<n>, no dependencies, and acceptance criteria quoting the
+    reviewer's exact text so the finding cannot be skipped.
+    """
+    if not roles:
+        if any((f.get("severity") or "").lower() in (severities or set(DEFAULT_BLOCKING_SEVERITIES))
+               for f in findings):
+            raise ValueError("roles must not be empty when blocking findings exist")
+        return []
+    blocking = severities if severities is not None else set(DEFAULT_BLOCKING_SEVERITIES)
+
+    seen: set[tuple[str, str, str]] = set()
+    kept: list[dict] = []
+    for f in findings:
+        sev = (f.get("severity") or "").lower()
+        if sev not in blocking:
+            continue
+        key = (sev, str(f.get("file")), str(f.get("title")))
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(f)
+
+    tasks: list[Task] = []
+    for i, f in enumerate(kept, start=1):
+        tid = f"{REPAIR_TASK_PREFIX}{cycle}F{i}"
+        assert ID_RE.match(tid), f"repair task id '{tid}' must match {ID_RE.pattern}"
+        sev = (f.get("severity") or "").lower()
+        title = str(f.get("title") or "")[:120]
+        file_ = f.get("file")
+        line = f.get("line")
+        loc = f"File: {file_}:{line}" if file_ is not None and line is not None else (
+            f"File: {file_}" if file_ is not None else "File: unknown")
+        description = str(f.get("description") or "")
+        rec = f.get("recommendation")
+        desc = (
+            f"MANDATORY repair for reviewer finding (cycle {cycle}). "
+            "This task cannot be skipped.\n\n"
+            f"{loc}\n\n"
+            f"Reviewer finding (severity: {sev}):\n{description}\n"
+        )
+        if rec:
+            desc += f"\nRecommendation: {rec}\n"
+        criterion = (
+            f'Reviewer said: "{description}" — resolve this finding '
+            f"({sev}): {f.get('title')} ({file_}:{line})"
+        )
+        tasks.append(Task(
+            id=tid,
+            title=title,
+            description=desc,
+            role=roles[(i - 1) % len(roles)],
+            depends_on=[],
+            acceptance_criteria=[criterion],
+            expected_files=[file_] if file_ is not None else [],
+        ))
+    return tasks
+
+
 
 class RunState(StrEnum):
     ISSUE_RECEIVED = "ISSUE_RECEIVED"
