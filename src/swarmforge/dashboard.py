@@ -198,8 +198,9 @@ div[data-testid="stSidebarContent"] .stButton > button[kind="primary"],
 div[data-testid="stSidebarContent"] .stButton > button[data-testid^="stBaseButton-primary"] {{
     border-left: 3px solid #ffc107; }}
 div[data-testid="stSidebarContent"] [class*="st-key-nav_"] {{ margin-bottom: .3rem; }}
-.nav-section {{ text-transform: uppercase; letter-spacing: .14em; font-size: .72rem; font-weight: 600;
-    color: rgba(255,255,255,.45); margin: 1.1rem 0 .2rem; }}
+section[data-testid="stSidebar"] [class*="st-key-menu_caption_"] [data-testid="stCaptionContainer"] {{
+    text-transform: uppercase; letter-spacing: .14em; font-size: .72rem; font-weight: 600;
+    color: #6b7a90; margin: .45rem 0 .2rem; }}
 </style>""", unsafe_allow_html=True)
 
 
@@ -222,7 +223,8 @@ with st.sidebar:
     st.caption(" · ".join(status))
     for section, section_pages in NAV_SECTIONS:
         if not rail:
-            st.markdown(f'<div class="nav-section">— {section.upper()} —</div>', unsafe_allow_html=True)
+            with st.container(key=f"menu_caption_{section.lower()}"):
+                st.caption(section.upper())
         for p in section_pages:
             full = p + (f"  ·  {badges[p]}" if badges.get(p) else "")
             if rail:  # icon-only rail: emoji label, full name + badges in the tooltip
