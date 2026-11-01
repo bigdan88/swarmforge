@@ -77,6 +77,75 @@ def test_chat_ask_shows_answer_and_sends_history(tmp_path, monkeypatch):
     assert at.session_state["chat_history"] == []
 
 
+def test_chat_passes_stable_conversation_id_and_reset_rotates_it(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    calls = []
+
+    def fake_ask(c, store, question, history=None, **kw):
+        calls.append({"question": question, "conversation": kw.get("conversation")})
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("first question").run()
+    assert not at.exception, [e.value for e in at.exception]
+    conv1 = calls[0]["conversation"]
+    assert isinstance(conv1, str) and conv1
+    at.chat_input[0].set_value("second question").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert calls[1]["conversation"] == conv1  # stable within one session
+    # reset starts a new thread: new conversation id, no history leak
+    at.button(key="chat_reset").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert at.session_state["chat_history"] == []
+    at.chat_input[0].set_value("third question").run()
+    assert not at.exception, [e.value for e in at.exception]
+    conv2 = calls[2]["conversation"]
+    assert isinstance(conv2, str) and conv2 and conv2 != conv1
+
+
+def test_chat_caption_shows_conversation_and_cost(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+
+    def fake_ask(c, store, question, history=None, **kw):
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question,
+                "conversation": kw.get("conversation"),
+                "usage": {"cost_usd": 0.0123, "total_tokens": 123}}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("what did it cost?").run()
+    assert not at.exception, [e.value for e in at.exception]
+    captions = [c.value for c in at.caption]
+    assert any("conversation" in c and "$0.0123" in c for c in captions)
+
+
+def test_chat_caption_degrades_gracefully_without_usage(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+
+    def fake_ask(c, store, question, history=None, **kw):
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("no usage here").run()
+    assert not at.exception, [e.value for e in at.exception]
+    captions = [c.value for c in at.caption]
+    assert any("conversation" in c and "$0.0000" in c for c in captions)
+
+
 def test_chat_error_is_shown_not_raised(tmp_path, monkeypatch):
     cfg = _write_cfg(tmp_path, monkeypatch)
     _seed(cfg)
