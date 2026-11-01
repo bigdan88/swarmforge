@@ -11,7 +11,6 @@ Cost accounting distinguishes three sources, recorded per call:
 from __future__ import annotations
 
 import asyncio
-import json
 import random
 import threading
 import time
@@ -153,6 +152,57 @@ class _ModelUnavailable(Exception):
     """This model can't serve the request right now; try the role's next fallback model."""
 
 
+# Model-name fragments that usually indicate vision-capable models (used when the
+# config's explicit `vision_models` list doesn't match).
+VISION_MODEL_HINTS: tuple[str, ...] = ("vision", "-vl", "vl-", "omni", "4o", "4v", "image", "multimodal")
+
+
+def model_supports_vision(model: str, vision_models: list[str] | None = None) -> bool:
+    """True if `model` is vision-capable, via the explicit config list (exact or
+    substring, case-insensitive) or the VISION_MODEL_HINTS name heuristic."""
+    low = model.lower()
+    for entry in vision_models or []:
+        e = entry.lower()
+        if e == low or e in low:
+            return True
+    return any(h in low for h in VISION_MODEL_HINTS)
+
+
+def messages_contain_images(messages: list[dict]) -> bool:
+    """True if any message carries list content with an image_url block."""
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list) and any(b.get("type") == "image_url" for b in content if isinstance(b, dict)):
+            return True
+    return False
+
+
+def normalize_messages(messages: list[dict], vision: bool) -> tuple[list[dict], int]:
+    """Prepare messages for a model with or without vision support.
+
+    Returns a NEW outer list (the input is never mutated). With vision, messages
+    pass through unchanged (image blocks included). Without vision, image_url
+    blocks are stripped and a short text note is prepended to each affected
+    message; other block types are kept. Returns (messages, images_stripped)."""
+    out: list[dict] = []
+    stripped = 0
+    for m in messages:
+        content = m.get("content")
+        if vision or not isinstance(content, list) or not any(
+                isinstance(b, dict) and b.get("type") == "image_url" for b in content):
+            out.append(m)
+            continue
+        n = sum(1 for b in content if isinstance(b, dict) and b.get("type") == "image_url")
+        stripped += n
+        note = {"type": "text",
+                "text": f"[note: {n} image attachment(s) were removed because this model does not support vision]"}
+        new_m = dict(m)
+        new_m["content"] = [note, *[b for b in content
+                                     if not (isinstance(b, dict) and b.get("type") == "image_url")]]
+        out.append(new_m)
+    return out, stripped
+
+
 class LLMClient:
     def __init__(self, config: Config, store=None, run_id: str | None = None,
                  budget: Budget | None = None, transport: httpx.AsyncBaseTransport | None = None,
@@ -172,7 +222,10 @@ class LLMClient:
                    task_key: str | None = None, tool_choice: Any = None) -> ChatResult:
         """Call the role's model. Busy/overloaded responses (429/503/529…) are retried patiently
         for up to `limits.busy_wait_s` per model; then the role's `fallback_models` are tried in
-        order. Every attempt that fails is recorded; the successful call records the model used."""
+        order. Every attempt that fails is recorded; the successful call records the model used.
+        Message `content` may be a string or an OpenAI-style list of blocks (text / image_url,
+        base64 data URLs supported); image blocks are forwarded as-is for vision-capable models
+        and replaced with a text note otherwise."""
         rc = self.config.role(role)
         pc = self.config.providers[rc.provider]
         key = pc.api_key()
@@ -192,9 +245,14 @@ class LLMClient:
         raise LLMError(f"{role} call failed on every configured model: " + " | ".join(errors))
 
     async def _chat_model(self, role, rc, pc, key, model, messages, tools, tool_choice, task_key) -> ChatResult:
+        vision = model_supports_vision(model, self.config.vision_models)
+        msgs, stripped = normalize_messages(messages, vision)
+        if stripped:
+            self._event(f"{role}: {model} is not vision-capable; {stripped} image block(s) "
+                        "replaced with a text note", task_key, role, level="warn")
         body: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": msgs,
             "temperature": rc.temperature,
             "max_tokens": rc.max_output_tokens,
             **rc.extra_body,
