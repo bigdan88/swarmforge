@@ -136,9 +136,10 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "New task", "Failures", "Knowledge", "Benchmarks"]
+PAGES = ["Work", "New task", "Failures", "Chat", "Knowledge", "Benchmarks", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
-            "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
+            "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
+NAV_ICON["Settings"] = ":material/settings:"
 SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
@@ -915,7 +916,8 @@ def work_items() -> list[dict]:
         out.append({"key": f"q:{i['id']}", "group": grp, "icon": icon, "status": label, "title": i["title"],
                     "repo": i["repo"], "item": i, "run": r,
                     "when": (r["created_at"] if r else i.get("created_at")) or 0,
-                    "order": waiting_pos.get(i["id"], 0), "hidden": False})
+                    "order": waiting_pos.get(i["id"], 0), "hidden": False,
+                    "archived": bool(r.get("archived")) if r else False})
     for r in runs:
         if r["id"] in used:
             continue
@@ -923,7 +925,7 @@ def work_items() -> list[dict]:
         out.append({"key": f"r:{r['id']}", "group": grp, "icon": icon, "status": label,
                     "title": r["issue_title"] or r["issue_url"] or r["id"], "repo": r["repo"] or "",
                     "item": None, "run": r, "when": r["created_at"] or 0, "order": 0,
-                    "hidden": r["id"] in healed})
+                    "hidden": r["id"] in healed, "archived": bool(r.get("archived"))})
     rank = {"active": 0, "waiting": 1}
     out.sort(key=lambda w: (rank.get(w["group"], 2), w["order"] if w["group"] == "waiting" else -w["when"]))
     return out
@@ -1153,7 +1155,8 @@ def work_row(w: dict) -> None:
         c = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
         c[0].checkbox("select", key=f"ck_{k}", label_visibility="collapsed")
         c[1].markdown(w["icon"])
-        c[2].markdown(f"{'▾' if is_open else '▸'} **{w['title'] or '(untitled)'}**")
+        c[2].markdown(f"{'▾' if is_open else '▸'} {'📦 ' if w.get('archived') else ''}"
+                      f"**{w['title'] or '(untitled)'}**")
         c[3].markdown(w["status"])
         c[4].markdown(cells["now"] or " ")
         c[5].markdown(_short_repo(w["repo"]))
@@ -1162,6 +1165,13 @@ def work_row(w: dict) -> None:
         if c[7].button("open", key=f"op_{k}", help="Show / hide details"):
             select_item(None if is_open else w["key"])
             st.rerun(scope="app")
+
+
+def _item_mode(w: dict) -> str | None:
+    """The mode of a work item: the run's when there is one, else the queue task's."""
+    if w["run"]:
+        return w["run"].get("mode")
+    return w["item"].get("mode") if w["item"] else None
 
 
 def work_list(items: list[dict], every) -> None:
@@ -1179,8 +1189,26 @@ def work_list(items: list[dict], every) -> None:
                                 label_visibility="collapsed", default="All") or "All"
     query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
                           label_visibility="collapsed").strip().lower()
-    shown = [w for w in visible if (FILTERS[filt] is None or w["group"] in FILTERS[filt])
-             and (not query or query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower())]
+    # filters above the table; options come from the full list so they stay stable while narrowing it
+    g1, g2, g3, g4 = st.columns([1.5, 1.5, 1.1, 1.1])
+    states = g1.multiselect("State", sorted({w["run"]["state"] for w in items if w["run"]}),
+                            key="w_state", placeholder="All states")
+    repo_sel = g2.selectbox("Repository", ["All repos"] + sorted({w["repo"] for w in items if w["repo"]}),
+                            key="w_repo")
+    mode_sel = g3.selectbox("Mode", ["All modes", "swarm", "single"], key="w_mode")
+    show_arch = g4.checkbox("Show archived", key="w_arch",
+                            help="Archived runs stay in the database but are hidden from this list.")
+    base = visible if show_arch else [w for w in visible if not w["archived"]]
+    shown = [w for w in base if FILTERS[filt] is None or w["group"] in FILTERS[filt]]
+    if states:
+        shown = [w for w in shown if w["run"] and w["run"]["state"] in states]
+    if repo_sel and repo_sel != "All repos":
+        shown = [w for w in shown if w["repo"] == repo_sel]
+    if mode_sel and mode_sel != "All modes":
+        shown = [w for w in shown if _item_mode(w) == mode_sel]
+    if query:
+        shown = [w for w in shown
+                 if query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower()]
     if not shown:
         st.caption("No tasks match.")
         return
@@ -1405,7 +1433,47 @@ def item_detail(w: dict, every) -> None:
         if i and i["status"] != "queued":
             st.markdown(i["body"][:3000])
         return
+    if r.get("archived"):
+        if st.button("📂 Unarchive", key=f"unarch_{r['id']}",
+                     help="Show this run in the Work list again."):
+            store.set_archived(r["id"], False)
+            st.rerun()
+    elif st.button("📦 Archive", key=f"arch_{r['id']}",
+                   help="Hide this run from the Work list. Its history, report and transcripts stay."):
+        store.set_archived(r["id"], True)
+        select_item(None)  # it leaves the list, so close it too
+        st.rerun()
+    free_disk_panel(r, w)
     run_detail(r["id"], header=False)
+
+
+def free_disk_panel(r: dict, w: dict) -> None:
+    """Reclaim the disk a finished run's clone and worktrees use.
+
+    Only ``repo`` and ``worktrees`` are removed: the database row, the report,
+    the transcripts and the logs stay. Active runs are never offered the action."""
+    from swarmforge.db import free_run_disk
+
+    rid = r["id"]
+    if w["group"] == "active":
+        st.caption("🧹 Free disk space is available once the run finishes.")
+        return
+    st.checkbox("Confirm: delete this run's repo and worktrees from disk", key=f"fd_ok_{rid}",
+                help="Frees disk space by removing the clone and the worktrees. The run's history, "
+                     "report, transcripts and logs are kept.")
+    if st.button("🧹 Free disk space", key=f"fd_{rid}",
+                 help="Deletes this run's repo and worktrees folders from the workdir."):
+        if not st.session_state.get(f"fd_ok_{rid}"):
+            st.warning("Tick the confirmation box first.")
+            return
+        rd = Path(r["run_dir"]) if r.get("run_dir") else (cfg.workdir / "runs" / rid if cfg else None)
+        if rd is None:
+            st.warning("This run has no work folder to clean up.")
+            return
+        freed = free_run_disk(rd)
+        store.event(rid, "disk", f"freed {freed} bytes")
+        _workdir_bytes.clear()  # the usage figure above must reflect the cleanup
+        st.success(f"Freed {freed / 1e6:.1f} MB from disk.")
 
 
 def welcome_panel(cfg, empty: bool = False) -> None:
@@ -1469,6 +1537,13 @@ def welcome_panel(cfg, empty: bool = False) -> None:
 }""")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _workdir_bytes(path: str) -> int:
+    """Total size of the workdir in bytes; cached briefly because it can hold many clones."""
+    from swarmforge.db import dir_size_bytes
+    return dir_size_bytes(Path(path))
+
+
 def page_work():
     from swarmforge import runqueue as rq
     if "flash" in st.session_state:
@@ -1478,6 +1553,8 @@ def page_work():
     if h2.button("New task", icon=":material/add:", type="primary", width="stretch"):
         st.session_state.goto = "New task"
         st.rerun()
+    if cfg is not None:
+        st.caption(f"💽 Workdir usage: {_workdir_bytes(str(cfg.workdir)) / 1e6:.1f} MB · `{cfg.workdir}`")
     items = work_items()
     show = st.session_state.pop("show_welcome", False)
     if not items or show:  # first run (or "Getting started" in the sidebar): welcome instead of an empty table
@@ -1574,6 +1651,42 @@ def page_failures():
     if cfg and b[2].button("↻ Diagnose again", key=f"fd_{f['run_id']}"):
         diagnose_now(f["run_id"])
         st.rerun()
+
+
+# ================================================================= CHAT page
+def page_chat():
+    if cfg is None:
+        st.error("Configuration not loaded; the chatbot needs a configured model role.")
+        return
+    from swarmforge import chatbot
+    st.header("Chat: ask about runs and swarm statuses")
+    st.caption("Answers are built from the SwarmForge store (runs, per-task swarm statuses, failures, "
+               "queue and pending approvals) and written by the configured `chat` role — or the planner "
+               "model if no chat role is set. CLI: `swarmforge ask \"…\"`.")
+    history = st.session_state.setdefault("chat_history", [])
+    if st.button("Reset conversation", key="chat_reset"):
+        history.clear()
+    for m in history:
+        with st.chat_message(m["role"]):
+            if m["role"] == "assistant":
+                st.markdown(m["content"])
+            else:
+                st.write(m["content"])
+    prompt = st.chat_input("Ask about runs, swarms, failures... e.g. which runs failed and why?")
+    if not prompt:
+        return
+    history.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.write(prompt)
+    try:
+        res = chatbot.ask(cfg, store, prompt, history=history[:-1])
+    except chatbot.ChatError as e:
+        st.error(f"Chatbot: {e}")
+        return
+    history.append({"role": "assistant", "content": res["answer"]})
+    with st.chat_message("assistant"):
+        st.markdown(res["answer"])
+        st.caption(f"answered by **{res['role']}** · `{res['model']}`")
 
 
 # ============================================================ NEW TASK page
@@ -1682,5 +1795,12 @@ def page_benchmarks():
         st.dataframe(df.astype(str), width="stretch")
 
 
-{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Knowledge": page_knowledge,
- "Benchmarks": page_benchmarks}[page]()
+# =========================================================== SETTINGS page
+def page_settings():
+    st.caption("Edit swarmforge.yaml, run health checks and test models.")
+    from swarmforge import settings
+    settings.render(cfg)
+
+
+{"Work": page_work, "New task": page_new_task, "Failures": page_failures, "Chat": page_chat,
+ "Knowledge": page_knowledge, "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()
