@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from datetime import UTC, datetime
 
 import httpx
@@ -176,6 +177,102 @@ def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = N
         transport: httpx.AsyncBaseTransport | None = None, max_runs: int = 12) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
     return asyncio.run(answer(cfg, store, question, history, transport=transport, max_runs=max_runs))
+
+
+# ======================================================== conversation persistence
+DEFAULT_CONVERSATION_TITLE = "General"
+
+
+def create_conversation(store: Store, title: str = DEFAULT_CONVERSATION_TITLE,
+                        last_run_id: str | None = None) -> dict:
+    """Create a new conversation and return it as a dict."""
+    conv_id = uuid.uuid4().hex
+    now = time.time()
+    store._exec(
+        "INSERT INTO conversations (id, title, created_at, updated_at, last_run_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (conv_id, title, now, now, last_run_id),
+    )
+    conv = get_conversation(store, conv_id)
+    assert conv is not None
+    return conv
+
+
+def get_conversation(store: Store, conversation_id: str) -> dict | None:
+    return store._one("SELECT * FROM conversations WHERE id = ?", (conversation_id,))
+
+
+def list_conversations(store: Store, limit: int = 50) -> list[dict]:
+    """Conversations most-recent first (by updated_at, then id)."""
+    return store._all(
+        "SELECT * FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ?", (limit,))
+
+
+def add_message(store: Store, conversation_id: str, role: str, content: str) -> dict:
+    """Append a message to a conversation; bumps the conversation's updated_at."""
+    if get_conversation(store, conversation_id) is None:
+        raise ChatError(f"unknown conversation {conversation_id}")
+    now = time.time()
+    with store._lock:
+        cur = store.conn.execute(
+            "INSERT INTO chat_messages (conversation_id, role, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (conversation_id, role, content, now),
+        )
+        store.conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
+        store.conn.commit()
+        msg_id = cur.lastrowid
+    msg = store._one("SELECT * FROM chat_messages WHERE id = ?", (msg_id,))
+    assert msg is not None
+    return msg
+
+
+def get_messages(store: Store, conversation_id: str, limit: int | None = None) -> list[dict]:
+    """Messages of a conversation, oldest first. With limit, the last `limit` messages."""
+    if limit is None:
+        return store._all(
+            "SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,))
+    rows = store._all(
+        "SELECT * FROM chat_messages WHERE conversation_id = ? "
+        "ORDER BY id DESC LIMIT ?", (conversation_id, limit))
+    return list(reversed(rows))
+
+
+def rename_conversation(store: Store, conversation_id: str, title: str) -> dict:
+    """Rename a conversation; bumps updated_at."""
+    if get_conversation(store, conversation_id) is None:
+        raise ChatError(f"unknown conversation {conversation_id}")
+    store._exec(
+        "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+        (title, time.time(), conversation_id),
+    )
+    conv = get_conversation(store, conversation_id)
+    assert conv is not None
+    return conv
+
+
+def delete_conversation(store: Store, conversation_id: str) -> bool:
+    """Delete a conversation and all its messages. Returns True if it existed."""
+    with store._lock:
+        store.conn.execute("DELETE FROM chat_messages WHERE conversation_id = ?",
+                           (conversation_id,))
+        cur = store.conn.execute("DELETE FROM conversations WHERE id = ?",
+                                 (conversation_id,))
+        store.conn.commit()
+        return cur.rowcount > 0
+
+
+def ensure_default_conversation(store: Store) -> dict:
+    """Return the default conversation, seeding it on first use."""
+    conv = store._one(
+        "SELECT * FROM conversations WHERE title = ? ORDER BY id LIMIT ?",
+        (DEFAULT_CONVERSATION_TITLE, 1),
+    )
+    if conv is not None:
+        return conv
+    return create_conversation(store, DEFAULT_CONVERSATION_TITLE)
 
 
 # ====================================================================== self-improvement
