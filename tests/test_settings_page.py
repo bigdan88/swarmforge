@@ -25,7 +25,8 @@ def test_get_health_checks_missing_api_key_and_dead_docker(tmp_path, monkeypatch
          "message": "The API key for provider 'fake' is missing",
          "fix": "add FAKE_KEY=... to the .env file next to the config and restart the dashboard"},
         {"name": "Docker running", "status": "fail", "message": "Docker is not responding.",
-         "fix": "Start Docker Desktop and wait until `docker info` succeeds."}])
+         "fix": "Start Docker Desktop and wait until `docker info` succeeds."},
+        {"name": "Git", "status": "ok", "message": "", "fix": ""}])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (False, "set GITHUB_TOKEN"))
     cfg = make_cfg(tmp_path)
     rows = settings.get_health_checks(cfg)
@@ -73,6 +74,7 @@ def test_get_health_checks_unmatched_row_becomes_extra_row(tmp_path, monkeypatch
 def test_get_health_checks_git_problem_matches_canonical_row(tmp_path, monkeypatch):
     """A structured 'Git' fail row maps to the canonical 'Git' row by name."""
     monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": "Provider API keys", "status": "ok", "message": "", "fix": ""},
         {"name": "Git", "status": "fail",
          "message": "git is not installed or not on PATH.",
          "fix": "Install Git for Windows and reopen the terminal."}])
@@ -101,11 +103,71 @@ def test_get_health_checks_maps_rows_purely_by_name(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     rows = settings.get_health_checks(make_cfg(tmp_path))
     by_name = {r["name"]: r for r in rows}
-    assert by_name["Git"]["status"] == "ok"  # no substring match on the message
+    assert "Git" not in by_name  # no fabricated row when preflight didn't report Git
     extra = by_name["Whatever"]
     assert extra["status"] == "fail"
     assert extra["fix"] == "install Git."  # verbatim, no 'Fix:' splitting
     assert "GIT IS NOT INSTALLED" not in by_name
+
+
+def test_canonical_checks_are_all_performed_by_preflight(tmp_path, monkeypatch):
+    """CANONICAL_CHECKS lists exactly the checks preflight.environment_check_results emits."""
+    from swarmforge import preflight
+    monkeypatch.setattr(preflight, "_docker_problem", lambda c, t: None)
+    monkeypatch.setattr(preflight, "_image_problems", lambda c, i: [])
+    monkeypatch.setenv("FAKE_KEY", "test-key")
+    cfg = make_cfg(tmp_path, "docker")
+    names = {r["name"] for r in preflight.environment_check_results(cfg)}
+    assert names == set(settings.CANONICAL_CHECKS)
+    assert "Provider base_url" not in settings.CANONICAL_CHECKS
+    assert "GitHub CLI" not in settings.CANONICAL_CHECKS
+
+
+def test_get_health_checks_never_invents_rows_for_unperformed_checks(tmp_path, monkeypatch):
+    """A canonical check absent from the preflight results produces no row at all."""
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": "Git", "status": "fail", "message": "git is not installed or not on PATH.",
+         "fix": "Install Git for Windows and reopen the terminal."}])
+    monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
+    rows = settings.get_health_checks(make_cfg(tmp_path))
+    names = {r["name"] for r in rows}
+    assert "Provider API keys" not in names  # not checked -> no fabricated 'ok' row
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["Docker running"]["status"] == "ok"
+    assert "local" in by_name["Docker running"]["message"]
+    assert by_name["Sandbox image built"]["status"] == "ok"
+    assert "local" in by_name["Sandbox image built"]["message"]
+
+
+def test_test_models_caps_busy_wait_s(tmp_path, monkeypatch):
+    """test_models caps busy_wait_s at 5s instead of zeroing it."""
+    import types
+
+    from swarmforge import llm
+
+    captured: list[float] = []
+
+    class FakeLLM:
+        def __init__(self, config, budget=None, max_retries=None, busy_wait_s=None, **kw):
+            captured.append(busy_wait_s)
+
+        async def chat(self, role, messages, **kw):
+            return types.SimpleNamespace(
+                tool_calls=[{"function": {"name": "report_status",
+                                          "arguments": '{"status": "ready"}'}}],
+                content="", usage=types.SimpleNamespace(total_tokens=10, cost_usd=0.001,
+                                                        cost_source=None))
+
+    monkeypatch.setattr(llm, "LLMClient", FakeLLM)
+    cfg = parse_config(base_raw(tmp_path / "work"))
+    settings.test_models(cfg, roles=["planner"])
+    assert captured == [5.0] and captured[0] > 0
+
+    raw = base_raw(tmp_path / "work")
+    raw["limits"]["busy_wait_s"] = 2
+    cfg = parse_config(raw)
+    settings.test_models(cfg, roles=["planner"])
+    assert captured[-1] == 2.0
 
 
 # ------------------------------------------------- preflight structured results
@@ -345,7 +407,8 @@ def test_health_rows_render_via_preflight_mapping(tmp_path, monkeypatch):
              "message": "The API key for provider 'fake' is missing",
              "fix": "add FAKE_KEY=... to the .env file next to the config and restart the dashboard"},
             {"name": "Docker running", "status": "fail", "message": "Docker is not responding.",
-             "fix": "start Docker Desktop and wait until `docker info` succeeds."}],
+             "fix": "start Docker Desktop and wait until `docker info` succeeds."},
+            {"name": "Git", "status": "ok", "message": "", "fix": ""}],
         github_access=lambda cfg: (False, "set GITHUB_TOKEN in .env"),
     )
     text = _page_text(at)

@@ -38,8 +38,7 @@ def github_access(cfg: Config) -> tuple[bool, str]:
 
 
 # canonical health-row names, in display order
-CANONICAL_CHECKS = ["Provider API keys", "Provider base_url", "GitHub CLI", "Git",
-                   "Docker running", "Sandbox image built"]
+CANONICAL_CHECKS = ["Provider API keys", "Git", "Docker running", "Sandbox image built"]
 
 
 def get_health_checks(cfg: Config) -> list[dict]:
@@ -66,7 +65,7 @@ def get_health_checks(cfg: Config) -> list[dict]:
     docker_optional = cfg.sandbox.mode != "docker"
     rows: list[dict] = []
     for name in CANONICAL_CHECKS:
-        optional = name in ("GitHub CLI", "Git") or \
+        optional = name == "Git" or \
             (docker_optional and name in ("Docker running", "Sandbox image built"))
         if name in indexed:
             r = indexed.pop(name)
@@ -76,9 +75,6 @@ def get_health_checks(cfg: Config) -> list[dict]:
             rows.append({"name": name, "status": "ok",
                          "message": "not used (sandbox.mode: local)", "fix": "",
                          "optional": True})
-        else:
-            rows.append({"name": name, "status": "ok", "message": "", "fix": "",
-                         "optional": optional})
     for r in indexed.values():  # unknown names pass through verbatim
         rows.append({"name": r["name"], "status": r["status"], "message": r["message"],
                      "fix": r["fix"], "optional": False})
@@ -113,7 +109,8 @@ def test_models(cfg: Config, roles: list[str] | None = None) -> list[dict]:
     from .llm import Budget, LLMClient, LLMError
 
     async def _run() -> list[dict]:
-        llm = LLMClient(cfg, budget=Budget(1.0), max_retries=1, busy_wait_s=0.0)
+        llm = LLMClient(cfg, budget=Budget(1.0), max_retries=1,
+                       busy_wait_s=min(float(cfg.limits.busy_wait_s), 5.0))
         tool = {"type": "function", "function": {
             "name": "report_status", "description": "Report a status word.",
             "parameters": {"type": "object", "properties": {"status": {"type": "string"}},
