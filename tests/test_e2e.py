@@ -421,3 +421,23 @@ async def test_finished_run_has_request_summary_and_knowledge_log(cfg, sample_re
     logs = [p for p in cfg.vault_path.rglob("*.md") if run_id in p.read_text(encoding="utf-8")
             and "Request and summary" in p.read_text(encoding="utf-8")]
     assert logs, "run-log note should include the request and summary"
+
+
+async def test_merged_and_deleted_base_branch_falls_back_to_default(cfg, sample_repo):
+    # A chained queue item continues from the previous item's result branch; if that PR was merged in the
+    # meantime (merging deletes the branch), the run must start from the default branch, not get BLOCKED.
+    store = Store(cfg.db_path)
+    orch = Orchestrator(cfg, store, mode="swarm", echo=None, llm_transport=_provider().transport)
+    run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo), base_branch="swarmforge/task-gone")
+    run = store.get_run(run_id)
+    assert run["state"] == "COMPLETED", run["state_reason"]
+    assert run["base_branch"] == "main"
+    assert any("no longer exists" in e["message"] for e in store.events(run_id))
+
+
+async def test_other_missing_base_branch_is_still_blocked(cfg, sample_repo):
+    store = Store(cfg.db_path)
+    orch = Orchestrator(cfg, store, mode="swarm", echo=None, llm_transport=_provider().transport)
+    run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo), base_branch="release-9")
+    run = store.get_run(run_id)
+    assert run["state"] == "BLOCKED" and "does not exist" in run["state_reason"]

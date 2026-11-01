@@ -26,6 +26,7 @@ async def test_worker_closes_runs_it_left_behind(cfg, tmp_path):
     st.queue_update(item, status="running", run_id="r1")
     st.kv_set(rq.PAUSED_KEY, "1")              # recover, then stop immediately
     await rq.work(cfg, st, echo=None)
-    assert st.queue_item(item)["status"] == "failed"
+    assert st.queue_item(item)["status"] == "queued"           # back in line; the dead run is closed
+    assert st.queue_item(item)["run_id"] is None
     run = st.get_run("r1")
     assert run["state"] == "FAILED" and "queue worker stopped" in run["state_reason"]

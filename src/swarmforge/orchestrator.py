@@ -242,6 +242,11 @@ class Orchestrator:
         self.sm.transition(state, reason)
 
     # =============================================================== pipeline
+    def _merged_base_gone(self, base_branch: str | None, err: Exception) -> bool:
+        """True when the requested base is one of our own result branches that has disappeared."""
+        prefix = self.cfg.github.branch_prefix or "swarmforge/"
+        return bool(base_branch and base_branch.startswith(prefix) and "does not exist in" in str(err))
+
     async def _pipeline(self, issue_url, issue_file, repo, base_branch) -> None:
         issue, source = await asyncio.to_thread(self._load_issue, issue_url, issue_file, repo)
         self.issue = issue
@@ -274,7 +279,18 @@ class Orchestrator:
             ref = normalize_repo(str(source))
             if base_branch:
                 ref.branch = base_branch
-            ref = await asyncio.to_thread(preflight, ref, token)
+            try:
+                ref = await asyncio.to_thread(preflight, ref, token)
+            except RepoError as e:
+                if not self._merged_base_gone(base_branch, e):
+                    raise
+                # The base was an earlier SwarmForge result whose PR has since been merged (merging deletes
+                # the branch), so its work is in the default branch now: start from there instead.
+                self.log("repo", f"base branch '{base_branch}' no longer exists (its pull request was most likely "
+                                 "merged and the branch deleted); starting from the default branch instead",
+                         level="warn")
+                ref = normalize_repo(str(source))
+                ref = await asyncio.to_thread(preflight, ref, token)
         except RepoError as e:
             raise RunAborted(RunState.BLOCKED, str(e))
         self.ref = ref

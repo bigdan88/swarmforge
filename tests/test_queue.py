@@ -201,3 +201,21 @@ def test_moves_and_requeue_stay_inside_their_queue(tmp_path):
     new, created = rq.requeue(s, s.queue_item(a), mode="swarm")
     assert created and s.queue_item(new)["queue"] == "alpha"
     assert [i["id"] for i in s.queue_items() if rq.lane(i) == "alpha" and i["status"] == "queued"][0] == new
+
+
+async def test_item_interrupted_by_a_worker_restart_is_queued_again_once(cfg, monkeypatch):
+    store = Store(cfg.db_path)
+    started = []
+
+    async def fake_run_item(c, st, item, **kw):
+        started.append(item["id"])
+        st.queue_update(item["id"], status="done")
+        return st.queue_item(item["id"])
+    monkeypatch.setattr(rq, "run_item", fake_run_item)
+    a = store.queue_add("A", "x", "repoA")
+    b = store.queue_add("B", "x", "repoB")
+    store.queue_update(a, status="running", run_id="r-old")                      # the old worker was killed
+    store.queue_update(b, status="running", note="worker stopped while this item was running; queued again")
+    assert await rq.work(cfg, store, echo=None, poll_s=0.01) == 1
+    assert started == [a] and store.queue_item(a)["status"] == "done"
+    assert store.queue_item(b)["status"] == "failed"                             # second interruption: give up

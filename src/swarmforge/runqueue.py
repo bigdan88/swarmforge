@@ -229,8 +229,15 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
         # recover items left 'running' by a crashed worker
         for i in store.queue_items(include_finished=False):
             if i["status"] == "running":
-                store.queue_update(i["id"], status="failed", finished_at=time.time(),
-                                   note="worker stopped while this item was running")
+                # put it back in line once (the worker was restarted, e.g. for new code); a second
+                # interruption marks it failed so a task that crashes the worker can't loop forever
+                again = "worker stopped while this item was running" in (i.get("note") or "")
+                if again:
+                    store.queue_update(i["id"], status="failed", finished_at=time.time(),
+                                       note="worker stopped while this item was running (twice); not retried")
+                else:
+                    store.queue_update(i["id"], status="queued", run_id=None, started_at=None,
+                                       note="worker stopped while this item was running; queued again")
                 run = store.get_run(i["run_id"]) if i.get("run_id") else None
                 if run and run["state"] not in ("COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"):
                     store.update_run(run["id"], state="FAILED", finished_at=time.time(),
