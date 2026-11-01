@@ -209,9 +209,9 @@ CREATE TABLE IF NOT EXISTS benchmarks (
 );
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
+    title TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
+    updated_at REAL,
     last_run_id TEXT
 );
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -221,6 +221,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     content TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS chat_messages_conv_idx ON chat_messages(conversation_id, id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, id);
 """
 
@@ -599,6 +600,44 @@ class Store:
             fields["overlay"] = json.dumps(fields["overlay"])
         sets = ", ".join(f"{k} = ?" for k in fields)
         self._exec(f"UPDATE variants SET {sets} WHERE id = ?", (*fields.values(), vid))
+
+    # ------------------------------------------------- chat conversations
+    def conversation_create(self, conv_id: str, title: str | None = None) -> dict:
+        self._exec("INSERT OR IGNORE INTO conversations (id, title, created_at) VALUES (?, ?, ?)",
+                   (conv_id, title, time.time()))
+        conv = self.conversation_get(conv_id)
+        assert conv is not None
+        return conv
+
+    def conversation_get(self, conv_id: str) -> dict | None:
+        return self._one("SELECT * FROM conversations WHERE id = ?", (conv_id,))
+
+    def conversations_list(self) -> list[dict]:
+        return self._all(
+            "SELECT * FROM conversations ORDER BY COALESCE(updated_at, created_at) DESC")
+
+    def conversation_delete(self, conv_id: str) -> None:
+        self._exec("DELETE FROM chat_messages WHERE conversation_id = ?", (conv_id,))
+        self._exec("DELETE FROM conversations WHERE id = ?", (conv_id,))
+
+    def conversation_append(self, conv_id: str, role: str, content: str) -> int:
+        self._exec("INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)",
+                   (conv_id, time.time()))
+        cur = self._exec(
+            "INSERT INTO chat_messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (conv_id, role, content, time.time()))
+        self._exec("UPDATE conversations SET updated_at = ? WHERE id = ?", (time.time(), conv_id))
+        return int(cur.lastrowid)
+
+    def conversation_messages(self, conv_id: str, limit: int | None = None) -> list[dict]:
+        if limit is None:
+            return self._all(
+                "SELECT id, conversation_id, role, content, created_at FROM chat_messages "
+                "WHERE conversation_id = ? ORDER BY id ASC", (conv_id,))
+        rows = self._all(
+            "SELECT id, conversation_id, role, content, created_at FROM chat_messages "
+            "WHERE conversation_id = ? ORDER BY id DESC LIMIT ?", (conv_id, limit))
+        return sorted(rows, key=lambda r: r["id"])
 
     def kv_get(self, key: str, default: str | None = None) -> str | None:
         row = self._one("SELECT value FROM kv WHERE key = ?", (key,))
