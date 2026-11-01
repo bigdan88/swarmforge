@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +30,38 @@ from .runtime import AgentResult
 from .tools import ToolContext
 
 PI_DIR = ".swarmforge/pi"                    # inside the worktree (git-excluded, bind-mounted)
+SF_BIN = ".swarmforge/bin"                   # the `sf` command (SwarmForge tools for Pi agents)
+# SwarmForge tools offered to Pi developers through `sf` (Pi has its own read/write/edit/bash)
+SF_TOOLS = ("start_process", "read_process_output", "stop_process", "browse", "check_code", "run_tests",
+            "outline", "find_symbol", "git_changes", "git_history", "http_request", "format_code",
+            "list_packages")
+
+
+def _refresh_changed_files(ctx) -> None:
+    """Pi edits files itself, so tell check_code/format_code what has changed so far (git status)."""
+    import subprocess
+    try:
+        p = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=str(ctx.workspace),
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return
+    for ln in p.stdout.splitlines():
+        path = ln[3:].split(" -> ")[-1].strip().strip('"')
+        if path and not path.startswith(".swarmforge/") and (ctx.workspace / path).is_file():
+            ctx.files_written.add(path)
+
+
+def install_sf(workspace: Path) -> Path:
+    """Write the `sf` command into the worktree (git-excluded) and return its bin directory."""
+    from importlib import resources
+    bindir = workspace / SF_BIN
+    bindir.mkdir(parents=True, exist_ok=True)
+    src = resources.files("swarmforge").joinpath("resources/sf.py").read_text(encoding="utf-8")
+    (bindir / "sf.py").write_text(src, encoding="utf-8")
+    wrapper = bindir / "sf"
+    wrapper.write_text('#!/bin/sh\nexec python "$(dirname "$0")/sf.py" "$@"\n', encoding="utf-8", newline="\n")
+    wrapper.chmod(0o755)
+    return bindir
 THINKING = {"none": "off", "low": "low", "medium": "medium", "high": "high"}
 SAFE_FLAGS = ["--no-session", "--offline", "--no-approve", "--no-extensions", "--no-mcp", "--no-skills",
               "--no-prompt-templates", "--no-themes"]
@@ -46,6 +80,8 @@ class _Agent:
     stopped: str | None = None          # "max_steps" | "budget" | "cancelled" | "error"
     error: str | None = None
     seen_tool_ids: set = field(default_factory=set)
+    ctx: Any = None                     # ToolContext for `sf` tool calls (None: tools not offered)
+    sf_calls: list = field(default_factory=list)   # [(tool, seconds, ok)]
 
 
 class ModelRelay:
@@ -68,9 +104,9 @@ class ModelRelay:
             self._server = None
 
     def register(self, role: str, task_key: str, *, max_steps: int, should_cancel=None,
-                 transcript: Path | None = None, on_event=None) -> str:
+                 transcript: Path | None = None, on_event=None, ctx=None) -> str:
         token = "sf-" + uuid.uuid4().hex
-        self.agents[token] = _Agent(role, task_key, max_steps, should_cancel, transcript, on_event)
+        self.agents[token] = _Agent(role, task_key, max_steps, should_cancel, transcript, on_event, ctx=ctx)
         return token
 
     def unregister(self, token: str) -> _Agent | None:
@@ -93,6 +129,8 @@ class ModelRelay:
             if method == "GET" and path.rstrip("/").endswith("/models"):
                 return await self._send(writer, 200, {"object": "list", "data": [
                     {"id": f"swarmforge-{agent.role}", "object": "model"}]})
+            if method == "POST" and path.rstrip("/").endswith("/sf/tool"):
+                return await self._send(writer, 200, await self._tool(agent, json.loads(body or b"{}")))
             if method != "POST" or not path.rstrip("/").endswith("/chat/completions"):
                 return await self._send(writer, 404, {"error": {"message": f"not found: {method} {path}"}})
             req = json.loads(body or b"{}")
@@ -139,6 +177,37 @@ class ModelRelay:
             writer.write(b"data: " + json.dumps(c).encode() + b"\n\n")
         writer.write(b"data: [DONE]\n\n")
         await writer.drain()
+
+    # ------------------------------------------------------------- SwarmForge tools (`sf`)
+    async def _tool(self, agent: _Agent, req: dict) -> dict:
+        """Run one SwarmForge developer tool for a Pi agent (called by the `sf` command in its sandbox).
+        Same implementations and the same per-agent context (sandbox session, artifacts, base commit)
+        as built-in agents get."""
+        from .tools import ASYNC_IMPLS, ToolError
+        name, args = str(req.get("tool") or ""), req.get("args") or {}
+        if agent.ctx is None or name not in SF_TOOLS:
+            return {"ok": False, "output": f"ERROR: unknown tool '{name}'. Run `sf help`."}
+        if agent.stopped or (agent.should_cancel and agent.should_cancel()):
+            return {"ok": False, "output": "ERROR: this agent has been stopped; finish now."}
+        if not isinstance(args, dict):
+            return {"ok": False, "output": "ERROR: tool arguments must be a JSON object"}
+        if name in ("check_code", "format_code") and not args.get("paths"):
+            await asyncio.to_thread(_refresh_changed_files, agent.ctx)   # default: files changed so far
+        start, ok = time.time(), True
+        if agent.on_event:
+            agent.on_event("tool", f"sf {name}: {json.dumps(args)[:160]}", {"tool": name, "via": "sf"})
+        try:
+            out = await ASYNC_IMPLS[name](agent.ctx, **args)
+        except ToolError as e:
+            out, ok = f"ERROR: {e}", False
+        except TypeError as e:
+            out, ok = f"ERROR: bad arguments for {name}: {e}", False
+        except (OSError, UnicodeError, RuntimeError, ValueError) as e:
+            out, ok = f"ERROR: {type(e).__name__}: {e}", False
+        agent.sf_calls.append((name, round(time.time() - start, 2), ok))
+        self._tx(agent, {"type": "tool", "name": f"sf {name}", "args": json.dumps(args)[:4000],
+                         "output": str(out)[:8000]})
+        return {"ok": ok, "output": out}
 
     # ------------------------------------------------------------- model call
     def _stop(self, agent: _Agent, why: str, text: str) -> dict:
@@ -258,11 +327,11 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
                        prompt: str, terminal, max_steps: int, timeout_s: int, max_tokens: int,
                        thinking: str | None, command: str = "pi", network: str = "bridge",
                        extra_args: list[str] | None = None, transcript: Path | None = None,
-                       should_cancel=None, on_event=None) -> AgentResult:
+                       should_cancel=None, on_event=None, sf_tools: bool = True) -> AgentResult:
     from .devtools import DockerSession, LocalSession, open_session
     start = time.time()
     token = relay.register(role, task_key, max_steps=max_steps, should_cancel=should_cancel,
-                           transcript=transcript, on_event=on_event)
+                           transcript=transcript, on_event=on_event, ctx=ctx if sf_tools else None)
     model_id = f"swarmforge-{role}"
     if transcript:
         transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +340,7 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
     pidir = ctx.workspace / PI_DIR
     pidir.mkdir(parents=True, exist_ok=True)
     out_file, err_file = pidir / f"{token}.jsonl", pidir / f"{token}.err"
+    bindir = install_sf(ctx.workspace) if sf_tools else None
     result = AgentResult(status="error")
     try:
         if isinstance(ctx.sandbox, DockerSandbox):
@@ -285,10 +355,13 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
                 raise RuntimeError(f"could not prepare Pi in the sandbox: {setup.output[-400:]}")
             rel = f"/workspace/{PI_DIR}/{token}"
             argv = pi_argv(command, model_id, thinking, system, prompt, extra_args)
-            script = 'exec timeout -k 10 "$SF_T" "$@" > "$SF_OUT" 2> "$SF_ERR"'
+            # files written from Windows may lack the exec bit inside the Linux container: set it here
+            script = ('chmod +x /workspace/' + SF_BIN + '/sf 2>/dev/null; export PATH="/workspace/' + SF_BIN
+                      + ':$PATH"; exec timeout -k 10 "$SF_T" "$@" > "$SF_OUT" 2> "$SF_ERR"')
             run = await session.exec_argv(["sh", "-c", script, "sh", *argv], timeout_s=timeout_s + 60, env={
                 "SF_T": str(int(timeout_s)), "SF_OUT": rel + ".jsonl", "SF_ERR": rel + ".err",
-                "SF_RELAY_TOKEN": token, "HOME": home, "PI_OFFLINE": "1"})
+                "SF_RELAY_TOKEN": token, "HOME": home, "PI_OFFLINE": "1",
+                "SF_TOOLS_URL": f"http://host.docker.internal:{relay.port}"})
             timed_out = run.exit_code == 124 or run.timed_out
         elif isinstance(ctx.sandbox, LocalSandbox):
             session = open_session(ctx)
@@ -299,7 +372,10 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
                 json.dumps(models_json(f"http://127.0.0.1:{relay.port}/v1", model_id, max_tokens)), encoding="utf-8")
             env = _scrubbed_env()
             env.update(getattr(ctx.sandbox, "agent_env", None) or {})
+            if bindir is not None:
+                env["PATH"] = str(bindir.resolve()) + os.pathsep + env.get("PATH", "")
             env.update({"SF_RELAY_TOKEN": token, "HOME": str(home), "USERPROFILE": str(home), "PI_OFFLINE": "1",
+                        "SF_TOOLS_URL": f"http://127.0.0.1:{relay.port}",
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "PYTHONPATH": str((ctx.workspace / DEPS_DIR).resolve())})
             argv = pi_argv(command, model_id, thinking, system, prompt, extra_args)
@@ -348,7 +424,14 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
         agent = relay.unregister(token)
         result.duration_s = time.time() - start
         if agent:
-            relay._tx(agent, {"type": "end", "status": result.status, "steps": result.steps, "error": result.error})
+            if agent.sf_calls:
+                result.tool_calls += len(agent.sf_calls)
+                used = Counter(n for n, _, _ in agent.sf_calls)
+                if on_event:
+                    on_event("sf_tools", "SwarmForge tools used: " + ", ".join(f"{n} x{c}" for n, c in used.most_common()),
+                             {"sf_calls": agent.sf_calls})
+            relay._tx(agent, {"type": "end", "status": result.status, "steps": result.steps, "error": result.error,
+                              "sf_calls": agent.sf_calls})
     return result
 
 

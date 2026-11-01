@@ -6,6 +6,15 @@ from datetime import datetime
 from pathlib import Path
 
 
+
+def blocking_severities(run: dict) -> set[str]:
+    """The severities that blocked approval for this run (from its config snapshot)."""
+    try:
+        sev = (json.loads(run.get("config_json") or "{}").get("review") or {}).get("blocking_severities")
+    except (json.JSONDecodeError, AttributeError):
+        sev = None
+    return set(sev or ("critical", "major"))
+
 def _ts(t: float | None) -> str:
     return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S") if t else "-"
 
@@ -158,9 +167,12 @@ def build_report(store, run_id: str) -> str:
     unv = [a for a in acc if a["status"] != "satisfied" and a["cycle"] == max((x["cycle"] for x in acc), default=0)]
     for a in unv:
         lim.append(f"Acceptance criterion {a['criterion_id']} is {a['status']}: {a['evidence']}")
-    open_minor = [f for f in findings if f["severity"] in ("minor",) and f["cycle"] == run["repair_cycle"]]
-    if open_minor:
-        lim.append(f"{len(open_minor)} non-blocking (minor) review finding(s) were not addressed.")
+    block = blocking_severities(run)
+    open_nb = [f for f in findings if f["severity"] not in block and f["severity"] != "info"
+               and f["cycle"] == run["repair_cycle"]]
+    if open_nb:
+        sev = ", ".join(sorted({f["severity"] for f in open_nb}))
+        lim.append(f"{len(open_nb)} non-blocking ({sev}) review finding(s) were not addressed.")
     L += [f"- {x}" for x in lim] or ["- None identified by the automated gates. A human should still review the diff."]
     L.append("")
 
@@ -212,12 +224,14 @@ def build_pr_body(store, run_id: str) -> str:
     L += ["", "## Review", ""]
     cur = [f for f in findings if f["cycle"] == run["repair_cycle"]]
     L += [f"- Findings in final review: {len(cur)} "
-          f"({sum(1 for f in cur if f['severity'] in ('critical', 'major'))} blocking)",
+          f"({sum(1 for f in cur if f['severity'] in blocking_severities(run))} blocking)",
           f"- Repair cycles: {run['repair_cycle']}", ""]
-    minors = [f for f in cur if f["severity"] in ("minor", "info")]
-    if minors:
-        L += ["### Known limitations (non-blocking findings)"] + [
-            f"- `{f['file']}`: {f['title']}" for f in minors[:15]] + [""]
+    order = {"critical": 0, "major": 1, "minor": 2, "info": 3}
+    nonblocking = sorted((f for f in cur if f["severity"] not in blocking_severities(run)),
+                         key=lambda f: order.get(f["severity"], 9))
+    if nonblocking:
+        L += ["### Known limitations (non-blocking findings — please check these)"] + [
+            f"- **[{f['severity']}]** `{f['file']}`: {f['title']}" for f in nonblocking[:20]] + [""]
     L += ["## Cost & supervision", ""] + cost_lines(store, run_id)
     L += [f"- Human interventions: {len(inter)}", "", f"Run id: `{run_id}`"]
     body = "\n".join(L)
@@ -356,7 +370,7 @@ def build_summary(store, run_id: str, *, lessons: bool = True) -> str:
         L += [f"  - {a['criterion_id']} {a['status']}: {a['text'][:120]}" for a in cur if a["status"] != "satisfied"]
     cur_f = [f for f in findings if f["cycle"] == run["repair_cycle"] and f["source"] == "reviewer"]
     if cur_f or run["repair_cycle"]:
-        blocking = sum(1 for f in cur_f if f["severity"] in ("critical", "major"))
+        blocking = sum(1 for f in cur_f if f["severity"] in blocking_severities(run))
         L.append(f"- **Review:** {len(cur_f)} finding(s) in the final review ({blocking} blocking) after "
                  f"{run['repair_cycle']} repair cycle(s)")
     L += ["", "### What you need to do", "", next_step(store, run), ""]

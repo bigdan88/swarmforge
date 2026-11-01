@@ -122,6 +122,9 @@ def run_metrics(store, run_id: str) -> dict | None:
         "agent_timeouts": sum(1 for m in msgs if m.startswith("end: timeout")),
         "step_limit_hits": sum(1 for m in msgs if "hitting its limit" in m),
         "model_busy_waits": sum(1 for m in msgs if "is busy (429" in m or "is busy (503" in m),
+        # SwarmForge tools used by Pi developers through `sf` (each call is logged as "sf <tool>: ...")
+        "sf_calls": sum(1 for m in msgs if re.match(r"sf \w+: ", m)),
+        "browse_calls": sum(1 for m in msgs if m.startswith(("sf browse: ", "browse: "))),
     }
     total = end - run["created_at"]
     return {
@@ -150,7 +153,7 @@ def flat(m: dict) -> dict:
     row.update(approval_wait_min=m["approval_wait_s"] / 60, test_suite_min=m["test_suite_s"] / 60,
                test_runs=m["test_runs"], repair_cycles=m["repair_cycles"], cost_usd=m["cost_usd"],
                agent_timeouts=m["agent_timeouts"], step_limit_hits=m["step_limit_hits"],
-               model_busy_waits=m["model_busy_waits"])
+               model_busy_waits=m["model_busy_waits"], sf_calls=m["sf_calls"], browse_calls=m["browse_calls"])
     for role, r in sorted(m["roles"].items()):
         row[f"{role}_min"] = r["time_s"] / 60
     row["started"] = m["started"]
@@ -244,7 +247,8 @@ def format_run(m: dict) -> str:
             lines.append(f"  {p:<9} {s / 60:6.1f} min  {100 * s / total:4.0f}%")
     lines.append(f"  test suite {m['test_suite_s'] / 60:.1f} min over {m['test_runs']} run(s); approval wait "
                  f"{m['approval_wait_s'] / 60:.1f} min; agent timeouts {m['agent_timeouts']}, step-limit hits "
-                 f"{m['step_limit_hits']}, busy-model waits {m['model_busy_waits']}")
+                 f"{m['step_limit_hits']}, busy-model waits {m['model_busy_waits']}; sf tool calls {m['sf_calls']} "
+                 f"(browser {m['browse_calls']})")
     for role, r in sorted(m["roles"].items(), key=lambda kv: -kv[1]["time_s"]):
         if r["time_s"] or r["calls"]:
             per = f", {r['call_s'] / r['calls']:.0f}s/call" if r["calls"] else ""
