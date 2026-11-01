@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import os
 import re
 import time
@@ -137,6 +138,10 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
                        base_branch=base, note=note)
     issue_url = item.get("issue_url")
     src = {"issue_url": issue_url} if issue_url else {"issue_file": str(issue_file), "repo": item["repo"]}
+    try:
+        att = json.loads(item.get("attachments") or "[]")
+    except Exception:
+        att = []
     if issue_url:
         _hook("on_run_start", cfg, item, echo=echo)
     def make(cc, seed, ctx=None, heal_of=None, attempt=None):
@@ -148,13 +153,15 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         else:
             orch.approve = dashboard_approver(store, lambda: orch.run_id, cc.approval.timeout_s)
         return orch
-    await make(c, item.get("seed_run_id")).execute(**src, base_branch=base, run_id=run_id)
+    await make(c, item.get("seed_run_id")).execute(**src, base_branch=base, run_id=run_id,
+                                                        attachments=att)
 
     async def launch(cc, seed, ctx, heal_of, attempt):
         rid = new_run_id()
         store.queue_update(item["id"], run_id=rid, note=(note + "; " if note else "")
                            + f"self-healing attempt {attempt} after {heal_of}")
-        return await make(cc, seed, ctx, heal_of, attempt).execute(**src, base_branch=base, run_id=rid)
+        return await make(cc, seed, ctx, heal_of, attempt).execute(**src, base_branch=base, run_id=rid,
+                                                                    attachments=att)
     from .postmortem import heal
     run_id = await heal(c, store, run_id, launch, attempts=item.get("heal_attempts"), echo=echo)
     run = store.get_run(run_id)
