@@ -23,6 +23,7 @@ import yaml
 
 from . import prompts
 from .agent.runtime import AgentResult, AgentSpec, run_agent
+from .agent.navtools import NAV_READONLY, NAV_TOOLS
 from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext
 from .config import Config
 from .db import Store
@@ -501,8 +502,8 @@ class Orchestrator:
         last_err = None
         for attempt in range(1, self.cfg.limits.max_planning_attempts + 1):
             res = await self._agent("planner", f"plan-{attempt}", prompts.PLANNER_SYSTEM, user,
-                                    READ_TOOLS, self._plan_terminal(set(), True),
-                                    ToolContext(workspace=self.ws.repo))
+                                    self._plan_tools(), self._plan_terminal(set(), True),
+                                    ToolContext(workspace=self.ws.repo, base_sha=self.ws.base_sha))
             if res.ok:
                 return res.value
             last_err = res.error
@@ -525,8 +526,8 @@ class Orchestrator:
         last_err = None
         for attempt in range(1, self.cfg.limits.max_planning_attempts + 1):
             res = await self._agent("planner", f"fixplan-c{cycle}-{attempt}", prompts.FIX_PLANNER_SYSTEM,
-                                    user, READ_TOOLS, self._plan_terminal(all_ids, False),
-                                    ToolContext(workspace=self.ws.repo))
+                                    user, self._plan_tools(), self._plan_terminal(all_ids, False),
+                                    ToolContext(workspace=self.ws.repo, base_sha=self.ws.base_sha))
             if res.ok:
                 return res.value
             last_err = res.error
@@ -615,7 +616,8 @@ class Orchestrator:
             self.store.upsert_task(self.run_id, task.id, attempts=attempt)
             ctx = ToolContext(workspace=path, sandbox=self.sandbox, installer=self._tool_installer(),
                               command_timeout_s=self.cfg.sandbox.command_timeout_s,
-                              artifacts_dir=self.artifacts / f"task-{task.id}")
+                              artifacts_dir=self.artifacts / f"task-{task.id}",
+                              test_command=self.cfg.project.test_command, base_sha=self.ws.base_sha)
             res = await self._agent(task.role, task.id, prompts.DEVELOPER_SYSTEM,
                                     self._dev_prompt(task, attempt, prev_error),
                                     READ_TOOLS + WRITE_TOOLS + self._exec_tools(), self._finish_terminal(), ctx,
@@ -666,7 +668,8 @@ class Orchestrator:
             ])
             ctx = ToolContext(workspace=rpath, sandbox=self.sandbox, installer=self._tool_installer(),
                               command_timeout_s=self.cfg.sandbox.command_timeout_s,
-                              artifacts_dir=self.artifacts / f"merge-{task.id}")
+                              artifacts_dir=self.artifacts / f"merge-{task.id}",
+                              test_command=self.cfg.project.test_command, base_sha=self.ws.base_sha)
             res = await self._agent(task.role, key, prompts.CONFLICT_SYSTEM, user,
                                     READ_TOOLS + WRITE_TOOLS + self._exec_tools(), self._finish_terminal(), ctx)
             if not res.ok:
@@ -733,7 +736,8 @@ class Orchestrator:
             if cycle else "",
         ])
         ctx = ToolContext(workspace=path, sandbox=self.sandbox, installer=self._tool_installer(), command_timeout_s=self.cfg.sandbox.command_timeout_s,
-                          artifacts_dir=self.artifacts / key)
+                          artifacts_dir=self.artifacts / key, test_command=self.cfg.project.test_command,
+                          base_sha=self.ws.base_sha)
         self.store.upsert_task(self.run_id, key, cycle=cycle, kind="test", title="Acceptance testing",
                                role="tester", model=self.cfg.roles["tester"].model, state="RUNNING", attempts=1,
                                started_at=time.time(), branch=branch, worktree=str(path))
@@ -789,7 +793,8 @@ class Orchestrator:
                             lambda a: validate_review(a.get("review", a)))
         for attempt in (1, 2):
             res = await self._agent("reviewer", f"review-c{cycle}-{attempt}", prompts.REVIEWER_SYSTEM, user,
-                                    READ_TOOLS, term, ToolContext(workspace=self.ws.repo))
+                                    self._review_tools(), term,
+                                    ToolContext(workspace=self.ws.repo, base_sha=self.ws.base_sha))
             if res.ok:
                 rv = res.value
                 for f in rv["findings"]:
@@ -1375,7 +1380,8 @@ class Orchestrator:
             user = "\n\n".join([prompts.render_issue(self.issue.title, self.issue.body), context,
                                  "Conflicted files:\n" + "\n".join(f"- {c}" for c in conflicts), self._test_hint()])
             ctx = ToolContext(workspace=rpath, sandbox=self.sandbox, installer=self._tool_installer(),
-                              command_timeout_s=self.cfg.sandbox.command_timeout_s, artifacts_dir=self.artifacts / key)
+                              command_timeout_s=self.cfg.sandbox.command_timeout_s, artifacts_dir=self.artifacts / key,
+                              test_command=self.cfg.project.test_command, base_sha=self.ws.base_sha)
             res = await self._agent(role, key, prompts.CONFLICT_SYSTEM, user,
                                     READ_TOOLS + WRITE_TOOLS + self._exec_tools(), self._finish_terminal(), ctx)
             if not res.ok:
@@ -1389,7 +1395,15 @@ class Orchestrator:
             return mr2.ok
 
     def _exec_tools(self) -> list[str]:
-        return EXEC_TOOLS + (DEV_TOOLS if self.cfg.sandbox.dev_tools else [])
+        return EXEC_TOOLS + (DEV_TOOLS + NAV_TOOLS if self.cfg.sandbox.dev_tools else [])
+
+    def _review_tools(self) -> list[str]:
+        """Read-only tools for the reviewer: files plus outline/find_symbol/git_changes/git_history."""
+        return READ_TOOLS + NAV_READONLY
+
+    def _plan_tools(self) -> list[str]:
+        """Read-only tools for the planner: files plus outline/find_symbol/git_changes/git_history."""
+        return READ_TOOLS + NAV_READONLY
 
     def _check_cancel(self) -> None:
         if self._should_cancel():
