@@ -67,14 +67,14 @@ def _open_settings(tmp_path, monkeypatch, *, unset_key: bool = False, **patches)
 # ------------------------------------------------------------------ AC1
 def test_health_rows_cover_every_check_plus_github(tmp_path, monkeypatch):
     """AC1: get_health_checks returns exactly one row per preflight check plus GitHub access."""
-    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [])
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": name, "status": "ok", "message": "", "fix": ""}
+        for name in settings.CANONICAL_CHECKS])
     monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
     cfg = parse_config(base_raw(tmp_path / "work"))
     rows = settings.get_health_checks(cfg)
     names = [r["name"] for r in rows]
-    for want in ("Provider API keys", "Provider base_url", "GitHub CLI", "Git",
-                 "Docker running", "Sandbox image built", "GitHub access"):
-        assert names.count(want) == 1, names
+    assert names == settings.CANONICAL_CHECKS + ["GitHub access"]
     assert all(r["status"] == "ok" for r in rows)
 
 
@@ -113,13 +113,17 @@ def test_health_section_renders_one_row_per_check(tmp_path, monkeypatch):
     _, at = _open_settings(
         tmp_path, monkeypatch,
         get_health_checks=settings.get_health_checks,
-        environment_check_results=lambda cfg: [],
+        environment_check_results=lambda cfg: [
+            {"name": name, "status": "ok", "message": "", "fix": ""}
+            for name in settings.CANONICAL_CHECKS],
         github_access=lambda cfg: (True, ""),
     )
     md = " ".join(m.value for m in at.markdown)
-    for want in ("Provider API keys", "Provider base_url", "GitHub CLI", "Git",
+    for want in ("Provider API keys", "Git",
                  "Docker running", "Sandbox image built", "GitHub access"):
         assert f"✅ **{want}**" in md, (want, md)
+    assert "Provider base_url" not in md
+    assert "GitHub CLI" not in md
 
 
 # ------------------------------------------------------------------ AC4
@@ -153,7 +157,8 @@ def test_test_models_caps_busy_wait_and_reports_usage(monkeypatch, tmp_path):
     assert all(r["ok"] for r in rows)
     assert rows[0]["total_tokens"] == 120 and rows[0]["cost_usd"] == 0.0005
     assert rows[0]["cost_source"] == "pricing table"
-    assert captured["busy_wait_s"] is not None and captured["busy_wait_s"] <= 5.0
+    assert captured["busy_wait_s"] == min(float(cfg.limits.busy_wait_s), 5.0)
+    assert captured["busy_wait_s"] > 0
     # same tiny tool-calling request as checks.run_checks(live=True)
     role, tools = captured["calls"][0]
     assert role == "planner" and tools[0]["function"]["name"] == "report_status"
