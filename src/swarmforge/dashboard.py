@@ -2024,24 +2024,89 @@ QUICK_PROMPTS = {
                                          "them faster or cheaper?",
 }
 CHAT_KV = "chat_history_v1"
+CHAT_MIGRATED = False  # legacy flat history is folded into 'General' once per process
 
 
-def _chat_save(history: list, actions: dict) -> None:
+def _chat_actions_key(conv_id: str) -> str:
+    return f"chat_actions_v1:{conv_id}"
+
+
+def _chat_rel_time(ts: float) -> str:
+    d = time.time() - ts
+    if d < 60:
+        return "just now"
+    if d < 3600:
+        return f"{int(d // 60)} min ago"
+    if d < 86400:
+        return f"{int(d // 3600)} h ago"
+    if d < 7 * 86400:
+        return f"{int(d // 86400)} d ago"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def _chat_conv_id() -> str:
+    """The active conversation: the remembered one if it still exists, else the most recent."""
+    from swarmforge import chatbot
+    convs = chatbot.list_conversations(store)
+    cid = st.session_state.get("chat_conv_id")
+    if cid and any(c["id"] == cid for c in convs):
+        return cid
+    if convs:
+        st.session_state.chat_conv_id = convs[0]["id"]
+        return convs[0]["id"]
+    cid = chatbot.ensure_default_conversation(store)["id"]
+    st.session_state.chat_conv_id = cid
+    return cid
+
+
+def _chat_migrate_legacy() -> None:
+    """Fold the pre-conversation flat chat_history_v1 kv into the seeded 'General' thread."""
+    global CHAT_MIGRATED
+    if CHAT_MIGRATED:
+        return
+    CHAT_MIGRATED = True
+    from swarmforge import chatbot
     try:
-        store.kv_set(CHAT_KV, json.dumps({"history": history[-40:], "actions": {
-            str(k): v for k, v in actions.items() if int(k) >= len(history) - 40}}))
+        raw = store.kv_get(CHAT_KV)
+    except Exception:  # noqa: BLE001
+        return
+    if not raw:
+        return
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    conv = chatbot.ensure_default_conversation(store)
+    for h in (d.get("history") or [])[-40:]:
+        chatbot.add_message(store, conv["id"], h.get("role", "user"), h.get("content", ""))
+    acts = {str(k): v for k, v in (d.get("actions") or {}).items()}
+    if acts:
+        store.kv_set(_chat_actions_key(conv["id"]), json.dumps(acts))
+    store.kv_set(CHAT_KV, None)
+
+
+def _chat_save(actions: dict, conv_id: str) -> None:
+    """Persist the per-conversation action payloads (messages persist via add_message at emit time)."""
+    try:
+        store.kv_set(_chat_actions_key(conv_id), json.dumps({str(k): v for k, v in actions.items()}))
     except Exception:  # noqa: BLE001
         pass
 
 
-def _chat_load() -> tuple[list, dict]:
-    if "chat_history" not in st.session_state:
+def _chat_load(conv_id: str) -> tuple[list, dict]:
+    """Session chat_history/chat_actions for the active conversation, loading it on switch."""
+    from swarmforge import chatbot
+    _chat_migrate_legacy()
+    if st.session_state.get("chat_loaded_conv") != conv_id:
+        st.session_state.chat_history = [{"role": m["role"], "content": m["content"]}
+                                         for m in chatbot.get_messages(store, conv_id)]
         try:
-            d = json.loads(store.kv_get(CHAT_KV) or "{}")
+            d = json.loads(store.kv_get(_chat_actions_key(conv_id)) or "{}")
         except json.JSONDecodeError:
             d = {}
-        st.session_state.chat_history = list(d.get("history") or [])
-        st.session_state.chat_actions = {int(k): v for k, v in (d.get("actions") or {}).items()}
+        st.session_state.chat_actions = {int(k): v for k, v in (d or {}).items()}
+        st.session_state.chat_loaded_conv = conv_id
+        st.session_state.pop("chat_done", None)
     return st.session_state.chat_history, st.session_state.setdefault("chat_actions", {})
 
 
@@ -2152,34 +2217,98 @@ def page_chat():
                "buttons: launch tasks in one click, or pick (or write) how a failed task should be fixed. "
                "Answers use the run store, failures, lessons in the knowledge base and the platform's own code "
                "layout. CLI: `swarmforge ask \"…\"`.")
-    history, actions = _chat_load()
-    needs = chatbot.failures_needing_attention(store)
-    q1, q2, q3, q4 = st.columns([1.4, 1.4, 1.5, 0.8])
-    pending = None
-    for col, key, (label, prompt_text) in zip((q1, q2, q3), ("improve", "failures", "slow"), QUICK_PROMPTS.items()):
-        lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
-        if col.button(lab, key="chat_q_" + key, width="stretch"):
-            pending = prompt_text
-    if q4.button("Reset conversation", key="chat_reset"):
-        history.clear()
-        actions.clear()
+    active_id = _chat_conv_id()
+    rail, main = st.columns([1, 3])
+
+    # ------------------------------------------------ conversation rail (left)
+    with rail:
+        new_clicked = st.button("+ New chat", key="chat_new")
+        renaming = st.session_state.get("chat_renaming")
+        sel_clicked = edit_clicked = del_clicked = None
+        save_clicked = cancel_clicked = None
+        for c in chatbot.list_conversations(store):
+            if renaming == c["id"]:
+                st.text_input("Rename", value=c["title"], key=f"chat_rename_{c['id']}")
+                save_clicked = c["id"] if st.button("Save", key=f"chat_rename_save_{c['id']}") else save_clicked
+                cancel_clicked = c["id"] if st.button("Cancel", key=f"chat_rename_cancel_{c['id']}") \
+                    else cancel_clicked
+                continue
+            label = ("● " if c["id"] == active_id else "") + c["title"]
+            sel_clicked = c["id"] if st.button(label, key=f"chat_sel_{c['id']}") else sel_clicked
+            st.caption(_chat_rel_time(c["updated_at"]))
+            edit_clicked = c["id"] if st.button("✎", key=f"chat_edit_{c['id']}") else edit_clicked
+            del_clicked = c["id"] if st.button("🗑", key=f"chat_del_{c['id']}") else del_clicked
+
+    # rail clicks are handled before the transcript renders; each one reruns
+    if new_clicked:
+        conv = chatbot.create_conversation(store, "New chat")
+        st.session_state.chat_conv_id = conv["id"]
+        st.session_state.pop("chat_done", None)
         st.session_state.pop("chat_done", None)
         st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
-        _chat_save(history, actions)
-    if needs and not history:
-        st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. Press **Review my failed tasks**.")
-    for n, m in enumerate(history):
-        with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
-            if m["role"] == "assistant":
-                st.markdown(m["content"])
-                render_message_actions(n, actions.get(n))
-            else:
-                st.write(m["content"])
-    typed = st.chat_input("Ask about runs, failures, or what to improve…")
+        st.rerun()
+        st.rerun()
+    if sel_clicked and sel_clicked != active_id:
+        st.session_state.chat_conv_id = sel_clicked
+        st.rerun()
+    if edit_clicked:
+        st.session_state.chat_renaming = edit_clicked
+        st.rerun()
+    if cancel_clicked:
+        st.session_state.pop("chat_renaming", None)
+        st.rerun()
+    if save_clicked:
+        convs = {c["id"]: c for c in chatbot.list_conversations(store)}
+        c = convs.get(save_clicked)
+        if c:
+            txt = st.session_state.get(f"chat_rename_{save_clicked}") or ""
+            chatbot.rename_conversation(store, save_clicked, txt.strip() or c["title"])
+        st.session_state.pop("chat_renaming", None)
+        st.rerun()
+    if del_clicked:
+        chatbot.delete_conversation(store, del_clicked)
+        if st.session_state.get("chat_renaming") == del_clicked:
+            st.session_state.pop("chat_renaming", None)
+        if active_id == del_clicked:
+            rest = chatbot.list_conversations(store)
+            st.session_state.chat_conv_id = (rest[0]["id"] if rest
+                                             else chatbot.ensure_default_conversation(store)["id"])
+        st.rerun()
+
+    # ------------------------------------------------ transcript (right)
+    history, actions = _chat_load(active_id)
+    needs = chatbot.failures_needing_attention(store)
+    with main:
+        q1, q2, q3, q4 = st.columns([1.4, 1.4, 1.5, 0.8])
+        pending = None
+        for col, key, (label, prompt_text) in zip((q1, q2, q3), ("improve", "failures", "slow"),
+                                                  QUICK_PROMPTS.items()):
+            lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
+            if col.button(lab, key="chat_q_" + key, width="stretch"):
+                pending = prompt_text
+        if q4.button("Reset conversation", key="chat_reset"):
+            chatbot.clear_messages(store, active_id)
+            store.kv_set(_chat_actions_key(active_id), None)
+            history.clear()
+            actions.clear()
+            st.session_state.pop("chat_done", None)
+            st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
+            _chat_save(actions, active_id)
+        if needs and not history:
+            st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. Press **Review my failed tasks**.")
+        for n, m in enumerate(history):
+            with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
+                if m["role"] == "assistant":
+                    st.markdown(m["content"])
+                    render_message_actions(n, actions.get(n))
+                else:
+                    st.write(m["content"])
+        typed = st.chat_input("Ask about runs, failures, or what to improve…")
     prompt = typed or pending
     if not prompt:
         return
     history.append({"role": "user", "content": prompt})
+    chatbot.add_message(store, active_id, "user", prompt)
     with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
         st.write(prompt)
     conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
@@ -2188,12 +2317,13 @@ def page_chat():
             res = chatbot.ask(cfg, store, prompt, history=history[:-1], conversation=conv)
     except chatbot.ChatError as e:
         st.error(f"Chatbot: {e}")
-        _chat_save(history, actions)
+        _chat_save(actions, active_id)
         return
     history.append({"role": "assistant", "content": res["answer"]})
+    chatbot.add_message(store, active_id, "assistant", res["answer"])
     if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
         actions[len(history) - 1] = res["actions"]
-    _chat_save(history, actions)
+    _chat_save(actions, active_id)
     with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
         st.markdown(res["answer"])
         st.caption(f"answered by **{res['role']}** · `{res['model']}`")

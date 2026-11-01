@@ -38,7 +38,8 @@ def github_access(cfg: Config) -> tuple[bool, str]:
 
 
 # canonical health-row names, in display order
-CANONICAL_CHECKS = ["Provider API keys", "Git", "Docker running", "Sandbox image built"]
+CANONICAL_CHECKS = ["Provider API keys", "Git", "Docker running",
+                 "Sandbox image built", "Sandbox tools"]
 
 
 def get_health_checks(cfg: Config) -> list[dict]:
@@ -72,14 +73,14 @@ def get_health_checks(cfg: Config) -> list[dict]:
                              "message": r.get("message", ""), "fix": r.get("fix", "")}
     docker_optional = cfg.sandbox.mode != "docker"
     rows: list[dict] = []
+    docker_optional_names = ("Docker running", "Sandbox image built", "Sandbox tools")
     for name in CANONICAL_CHECKS:
-        optional = name == "Git" or \
-            (docker_optional and name in ("Docker running", "Sandbox image built"))
+        optional = name == "Git" or (docker_optional and name in docker_optional_names)
         if name in indexed:
             r = indexed.pop(name)
             rows.append({"name": name, "status": r["status"], "message": r["message"],
                          "fix": r["fix"], "optional": optional})
-        elif docker_optional and name in ("Docker running", "Sandbox image built"):
+        elif docker_optional and name in docker_optional_names:
             rows.append({"name": name, "status": "skipped",
                          "message": "not checked (sandbox.mode: local)", "fix": "",
                          "optional": True})

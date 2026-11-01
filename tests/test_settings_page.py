@@ -95,7 +95,7 @@ def test_get_health_checks_git_problem_matches_canonical_row(tmp_path, monkeypat
     git_rows = [r for r in rows if "git" in r["message"].lower()]
     assert len(git_rows) == 1
     # other canonical rows unchanged
-    for name in ("Provider API keys", "Docker running", "Sandbox image built"):
+    for name in ("Provider API keys", "Docker running", "Sandbox image built", "Sandbox tools"):
         assert name in by_name
 
 
@@ -120,6 +120,7 @@ def test_canonical_checks_are_all_performed_by_preflight(tmp_path, monkeypatch):
     from swarmforge import preflight
     monkeypatch.setattr(preflight, "_docker_problem", lambda c, t: None)
     monkeypatch.setattr(preflight, "_image_problems", lambda c, i: [])
+    monkeypatch.setattr(preflight, "_sandbox_tool_problems", lambda c, i, t: [])
     monkeypatch.setenv("FAKE_KEY", "test-key")
     cfg = make_cfg(tmp_path, "docker")
     names = {r["name"] for r in preflight.environment_check_results(cfg)}
@@ -143,6 +144,8 @@ def test_get_health_checks_never_invents_rows_for_unperformed_checks(tmp_path, m
     assert "local" in by_name["Docker running"]["message"]
     assert by_name["Sandbox image built"]["status"] == "skipped"
     assert "local" in by_name["Sandbox image built"]["message"]
+    assert by_name["Sandbox tools"]["status"] == "skipped"
+    assert "local" in by_name["Sandbox tools"]["message"]
     # the only green 'ok' row is the one actually checked (GitHub access)
     assert {r["name"] for r in rows if r["status"] == "ok"} == {"GitHub access"}
 
@@ -196,9 +199,11 @@ def test_environment_check_results_git_fail_and_docker_rows(tmp_path, monkeypatc
     monkeypatch.setattr(preflight, "_docker_problem",
                         lambda c, t: ("Docker is not responding.", "Start Docker Desktop."))
     monkeypatch.setattr(preflight, "_image_problems", lambda c, i: [])
+    monkeypatch.setattr(preflight, "_sandbox_tool_problems", lambda c, i, t: [])
     rows = preflight.environment_check_results(cfg)
     by_name = {r["name"]: r for r in rows}
-    assert set(by_name) == {"Provider API keys", "Git", "Docker running", "Sandbox image built"}
+    assert set(by_name) == {"Provider API keys", "Git", "Docker running",
+                           "Sandbox image built", "Sandbox tools"}
     assert by_name["Git"]["status"] == "fail"
     assert "git is not installed" in by_name["Git"]["message"]
     assert by_name["Docker running"]["status"] == "fail"
@@ -215,6 +220,28 @@ def test_environment_check_results_git_fail_and_docker_rows(tmp_path, monkeypatc
     assert by_name["Docker running"]["status"] == "ok"
     assert by_name["Sandbox image built"]["status"] == "fail"
     assert by_name["Sandbox image built"]["fix"] == "swarmforge sandbox build"
+    assert by_name["Sandbox tools"]["status"] == "skipped"  # image missing -> probe not run
+    assert "not checked" in by_name["Sandbox tools"]["message"]
+
+
+def test_get_health_checks_surfaces_sandbox_tools_fail_with_fix(tmp_path, monkeypatch):
+    """A 'Sandbox tools' fail row from preflight keeps its fix hint (e.g. missing ruff)."""
+    monkeypatch.setattr(settings, "environment_check_results", lambda cfg: [
+        {"name": "Provider API keys", "status": "ok", "message": "", "fix": ""},
+        {"name": "Git", "status": "ok", "message": "", "fix": ""},
+        {"name": "Docker running", "status": "ok", "message": "", "fix": ""},
+        {"name": "Sandbox image built", "status": "ok", "message": "", "fix": ""},
+        {"name": "Sandbox tools", "status": "fail",
+         "message": "The sandbox image 'dev-sandbox' is missing 'ruff'.",
+         "fix": "install the tool in the image Dockerfile (`pip install ruff`) and rebuild: "
+                "swarmforge sandbox build"}])
+    monkeypatch.setattr(settings, "github_access", lambda cfg: (True, ""))
+    rows = settings.get_health_checks(make_cfg(tmp_path, "docker"))
+    row = next(r for r in rows if r["name"] == "Sandbox tools")
+    assert row["status"] == "fail"
+    assert "missing 'ruff'" in row["message"]
+    assert "pip install ruff" in row["fix"]
+    assert row["optional"] is False
 
 
 def test_environment_check_results_missing_key_row(tmp_path, monkeypatch):
