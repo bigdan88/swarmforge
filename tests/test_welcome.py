@@ -14,6 +14,8 @@ def make_cfg(tmp_path, sandbox_mode="local"):
 
 def test_health_checks_missing_api_key(tmp_path, monkeypatch):
     monkeypatch.delenv("FAKE_KEY", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(welcome, "github_logged_in", lambda cfg: False)
     cfg = make_cfg(tmp_path)
     items = welcome.health_checks(cfg)
     by_name = {i.name: i for i in items}
@@ -22,6 +24,7 @@ def test_health_checks_missing_api_key(tmp_path, monkeypatch):
     assert ".env" in by_name["API key (FAKE_KEY)"].fix
     gh = by_name["GitHub login"]
     assert gh.optional
+    assert not gh.ok
     assert "gh auth login" in gh.fix
 
 
