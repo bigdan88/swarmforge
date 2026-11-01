@@ -69,6 +69,25 @@ def test_truncate_context_token_budget():
     assert [m["content"][0] for m in kept] == ["y", "z"]
 
 
+def test_truncate_context_reserved_tokens():
+    msgs = [{"role": "user", "content": "a" * 200},   # 50 tokens
+            {"role": "assistant", "content": "b" * 200},
+            {"role": "user", "content": "c" * 40}]    # 10 tokens
+    kept = chatbot.truncate_context(msgs, 10, max_tokens=200, reserved_tokens=150)
+    # 150 + 50 + 50 + 10 = 260 > 200 -> drop oldest; 150 + 50 + 10 = 210 > 200
+    # -> drop again; 150 + 10 = 160 <= 200
+    assert [m["content"][0] for m in kept] == ["c"]
+    assert 150 + chatbot.estimate_tokens(kept) <= 200
+
+
+def test_truncate_context_reserved_default_zero():
+    msgs = [{"role": "user", "content": "x" * 400},
+            {"role": "assistant", "content": "y" * 400},
+            {"role": "user", "content": "z" * 40}]
+    kept = chatbot.truncate_context(msgs, 10, max_tokens=150)
+    assert [m["content"][0] for m in kept] == ["y", "z"]
+
+
 def test_truncate_context_newest_always_kept():
     msgs = [{"role": "user", "content": "tiny"},
             {"role": "user", "content": "big " * 5000}]

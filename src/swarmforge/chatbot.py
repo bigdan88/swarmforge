@@ -39,17 +39,20 @@ def estimate_tokens(messages: list[dict]) -> int:
 
 
 def truncate_context(messages: list[dict], max_messages: int,
-                      max_tokens: int | None = None) -> list[dict]:
+                      max_tokens: int | None = None, *, reserved_tokens: int = 0) -> list[dict]:
     """Deterministically keep the newest messages: drop from the front until
     len(kept) <= max_messages, then (while over the token budget and more than
-    one message remains) drop the oldest. The newest message is ALWAYS kept,
-    even if it alone exceeds the budget. Never mutates the input; preserves
-    chronological order."""
+    one message remains) drop the oldest. The budget covers the ENTIRE request:
+    `reserved_tokens` (the fixed system context) plus the thread. When the
+    combined estimate exceeds `max_tokens`, the oldest thread messages are
+    dropped until it fits or only the newest remains. The newest message is
+    ALWAYS kept, even if it alone exceeds the budget. Never mutates the input;
+    preserves chronological order."""
     kept = list(messages)
     while len(kept) > max_messages:
         kept.pop(0)
     if max_tokens is not None:
-        while len(kept) > 1 and estimate_tokens(kept) > max_tokens:
+        while len(kept) > 1 and reserved_tokens + estimate_tokens(kept) > max_tokens:
             kept.pop(0)
     return kept
 
@@ -201,7 +204,9 @@ async def answer(cfg: Config, store: Store, question: str,
     if conversation:
         store.conversation_append(conversation, "user", question)
         msgs = store.conversation_messages(conversation)
-        context = truncate_context(msgs, cfg.chat.context_max_messages, cfg.chat.context_max_tokens)
+        reserved = estimate_tokens(messages)
+        context = truncate_context(msgs, cfg.chat.context_max_messages,
+                                   cfg.chat.context_max_tokens, reserved_tokens=reserved)
         for m in context:
             messages.append({"role": m["role"], "content": m["content"]})
         run_id = CHAT_RUN_PREFIX + conversation
