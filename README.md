@@ -86,6 +86,11 @@ swarmforge dashboard          # opens http://localhost:8501
   one-click demo) or *Add to the queue* (one task, or import a backlog file such as
   `docs/SELF_IMPROVEMENT_BACKLOG.md`). Runs are background processes and keep going if you close
   the browser.
+* The sidebar is a **grouped burger menu** (Workflow / Insights / System) with icon pill buttons and
+  an active-page highlight; the **☰ button** collapses it to an icon-only rail and expands it back.
+  When starting a run now or queueing one you can **attach files and images** (logs, specs, CSVs and
+  code are inlined into the task; screenshots are saved and referenced by path), and the run's
+  *Task & summary* shows thumbnails of the images you attached.
 * Every page has its own address (`?page=work`, `?page=failures`, …), handy for bookmarks on an iPad.
 * **Chat**: ask the assistant about run and swarm statuses.
 * **Knowledge**: the Zettelkasten. Browse, search, edit and link notes, view the note graph,

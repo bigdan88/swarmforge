@@ -140,6 +140,17 @@ PAGES = ["Work", "New task", "Failures", "Chat", "Knowledge", "Benchmarks", "Set
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
             "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
 NAV_ICON["Settings"] = ":material/settings:"
+NAV_EMOJI = {"Work": "📋", "New task": "➕", "Failures": "🩺", "Chat": "💬", "Knowledge": "📚",
+             "Benchmarks": "📊", "Settings": "⚙️"}
+NAV_SECTIONS = [("Workflow", ["Work", "New task"]), ("Insights", ["Failures", "Chat", "Knowledge"]),
+                ("System", ["Benchmarks", "Settings"])]
+NAV_HELP = {"Work": "Runs, waiting tasks and approvals at a glance.",
+            "New task": "Start a run now, or queue one for later.",
+            "Failures": "Post-mortems of runs that failed, and what fixed them.",
+            "Chat": "Ask the assistant about runs and swarm status.",
+            "Knowledge": "Browse, search and edit the Zettelkasten notes.",
+            "Benchmarks": "Single agent vs swarm comparisons.",
+            "Settings": "Config, health checks and model tests."}
 SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
@@ -177,16 +188,51 @@ section[data-testid="stSidebar"] .st-key-nav_{SLUG[page]} button {{
     background: rgba(255, 75, 75, 0.12); color: #ff4b4b; font-weight: 600; }}
 section[data-testid="stSidebar"] [class*="st-key-nav_"] {{ margin-bottom: -0.6rem; }}
 .sf-badge {{ font-size: 0.75rem; opacity: 0.7; }}
+/* grouped burger menu: pill nav buttons with a hover nudge and an amber accent */
+div[data-testid="stSidebarContent"] .stButton > button {{ border-radius: 12px; padding: .45rem .8rem;
+    border: 1px solid rgba(255,255,255,.14); text-align: left;
+    transition: transform .15s ease, border-color .15s ease; }}
+div[data-testid="stSidebarContent"] .stButton > button:hover {{ transform: translateX(2px);
+    border-color: #ffc107; }}
+div[data-testid="stSidebarContent"] .stButton > button[kind="primary"],
+div[data-testid="stSidebarContent"] .stButton > button[data-testid^="stBaseButton-primary"] {{
+    border-left: 3px solid #ffc107; }}
+div[data-testid="stSidebarContent"] [class*="st-key-nav_"] {{ margin-bottom: .3rem; }}
+.nav-section {{ text-transform: uppercase; letter-spacing: .14em; font-size: .72rem; font-weight: 600;
+    color: rgba(255,255,255,.45); margin: 1.1rem 0 .2rem; }}
 </style>""", unsafe_allow_html=True)
 
+
+def _toggle_rail() -> None:
+    """☰ collapse the menu to an icon-only rail (and back)."""
+    st.session_state.nav_rail = not st.session_state.setdefault("nav_rail", False)
+
+
 with st.sidebar:
-    st.markdown("### 🐝 SwarmForge")
+    rail = bool(st.session_state.setdefault("nav_rail", False))
     badges = _nav_badges()
-    for p in PAGES:
-        label = p + (f"  ·  {badges[p]}" if badges.get(p) else "")
-        if st.button(label, icon=NAV_ICON[p], key=f"nav_{SLUG[p]}", type="tertiary", width="stretch"):
-            st.session_state.page = p
-            st.rerun()
+    h1, h2 = st.columns([4, 1], vertical_alignment="bottom")
+    h1.markdown("### 🐝 SwarmForge")
+    h2.button(":material/menu:" if not rail else ":material/close:", key="nav_toggle",
+              help="Collapse / expand the menu", width="content", on_click=_toggle_rail)
+    work_bits = [b for b in (badges.get("Work") or "").split(" · ") if b]
+    status = ["autonomous team"] + [b for b in work_bits if not b.startswith("🔔")]
+    if pending_all:
+        status.append(f"🔔 {len(pending_all)} pending")
+    st.caption(" · ".join(status))
+    for section, section_pages in NAV_SECTIONS:
+        if not rail:
+            st.markdown(f'<div class="nav-section">— {section.upper()} —</div>', unsafe_allow_html=True)
+        for p in section_pages:
+            full = p + (f"  ·  {badges[p]}" if badges.get(p) else "")
+            if rail:  # icon-only rail: emoji label, full name + badges in the tooltip
+                label, icon, help_text = NAV_EMOJI[p], None, full
+            else:
+                label, icon, help_text = full, NAV_ICON[p], NAV_HELP.get(p)
+            if st.button(label, icon=icon, key=f"nav_{SLUG[p]}", help=help_text,
+                         type="primary" if p == page else "secondary", width="stretch"):
+                st.session_state.page = p
+                st.rerun()
     if st.button("Getting started", icon=":material/help:", key="nav_getting_started", type="tertiary",
                  width="stretch"):
         st.session_state.show_welcome = True
@@ -198,6 +244,11 @@ with st.sidebar:
     st.divider()
     auto = st.toggle("Live refresh (3 s)", value=os.environ.get("SWARMFORGE_DASH_AUTOREFRESH", "1") == "1",
                      help="Refreshes the Work list and the open task while something is running.")
+    r1, r2 = st.columns([1, 1])
+    if r1.button("↻ Refresh now", key="refresh_now", width="stretch"):
+        st.rerun()
+    r2.caption(f"Updated {fmt_ts(time.time())}")
+    st.caption("🐝 SwarmForge · runs keep going if you close the browser")
     if cfg:
         with st.expander("Setup", icon=":material/settings:"):
             st.caption(f"Config: `{cfg.source_path}`")
@@ -251,6 +302,9 @@ def page_new_run():
                             placeholder="Describe what you want built. Be specific about interfaces and "
                                         "acceptance criteria; the planner turns this into a task graph.")
         repo = repo_picker("Repository", "nr_repo")
+    uploads = st.file_uploader("📎 Attach files & images", accept_multiple_files=True, key="nr_files",
+                               help="Logs, specs, CSVs and code (text) are inlined into the task; "
+                                    "screenshots and images are saved and referenced by path. Up to 10 files.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     mode = c1.selectbox("Team", ["swarm", "single"], format_func=lambda m: {
@@ -287,6 +341,7 @@ def page_new_run():
     if st.button("🚀 Start run", type="primary"):
         from swarmforge.github import get_token, parse_issue_url
         from swarmforge.repos import RepoError, normalize_repo, preflight
+        attachments = [(f.name, f.getvalue()) for f in (uploads or [])][:10]
         try:
             base = None
             repo_arg = None
@@ -320,7 +375,8 @@ def page_new_run():
                                     mode=mode, budget=budget, max_cycles=int(cycles), approval=approval,
                                     test_command=(test_cmd or "").strip() or None,
                                     sandbox_image=(image or "").strip() or None, base=base,
-                                    max_runtime_s=int(hours * 3600), heal_attempts=heal)
+                                    max_runtime_s=int(hours * 3600), heal_attempts=heal,
+                                    attachments=attachments)
         except (ValueError, RepoError) as e:
             st.error(str(e))
             return
@@ -602,6 +658,20 @@ def run_detail(run_id, header=True):
             st.markdown(build_summary(store, run_id))
         except Exception as e:  # the summary must never break the page
             st.caption(f"summary unavailable: {e}")
+        try:  # attachments saved with this run: thumbnails for images, names for everything
+            from swarmforge.attachments import IMAGE_EXTENSIONS
+            att_dir = (cfg.workdir / "issues" / "attachments" / run_id) if cfg else None
+            if att_dir and att_dir.is_dir():
+                files = sorted(p for p in att_dir.iterdir() if p.is_file())
+                imgs = [p for p in files if p.suffix.lower() in IMAGE_EXTENSIONS]
+                if imgs:
+                    cols = st.columns(min(4, len(imgs)))
+                    for i, p in enumerate(imgs[:4]):
+                        cols[i].image(str(p), caption=p.name)
+                if files:
+                    st.caption("Attached: " + ", ".join(p.name for p in files))
+        except Exception:  # noqa: BLE001 - attachments are decoration; never break the page
+            pass
 
     visited = [json.loads(e["data"])["to"] for e in events if e["kind"] == "state" and e["data"]]
     chips = [("🔵" if s == run["state"] else "🟢" if s in visited else "⚪") + f" {s}" for s in FLOW]
@@ -1723,15 +1793,23 @@ def queue_forms() -> None:
         title = st.text_input("Title", key="qa_title")
         body = st.text_area("Description with acceptance criteria", height=200, key="qa_body")
         repo = repo_picker("Repository", "qa_repo")
+        q_uploads = st.file_uploader("📎 Attach files & images", accept_multiple_files=True, key="qa_files",
+                                     help="Saved with the queued task and handed to the agents when it runs. "
+                                          "Text files are inlined into the task, images are referenced by "
+                                          "path. Up to 10 files.")
         mode, budget, cycles, approval, chain, runtime, heal = common("qa")
         if st.button("Add to queue", type="primary"):
             try:
                 if not title.strip() or not body.strip():
                     raise ValueError("title and description are required")
                 src = checked_repo(repo)
+                from swarmforge.attachments import MAX_FILES, save_attachments
+                saved = save_attachments(cfg.workdir / "attachments" / "queue",
+                                         [(f.name, f.getvalue()) for f in (q_uploads or [])][:MAX_FILES])
                 new_id = store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget,
                                          max_cycles=int(cycles), chain=int(chain), approval=approval,
-                                         max_runtime_s=runtime, heal_attempts=heal)
+                                         max_runtime_s=runtime, heal_attempts=heal,
+                                         attachments=json.dumps([str(p) for p in saved]))
                 store.remember_repo(src)
                 st.session_state.flash = f"Queued: {title.strip()}. Press ▶ Start queue when you're ready."
                 select_item(f"q:{new_id}")
