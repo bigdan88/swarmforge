@@ -150,7 +150,7 @@ def build_sandbox_image(cfg: Config, on_line=None) -> int:
     from importlib import resources
 
     dockerfile = resources.files("swarmforge").joinpath("resources/Dockerfile.sandbox")
-    dockerfile_dir = str(dockerfile.parent)
+    dockerfile_dir = str(Path(str(dockerfile)).parent)
     if not shutil.which(cfg.sandbox.docker_binary):
         if on_line:
             on_line("docker binary not found")
