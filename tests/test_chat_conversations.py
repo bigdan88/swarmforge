@@ -1,4 +1,5 @@
-"""Per-conversation chat storage (db.py) and the `chat:` config section."""
+"""Offline unit tests for conversation/message persistence (swarmforge.chatbot)."""
+
 import time
 
 import pytest
@@ -122,6 +123,7 @@ from swarmforge.chatbot import (  # noqa: E402
     DEFAULT_CONVERSATION_TITLE,
     ChatError,
     add_message,
+    clear_messages,
     create_conversation,
     delete_conversation,
     ensure_default_conversation,
@@ -233,3 +235,57 @@ def test_ensure_default_conversation_seeds_once(store):
     seeded = ensure_default_conversation(store)
     assert seeded["id"] != other["id"]  # nothing new was seeded
     assert len(list_conversations(store)) == 2
+
+
+def test_clear_messages_empties_but_keeps_conversation(store):
+    conv = create_conversation(store, "Keep me")
+    add_message(store, conv["id"], "user", "hi")
+    add_message(store, conv["id"], "assistant", "hello")
+
+    deleted = clear_messages(store, conv["id"])
+
+    assert deleted == 2
+    assert get_messages(store, conv["id"]) == []
+    assert get_conversation(store, conv["id"]) is not None
+    assert get_conversation(store, conv["id"])["id"] == conv["id"]
+
+
+def test_clear_messages_returns_zero_when_empty(store):
+    conv = create_conversation(store, "Empty")
+    assert clear_messages(store, conv["id"]) == 0
+    assert clear_messages(store, conv["id"]) == 0
+
+
+def test_clear_messages_unknown_conversation_raises(store):
+    with pytest.raises(ChatError) as exc:
+        clear_messages(store, 987654)
+    assert "987654" in str(exc.value)
+
+
+def test_clear_messages_leaves_other_conversations_alone(store):
+    a = create_conversation(store, "A")
+    b = create_conversation(store, "B")
+    add_message(store, a["id"], "user", "a1")
+    add_message(store, b["id"], "user", "b1")
+    add_message(store, b["id"], "assistant", "b2")
+
+    assert clear_messages(store, a["id"]) == 1
+    assert [m["content"] for m in get_messages(store, b["id"])] == ["b1", "b2"]
+
+
+def test_clear_messages_does_not_bump_updated_at(store):
+    first = create_conversation(store, "First")
+    second = create_conversation(store, "Second")
+    add_message(store, first["id"], "user", "hi")
+    add_message(store, second["id"], "user", "yo")
+
+    before = [c["id"] for c in list_conversations(store)]
+    second_now = get_conversation(store, second["id"])
+
+    clear_messages(store, second["id"])
+
+    after = [c["id"] for c in list_conversations(store)]
+    assert after == before
+    assert (
+        get_conversation(store, second["id"])["updated_at"] == second_now["updated_at"]
+    )
