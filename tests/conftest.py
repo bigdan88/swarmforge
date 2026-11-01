@@ -84,3 +84,11 @@ class FakeProvider:
 def _no_update_check(monkeypatch):
     """Dashboards rendered in tests must not contact GitHub to look for SwarmForge updates."""
     monkeypatch.setenv("SWARMFORGE_DASH_UPDATE_CHECK", "0")
+
+
+@pytest.fixture(autouse=True)
+def _clean_git_env(monkeypatch):
+    """Never let a host run's GIT_* environment leak into test git calls."""
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+              "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        monkeypatch.delenv(k, raising=False)
