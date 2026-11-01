@@ -44,7 +44,8 @@ def _app() -> AppTest:
 
 def _up(at: AppTest, key: str):
     """The file_uploader with the given key, or None (AppTest exposes them by type)."""
-    ups = [u for u in at.get("file_uploader") if u.key == key]
+    ups = list(getattr(at, "file_uploader", None) or []) or list(at.get("file_uploader"))
+    ups = [u for u in ups if u.key == key]
     return ups[0] if ups else None
 
 
@@ -58,8 +59,9 @@ def test_menu_renders_grouped_sections_and_all_nav_keys(tmp_path, monkeypatch):
     assert at.button(key="nav_toggle")
     assert at.button(key="nav_getting_started")
     text = " ".join(m.value for m in at.markdown)
+    caps = {c.value for c in at.caption}
     for section in ("WORKFLOW", "INSIGHTS", "SYSTEM"):
-        assert section in text
+        assert section in text or section in caps
     # the active page is primary, every other page secondary
     assert at.button(key="nav_work").proto.type == "primary"
     for p in PAGES[1:]:
@@ -82,6 +84,7 @@ def test_nav_toggle_collapses_to_icon_rail_and_back(tmp_path, monkeypatch):
     after = at.button(key="nav_work").label
     assert after != before and "Work" not in after  # icon-only label
     assert "WORKFLOW" not in " ".join(m.value for m in at.markdown)  # captions collapse too
+    assert not any(c.value == "WORKFLOW" for c in at.caption)
     # navigation still works from the rail
     at.button(key=_slug("New task")).click().run()
     assert not at.exception, [e.value for e in at.exception]
