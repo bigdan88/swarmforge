@@ -60,6 +60,10 @@ a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
 /* status boxes keep their own light backgrounds when the base theme is light: dark text there */
 [data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] span,
 [data-testid="stNotification"] p { color: inherit; }
+/* Claude-style chat bubbles: calm neutral palette, appended after the generic text rule above so
+   the higher specificity wins for bubble text. LIGHT_CSS mirrors these selectors + properties. */
+[data-testid="stChatMessageContent"] { background-color: #16181d; color: #fafafa; border: 1px solid #33343d; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] { background-color: #1a1c22; }
 </style>"""
 
 LIGHT_CSS = """<style>
@@ -92,10 +96,28 @@ a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
 /* status boxes keep their own tinted backgrounds: let them pick their own text colour again */
 [data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] span,
 [data-testid="stNotification"] p { color: inherit; }
+/* Light reset of the chat bubbles: identical selectors + properties as the dark block, so the
+   dark->light toggle leaves no stale dark colours behind. */
+[data-testid="stChatMessageContent"] { background-color: #f5f2ec; color: #31333f; border: 1px solid #dcd3c1; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] { background-color: #e9e4d8; }
 </style>"""
 
 # Every dark-palette colour DARK_CSS sets: none of these may appear in LIGHT_CSS (tests scan with it).
 DARK_CSS_COLORS = ("#0e1117", "#16181d", "#1a1c22", "#262730", "#33343d", "#e6e6e6", "#fafafa")
+
+CHAT_CSS = """<style>
+/* Claude-style chat transcript: geometry + typography only. Colours live exclusively in
+   DARK_CSS / LIGHT_CSS so every bubble colour is reversible on the dark->light toggle. */
+[data-testid="stChatMessage"] { align-items: flex-start; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { flex-direction: row-reverse; }
+[data-testid="stChatMessageContent"] { border-radius: 18px; padding: 0.7rem 1.05rem; max-width: 78%; line-height: 1.75; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] { border-bottom-right-radius: 6px; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) [data-testid="stChatMessageContent"] { border-bottom-left-radius: 6px; }
+[data-testid="stChatMessageContent"] h1, [data-testid="stChatMessageContent"] h2, [data-testid="stChatMessageContent"] h3, [data-testid="stChatMessageContent"] h4 { font-family: Georgia, "Times New Roman", serif; font-weight: 600; letter-spacing: 0.01em; line-height: 1.5; }
+</style>"""
+
+# Slash-format Material icons for the chat page avatars (colon format raises StreamlitAPIException).
+CHAT_AVATARS = {"user": ":material/person:", "assistant": ":material/auto_awesome:"}
 
 
 def theme_css(mode: str) -> str:
@@ -211,6 +233,12 @@ if css:  # one keyed element: toggling modes replaces the previous block wholesa
         st.markdown(css, key="sf_theme_css", unsafe_allow_html=True)
     except TypeError:  # Streamlit without keyed markdown: one plain element still replaces the old block
         st.markdown(css, unsafe_allow_html=True)
+# Chat bubble geometry is theme-neutral (no colours), so it is injected on every render, even in
+# auto mode; keyed so reruns replace the element wholesale, same pattern as sf_theme_css.
+try:
+    st.markdown(CHAT_CSS, key="sf_chat_css", unsafe_allow_html=True)
+except TypeError:  # Streamlit without keyed markdown: one plain element still replaces the old block
+    st.markdown(CHAT_CSS, unsafe_allow_html=True)
 
 
 HEAL_HELP = ("If the task fails, SwarmForge asks a model why, then automatically retries this many times, "
@@ -2141,7 +2169,7 @@ def page_chat():
     if needs and not history:
         st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. Press **Review my failed tasks**.")
     for n, m in enumerate(history):
-        with st.chat_message(m["role"]):
+        with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
             if m["role"] == "assistant":
                 st.markdown(m["content"])
                 render_message_actions(n, actions.get(n))
@@ -2152,7 +2180,7 @@ def page_chat():
     if not prompt:
         return
     history.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
         st.write(prompt)
     conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
     try:
@@ -2166,7 +2194,7 @@ def page_chat():
     if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
         actions[len(history) - 1] = res["actions"]
     _chat_save(history, actions)
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
         st.markdown(res["answer"])
         st.caption(f"answered by **{res['role']}** · `{res['model']}`")
         st.caption(f"conversation {res.get('conversation', conv)} · "
