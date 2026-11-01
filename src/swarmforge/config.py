@@ -192,6 +192,7 @@ class Config:
     watch: WatchConfig = field(default_factory=WatchConfig)
     pi: PiConfig = field(default_factory=PiConfig)
     reasoning_effort: str | None = None          # default thinking level for every role (none|low|medium|high)
+    vision_models: list[str] = field(default_factory=list)  # models that accept image blocks (exact or substring match)
     active_variant: str | None = None            # variant id from `swarmforge variants` applied to every run
     prompt_addenda: dict = field(default_factory=dict)   # filled from the active variant (role group -> text)
     variant_applied: bool = False                # runtime flag: the variant overlay is already applied
@@ -275,6 +276,7 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         pi=_build(PiConfig, raw.get("pi"), "pi"),
         active_variant=(str(raw["active_variant"]) if raw.get("active_variant") else None),
         reasoning_effort=(str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None),
+        vision_models=[str(m) for m in (raw.get("vision_models") or [])],
         workdir=workdir,
         source_path=source_path,
     )

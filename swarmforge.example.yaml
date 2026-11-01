@@ -70,6 +70,12 @@ roles:
 
 developer_roles: [developer_backend, developer_frontend]
 
+# Models allowed to receive image blocks (list-content chat messages). Matched case-
+# insensitively as exact ids or substrings. Models not listed are vision-capable only if
+# their name hints at it (vision, -vl, vl-, omni, 4o, 4v, image, multimodal); images sent to
+# a non-vision model are stripped and replaced with a text note instead of failing.
+# vision_models: [Qwen/Qwen2.5-VL-72B-Instruct, openai/gpt-4o]
+
 # Thinking level for reasoning models: none | low | medium | high. DeepInfra defaults reasoning
 # models to high (slow, expensive); override per role with roles.<role>.reasoning_effort.
 reasoning_effort: medium

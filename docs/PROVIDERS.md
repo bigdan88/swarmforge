@@ -91,3 +91,23 @@ roles:
 ```
 
 Calls with neither are reported as "cost unavailable" and do not count toward the budget.
+
+## Multimodal (vision) messages
+
+A chat message's `content` may be a list of blocks instead of a plain string, following the
+OpenAI format: `{type: 'text', text: ...}` and `{type: 'image_url', image_url: {url: ...}}`.
+Base64 `data:` URLs are supported and forwarded to the provider unchanged (no re-encoding).
+
+Whether a model may receive image blocks is decided at call time:
+
+- The top-level `vision_models` config key lists model ids (or substrings, matched
+  case-insensitively) that are vision-capable:
+  ```yaml
+  vision_models: [Qwen/Qwen2.5-VL-72B-Instruct, openai/gpt-4o]
+  ```
+- Models not listed are treated as vision-capable only if their name hints at it
+  (contains `vision`, `-vl`, `vl-`, `omni`, `4o`, `4v`, `image` or `multimodal`).
+
+If images are passed to a model that is not vision-capable, the call does not fail: the image
+blocks are stripped from the message and replaced with a short text note, and the request is
+sent as text-only. Plain string content is unaffected.
