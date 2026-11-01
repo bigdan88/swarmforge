@@ -186,6 +186,11 @@ with st.sidebar:
         if st.button(label, icon=NAV_ICON[p], key=f"nav_{SLUG[p]}", type="tertiary", width="stretch"):
             st.session_state.page = p
             st.rerun()
+    if st.button("Getting started", icon=":material/help:", key="nav_getting_started", type="tertiary",
+                 width="stretch"):
+        st.session_state.show_welcome = True
+        st.session_state.goto = "Work"
+        st.rerun()
     st.write("")
     if pending_all:
         st.warning(f"🔔 {len(pending_all)} approval(s) waiting on the Work page")
@@ -1385,6 +1390,67 @@ def item_detail(w: dict, every) -> None:
     run_detail(r["id"], header=False)
 
 
+def welcome_panel(cfg, empty: bool = False) -> None:
+    """First-run welcome: setup checklist, the sample run and how a run works.
+
+    ``empty`` adds the Work page's "nothing here yet" hint; only a fresh database shows it.
+    Checks and the sample run go through ``swarmforge.welcome`` module attributes so tests can
+    monkeypatch them (AppTest runs the script in this process, but functions defined here could
+    not be patched from outside)."""
+    from swarmforge import welcome
+
+    st.header("Welcome to SwarmForge")
+    st.caption("SwarmForge turns an issue into a reviewed branch: plan it, build it in parallel, "
+               "test it, review it, repair it, then prepare a draft pull request.")
+    if empty:
+        st.info("Nothing here yet. Go to **New task** to start a run or find an issue to fix.")
+    st.subheader("Getting started")
+    try:
+        for item in welcome.health_checks(cfg):
+            if item.ok:
+                st.markdown(f"✅ {item.name}")
+            else:
+                st.markdown(f"{'⬜' if item.optional else '❌'} {item.name}"
+                            f"{' (optional)' if item.optional else ''}")
+                if item.fix:
+                    st.code(item.fix, language=None)
+    except Exception as e:  # noqa: BLE001 - a broken check must never blank the page
+        st.caption(f"Setup checks unavailable: {e}")
+    st.caption("Creates ~/swarmforge-sample and runs the bundled CSV/JSON export issue with 1 repair "
+               "cycle and a $3 budget.")
+    if st.button("🧪 Try the sample (about $0.40, 15 minutes)", type="primary", key="ws_sample"):
+        if not cfg:
+            st.error("Configuration not loaded; cannot start the sample run.")
+            return
+        try:
+            with st.spinner("Preparing the sample…"):
+                run_id = welcome.start_sample_run(cfg, store)
+        except Exception as e:  # noqa: BLE001 - show it, keep the page alive
+            st.error(f"Could not start the sample run: {e}")
+            return
+        st.session_state.flash = "Sample run started — watch it below."
+        select_item(f"r:{run_id}")
+        st.session_state.goto = "Work"
+        st.rerun()
+    st.subheader("How SwarmForge works")
+    st.markdown("The planner breaks the issue down → two developers work **in parallel** on separate "
+                "branches → the branches are merged → the tester runs the suite → the reviewer checks "
+                "the result → blocking problems go back for a **repair cycle** → an approved change "
+                "becomes a draft **PR**.")
+    st.graphviz_chart("""digraph swarmforge {
+  rankdir=LR;
+  Issue -> Planner;
+  Planner -> Backend;
+  Planner -> Frontend;
+  Backend -> Merge;
+  Frontend -> Merge;
+  Merge -> Tester;
+  Tester -> Reviewer;
+  Reviewer -> Planner [style=dashed, label="blocking problems (repair cycle)"];
+  Reviewer -> PR [label="approved"];
+}""")
+
+
 def page_work():
     from swarmforge import runqueue as rq
     if "flash" in st.session_state:
@@ -1395,6 +1461,13 @@ def page_work():
         st.session_state.goto = "New task"
         st.rerun()
     items = work_items()
+    show = st.session_state.pop("show_welcome", False)
+    if not items or show:  # first run (or "Getting started" in the sidebar): welcome instead of an empty table
+        welcome_panel(cfg, empty=not items)
+        if items:
+            st.divider()
+    if not items:
+        return
     busy = any(w["group"] == "active" for w in items) or bool(rq.worker_pid(store))
     open_w = next((w for w in items if w["key"] == st.session_state.get("sel_item")), None)
     editing = bool(open_w and (open_w["group"] != "active" or st.session_state.get("confirm_delete")))
