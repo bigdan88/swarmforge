@@ -651,6 +651,21 @@ def run_detail(run_id, header=True):
                     st.error("Publishing failed: check that the token has Contents and Pull requests write "
                              "access to this repository (details in the Events tab).")
 
+    try:  # attachments saved with this run: thumbnails for images, names for everything
+        from swarmforge.attachments import IMAGE_EXTENSIONS
+        att_dir = (cfg.workdir / "issues" / "attachments" / run_id) if cfg else None
+        if att_dir and att_dir.is_dir():
+            files = sorted(p for p in att_dir.iterdir() if p.is_file())
+            imgs = [p for p in files if p.suffix.lower() in IMAGE_EXTENSIONS]
+            if imgs:
+                cols = st.columns(min(4, len(imgs)))
+                for i, p in enumerate(imgs[:4]):
+                    cols[i].image(str(p), caption=p.name)
+            if files:
+                st.caption("Attached: " + ", ".join(p.name for p in files))
+    except Exception:  # noqa: BLE001 - attachments are decoration; never break the page
+        pass
+
     with st.expander("📋 Task & summary: what was asked, what was done, what you need to do",
                      expanded=run["state"] in TERMINAL):
         try:
@@ -658,20 +673,6 @@ def run_detail(run_id, header=True):
             st.markdown(build_summary(store, run_id))
         except Exception as e:  # the summary must never break the page
             st.caption(f"summary unavailable: {e}")
-        try:  # attachments saved with this run: thumbnails for images, names for everything
-            from swarmforge.attachments import IMAGE_EXTENSIONS
-            att_dir = (cfg.workdir / "issues" / "attachments" / run_id) if cfg else None
-            if att_dir and att_dir.is_dir():
-                files = sorted(p for p in att_dir.iterdir() if p.is_file())
-                imgs = [p for p in files if p.suffix.lower() in IMAGE_EXTENSIONS]
-                if imgs:
-                    cols = st.columns(min(4, len(imgs)))
-                    for i, p in enumerate(imgs[:4]):
-                        cols[i].image(str(p), caption=p.name)
-                if files:
-                    st.caption("Attached: " + ", ".join(p.name for p in files))
-        except Exception:  # noqa: BLE001 - attachments are decoration; never break the page
-            pass
 
     visited = [json.loads(e["data"])["to"] for e in events if e["kind"] == "state" and e["data"]]
     chips = [("🔵" if s == run["state"] else "🟢" if s in visited else "⚪") + f" {s}" for s in FLOW]
