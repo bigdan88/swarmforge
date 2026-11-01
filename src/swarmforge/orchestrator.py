@@ -31,7 +31,7 @@ from .deps import ensure_deps, plan_install
 from .preflight import environment_problems
 from .repos import RepoError, _redact, auth_args, normalize_repo, preflight
 from .knowledge import NOTES_JSON_SCHEMA, Vault, render_for_prompt, validate_notes, write_distilled
-from .llm import Budget, BudgetExceeded, LLMClient
+from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 from .plan import (PLAN_JSON_SCHEMA, REVIEW_JSON_SCHEMA, TEST_REPORT_JSON_SCHEMA, Criterion, Plan,
                    PlanValidationError, Task, validate_plan, validate_review, validate_test_report)
 from .report import build_pr_body, build_summary, write_report, write_summary
@@ -140,8 +140,11 @@ class Orchestrator:
         self._started = time.monotonic()
         self._timed_out = False
         self._issue_file_hint = issue_file
+        self._repo_arg, self._issue_url_arg = repo, issue_url
+        self._git_auth: list[str] = []
         try:
-            await self._wait_for_repo(repo, issue_url)
+            if self._same_repo_mode() == "serial":
+                await self._wait_for_repo(repo, issue_url)
             self._started = time.monotonic()
             pipeline = asyncio.ensure_future(self._pipeline(issue_url, issue_file, repo, base_branch))
             watchdog = asyncio.ensure_future(self._watchdog(pipeline))
@@ -258,6 +261,8 @@ class Orchestrator:
         self.store.update_run(self.run_id, issue_title=issue.title, issue_number=issue.number,
                               repo=issue.full_repo or str(source))
         self.log("issue", f"issue: {issue.title}")
+        if self._same_repo_mode() == "coordinate":
+            await self._coordinate("start")
 
         # -------------------------------------------------- inspection
         self.sm.transition(RunState.REPOSITORY_INSPECTION)
@@ -287,9 +292,8 @@ class Orchestrator:
         self.ws = GitWorkspace(self.run_dir, self.run_id, self.cfg.github.branch_prefix)
         self.source = str(source)
         try:
-            await asyncio.to_thread(self.ws.prepare, str(source), issue.number, base_branch,
-                                    ["-c", "credential.helper=",
-                                     *(auth_args(str(source), token) if ref.use_auth else [])])
+            self._git_auth = ["-c", "credential.helper=", *(auth_args(str(source), token) if ref.use_auth else [])]
+            await asyncio.to_thread(self.ws.prepare, str(source), issue.number, base_branch, self._git_auth)
         except EmptyRepository:
             raise RunAborted(RunState.BLOCKED, (
                 f"the repository {source} has no commits yet. SwarmForge needs a base commit to branch "
@@ -339,6 +343,8 @@ class Orchestrator:
         self._register_tasks(plan.tasks, cycle=0)
         self.log("plan", f"plan accepted: {len(plan.tasks)} task(s), waves={plan.waves()}",
                  data=plan.to_dict())
+        if self._same_repo_mode() == "coordinate":
+            await self._coordinate("plan")
 
         cycle = 0
         tasks = plan.tasks
@@ -370,6 +376,8 @@ class Orchestrator:
             review = await self._review(cycle, evidence)
 
             problems = self._gate(cycle, evidence, tester_report, review, failed_tasks)
+            if not problems:
+                problems = await self._update_with_base(cycle)
             if not problems:
                 self.sm.transition(RunState.APPROVED,
                                    f"tests passed ({evidence.short()}); no blocking findings")
@@ -487,6 +495,7 @@ class Orchestrator:
             f"(models: {', '.join(f'{r}={self.cfg.roles[r].model}' for r in self.cfg.developer_roles)}).",
             f"Maximum number of tasks: {self.cfg.limits.max_tasks}. "
             f"Up to {self.cfg.limits.max_concurrent_agents} tasks can run concurrently.",
+            self._peer_note(),
             "Explore the repository, then call submit_plan.",
         ])
         last_err = None
@@ -1183,6 +1192,201 @@ class Orchestrator:
         if role == self.cfg.librarian_role and role not in ("planner", "reviewer", "tester"):
             return "librarian"
         return role
+
+    # ===================================================== several runs on one repository
+    def _peer_note(self) -> str:
+        """For the planner: what teammates are changing on this repository right now."""
+        if self._same_repo_mode() != "coordinate":
+            return ""
+        peers = self._active_peers()
+        if not peers:
+            return ""
+        lines = [f"- run {p['id']}: {p.get('issue_title') or '?'}"
+                 + (f" — files: {', '.join(sorted(self._plan_files(p))[:15])}" if self._plan_files(p) else "")
+                 for p in peers]
+        return ("Other work is in progress on this repository on separate branches:\n" + "\n".join(lines)
+                + "\nPlan this task so it avoids editing those files where reasonably possible (list the files you "
+                  "really need in expected_files); if you must touch them, keep those edits small.")
+
+    def _same_repo_mode(self) -> str:
+        lim = self.cfg.limits
+        if not lim.one_run_per_repo:
+            return "parallel"
+        return lim.same_repo
+
+    def _active_peers(self) -> list[dict]:
+        key = lock_key(self._repo_arg, self._issue_url_arg) or lock_key(
+            (self.store.get_run(self.run_id) or {}).get("repo"))
+        return blocking_runs(self.store, self.run_id, key) if key else []
+
+    @staticmethod
+    def _plan_files(run: dict) -> set[str]:
+        try:
+            plan = json.loads(run.get("plan_json") or "{}")
+        except json.JSONDecodeError:
+            return set()
+        return {f.strip().lstrip("./") for t in plan.get("tasks", []) for f in (t.get("expected_files") or [])
+                if isinstance(f, str) and f.strip()}
+
+    async def _coordinate(self, stage: str) -> None:
+        """Like an engineering manager: before starting, check the work in progress on this repository;
+        after planning, make sure this run won't edit the same files as an earlier run still going."""
+        peers = self._active_peers()
+        if not peers:
+            return
+        if stage == "start":
+            decision = await self._triage(peers)
+            ids = [p["id"] for p in peers]
+            if decision["decision"] == "duplicate":
+                raise RunAborted(RunState.BLOCKED, f"duplicate of run(s) {', '.join(decision['overlaps_with'] or ids)}"
+                                                   f": {decision['reason']}")
+            if decision["decision"] == "wait":
+                wait = [i for i in decision["overlaps_with"] if i in ids] or ids
+                await self._wait_runs(wait, decision["reason"])
+                await self._refresh_base_after_wait()
+            return
+        mine = self._plan_files({"plan_json": json.dumps(self.plan.to_dict())})
+        clash = {p["id"]: sorted(mine & self._plan_files(p)) for p in peers}
+        clash = {k: v for k, v in clash.items() if v}
+        if not clash:
+            self.log("coordination", f"no file overlap with the {len(peers)} other run(s) on this repository; "
+                                     "working in parallel on branch "
+                                     + str(getattr(self.ws, "integration_branch", None) or "?"))
+            return
+        detail = "; ".join(f"{k}: {', '.join(v[:5])}" for k, v in clash.items())
+        await self._wait_runs(list(clash), f"the plans edit the same files ({detail})")
+        await self._refresh_base_after_wait()
+
+    async def _triage(self, peers: list[dict]) -> dict:
+        lines = []
+        for p in peers:
+            plan = {}
+            try:
+                plan = json.loads(p.get("plan_json") or "{}")
+            except json.JSONDecodeError:
+                pass
+            tasks = "; ".join(f"{t.get('title')} [{', '.join(t.get('expected_files') or [])}]"
+                              for t in plan.get("tasks", []))[:1500]
+            lines.append(f"### Run {p['id']} ({p['state']})\nTask: {p.get('issue_title') or '-'}\n"
+                         f"{(p.get('issue_body') or '')[:1500]}\n"
+                         + (f"Plan: {plan.get('summary', '')[:600]}\nWork items: {tasks}" if plan else "Not planned yet."))
+        user = (f"## NEW task\n{self.issue.title}\n{(self.issue.body or '')[:3000]}\n\n"
+                "## Work in progress on the same repository\n" + "\n\n".join(lines))
+        fallback = {"decision": "wait", "overlaps_with": [p["id"] for p in peers],
+                    "reason": "could not get a coordination decision; waiting to be safe"}
+        try:
+            res = await self.llm.chat("planner", [{"role": "system", "content": prompts.COORDINATOR_SYSTEM},
+                                                  {"role": "user", "content": user}], task_key="coordination")
+            m = re.search(r"\{.*\}", res.content or "", re.S)
+            d = json.loads(m.group(0)) if m else {}
+            if d.get("decision") not in ("parallel", "wait", "duplicate"):
+                d = fallback
+        except (LLMError, json.JSONDecodeError) as e:
+            self.log("coordination", f"manager check failed ({e}); waiting to be safe", level="warn")
+            d = fallback
+        d["overlaps_with"] = [str(x) for x in (d.get("overlaps_with") or [])]
+        d["reason"] = str(d.get("reason") or "")[:500]
+        self.log("coordination", f"manager: {d['decision']} — {d['reason']}"
+                                 + (f" (overlaps with {', '.join(d['overlaps_with'])})" if d["overlaps_with"] else ""),
+                 data=d)
+        return d
+
+    async def _wait_runs(self, ids: list[str], reason: str) -> None:
+        from .launcher import pid_alive
+        from .state import TERMINAL
+        terminal = {str(s) for s in TERMINAL}
+        self.log("coordination", f"waiting for run(s) {', '.join(ids)}: {reason}")
+        self.store.update_run(self.run_id, state_reason=f"waiting for the repository: run(s) {', '.join(ids)} "
+                                                        f"— {reason}"[:400])
+        t0 = time.monotonic()
+        while True:
+            left = [i for i in ids if (r := self.store.get_run(i)) and r["state"] not in terminal and pid_alive(r["pid"])]
+            if not left:
+                break
+            self._check_cancel()
+            await asyncio.sleep(self._repo_poll_s)
+        waited = time.monotonic() - t0
+        self._started += waited             # waiting doesn't use this run's time limit
+        self.store.update_run(self.run_id, state_reason=None)
+        self.log("coordination", f"run(s) {', '.join(ids)} finished after {waited / 60:.0f} min; continuing")
+
+    async def _refresh_base_after_wait(self) -> None:
+        """After waiting, start from the newest base (a teammate's work may have been merged meanwhile)."""
+        if self.ws is None or not self.ws.repo.exists():
+            return
+        if await asyncio.to_thread(self.ws.changed_files):
+            return                           # work already exists; it's updated before the PR instead
+        try:
+            new = await asyncio.to_thread(self.ws.fetch_base, self._git_auth)
+        except GitError as e:
+            self.log("coordination", f"could not fetch the latest {self.ws.base_branch}: {e}", level="warn")
+            return
+        if new != self.ws.base_sha:
+            await asyncio.to_thread(git, self.ws.repo, "reset", "--quiet", "--hard", new)
+            self.ws.base_sha = new
+            self.log("coordination", f"starting from the latest {self.ws.base_branch} ({new[:8]})")
+
+    async def _update_with_base(self, cycle: int) -> list[dict]:
+        """Before the merge request: bring the branch up to date with the latest base, resolve conflicts,
+        and re-run the tests if anything changed. Returns blocking problems (empty = ready)."""
+        if self.ws is None:
+            return []
+        try:
+            new = await asyncio.to_thread(self.ws.fetch_base, self._git_auth)
+        except GitError as e:
+            self.log("integrate", f"could not fetch the latest {self.ws.base_branch}; opening the PR against the "
+                                  f"base it started from: {e}", level="warn")
+            return []
+        if new == self.ws.base_sha or await asyncio.to_thread(self.ws.is_ancestor, new, self.ws.integration_branch):
+            return []
+        self.log("integrate", f"{self.ws.base_branch} moved on ({self.ws.base_sha[:8]} -> {new[:8]}) while this run "
+                              "worked; updating the branch before the merge request")
+        ref = f"refs/remotes/origin/{self.ws.base_branch}"
+        ok = await self._merge_with_resolution(ref, f"update-c{cycle}",
+                                               f"Update with latest {self.ws.base_branch} ({new[:8]})",
+                                               self.cfg.developer_roles[0],
+                                               f"Bringing this branch up to date with the latest {self.ws.base_branch}, "
+                                               "which now contains other merged work. Keep BOTH this branch's "
+                                               "changes and the new base's changes.")
+        if not ok:
+            return [{"kind": "merge", "summary": f"could not merge the latest {self.ws.base_branch} into this branch",
+                     "detail": "Resolve the conflicts between this work and the latest base branch."}]
+        self.ws.base_sha = new
+        self.store.update_run(self.run_id, base_branch=self.ws.base_branch)
+        ev = await run_tests(self.sandbox, self.ws.repo, self.cfg.project.test_command, self.artifacts,
+                             f"update{cycle}", self.cfg.sandbox.command_timeout_s)
+        self._record_tests(ev, cycle)
+        self.log("test", f"tests after updating with {self.ws.base_branch}: {ev.short()}",
+                 level="info" if ev.ok else "warn")
+        if ev.ok:
+            return []
+        return [{"kind": "tests", "summary": f"tests fail after updating with the latest {self.ws.base_branch}: "
+                                             f"{ev.short()}", "detail": ev.failure_report()}]
+
+    async def _merge_with_resolution(self, branch: str, key: str, message: str, role: str, context: str) -> bool:
+        async with self._integration_lock:
+            mr = await asyncio.to_thread(self.ws.merge_into_integration, branch, message)
+            if mr.ok:
+                self.log("integrate", f"merged {branch} cleanly ({mr.sha[:8]})")
+                return True
+            self.log("integrate", f"merge conflict in {mr.conflicts}; asking an agent to resolve it", level="warn")
+            rpath, rbranch, conflicts = await asyncio.to_thread(self.ws.start_conflict_resolution, key, branch)
+            await self._ensure_deps(rpath, key)
+            user = "\n\n".join([prompts.render_issue(self.issue.title, self.issue.body), context,
+                                 "Conflicted files:\n" + "\n".join(f"- {c}" for c in conflicts), self._test_hint()])
+            ctx = ToolContext(workspace=rpath, sandbox=self.sandbox, installer=self._tool_installer(),
+                              command_timeout_s=self.cfg.sandbox.command_timeout_s, artifacts_dir=self.artifacts / key)
+            res = await self._agent(role, key, prompts.CONFLICT_SYSTEM, user,
+                                    READ_TOOLS + WRITE_TOOLS + self._exec_tools(), self._finish_terminal(), ctx)
+            if not res.ok:
+                return False
+            ok, bad = await asyncio.to_thread(self.ws.finish_conflict_resolution, rpath, message + " (conflicts resolved)")
+            if not ok:
+                self.log("integrate", f"conflict markers remain in {bad}", level="error")
+                return False
+            mr2 = await asyncio.to_thread(self.ws.merge_into_integration, rbranch, message)
+            await asyncio.to_thread(self.ws.remove_worktree, rpath)
+            return mr2.ok
 
     def _exec_tools(self) -> list[str]:
         return EXEC_TOOLS + (DEV_TOOLS if self.cfg.sandbox.dev_tools else [])

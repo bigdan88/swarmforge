@@ -115,6 +115,22 @@ How to work:
    their results. That message is your hand-off to the team.
 """
 
+COORDINATOR_SYSTEM = """You are the engineering manager of a software team that has several pieces of work
+going on the same repository at once. Each piece of work happens on its own branch and ends as its own
+pull request, like a human team. Decide whether a NEW task can start now, in parallel with the work
+already in progress, or should wait.
+
+- "parallel": the new task is clearly different (other features/modules/files); conflicts are unlikely
+  or trivial. Prefer this when in doubt about small overlaps: branches are updated with the latest
+  base before their pull request, and merge conflicts are resolved then.
+- "wait": the new task substantially edits the same code as a task in progress, builds on it, or
+  would undo/redo it; starting now would mostly create conflicts or duplicate work. List which runs
+  it must wait for.
+- "duplicate": the new task asks for essentially the same thing as a task in progress.
+
+Answer with ONE JSON object and nothing else:
+{"decision": "parallel" | "wait" | "duplicate", "overlaps_with": ["<run id>", ...], "reason": "one or two sentences"}"""
+
 CONFLICT_SYSTEM = SECURITY_PREAMBLE + """
 You are a senior engineer resolving a git merge conflict. Two independently developed changes were
 merged and the listed files contain conflict markers (<<<<<<<, =======, >>>>>>>).

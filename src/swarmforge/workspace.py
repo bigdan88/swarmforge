@@ -145,6 +145,16 @@ class GitWorkspace:
             self.seed_updated = True
             return self.head(self.repo)
 
+    def fetch_base(self, git_config: list[str] | None = None) -> str:
+        """Fetch the latest base branch from the source repository; returns its sha."""
+        with self._lock:
+            ref = f"refs/remotes/origin/{self.base_branch}"
+            git(self.repo, *(git_config or []), "fetch", "--quiet", "origin", f"+refs/heads/{self.base_branch}:{ref}")
+            return git(self.repo, "rev-parse", ref).strip()
+
+    def is_ancestor(self, a: str, b: str) -> bool:
+        return git_rc(self.repo, "merge-base", "--is-ancestor", a, b)[0] == 0
+
     def attach(self, base_branch: str, base_sha: str, integration_branch: str) -> None:
         """Re-attach to an existing run directory (used by benchmark/report tooling)."""
         self.base_branch, self.base_sha, self.integration_branch = base_branch, base_sha, integration_branch

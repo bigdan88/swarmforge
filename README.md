@@ -211,6 +211,26 @@ the others keep going. Pause/resume a single queue from the queue bar or with
 `swarmforge queue pause|resume --queue NAME`. Issues from `swarmforge watch` go to the `github` queue
 (`watch.queue`). Two queues working on the same repository still take turns (one active run per repo).
 
+## Several runs on one repository (like a team)
+
+With `limits.same_repo: coordinate` (default), several tasks can be worked on the same repository at once,
+the way a human team does it:
+
+1. **Manager check before starting.** If other runs are active on the repository, the planner model
+   looks at the new task and the work in progress (their issues and plans) and decides: *parallel*
+   (different enough), *wait* for specific runs (same code, or builds on them), or *duplicate* (blocked).
+2. **Planning around teammates.** The planner is told which files the other runs are changing and
+   avoids them where it can. If the accepted plan still edits a file another active run plans to edit,
+   this run waits for that run, then starts from the newest base branch.
+3. **Own branch.** Every run works in its own clone on its own `swarmforge/*` branch.
+4. **Update before the merge request.** Before delivering, the run fetches the latest base branch; if
+   it moved (a teammate's PR was merged), it merges it in (an agent resolves conflicts), re-runs the
+   tests, and only then opens the draft PR, whose diff shows only this run's work. Failing tests or an
+   unresolvable conflict go back into the normal repair cycle.
+
+Time spent waiting doesn't count against a run's time limit. `serial` restores one run per repository;
+`parallel` skips all checks.
+
 ## Speed
 
 Runs are slow mainly because of repeated full test-suite runs, many large-model calls and hand-offs.

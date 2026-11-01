@@ -58,7 +58,11 @@ class Limits:
     max_runtime_s: int = 21600     # 6 hours
     busy_wait_s: int = 900         # keep retrying a busy/rate-limited model this long before falling back
     max_concurrent_agents: int = 2
-    one_run_per_repo: bool = True     # a run waits while an earlier run on the same repository is active
+    one_run_per_repo: bool = True     # false = runs on the same repository never wait for each other
+    # several runs on one repository: "coordinate" (a manager checks the tasks are different enough,
+    # each run works on its own branch and is updated with the latest base before its PR),
+    # "serial" (one run per repository at a time) or "parallel" (no checks)
+    same_repo: str = "coordinate"
     max_parallel_queues: int = 3      # queues ("piles") the worker runs side by side
     max_repair_cycles: int = 3
     max_tasks: int = 8
@@ -283,6 +287,8 @@ def validate_config(cfg: Config) -> None:
     for n, r in cfg.roles.items():
         if r.runtime not in ("builtin", "pi"):
             raise ConfigError(f"roles.{n}.runtime must be 'builtin' or 'pi'")
+    if cfg.limits.same_repo not in ("coordinate", "serial", "parallel"):
+        raise ConfigError("limits.same_repo must be coordinate, serial or parallel")
     if cfg.pi.network not in ("bridge", "none"):
         raise ConfigError("pi.network must be 'bridge' (needed to reach the model relay) or 'none'")
     lim = cfg.limits
