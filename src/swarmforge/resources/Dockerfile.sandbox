@@ -13,9 +13,11 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && npm install -g --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@${PI_VERSION}" \
- && apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/* \
+# preflight self-checks these tools inside the image (swarmforge/preflight.py: SANDBOX_REQUIRED_TOOLS)
+ && apt-get update && apt-get install -y --no-install-recommends ripgrep git curl && rm -rf /var/lib/apt/lists/* \
  && pi --version
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# preflight self-checks these tools inside the image (swarmforge/preflight.py: SANDBOX_REQUIRED_TOOLS)
 RUN pip install --no-cache-dir "pytest>=8" "pytest-timeout>=2" "ruff>=0.6" "mypy>=1.11" \
  && if [ "$WITH_BROWSER" = "1" ]; then \
       pip install --no-cache-dir "playwright>=1.45" \
