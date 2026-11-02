@@ -185,3 +185,34 @@ def test_on_tool_errors_swallowed(cfg):
     )
     assert res.content == "done"
     assert messages[2]["content"] == "out"
+
+
+def test_max_rounds_zero_or_negative_raises(cfg):
+    fake = FakeProvider(
+        {"qwen-fake": lambda body: {"role": "assistant", "content": "x"}}
+    )
+    client = _client(cfg, fake)
+    for rounds in (0, -1):
+        messages = [{"role": "user", "content": "hi"}]
+        with pytest.raises(ValueError, match="max_rounds must be >= 1"):
+            _run(
+                client.chat_with_tools(
+                    "planner", messages, [], lambda n, a: "x", max_rounds=rounds
+                )
+            )
+        assert fake.requests == []  # no model call was made
+
+
+def test_config_rejects_bad_max_tool_rounds(tmp_path, monkeypatch):
+    from swarmforge.config import ConfigError, parse_config
+
+    from .conftest import base_raw
+
+    monkeypatch.setenv("FAKE_KEY", "test-key")
+    raw = base_raw(tmp_path / "work")
+    raw["chat"] = {"tools_enabled": True, "max_tool_rounds": 0}
+    with pytest.raises(ConfigError, match="max_tool_rounds"):
+        parse_config(raw)
+    raw["chat"] = {"tools_enabled": True, "max_tool_rounds": 1}
+    cfg = parse_config(raw)
+    assert cfg.chat.max_tool_rounds == 1

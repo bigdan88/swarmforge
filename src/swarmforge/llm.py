@@ -361,6 +361,8 @@ class LLMClient:
         `"ERROR: ..."` tool messages and never raised out of the loop. `on_tool(name,
         args)` fires before each execution (sync or async) and its errors are
         swallowed."""
+        if max_rounds <= 0:
+            raise ValueError("max_rounds must be >= 1")
         res: ChatResult | None = None
         for _ in range(max_rounds):
             res = await self.chat(role, messages, tools=tools, task_key=task_key)
