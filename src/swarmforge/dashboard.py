@@ -1301,6 +1301,17 @@ def queue_bar() -> None:
                          "queue. Their runs stay in the list."):
                 store.queue_clear_finished()
                 st.rerun(scope="app")
+        blocked = [i for i in items if i["status"] == "failed" and "BLOCKED:" in (i.get("note") or "")
+                   and rq.RESTARTED not in (i.get("note") or "")]
+        if blocked:
+            b1, b2 = st.columns([5, 1.3])
+            b1.caption(f"⛔ {len(blocked)} task(s) stopped as BLOCKED before doing any work (e.g. Docker or the "
+                       "sandbox image). Once that is fixed they can go back in line, in their original order.")
+            if b2.button("↻ Retry blocked", key="qb_retry_blocked"):
+                rq.retry_blocked(store)
+                if not pid and cfg:
+                    rq.start_worker(cfg, store)
+                st.rerun(scope="app")
         policy = store.kv_get(rq.POLICY_KEY) or "stop"
         new_policy = c4.selectbox("If a task fails", ["stop", "continue"], index=["stop", "continue"].index(policy),
                                   key="qb_policy", format_func=lambda p: {"stop": "If a task fails: pause its queue",
@@ -1324,6 +1335,10 @@ def queue_bar() -> None:
                 q1.markdown(f"🗂 **{n}** — " + ("⏸ paused · " if lp else "")
                             + (f"running: {run_[0]['title'][:60]}" if run_ else "idle")
                             + (f" · {len(wait_)} waiting" if wait_ else ""))
+                env = next((i for i in wait_ if (i.get("note") or "").startswith(rq.ENV_PAUSE_NOTE)), None)
+                if lp and env:
+                    q1.warning("Paused because of an environment problem; fix it, then Resume. "
+                               + env["note"][len(rq.ENV_PAUSE_NOTE) + 2:][:400], icon="⚠️")
                 if lp and q2.button("▶ Resume", key=f"qb_lane_res_{n}"):
                     rq.set_lane_paused(store, n, False)
                     if not pid and cfg:

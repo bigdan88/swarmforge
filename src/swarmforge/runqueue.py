@@ -164,6 +164,17 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     from .postmortem import heal
     run_id = await heal(c, store, run_id, launch, attempts=item.get("heal_attempts"), echo=echo)
     run = store.get_run(run_id)
+    if environment_blocked(store, run):
+        # Docker down, image missing, no API key...: every other task would hit the same wall, so keep
+        # this one in line and pause its queue until the problem is fixed (Resume starts it again).
+        name = lane(item)
+        set_lane_paused(store, name, True)
+        store.queue_update(item["id"], status="queued", run_id=None, started_at=None,
+                           note=f"{ENV_PAUSE_NOTE}: {(run['state_reason'] or '')[:300]}")
+        if echo:
+            echo(f"queue '{name}' paused: environment problem ({(run['state_reason'] or '')[:200]}). "
+                 "Fix it, then resume the queue.")
+        return store.queue_item(item["id"])
     status = {"COMPLETED": "done", "CANCELLED": "cancelled"}.get(run["state"], "failed")
     rb = result_branch_of(run)
     store.queue_update(item["id"], status=status, finished_at=time.time(), result_branch=rb,
@@ -183,6 +194,32 @@ def _hook(name: str, *args, echo=None) -> None:
     except Exception as e:  # noqa: BLE001
         if echo:
             echo(f"watch: could not update the GitHub issue ({name}): {type(e).__name__}: {e}")
+
+
+ENV_PAUSE_NOTE = "paused, not failed: environment problem"
+
+
+def environment_blocked(store: Store, run: dict | None) -> bool:
+    """A run stopped by the environment check (not by anything about its task)."""
+    if not run or run.get("state") != "BLOCKED":
+        return False
+    return any(e["kind"] == "environment" and e["level"] == "error"
+               for e in store._all("SELECT kind, level FROM events WHERE run_id = ? AND kind = 'environment'",
+                                   (run["id"],)))
+
+
+def retry_blocked(store: Store, queue: str | None = None) -> list[int]:
+    """Put failed items whose run was BLOCKED back in line, in their original order (same rows)."""
+    out = []
+    for i in store.queue_items(include_finished=True):
+        if i["status"] != "failed" or (queue and lane(i) != queue):
+            continue
+        if "BLOCKED:" not in (i.get("note") or "") or RESTARTED in (i.get("note") or ""):
+            continue
+        store.queue_update(i["id"], status="queued", run_id=None, started_at=None, finished_at=None,
+                           note="retried after BLOCKED: " + (i.get("note") or "")[:200])
+        out.append(i["id"])
+    return out
 
 
 def lane(item: dict) -> str:

@@ -219,3 +219,33 @@ async def test_item_interrupted_by_a_worker_restart_is_queued_again_once(cfg, mo
     assert await rq.work(cfg, store, echo=None, poll_s=0.01) == 1
     assert started == [a] and store.queue_item(a)["status"] == "done"
     assert store.queue_item(b)["status"] == "failed"                             # second interruption: give up
+
+
+async def test_environment_block_pauses_the_queue_instead_of_failing_every_task(cfg, sample_repo, monkeypatch):
+    from swarmforge import orchestrator as orch_mod
+    store = Store(cfg.db_path)
+    store.kv_set(rq.POLICY_KEY, "continue")            # even with "continue on failure"
+    monkeypatch.setattr(orch_mod, "environment_problems", lambda c, img=None: ["Docker is not responding."])
+    a = store.queue_add("A", "body", str(sample_repo), queue="self")
+    b = store.queue_add("B", "body", str(sample_repo), queue="self")
+    other = store.queue_add("C", "body", str(sample_repo), queue="other")
+    await rq.work(cfg, store, echo=None, poll_s=0.01, llm_transport=_provider().transport)
+    ia, ib = store.queue_item(a), store.queue_item(b)
+    assert ia["status"] == "queued" and ia["note"].startswith(rq.ENV_PAUSE_NOTE) and "Docker" in ia["note"]
+    assert ib["status"] == "queued" and ib["run_id"] is None              # never started
+    assert rq.lane_paused(store, "self") and rq.lane_paused(store, "other")
+    assert store.queue_item(other)["status"] == "queued"
+    blocked = [r for r in store.list_runs(10) if r["state"] == "BLOCKED"]
+    assert len(blocked) == 2                                             # one try per queue, then paused
+
+
+def test_retry_blocked_puts_failed_blocked_items_back_in_order(tmp_path):
+    st = Store(tmp_path / "db")
+    ids = [st.queue_add(t, "b", "r", queue="q") for t in ("one", "two", "three", "four")]
+    st.queue_update(ids[0], status="failed", note="BLOCKED: The sandbox image is missing 'git'")
+    st.queue_update(ids[1], status="failed", note="FAILED: repair limit reached")
+    st.queue_update(ids[2], status="failed", note="BLOCKED: The sandbox image is missing 'git'")
+    st.queue_update(ids[3], status="failed", note=f"BLOCKED: x · {rq.RESTARTED}9")
+    assert rq.retry_blocked(st) == [ids[0], ids[2]]
+    assert [q["id"] for q in st.queue_items() if q["status"] == "queued"] == [ids[0], ids[2]]
+    assert st.queue_item(ids[1])["status"] == "failed" and rq.retry_blocked(st, "nope") == []

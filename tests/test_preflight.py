@@ -69,11 +69,11 @@ def test_all_tools_present_ok_row(tmp_path, monkeypatch, docker_ok):
     assert cfg.sandbox.image in row["message"]
 
 
-def test_environment_problems_includes_missing_tool(tmp_path, monkeypatch, docker_ok):
+def test_environment_problems_ignores_missing_tools(tmp_path, monkeypatch, docker_ok):
+    """Missing ruff/git/curl never block a run (see preflight.sandbox_tool_warnings)."""
     cfg = make_cfg(tmp_path, monkeypatch)
     monkeypatch.setattr(preflight.subprocess, "run", fake_run(missing=("ruff",)))
-    problems = preflight.environment_problems(cfg)
-    assert any("missing 'ruff'" in p and "pip install ruff" in p for p in problems)
+    assert preflight.environment_problems(cfg) == []
 
 
 def test_environment_problems_empty_when_healthy(tmp_path, monkeypatch, docker_ok):

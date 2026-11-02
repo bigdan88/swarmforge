@@ -29,7 +29,7 @@ from .config import Config
 from .db import Store
 from .github import GitHubClient, GitHubError, Issue, get_token, load_issue_file, parse_issue_url, push_branch
 from .deps import ensure_deps, plan_install
-from .preflight import environment_problems
+from .preflight import environment_problems, sandbox_tool_warnings
 from .repos import RepoError, _redact, auth_args, normalize_repo, preflight
 from .knowledge import NOTES_JSON_SCHEMA, Vault, render_for_prompt, validate_notes, write_distilled
 from .llm import Budget, BudgetExceeded, LLMClient, LLMError
@@ -313,7 +313,11 @@ class Orchestrator:
         if self._sandbox_override is None:
             problems = await asyncio.to_thread(environment_problems, self.cfg, self._override_image)
             if problems:
+                # marks the block as an environment problem: the queue pauses instead of failing every task
+                self.log("environment", " ".join(problems)[:1000], level="error")
                 raise RunAborted(RunState.BLOCKED, " ".join(problems))
+            for w in await asyncio.to_thread(sandbox_tool_warnings, self.cfg, self._override_image):
+                self.log("environment", f"{w} (not blocking: the run continues)", level="warn")
         self.ws = GitWorkspace(self.run_dir, self.run_id, self.cfg.github.branch_prefix)
         self.source = str(source)
         try:

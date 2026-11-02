@@ -166,12 +166,33 @@ def environment_problems(
             return problems
         for message, fix in _image_problems(cfg, image):
             problems.append(f"{message} Run `{fix}` once.")
-        if not problems:
-            for message, fix in _sandbox_tool_problems(
-                cfg, image or cfg.sandbox.image, docker_timeout_s
-            ):
-                problems.append(f"{message} {fix}")
     return problems
+
+
+_TOOL_CHECKS: dict[str, list[str]] = {}   # image id -> warnings (an image's contents never change)
+
+
+def sandbox_tool_warnings(
+    cfg: Config, image: str | None = None, *, docker_timeout_s: int = 20
+) -> list[str]:
+    """Missing convenience tools (ruff, git, curl) in the sandbox image, as WARNINGS.
+
+    Runs never block on these: agents work without them (only the matching tool degrades), and a
+    newer Dockerfile than the built image must not stop every queued task. Checked once per image id."""
+    if cfg.sandbox.mode != "docker":
+        return []
+    img = image or cfg.sandbox.image
+    try:
+        r = subprocess.run([cfg.sandbox.docker_binary, "image", "inspect", "--format", "{{.Id}}", img],
+                           check=False, capture_output=True, text=True, timeout=docker_timeout_s)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    key = r.stdout.strip() or img
+    if key not in _TOOL_CHECKS:
+        _TOOL_CHECKS[key] = [f"{m} {fix}" for m, fix in _sandbox_tool_problems(cfg, img, docker_timeout_s)]
+    return list(_TOOL_CHECKS[key])
 
 
 def environment_check_results(

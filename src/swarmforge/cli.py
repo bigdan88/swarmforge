@@ -458,6 +458,16 @@ def cmd_queue(args, cfg) -> int:
             raise SystemExit(f"error: {e}")
 
     a = args.qcmd
+    if a == "retry-blocked":
+        ids = rq.retry_blocked(store, getattr(args, "queue", None))
+        print(f"put {len(ids)} blocked task(s) back in line: " + ", ".join(f"#{i}" for i in ids) if ids else
+              "no blocked tasks to retry")
+        if ids and not getattr(args, "no_start", False):
+            rq.resume_all(store) if not getattr(args, "queue", None) else rq.set_lane_paused(store, args.queue, False)
+            store.kv_set(rq.PAUSED_KEY, "0")
+            pid = rq.start_worker(cfg, store)
+            print(f"queue worker {'started (pid %d)' % pid if pid else 'already running'}")
+        return 0
     if a == "list":
         items = store.queue_items()
         if not items:
@@ -674,6 +684,10 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--queue")
     x = qs.add_parser("resume", help="un-pause and start the background worker; --queue for one queue only")
     x.add_argument("--queue")
+    x = qs.add_parser("retry-blocked", help="put tasks that failed as BLOCKED back in line (same order) and "
+                                            "resume; --queue for one queue only")
+    x.add_argument("--queue")
+    x.add_argument("--no-start", action="store_true", help="don't start the worker")
     x = qs.add_parser("policy", help="what to do when an item fails")
     x.add_argument("policy", choices=["stop", "continue"])
     qs.add_parser("work", help="run the queue in this terminal (the dashboard starts it in the background)")

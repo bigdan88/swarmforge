@@ -5,9 +5,8 @@ Issue: "Add sandbox image self-check to preflight (ruff, git, curl)".
 * AC1  docker mode probes `docker run --rm <image> which <tool>` for every required tool and
        reports a failing 'Sandbox tools' row naming each missing tool with the one-line
        Dockerfile install hint (`pip install ruff`).
-* AC2  environment_problems() carries the finding so the orchestrator aborts the run at
-       preflight (BLOCKED, zero LLM calls, zero repair cycles) and the dashboard Start-run
-       button shows the error instead of launching a doomed run.
+* AC2  (revised) a missing tool is a WARNING in the run log, never a reason to block: agents work
+       without ruff/git/curl, and an image older than the Dockerfile once blocked every queued task.
 * AC4  every tool referenced in prompts.py (incl. start_process) is registered.
 * AC5  the Settings & health page treats 'Sandbox tools' as a canonical check (skipped
        "not checked" row in local mode, real probe result in docker mode, no fabricated rows).
@@ -111,86 +110,43 @@ def test_multiple_missing_tools_all_named_with_their_hints(
     assert "pip install ruff" not in row["fix"]
 
 
-def test_environment_problems_carries_missing_tool_finding(
-    tmp_path, monkeypatch, docker_env_ok
-):
+def test_missing_tool_is_a_warning_not_a_blocker(tmp_path, monkeypatch, docker_env_ok):
     cfg = _docker_cfg(tmp_path, monkeypatch)
-    monkeypatch.setattr(preflight.subprocess, "run", make_docker_run(missing=("ruff",)))
-    problems = preflight.environment_problems(cfg)
-    assert any("missing 'ruff'" in p and "pip install ruff" in p for p in problems)
-    monkeypatch.setattr(preflight.subprocess, "run", make_docker_run())
+    run = make_docker_run(missing=("ruff",))
+
+    def fake(cmd, *a, **kw):
+        if cmd[1:3] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="sha256:img1\n", stderr="")
+        return run(cmd, *a, **kw)
+    monkeypatch.setattr(preflight.subprocess, "run", fake)
+    monkeypatch.setattr(preflight, "_TOOL_CHECKS", {})
     assert preflight.environment_problems(cfg) == []
+    warnings = preflight.sandbox_tool_warnings(cfg)
+    assert any("missing 'ruff'" in w and "pip install ruff" in w for w in warnings)
+    probes = len(run.calls)
+    assert preflight.sandbox_tool_warnings(cfg) == warnings and len(run.calls) == probes   # once per image
 
 
 # ------------------------------------------------------------------ AC2: fail fast
 
 
-async def test_orchestrator_aborts_at_preflight_when_tool_missing(
-    cfg, sample_repo, monkeypatch, docker_env_ok
-):
-    """A broken sandbox stops the run at REPOSITORY_INSPECTION/preflight: BLOCKED state,
-    the finding in state_reason, and not a single LLM call (no repair cycles burned)."""
-    cfg.sandbox.mode = "docker"
-    # simulate a host where the docker binary exists (make_sandbox only checks shutil.which)
-    import shutil as _shutil
+async def test_orchestrator_logs_missing_tools_and_keeps_going(cfg, sample_repo, monkeypatch):
+    """A sandbox image without ruff/git/curl must not stop the run: it is logged as a warning."""
+    from swarmforge import orchestrator as orch_mod
 
-    real_which = _shutil.which
-    monkeypatch.setattr(
-        _shutil, "which",
-        lambda name: f"/usr/bin/{name}" if name == cfg.sandbox.docker_binary else real_which(name),
-    )
-    monkeypatch.setattr(preflight.subprocess, "run", make_docker_run(missing=("ruff",)))
-    provider = FakeProvider({})
+    from . import fake_team
+    monkeypatch.setattr(orch_mod, "sandbox_tool_warnings", lambda c, img: [
+        "The sandbox image 'swarmforge-sandbox:latest' is missing 'git'. install the tool ..."])
+    provider = FakeProvider({"qwen-fake": fake_team.planner, "deepseek-fake": fake_team.developer,
+                             "kimi-fake": fake_team.developer, "minimax-fake": fake_team.tester,
+                             "glm-fake": fake_team.Reviewer()})
     store = Store(cfg.db_path)
     orch = Orchestrator(cfg, store, echo=None, llm_transport=provider.transport)
     run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
     run = store.get_run(run_id)
-    assert run["state"] == "BLOCKED", run["state_reason"]
-    reason = run["state_reason"] or ""
-    assert "missing 'ruff'" in reason
-    assert "pip install ruff" in reason
-    assert provider.requests == []
-    assert store.cost_summary(run_id)["calls"] == 0
-    assert store.tasks(run_id) == []  # nothing was ever planned or dispatched
-
-
-def test_dashboard_start_run_aborts_on_missing_sandbox_tool(tmp_path, monkeypatch, sample_repo):
-    """AC2 (dashboard side): Start run shows the finding and does not launch a doomed run."""
-    import streamlit as st
-    import yaml
-
-    pytest.importorskip("streamlit")
-    from streamlit.testing.v1 import AppTest
-
-    st.cache_resource.clear()
-    raw = base_raw(tmp_path / "work", "docker")
-    path = tmp_path / "swarmforge.yaml"
-    path.write_text(yaml.safe_dump(raw))
-    monkeypatch.setenv("FAKE_KEY", "test-key")
-    for k in ("SWARMFORGE_CONFIG", "SWARMFORGE_DASH_AUTOREFRESH", "SWARMFORGE_DASH_UPDATE_CHECK"):
-        monkeypatch.setenv(k, "0" if k != "SWARMFORGE_CONFIG" else str(path))
-    monkeypatch.delenv("SWARMFORGE_DB", raising=False)
-    cfg = load_config(str(path))
-    store = Store(cfg.db_path)
-    store.remember_repo(str(sample_repo))
-    monkeypatch.setattr(preflight, "_docker_problem", lambda cfg, t: None)
-    monkeypatch.setattr(preflight, "_image_problems", lambda cfg, img: [])
-    monkeypatch.setattr(preflight.subprocess, "run", make_docker_run(missing=("ruff",)))
-
-    app = Path(preflight.__file__).resolve().parent / "dashboard.py"
-    at = AppTest.from_file(str(app), default_timeout=90)
-    at.run()
-    at.button(key="nav_new-task").click().run()
-    at.text_input(key="nr_title").input("Add export")
-    at.text_area(key="nr_body").input("Add CSV export with tests.")
-    at.selectbox(key="nr_repo").set_value(str(sample_repo))
-    next(b for b in at.button if "Start run" in b.label).click().run()
-
-    assert not at.exception, [e.value for e in at.exception]
-    errors = " ".join(e.value for e in at.error)
-    assert "missing 'ruff'" in errors, errors
-    assert "pip install ruff" in errors, errors
-    assert store.list_runs() == []  # the run was never started
+    assert run["state"] == "COMPLETED", run["state_reason"]
+    assert any(e["kind"] == "environment" and e["level"] == "warn" and "not blocking" in e["message"]
+               for e in store.events(run_id))
 
 
 # ------------------------------------------------------------------ AC3 (beyond dev tests)
