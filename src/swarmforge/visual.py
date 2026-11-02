@@ -18,6 +18,7 @@ page, unreadable text); everything else is listed in the pull request for a huma
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import fnmatch
 import json
@@ -113,12 +114,29 @@ async def capture(ctx, pv: Preview, cycle: int, log=None) -> list[dict]:
 
     Returns one dict per shot: page, theme, url, file (PNG on the host, or None), problems (errors
     shown on the page, uncaught JS errors, console errors, failed requests), text (start of the page)."""
-    from .agent.devtools import browse_raw, start_process, stop_process
+    from .agent.devtools import browse_raw, open_session, start_process, stop_process
     from .agent.tools import ToolError
     status = await start_process(ctx, "preview", pv.command, ready_port=pv.port, ready_text=pv.ready_text,
                                  wait_s=pv.wait_s)
     if "RUNNING and ready" not in status:
         raise ToolError("the app did not come up for screenshots:\n" + status[-1500:])
+    # The port being open does not mean the server answers HTTP yet (cold start, port race);
+    # poll briefly so an unusable preview becomes a PreviewError (skipped) instead of
+    # critical "could not load the page" findings for pages that are actually fine.
+    session = open_session(ctx)
+    probe = (f"{session.python} -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("
+             f"'http://localhost:{pv.port}{pv.pages[0].path}', timeout=5).status < 500 else 1)\"")
+    for _ in range(10):
+        r = await session.exec(probe, timeout_s=15)
+        if r.exit_code == 0:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        try:
+            await stop_process(ctx, "preview")
+        except ToolError:
+            pass
+        raise PreviewError(f"preview server on port {pv.port} is not answering HTTP requests")
     shots: list[dict] = []
     try:
         for page in pv.pages:
@@ -127,7 +145,7 @@ async def capture(ctx, pv: Preview, cycle: int, log=None) -> list[dict]:
                     break
                 url = f"http://localhost:{pv.port}{page.path}"
                 name = f"visual/c{cycle}-{_slug(page.name)}-{theme}.png"
-                shot = {"page": page.name, "path": page.path, "theme": theme, "url": url, "file": None,
+                shot: dict = {"page": page.name, "path": page.path, "theme": theme, "url": url, "file": None,
                         "problems": [], "text": ""}
                 try:
                     data = await browse_raw(ctx, url, actions=page.actions, screenshot_name=name,
@@ -192,7 +210,7 @@ def review_messages(system: str, title: str, body: str, changed: list[str], shot
 
 def parse_review(text: str) -> tuple[str, list[dict]]:
     """(summary, findings) from the model's JSON answer (tolerates code fences and chatter around it)."""
-    m = re.search(r"\{.*\}", text or "", flags=re.S)
+    m = re.search(r"\{.*\}", text or "", flags=re.DOTALL)
     if not m:
         raise ValueError("the visual reviewer did not answer with JSON")
     data = json.loads(m.group(0))
