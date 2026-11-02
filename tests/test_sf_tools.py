@@ -18,7 +18,10 @@ from swarmforge.sandbox import LocalSandbox
 from .test_pi import _llm
 
 
-def test_sf_parses_every_command():
+def test_sf_parses_every_command(monkeypatch):
+    # This test must behave as if no agent session is active.
+    monkeypatch.delenv("SF_TOOLS_URL", raising=False)
+    monkeypatch.delenv("SF_RELAY_TOKEN", raising=False)
     p = SF.parse
     assert p(["start", "web", "--port", "8501", "--", "streamlit", "run", "app.py", "--server.port", "8501"]) == (
         "start_process", {"name": "web", "ready_port": 8501, "command": "streamlit run app.py --server.port 8501"})
