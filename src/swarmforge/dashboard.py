@@ -7,6 +7,7 @@ processes; the dashboard only reads the SQLite store / vault and writes explicit
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -2376,6 +2377,8 @@ def page_chat():
     with main, st.container(key="chat_main"):
         with st.container(key="chat_topbar", horizontal=True, vertical_alignment="center"):
             st.markdown(active_conv.get("title") or "New chat", width="stretch")
+            tools_on = st.toggle("Tools", value=cfg.chat.tools_enabled, key="chat_tools_enabled",
+                                 help="Let the assistant call fetch_url / list_files while answering")
             reset = st.button("Clear", icon=":material/restart_alt:", key="chat_reset", type="tertiary",
                               help="Remove every message in this conversation")
         if reset:
@@ -2464,7 +2467,9 @@ def page_chat():
 
             try:
                 with st.spinner("Thinking…"):
-                    res = chatbot.ask(cfg, store, prompt, on_tool=_on_tool, **kwargs)
+                    ask_cfg = dataclasses.replace(
+                        cfg, chat=dataclasses.replace(cfg.chat, tools_enabled=tools_on))
+                    res = chatbot.ask(ask_cfg, store, prompt, on_tool=_on_tool, **kwargs)
             except chatbot.ChatError as e:
                 answer_slot.error(f"Chatbot: {e}")
                 _chat_save(actions, active_id)
