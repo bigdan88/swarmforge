@@ -102,6 +102,7 @@ def _free_port():
 
 
 @pytest.mark.slow
+@pytest.mark.browser
 def test_real_browser_sidebar_switches_the_whole_page(tmp_path, monkeypatch):
     """The real thing: `swarmforge dashboard --theme dark` in Chromium. The first visit starts dark, the
     sidebar switches light <-> dark, and the choice holds on other pages (tables included)."""

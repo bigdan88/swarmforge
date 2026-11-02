@@ -102,6 +102,7 @@ def _provider(seen):
 
 
 @pytest.mark.slow
+@pytest.mark.browser
 async def test_run_screenshots_light_and_dark_and_vision_review_is_listed_not_blocking(
         tmp_path, monkeypatch, sample_repo):
     pytest.importorskip("playwright")
@@ -134,6 +135,7 @@ async def test_run_screenshots_light_and_dark_and_vision_review_is_listed_not_bl
 
 
 @pytest.mark.slow
+@pytest.mark.browser
 async def test_error_on_the_page_blocks_without_asking_the_model(tmp_path, monkeypatch, sample_repo):
     pytest.importorskip("playwright")
     _repo_with_preview(sample_repo, PAGE_BROKEN)

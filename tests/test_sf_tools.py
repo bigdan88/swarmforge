@@ -114,6 +114,7 @@ def _free_port():
 
 
 @pytest.mark.slow
+@pytest.mark.browser
 @pytest.mark.skipif(not shutil.which("pi"), reason="Pi (pi.dev) is not installed")
 async def test_real_pi_agent_uses_sf_to_start_browse_and_stop_an_app(cfg, tmp_path, monkeypatch):
     """A real Pi process: bash -> sf -> relay -> start_process / browse (real Chromium) / stop_process."""
