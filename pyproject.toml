@@ -33,4 +33,7 @@ swarmforge = ["resources/*"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-markers = ["slow: end-to-end runs of the whole fake swarm (skip with -m \"not slow\" while iterating)"]
+markers = [
+  "slow: end-to-end runs of the whole fake swarm (skip with -m \"not slow\" while iterating)",
+  "browser: launches a real Chromium; serialised one at a time across xdist workers via the conftest browser_lock (skip with -m \"not browser\" on machines without Chromium)",
+]
