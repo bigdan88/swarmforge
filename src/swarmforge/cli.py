@@ -424,6 +424,32 @@ def cmd_sandbox(args, cfg) -> int:
     return 0
 
 
+def cmd_visual(args, cfg) -> int:
+    from . import visual
+    tabs = [t for t in (args.tabs.split(",") if args.tabs else []) if t] or None
+    try:
+        if args.visual_cmd == "regress":
+            result = visual.regress(args.branch, args.base, repo=args.repo,
+                                    threshold=args.threshold, tabs=tabs, port=args.port)
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(f"{'tab':<16} {'theme':<8} {'diff':>8}  status")
+                for row in result["tabs"]:
+                    print(f"{row['tab']:<16} {row['theme']:<8} {row['score'] * 100:>7.2f}%  {row['status']}")
+                for f in result["findings"]:
+                    print(f"[major] {f['title']}")
+            return 0 if result["ok"] else 1
+        written = visual.update_golden(repo=args.repo, branch=args.branch, tabs=tabs, port=args.port)
+        for p in written:
+            print(f"golden image written: {p}")
+        print(f"{len(written)} golden image(s) refreshed")
+        return 0
+    except visual.RegressError as e:
+        print(f"visual regression failed: {e}", file=sys.stderr)
+        return 2
+
+
 def cmd_publish(args, cfg) -> int:
     from .publish import publish_run
     store = _store(cfg)
@@ -644,6 +670,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dev", action="store_true",
                    help="build swarmforge-dev-sandbox, used when SwarmForge works on its own code")
     s.set_defaults(fn=cmd_sandbox)
+
+    from . import visual as _visual
+    v = sub.add_parser("visual", help="visual-regression gate for dashboard tabs")
+    vsub = v.add_subparsers(dest="visual_cmd", required=True)
+    vr = vsub.add_parser("regress", help="screenshot every dashboard tab on both branches and diff")
+    vr.add_argument("--branch", "-b", required=True, help="the PR branch to check")
+    vr.add_argument("--base", default="main", help="base branch to compare against (default: main)")
+    vr.add_argument("--repo", default=".", help="repository path (default: current directory)")
+    vr.add_argument("--threshold", type=float, default=_visual.DIFF_THRESHOLD,
+                    help="per-tab pixel-diff threshold as a fraction (default: 0.02 = 2%%)")
+    vr.add_argument("--tabs", help="comma-separated tab list (default: all dashboard tabs)")
+    vr.add_argument("--port", type=int, default=None, help="port for the dashboard server")
+    vr.add_argument("--json", action="store_true", help="output the full result as JSON")
+    vu = vsub.add_parser("update-golden", help="refresh the golden PNGs under tests/golden")
+    vu.add_argument("--branch", default=None, help="branch to capture from (default: current checkout)")
+    vu.add_argument("--repo", default=".", help="repository path (default: current directory)")
+    vu.add_argument("--tabs", help="comma-separated tab list (default: all dashboard tabs)")
+    vu.add_argument("--port", type=int, default=None, help="port for the dashboard server")
+    v.set_defaults(fn=cmd_visual)
 
     s = sub.add_parser("publish", help="push an approved run's branch and open the draft PR")
     s.add_argument("run_id")
@@ -880,6 +925,17 @@ def cmd_update(args, cfg) -> int:
     if res["behind"]:
         print(su.request_worker_restart(_store(cfg)))
         print("Restart the dashboard to use the new code (or use the dashboard's Update & restart button).")
+        try:
+            from . import visual
+            refresh = visual.maybe_refresh_golden_after_update(su.ROOT)
+            if refresh is None:
+                pass
+            elif refresh.get("refreshed"):
+                print(f"golden screenshots refreshed ({len(refresh['files'])} file(s))")
+            else:
+                print(f"golden screenshots not refreshed: {refresh.get('reason')}")
+        except Exception as e:                      # a refresh failure must never break the update  # noqa: BLE001
+            print(f"golden screenshots not refreshed: {e}")
     return 0
 
 
