@@ -172,7 +172,7 @@ def _apply(path: str | Path, hunks: list[dict[str, Any]]) -> str:
             errors.append(f"{tag} range out of bounds (file has {file_lines} line(s))")
             continue
         if start <= prev_end:
-            errors.append(f"{tag} hunks overlap or are not in ascending line order")
+            errors.append(f"{tag} hunks overlap or are not in ascending order")
             continue
         prev_end = end
         if old is not None:
