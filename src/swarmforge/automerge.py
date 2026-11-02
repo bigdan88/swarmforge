@@ -117,11 +117,8 @@ def fix_depth(body: str | None) -> tuple[int, str | None]:
     return (int(m.group(1)), m.group(2)) if m else (0, None)
 
 
-def queue_fix(store, run_id: str, *, title: str, body: str, repo: str, url: str, reason: str,
-              findings: list[dict], queue: str | None = None) -> int:
-    """Queue a fix-up task at the front of its queue: it continues the held run's code, addresses
-    exactly why it was held, and its pull request replaces (closes) the held one."""
-    from . import runqueue as rq
+def fix_task(*, title: str, body: str, url: str, reason: str, findings: list[dict]) -> tuple[str, str]:
+    """(title, body) of the fix-up task for a held PR: continue its code, address why it was held."""
     depth, _ = fix_depth(body)
     base_body = FIX_MARK.sub("", body or "").split("\n\n## Fix-up round")[0].rstrip()
     listed = "\n".join(f"- [{f['severity']}] {f['title']} ({f.get('file') or ''}): "
@@ -134,9 +131,25 @@ def queue_fix(store, run_id: str, *, title: str, body: str, repo: str, url: str,
                   "above; no drive-by reformatting or unrelated rewrites, and keep the change as small as possible "
                   "(split nothing out, remove nothing that works). Its new pull request replaces the old one.\n"
                 + f"<!-- sf-autofix depth={depth + 1} supersedes={url} -->")
-    clean = re.sub(r"^(Fix up: )+", "", title or "")
-    qid = store.queue_add(f"Fix up: {clean}", new_body, repo, seed_run_id=run_id, chain=0, approval="yes",
-                          queue=queue or "main")
+    return "Fix up: " + re.sub(r"^(Fix up: )+", "", title or ""), new_body
+
+
+def start_fix(cfg, run_id: str, *, title: str, body: str, repo: str, url: str, reason: str,
+              findings: list[dict]) -> str:
+    """Start the fix-up run right now (alongside whatever the queue is doing). Returns its run id.
+    Raises ValueError if it can't be started here (e.g. no config path); callers then queue it."""
+    from .launcher import start_run
+    t, b = fix_task(title=title, body=body, url=url, reason=reason, findings=findings)
+    rid, _ = start_run(cfg, repo=repo, issue_title=t, issue_body=b, seed_run_id=run_id, approval="yes")
+    return rid
+
+
+def queue_fix(store, run_id: str, *, title: str, body: str, repo: str, url: str, reason: str,
+              findings: list[dict], queue: str | None = None) -> int:
+    """Fallback: queue the fix-up task at the front of its queue (same content as start_fix)."""
+    from . import runqueue as rq
+    t, b = fix_task(title=title, body=body, url=url, reason=reason, findings=findings)
+    qid = store.queue_add(t, b, repo, seed_run_id=run_id, chain=0, approval="yes", queue=queue or "main")
     mine = rq.lane(store.queue_item(qid))
     waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != qid and rq.lane(q) == mine]
     if waiting:

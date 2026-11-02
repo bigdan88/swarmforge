@@ -1102,16 +1102,22 @@ class Orchestrator:
         amc = self.cfg.auto_merge
         depth, _ = am.fix_depth(self.issue.body)
         if amc.auto_fix and depth < amc.fix_attempts:
+            args = dict(title=self.issue.title, body=self.issue.body, repo=info["repo"], url=info["url"],
+                        reason=info.get("reason", ""), findings=[f for f in open_findings if f["severity"] != "info"])
+            try:
+                info["fix_run"] = am.start_fix(self.cfg, self.run_id, **args)       # starts right away
+                self.store.record_intervention(self.run_id, am.FIXING, json.dumps(info))
+                self.log("merge", f"not merged ({info.get('reason')}); started fix-up run {info['fix_run']} that "
+                                  "continues this work and replaces the PR", level="warn")
+                return
+            except Exception as e:  # noqa: BLE001 - fall back to the queue
+                self.log("merge", f"could not start the fix-up run now ({e}); queueing it", level="warn")
             item = self.store._one("SELECT queue FROM queue_items WHERE run_id = ?", (self.run_id,))
             try:
-                qid = am.queue_fix(self.store, self.run_id, title=self.issue.title, body=self.issue.body,
-                                   repo=info["repo"], url=info["url"], reason=info.get("reason", ""),
-                                   findings=[f for f in open_findings if f["severity"] != "info"],
-                                   queue=(item or {}).get("queue"))
-                info["fix_task"] = qid
+                info["fix_task"] = am.queue_fix(self.store, self.run_id, queue=(item or {}).get("queue"), **args)
                 self.store.record_intervention(self.run_id, am.FIXING, json.dumps(info))
-                self.log("merge", f"not merged ({info.get('reason')}); queued fix-up task #{qid} that continues this "
-                                  "work and replaces the PR", level="warn")
+                self.log("merge", f"not merged ({info.get('reason')}); queued fix-up task #{info['fix_task']} that "
+                                  "continues this work and replaces the PR", level="warn")
                 return
             except Exception as e:  # noqa: BLE001 - never let this change the run outcome
                 info["reason"] = f"{info.get('reason')} (could not queue a fix-up: {e})"
