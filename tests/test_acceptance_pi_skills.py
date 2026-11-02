@@ -41,7 +41,14 @@ def test_ac1_skill_is_a_dataclass_with_registry_fields(tmp_path):
     """AC1: pi_skills defines a Skill dataclass with the registry fields."""
     assert dataclasses.is_dataclass(pi_skills.Skill)
     field_names = {f.name for f in dataclasses.fields(pi_skills.Skill)}
-    assert {"name", "title", "category", "summary", "playbook", "sources"} <= field_names
+    assert {
+        "name",
+        "title",
+        "category",
+        "summary",
+        "playbook",
+        "sources",
+    } <= field_names
     reg = pi_skills.get_registry(tmp_path / "no-vault")
     skill = reg["cap-truncation"]
     assert isinstance(skill, pi_skills.Skill)
@@ -62,17 +69,25 @@ def test_ac1_registry_built_in_seeds_without_vault(tmp_path):
 def test_ac1_registry_enriched_from_knowledge_base_notes(tmp_path):
     """AC1: Vault notes matched by category are merged into the registry entries."""
     vault = Vault(tmp_path / "kb")
-    vault.write("Button key lives on proto",
-                "AppTest buttons expose .key; the element object is proto.key, not b.key.",
-                type="pitfall")
-    vault.write("Unrelated ops note", "Nothing to do with streamlit accessors or icons.",
-                type="pitfall")
+    vault.write(
+        "Button key lives on proto",
+        "AppTest buttons expose .key; the element object is proto.key, not b.key.",
+        type="pitfall",
+    )
+    vault.write(
+        "Unrelated ops note",
+        "Nothing to do with streamlit accessors or icons.",
+        type="pitfall",
+    )
     reg = pi_skills.build_registry(vault.root)
     text = reg["apptest-button-key"].playbook
     assert "## Related knowledge-base notes" in text
     assert "Button key lives on proto" in text
     assert "Unrelated ops note" not in text
-    assert vault.get(reg["apptest-button-key"].sources[0]).title == "Button key lives on proto"
+    assert (
+        vault.get(reg["apptest-button-key"].sources[0]).title
+        == "Button key lives on proto"
+    )
     # skills whose category has no matching notes stay pure seeds
     assert reg["cap-truncation"].sources == ()
     assert "Related knowledge-base notes" not in reg["cap-truncation"].playbook
@@ -109,7 +124,10 @@ def test_ac2_load_skill_registered_alongside_navtools():
 def test_ac2_relay_allowlist_and_sf_cli_mapping():
     """AC2: the model relay allowlists the skill tools and the `sf` CLI maps them."""
     assert {"load_skill", "list_skills"} <= set(SF_TOOLS)
-    assert SF.parse(["skill", "cap-truncation"]) == ("load_skill", {"name": "cap-truncation"})
+    assert SF.parse(["skill", "cap-truncation"]) == (
+        "load_skill",
+        {"name": "cap-truncation"},
+    )
     assert SF.parse(["skills"]) == ("list_skills", {})
     with pytest.raises(SF.Usage):
         SF.parse(["skill"])
@@ -136,7 +154,9 @@ async def test_ac2_relay_returns_playbook_text(cfg, tmp_path, monkeypatch):
             headers = {"Authorization": f"Bearer {tok}"}
 
             async def call(tool, args):
-                r = await c.post("/sf/tool", json={"tool": tool, "args": args}, headers=headers)
+                r = await c.post(
+                    "/sf/tool", json={"tool": tool, "args": args}, headers=headers
+                )
                 return r.json()
 
             res = await call("load_skill", {"name": "apptest-button-key"})
@@ -174,13 +194,25 @@ async def test_ac2_sf_cli_subprocess_through_relay(cfg, tmp_path, monkeypatch):
     ws.mkdir()
     ctx = ToolContext(workspace=ws, sandbox=LocalSandbox(SandboxConfig(mode="local")))
     tok = relay.register("developer_backend", "T1", max_steps=5, ctx=ctx)
-    env = {"PATH": "/usr/bin:/bin", "FAKE_KEY": "k",
-           "SF_TOOLS_URL": f"http://127.0.0.1:{relay.port}", "SF_RELAY_TOKEN": tok}
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "FAKE_KEY": "k",
+        "SF_TOOLS_URL": f"http://127.0.0.1:{relay.port}",
+        "SF_RELAY_TOKEN": tok,
+    }
     sf_py = Path(SF.__file__)
     try:
+
         def run(*argv):
-            return subprocess.run([sys.executable, str(sf_py), *argv], capture_output=True,
-                                  text=True, env=env, timeout=60)
+            return subprocess.run(
+                [sys.executable, str(sf_py), *argv],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60,
+                check=False,
+            )
+
         r = await asyncio.to_thread(run, "skill", "apptest-button-key")
         assert r.returncode == 0, r.stderr
         assert "b.key" in r.stdout and "proto.key" in r.stdout
@@ -207,9 +239,9 @@ def test_ac3_load_skill_name_normalization(tmp_path):
     vault = tmp_path / "missing-vault"
     expected = pi_skills.load_skill("apptest-button-key", vault)
     assert pi_skills.load_skill("APPTEST_BUTTON_KEY", vault) == expected
-    assert pi_skills.load_skill(" material-icon-format ", vault) == pi_skills.load_skill(
-        "material_icon_format", vault
-    )
+    assert pi_skills.load_skill(
+        " material-icon-format ", vault
+    ) == pi_skills.load_skill("material_icon_format", vault)
 
 
 # --------------------------------------------------------------------------- AC4
