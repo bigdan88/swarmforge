@@ -264,3 +264,136 @@ def test_chat_uploader_failure_degrades_gracefully(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert "attachments" not in calls[0]["kw"]
     assert any("still works?" in m.value for m in at.markdown)
+
+
+# ------------------------------------------------------- quick actions + tools
+def test_chat_url_paste_adds_fetch_url_hint(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    calls = []
+
+    def fake_ask(c, store, question, history=None, **kw):
+        calls.append(question)
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("Summarize https://github.com/o/r please").run()
+    assert not at.exception, [e.value for e in at.exception]
+    # the question sent to ask() carries the fetch_url hint and the URL
+    assert "fetch_url" in calls[0]
+    assert "https://github.com/o/r" in calls[0]
+    # the user bubble still shows what the user typed
+    assert any("Summarize https://github.com/o/r please" in m.value for m in at.markdown)
+    # and a hint caption is rendered
+    assert any("fetch_url hint" in c.value for c in at.caption)
+    # the expanded question is what gets persisted in history
+    assert at.session_state["chat_history"][0]["content"] == calls[0]
+
+
+def test_chat_slash_repo_expands_to_structured_prompt(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    calls = []
+
+    def fake_ask(c, store, question, history=None, **kw):
+        calls.append(question)
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("/repo foo/bar").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert calls[0].startswith("Use the fetch_url tool on https://github.com/foo/bar")
+    # the user bubble shows the raw slash command, not the expansion
+    assert any("/repo foo/bar" in m.value for m in at.markdown)
+
+
+def test_chat_slash_code_and_issues_expand(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    calls = []
+
+    def fake_ask(c, store, question, history=None, **kw):
+        calls.append(question)
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("/code the retry loop").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert "the retry loop" in calls[0] and "fetch_url" in calls[0]
+    at.chat_input[0].set_value("/issues foo/bar").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert calls[1].startswith("Use the fetch_url tool on https://github.com/foo/bar/issues")
+
+
+def test_chat_tools_used_expander_renders(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+
+    def fake_ask(c, store, question, history=None, **kw):
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question,
+                "tools_used": [{"name": "fetch_url", "args": {"url": "https://x"},
+                                "ok": True, "preview": "# Doc"}]}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("what is at https://x?").run()
+    assert not at.exception, [e.value for e in at.exception]
+    expanders = [e for e in at.expander if "Tools used" in e.label]
+    assert len(expanders) == 1
+    assert "1" in expanders[0].label
+    markdowns = [m.value for m in expanders[0].markdown]
+    assert any("fetch_url" in m for m in markdowns)
+    assert any("ok" in m for m in markdowns)
+    codes = [c.value for c in expanders[0].code]
+    assert any("https://x" in c for c in codes)
+    assert any("# Doc" in c.value for c in expanders[0].caption)
+
+
+def test_chat_no_tools_used_expander_when_absent(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+
+    def fake_ask(c, store, question, history=None, **kw):
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("plain question").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not [e for e in at.expander if "Tools used" in e.label]
+
+
+def test_chat_no_tools_used_expander_when_empty(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+
+    def fake_ask(c, store, question, history=None, **kw):
+        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question,
+                "tools_used": []}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("another plain question").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not [e for e in at.expander if "Tools used" in e.label]
