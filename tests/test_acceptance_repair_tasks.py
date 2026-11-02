@@ -234,3 +234,70 @@ async def test_pipeline_repair_tasks_run_and_integrate_before_rereview(cfg, samp
     # deterministic registration is logged by the orchestrator (not the planner)
     assert any("mandatory repair task(s) created from reviewer findings" in e["message"]
                for e in store.events(run_id))
+
+
+# ------------------------------------------------ scope-locked repair tasks
+def _small_plan(orch, expected_files):
+    from swarmforge.plan import validate_plan
+
+    data = {
+        "summary": "Theme switching",
+        "acceptance_criteria": [{"id": "AC1", "text": "theme toggles"}],
+        "tasks": [{"id": "T1", "title": "theme", "description": "switch themes",
+                   "role": orch.cfg.developer_roles[0], "depends_on": [],
+                   "acceptance_criteria": ["AC1"],
+                   "expected_files": list(expected_files)}],
+    }
+    return validate_plan(data, orch.cfg.developer_roles, orch.cfg.limits.max_tasks)
+
+
+def test_repair_tasks_skip_out_of_scope_findings_and_log(cfg):
+    """AC1/AC3: findings outside the original plan's file set are skipped from
+    deterministic repair tasks and logged as 'out-of-scope' scope events."""
+    orch, store = _orch_with_run(cfg)
+    orch.plan = _small_plan(orch, {"src/swarmforge/theme.py"})
+
+    in_scope = make_finding(1, file="src/swarmforge/theme.py")
+    out_git = dict(make_finding(2, file="src/swarmforge/repos.py"),
+                   title="[major] GIT env in repos.py")
+    out_docker = dict(make_finding(3, file="src/swarmforge/resources/Dockerfile.sandbox"),
+                      title="[major] ruff missing in Dockerfile")
+    review = {"verdict": "request_changes", "summary": "blocking",
+              "findings": [in_scope, out_git, out_docker]}
+
+    tasks = orch._repair_tasks_from_review(review, 1)
+    assert [t.id for t in tasks] == ["R1F1"]
+    assert tasks[0].title == in_scope["title"]
+    assert not any("repos.py" in t.description or "Dockerfile" in t.description for t in tasks)
+
+    events = [e for e in store.events(orch.run_id) if e["kind"] == "scope"]
+    assert len(events) == 2
+    assert all(e["level"] == "warn" for e in events)
+    msgs = " ".join(e["message"] for e in events)
+    assert "out-of-scope" in msgs
+    assert "src/swarmforge/repos.py" in msgs
+    assert "src/swarmforge/resources/Dockerfile.sandbox" in msgs
+    import json
+
+    def payload(e):
+        d = e["data"]
+        return json.loads(d) if isinstance(d, str) else d
+
+    payloads = [payload(e) for e in events]
+    assert any(p and p.get("file") == "src/swarmforge/repos.py" for p in payloads)
+    assert any(p and p.get("file") == "src/swarmforge/resources/Dockerfile.sandbox" for p in payloads)
+
+
+def test_repair_tasks_without_plan_keep_all_findings(cfg):
+    """AC5: no plan -> empty scope -> no filtering, tasks exactly as before."""
+    orch, store = _orch_with_run(cfg)
+    assert getattr(orch, "plan", None) is None
+    assert orch._repair_scope_files() == set()
+
+    findings = [make_finding(1, file="src/a.py"), make_finding(2, file="src/b.py"),
+                make_finding(3, file="src/c.py")]
+    review = {"verdict": "request_changes", "summary": "blocking", "findings": findings}
+    tasks = orch._repair_tasks_from_review(review, 1)
+    assert [t.id for t in tasks] == ["R1F1", "R1F2", "R1F3"]
+    assert [t.title for t in tasks] == [f["title"] for f in findings]
+    assert not [e for e in store.events(orch.run_id) if e["kind"] == "scope"]
