@@ -2238,6 +2238,36 @@ def render_message_actions(i: int, actions: dict | None) -> None:
         render_task_actions(i, actions["tasks"])
 
 
+def _chat_save_attachments(uploaded):
+    """Save chat uploads under <workdir>/chat_attachments.
+
+    Returns ``(metadata, paths)`` where metadata dicts carry name/kind/path for
+    transcript rendering and paths feed ``chatbot.ask(attachments=...)``.
+    """
+    if not uploaded:
+        return [], []
+    try:
+        from swarmforge.attachments import classify, save_attachments
+        paths = save_attachments(uploaded, cfg.workdir / "chat_attachments")
+    except Exception as e:  # never break the Chat page on upload problems
+        st.error(f"Could not save attachments: {e}")
+        return [], []
+    meta = [{"name": p.name, "kind": classify(p), "path": str(p)} for p in paths]
+    return meta, paths
+
+
+def _render_chat_attachments(atts):
+    """Render attached files: thumbnails for images, name chips otherwise."""
+    for att in atts or []:
+        try:
+            if att.get("kind") == "image" and Path(att.get("path", "")).is_file():
+                st.image(att["path"], width=180, caption=att.get("name", ""))
+            else:
+                st.markdown(f"`:blue[{att.get('name', 'file')}]`")
+        except Exception:
+            continue
+
+
 _UNESCAPED_DOLLAR = re.compile(r"(?<!\\)\$")
 
 
@@ -2362,6 +2392,7 @@ def page_chat():
                     render_message_actions(n, actions.get(n))
                 else:
                     st.write(m["content"])
+                _render_chat_attachments(m.get("attachments"))
         live = st.container()  # the new exchange renders here, above the chips and the input
         pending = None
         with st.container(key="chat_chips", horizontal=True, horizontal_alignment="center" if not history
@@ -2370,19 +2401,38 @@ def page_chat():
                 lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
                 if st.button(lab, key="chat_q_" + key):
                     pending = prompt_text
+        try:
+            from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
+            uploaded = st.file_uploader(
+                "Attach images or files",
+                type=sorted(TEXT_EXTENSIONS | IMAGE_EXTENSIONS),
+                accept_multiple_files=True,
+                key="chat_files",
+                help="Images and text/code files are attached to your next question.",
+            )
+        except Exception:
+            uploaded = None
         typed = st.chat_input("Ask about runs, failures, or what to improve…")
     prompt = typed or pending
     if not prompt:
         return
-    history.append({"role": "user", "content": prompt})
+    att_meta, att_paths = _chat_save_attachments(uploaded)
+    msg = {"role": "user", "content": prompt}
+    if att_meta:
+        msg["attachments"] = att_meta
+    history.append(msg)
     chatbot.add_message(store, active_id, "user", prompt)
     with live:
         with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
             st.write(prompt)
+            _render_chat_attachments(att_meta)
         conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
+        kwargs = {"history": history[:-1], "conversation": conv}
+        if att_paths:
+            kwargs["attachments"] = att_paths
         try:
             with st.spinner("Thinking…"):
-                res = chatbot.ask(cfg, store, prompt, history=history[:-1], conversation=conv)
+                res = chatbot.ask(cfg, store, prompt, **kwargs)
         except chatbot.ChatError as e:
             st.error(f"Chatbot: {e}")
             _chat_save(actions, active_id)

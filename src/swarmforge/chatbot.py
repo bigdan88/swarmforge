@@ -19,6 +19,7 @@ import asyncio
 import time
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 
@@ -195,9 +196,43 @@ def status_snapshot(store: Store, max_runs: int = 12) -> str:
     return _cap("\n".join(L))
 
 
+def build_user_content(question: str, attachments) -> str | list[dict]:
+    """Build the user message content for PATH attachments (dashboard uploads):
+    the plain question when there are no attachments, otherwise an OpenAI-style
+    block list (text block with the question plus an 'Attached files:' listing,
+    then one image_url data-URL block per image attachment). Unreadable files
+    are skipped, never raised."""
+    from . import attachments as att
+
+    if not attachments:
+        return question
+    lines = [question, "", "Attached files:"]
+    image_blocks: list[dict] = []
+    for path in attachments:
+        try:
+            kind = att.classify(path)
+            text = att.inline_text(path)
+            if text is not None:
+                lines.append(f"**{path.name}**")
+                lines.append("```")
+                lines.append(text)
+                lines.append("```")
+            else:
+                lines.append(f"- {path.name} ({kind})")
+            if kind == "image":
+                image_blocks.append({"type": "image_url",
+                                     "image_url": {"url": att.image_data_url(path)}})
+        except OSError:
+            continue
+    blocks: list[dict] = [{"type": "text", "text": "\n".join(lines)}]
+    blocks.extend(image_blocks)
+    return blocks
+
+
 def build_attachment_message(cfg: Config, attachments: list[dict] | None,
                              conversation: str | None) -> dict | None:
-    """Build an extra user message carrying the request's attachments.
+    """Build an extra user message carrying the request's DICT attachments
+    ({"name": str, "data": bytes}).
 
     Returns None when there are no attachments (zero behavior change).
     Files are persisted via swarmforge.attachments.save_attachments under
@@ -243,10 +278,17 @@ def build_attachment_message(cfg: Config, attachments: list[dict] | None,
     return {"role": "user", "content": [{"type": "text", "text": text}, *images]}
 
 
+def _dict_attachments(attachments) -> bool:
+    """True when attachments are chatbot-style {"name", "data"} dicts (as
+    opposed to dashboard-style saved Paths)."""
+    return bool(attachments) and isinstance(attachments[0], dict)
+
+
 async def answer(cfg: Config, store: Store, question: str,
                  history: list[dict] | None = None, *, conversation: str | None = None,
                  transport: httpx.AsyncBaseTransport | None = None,
-                 max_runs: int = 12, budget=None, attachments: list[dict] | None = None) -> dict:
+                 max_runs: int = 12, budget=None,
+                 attachments: list | None = None) -> dict:
     """Ask the status chatbot a question; returns {answer, role, model, question}.
 
     With `conversation` set, the question and reply are persisted to that
@@ -255,16 +297,19 @@ async def answer(cfg: Config, store: Store, question: str,
     result additionally carries "conversation" and "usage" (per-conversation
     cost summary).
 
-    `attachments` is an optional list of {"name": str, "data": bytes} dicts.
-    Text files are inlined into the prompt (size-capped); images are forwarded
-    as image_url blocks — vision models receive them unchanged, non-vision
-    models get a placeholder note via llm.py message normalization. Attachments
-    are per-request and are NOT stored in the conversation DB; they are saved to
-    disk under <workdir>/chat/attachments/."""
+    `attachments` is an optional keyword-only list, in one of two shapes:
+    - dashboard-style saved ``Path`` objects: the last user message becomes a
+      multimodal block list (text + image_url data-URL blocks);
+    - chatbot-style ``{"name": str, "data": bytes}`` dicts: text files are
+      inlined into an extra user message (size-capped); images are forwarded
+      as image_url blocks — vision models receive them unchanged, non-vision
+      models get a placeholder note via llm.py message normalization.
+    Attachments are per-request and are NOT stored in the conversation DB;
+    dict attachments are saved to disk under <workdir>/chat/attachments/."""
     from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 
     role = resolve_role(cfg)
-    messages = [{"role": "system",
+    messages: list[dict] = [{"role": "system",
                  "content": SYSTEM_PROMPT + "\n" + IMPROVE_PROMPT + "\n\n<status>\n" + status_snapshot(store, max_runs)
                  + "\n</status>\n\n<improvement_context>\n" + improvement_context(cfg, store)
                  + "\n</improvement_context>"}]
@@ -276,9 +321,13 @@ async def answer(cfg: Config, store: Store, question: str,
                                    cfg.chat.context_max_tokens, reserved_tokens=reserved)
         for m in context:
             messages.append({"role": m["role"], "content": m["content"]})
-        att_msg = build_attachment_message(cfg, attachments, conversation)
-        if att_msg is not None:
-            messages.append(att_msg)
+        if attachments:
+            if _dict_attachments(attachments):
+                att_msg = build_attachment_message(cfg, attachments, conversation)
+                if att_msg is not None:
+                    messages.append(att_msg)
+            else:
+                messages[-1] = {"role": "user", "content": build_user_content(question, attachments)}
         run_id = CHAT_RUN_PREFIX + conversation
         llm_budget = budget if budget is not None else Budget(
             max(2.0, cfg.limits.budget_usd), store.cost_summary(run_id)["total"])
@@ -296,10 +345,13 @@ async def answer(cfg: Config, store: Store, question: str,
     for m in (history or []):
         if m.get("role") in ("user", "assistant") and m.get("content"):
             messages.append({"role": m["role"], "content": str(m["content"])})
-    messages.append({"role": "user", "content": question})
-    att_msg = build_attachment_message(cfg, attachments, conversation)
-    if att_msg is not None:
-        messages.append(att_msg)
+    if attachments and _dict_attachments(attachments):
+        messages.append({"role": "user", "content": question})
+        att_msg = build_attachment_message(cfg, attachments, conversation)
+        if att_msg is not None:
+            messages.append(att_msg)
+    else:
+        messages.append({"role": "user", "content": build_user_content(question, attachments)})
     try:
         llm = LLMClient(cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport)
         res = await llm.chat(role, messages, task_key="chatbot")
@@ -312,10 +364,11 @@ async def answer(cfg: Config, store: Store, question: str,
 
 def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = None, *,
         conversation: str | None = None, transport: httpx.AsyncBaseTransport | None = None,
-        max_runs: int = 12, attachments: list[dict] | None = None) -> dict:
+        max_runs: int = 12, attachments: list | None = None) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
     return asyncio.run(answer(cfg, store, question, history, conversation=conversation,
-                               transport=transport, max_runs=max_runs, attachments=attachments))
+                              transport=transport, max_runs=max_runs,
+                              attachments=attachments))
 
 
 # ======================================================== conversation persistence

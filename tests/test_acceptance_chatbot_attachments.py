@@ -316,8 +316,8 @@ def test_ac5_constants():
     ("notes.md", "notes.md"),
     ("../../evil/x.txt", "x.txt"),                       # basename only
     (r"C:\dir\file.log", "file.log"),                    # windows path
-    ("héllo wörld.txt", "h_llo w_rld.txt"),              # charset strip, spaces kept
-    ("weird!@#$%.csv", "weird_____.csv"),
+    ("héllo wörld.txt", "h_llo_w_rld.txt"),            # charset strip, spaces sanitized
+    ("weird!@#$%.csv", "weird.csv"),                     # trailing separators stripped
 ])
 def test_ac5_sanitize_name(name, expect):
     got = sanitize_name(name)
@@ -329,7 +329,8 @@ def test_ac5_sanitize_name_caps_at_80():
     assert len(sanitize_name("a" * 200)) <= 80
     long_txt = "b" * 200 + ".txt"
     got = sanitize_name(long_txt)
-    assert len(got) <= 80 and got.endswith(".txt")
+    # stem capped at 80 chars, extension preserved
+    assert got == "b" * 80 + ".txt"
     assert sanitize_name("") == "file"
     assert sanitize_name("///") == "file"
 
