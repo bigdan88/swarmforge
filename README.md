@@ -281,22 +281,26 @@ get the screenshots and the automatic error check.
 
 ## Auto-merge
 
-Turn on `auto_merge` in swarmforge.yaml and the swarm's pull requests merge themselves when it is safe:
+Turn on `auto_merge` in swarmforge.yaml and the swarm's pull requests merge themselves:
 
-* **Small changes** (up to `max_lines`, default 400 lines added + deleted) merge as soon as the run
-  completes with passing tests and no unresolved [major] findings (code review, tester, screenshots).
-* **Larger changes** go to a judge model (`judge_role`, default the reviewer). It reads the task, the
-  diff, the test result and the remaining findings, and answers merge or hold with a risk level; only
-  "merge" at low or medium risk is merged. Above `judge_max_lines` (3000) a change always waits for you.
-* **Never automatic:** conflicts, failing checks or branch protection, and any file the repository lists
-  under `protected_paths` in its swarmforge.project.yml. SwarmForge protects its own core this way
-  (orchestrator, queue, preflight, config, sandbox, agent harness, Dockerfiles...): one bad merge
-  there stops every task, so those PRs wait for you whatever their size.
-* **No surprise restarts:** merged code reaches the running SwarmForge only with your next Update &
-  restart.
+* **Small, clean changes** (up to `max_lines`, default 400 lines added + deleted, no open [major]
+  findings, no core files) merge as soon as the run completes with passing tests.
+* **Everything else goes to a judge model** (`judge_role`, default the reviewer): larger changes, PRs
+  with open [major] findings (the judge sees them), and PRs touching the repository's `protected_paths`
+  (SwarmForge's own core: orchestrator, queue, config, sandbox, agent harness...). It reads the task,
+  the diff, the tests and the findings and answers merge or hold with a risk level. Core files need a
+  **low** risk verdict, everything else low or medium. Set `protected: hold` or `major_findings: hold`
+  to keep those for you instead. Above `judge_max_lines` (3000) a change always waits for you.
+* **Conflicts are resolved, not skipped:** if main moved on and the PR conflicts, SwarmForge merges the
+  latest main into the branch (an agent resolves the conflicts), re-runs the tests, pushes and merges.
+* **A held PR fixes itself once** (`auto_fix`): a fix-up task goes to the front of the same queue,
+  continues the held PR's code (with the latest main merged in), addresses exactly why it was held, and
+  its PR replaces the old one, which is closed. Only if that is held too does it wait for you.
+* **No surprise restarts:** merged code reaches the running SwarmForge with your next Update & restart.
 
-The **Pull requests** page lists every decision (merged / waiting for you, with the reason and whether
-the judge decided) and has a **Revert** button: GitHub creates a revert PR and it is merged at once.
+The **Pull requests** page lists every decision with its reason. Anything waiting for you has **Merge
+now**, **Fix with the swarm** and **Close**; merged PRs have **Revert** (GitHub creates a revert PR and
+it is merged at once). PRs you already merged or closed on GitHub show as no longer open.
 
 ## Several queues (one per project)
 
