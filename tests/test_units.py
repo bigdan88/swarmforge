@@ -1,17 +1,32 @@
 import asyncio
 import json
 import time
-from pathlib import Path
 
 import httpx
 import pytest
 
-from swarmforge.agent.tools import ToolContext, ToolError, edit_file, read_file, write_file
+from swarmforge.agent.tools import (
+    ToolContext,
+    ToolError,
+    edit_file,
+    read_file,
+    write_file,
+)
 from swarmforge.config import ConfigError, parse_config
-from swarmforge.github import GitHubClient, GitHubError, check_branch_safe, parse_issue_url
+from swarmforge.github import (
+    GitHubClient,
+    GitHubError,
+    check_branch_safe,
+    parse_issue_url,
+)
 from swarmforge.llm import Budget, BudgetExceeded, LLMClient, Usage, parse_usage
-from swarmforge.plan import (PlanValidationError, Task, topo_waves, validate_plan, validate_review,
-                             validate_test_report)
+from swarmforge.plan import (
+    PlanValidationError,
+    Task,
+    validate_plan,
+    validate_review,
+    validate_test_report,
+)
 from swarmforge.scheduler import Scheduler
 from swarmforge.state import InvalidTransition, RunState, StateMachine, TaskState
 from swarmforge.testing import TestEvidence, evaluate_criteria, normalize_test_id
@@ -22,6 +37,7 @@ from .conftest import ROOT, base_raw
 # ------------------------------------------------------------------ config
 def test_example_config_parses(monkeypatch):
     import yaml
+
     raw = yaml.safe_load((ROOT / "swarmforge.example.yaml").read_text())
     cfg = parse_config(raw)
     assert cfg.roles["planner"].model.startswith("Qwen/")
@@ -50,26 +66,43 @@ DEV = ["developer_backend", "developer_frontend"]
 
 
 def _plan(tasks, ac=True):
-    return {"summary": "s", "tasks": tasks,
-            "acceptance_criteria": [{"id": "AC1", "text": "works"}] if ac else []}
+    return {
+        "summary": "s",
+        "tasks": tasks,
+        "acceptance_criteria": [{"id": "AC1", "text": "works"}] if ac else [],
+    }
 
 
 def _t(i, deps=(), role="developer_backend"):
-    return {"id": i, "title": i, "description": "d", "role": role, "depends_on": list(deps),
-            "acceptance_criteria": ["x"], "expected_files": [f"{i}.py"]}
+    return {
+        "id": i,
+        "title": i,
+        "description": "d",
+        "role": role,
+        "depends_on": list(deps),
+        "acceptance_criteria": ["x"],
+        "expected_files": [f"{i}.py"],
+    }
 
 
 def test_plan_valid_and_waves():
-    p = validate_plan(_plan([_t("T1"), _t("T2", role="developer_frontend"), _t("T3", ["T1", "T2"])]), DEV, 8)
+    p = validate_plan(
+        _plan([_t("T1"), _t("T2", role="developer_frontend"), _t("T3", ["T1", "T2"])]),
+        DEV,
+        8,
+    )
     assert p.waves() == [["T1", "T2"], ["T3"]]
 
 
-@pytest.mark.parametrize("tasks,msg", [
-    ([_t("T1", ["T2"]), _t("T2", ["T1"])], "cycle"),
-    ([_t("T1", ["T9"])], "unknown task"),
-    ([_t("T1", role="hacker")], "must be one of"),
-    ([_t("T1"), _t("T1")], "duplicated"),
-])
+@pytest.mark.parametrize(
+    "tasks,msg",
+    [
+        ([_t("T1", ["T2"]), _t("T2", ["T1"])], "cycle"),
+        ([_t("T1", ["T9"])], "unknown task"),
+        ([_t("T1", role="hacker")], "must be one of"),
+        ([_t("T1"), _t("T1")], "duplicated"),
+    ],
+)
 def test_plan_invalid(tasks, msg):
     with pytest.raises(PlanValidationError, match=msg):
         validate_plan(_plan(tasks), DEV, 8)
@@ -85,27 +118,55 @@ def test_plan_rejects_escaping_paths_and_too_many():
 
 
 def test_fix_plan_may_depend_on_existing():
-    p = validate_plan(_plan([_t("F1", ["T1"])], ac=False), DEV, 8, existing_ids={"T1"}, require_criteria=False)
+    p = validate_plan(
+        _plan([_t("F1", ["T1"])], ac=False),
+        DEV,
+        8,
+        existing_ids={"T1"},
+        require_criteria=False,
+    )
     assert p.tasks[0].depends_on == ["T1"]
 
 
 def test_review_validation_consistency():
-    v, err = validate_review({"verdict": "approve", "summary": "", "findings": [
-        {"severity": "major", "file": "a", "title": "t", "description": "d", "recommendation": "r"}]})
+    v, err = validate_review(
+        {
+            "verdict": "approve",
+            "summary": "",
+            "findings": [
+                {
+                    "severity": "major",
+                    "file": "a",
+                    "title": "t",
+                    "description": "d",
+                    "recommendation": "r",
+                }
+            ],
+        }
+    )
     assert v is None and "inconsistent" in err
-    v, err = validate_review({"verdict": "request_changes", "summary": "x", "findings": []})
+    v, err = validate_review(
+        {"verdict": "request_changes", "summary": "x", "findings": []}
+    )
     assert err is None
 
 
 def test_test_report_validation():
-    v, err = validate_test_report({"summary": "s", "criteria_tests": [{"criterion_id": "AC9", "tests": []}],
-                                   "defects": []}, {"AC1"})
+    v, err = validate_test_report(
+        {
+            "summary": "s",
+            "criteria_tests": [{"criterion_id": "AC9", "tests": []}],
+            "defects": [],
+        },
+        {"AC1"},
+    )
     assert v is None and "AC9" in err
 
 
 # ------------------------------------------------------------ state machine
 def test_state_machine_rejects_illegal(tmp_path):
     from swarmforge.db import Store
+
     st = Store(tmp_path / "db.sqlite")
     st.create_run("r1")
     sm = StateMachine(st, "r1")
@@ -128,13 +189,23 @@ async def test_scheduler_parallel_and_dependencies():
         events.append(("end", t.id, time.monotonic()))
         return t.id != "T2"
 
-    tasks = [Task("T1", "", "", "r"), Task("T2", "", "", "r"), Task("T3", "", "", "r", ["T1"]),
-             Task("T4", "", "", "r", ["T2"]), Task("T5", "", "", "r", ["T4"])]
+    tasks = [
+        Task("T1", "", "", "r"),
+        Task("T2", "", "", "r"),
+        Task("T3", "", "", "r", ["T1"]),
+        Task("T4", "", "", "r", ["T2"]),
+        Task("T5", "", "", "r", ["T4"]),
+    ]
     res = await Scheduler(tasks, run, max_concurrency=2).run()
     assert res.max_parallel == 2
-    assert res.states["T1"] == TaskState.SUCCEEDED and res.states["T3"] == TaskState.SUCCEEDED
+    assert (
+        res.states["T1"] == TaskState.SUCCEEDED
+        and res.states["T3"] == TaskState.SUCCEEDED
+    )
     assert res.states["T2"] == TaskState.FAILED
-    assert res.states["T4"] == TaskState.BLOCKED and res.states["T5"] == TaskState.BLOCKED
+    assert (
+        res.states["T4"] == TaskState.BLOCKED and res.states["T5"] == TaskState.BLOCKED
+    )
     start = {e[1]: e[2] for e in events if e[0] == "start"}
     end = {e[1]: e[2] for e in events if e[0] == "end"}
     assert start["T3"] >= end["T1"]
@@ -153,7 +224,9 @@ async def test_scheduler_respects_concurrency_limit():
         live -= 1
         return True
 
-    await Scheduler([Task(f"T{i}", "", "", "r") for i in range(6)], run, max_concurrency=3).run()
+    await Scheduler(
+        [Task(f"T{i}", "", "", "r") for i in range(6)], run, max_concurrency=3
+    ).run()
     assert peak == 3
 
 
@@ -180,9 +253,14 @@ def test_edit_file_requires_unique_match(tmp_path):
 
 # ---------------------------------------------------------------- llm/cost
 def test_parse_usage_sources():
-    u = parse_usage({"prompt_tokens": 10, "completion_tokens": 5, "estimated_cost": 0.002}, None)
+    u = parse_usage(
+        {"prompt_tokens": 10, "completion_tokens": 5, "estimated_cost": 0.002}, None
+    )
     assert u.cost_source == "provider_reported" and u.cost_usd == 0.002
-    u = parse_usage({"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}, {"in": 0.5, "out": 2.0, "cached": None})
+    u = parse_usage(
+        {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
+        {"in": 0.5, "out": 2.0, "cached": None},
+    )
     assert u.cost_source == "estimated" and u.cost_usd == pytest.approx(2.5)
     u = parse_usage({"prompt_tokens": 1, "completion_tokens": 1}, None)
     assert u.cost_source == "unavailable" and u.cost_usd is None
@@ -198,19 +276,38 @@ def test_budget():
 
 async def test_llm_retries_then_records(cfg, tmp_path):
     from swarmforge.db import Store
+
     calls = {"n": 0}
 
     def handler(req):
         calls["n"] += 1
         if calls["n"] == 1:
-            return httpx.Response(429, headers={"retry-after": "0"}, json={"error": "rate"})
-        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "hi"},
-                                                      "finish_reason": "stop"}],
-                                         "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5,
-                                                   "estimated_cost": 0.5}})
+            return httpx.Response(
+                429, headers={"retry-after": "0"}, json={"error": "rate"}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                    "estimated_cost": 0.5,
+                },
+            },
+        )
+
     store = Store(tmp_path / "db.sqlite")
     store.create_run("r")
-    llm = LLMClient(cfg, store, "r", Budget(0.4), transport=httpx.MockTransport(handler))
+    llm = LLMClient(
+        cfg, store, "r", Budget(0.4), transport=httpx.MockTransport(handler)
+    )
     res = await llm.chat("planner", [{"role": "user", "content": "x"}])
     assert res.content == "hi" and calls["n"] == 2
     assert store.cost_summary("r")["measured"] == 0.5
@@ -220,12 +317,29 @@ async def test_llm_retries_then_records(cfg, tmp_path):
 
 # --------------------------------------------------------------- evidence
 def test_normalize_and_criteria():
-    assert normalize_test_id("tests/test_a.py::TestX::test_b[1]") == normalize_test_id("tests.test_a.TestX.test_b[1]")
-    ev = TestEvidence("l", "c", 0, False, 1.0, junit_found=True, passed=2, failed=1,
-                      cases={"tests.test_a.test_ok": "passed", "tests.test_a.test_ok2": "passed",
-                             "tests.test_b.test_bad": "failed"})
-    res = evaluate_criteria({"AC1": ["tests/test_a.py"], "AC2": ["tests/test_b.py::test_bad"], "AC3": []},
-                            [("AC1", "a"), ("AC2", "b"), ("AC3", "c")], ev)
+    assert normalize_test_id("tests/test_a.py::TestX::test_b[1]") == normalize_test_id(
+        "tests.test_a.TestX.test_b[1]"
+    )
+    ev = TestEvidence(
+        "l",
+        "c",
+        0,
+        False,
+        1.0,
+        junit_found=True,
+        passed=2,
+        failed=1,
+        cases={
+            "tests.test_a.test_ok": "passed",
+            "tests.test_a.test_ok2": "passed",
+            "tests.test_b.test_bad": "failed",
+        },
+    )
+    res = evaluate_criteria(
+        {"AC1": ["tests/test_a.py"], "AC2": ["tests/test_b.py::test_bad"], "AC3": []},
+        [("AC1", "a"), ("AC2", "b"), ("AC3", "c")],
+        ev,
+    )
     assert [r["status"] for r in res] == ["satisfied", "failed", "unverified"]
     assert not ev.ok
 
@@ -252,36 +366,76 @@ def test_github_fetch_issue_and_draft_pr(cfg, monkeypatch):
 
     def handler(req: httpx.Request):
         if req.method == "GET":
-            return httpx.Response(200, json={"title": "Add export", "body": "please", "html_url": "u",
-                                             "labels": [{"name": "enhancement"}]})
+            return httpx.Response(
+                200,
+                json={
+                    "title": "Add export",
+                    "body": "please",
+                    "html_url": "u",
+                    "labels": [{"name": "enhancement"}],
+                },
+            )
         seen["pr"] = json.loads(req.content)
         assert req.headers["authorization"] == "Bearer t0k"
         return httpx.Response(201, json={"html_url": "https://github.com/o/r/pull/7"})
+
     gh = GitHubClient(cfg.github, transport=httpx.MockTransport(handler))
     issue = gh.fetch_issue("https://github.com/o/r/issues/3")
-    assert issue.title == "Add export" and issue.labels == ["enhancement"] and issue.clone_url.endswith("o/r.git")
+    assert (
+        issue.title == "Add export"
+        and issue.labels == ["enhancement"]
+        and issue.clone_url.endswith("o/r.git")
+    )
     url = gh.create_draft_pr("o", "r", "swarmforge/x", "main", "t", "b")
     assert url.endswith("/pull/7") and seen["pr"]["draft"] is True
 
 
 def test_knowledge_search_scopes_other_repositories(tmp_path):
     from swarmforge.knowledge import Vault, render_for_prompt
+
     v = Vault(tmp_path)
-    v.write("Export CLI json flag parsing quirk", "json cli export flag parsing details " * 3, type="repo-fact", repo="other")
-    v.write("Reviewer GLM flags json cli edge cases", "json cli export flag review lesson " * 3, type="review-lesson", repo="other")
-    v.write("Status command json output lives in cli.py", "json status cli output " * 3, type="repo-fact", repo="mine")
-    got = {n.title: n for _, n in v.search("add json output to cli status export flag", repo="mine", min_other=0)}
-    assert "Status command json output lives in cli.py" in got          # same repo
-    assert "Reviewer GLM flags json cli edge cases" in got              # transferable type
-    assert "Export CLI json flag parsing quirk" not in got              # other repo's facts don't transfer
-    assert "(repo: other;" in render_for_prompt([(1.0, got["Reviewer GLM flags json cli edge cases"])])
+    v.write(
+        "Export CLI json flag parsing quirk",
+        "json cli export flag parsing details " * 3,
+        type="repo-fact",
+        repo="other",
+    )
+    v.write(
+        "Reviewer GLM flags json cli edge cases",
+        "json cli export flag review lesson " * 3,
+        type="review-lesson",
+        repo="other",
+    )
+    v.write(
+        "Status command json output lives in cli.py",
+        "json status cli output " * 3,
+        type="repo-fact",
+        repo="mine",
+    )
+    got = {
+        n.title: n
+        for _, n in v.search(
+            "add json output to cli status export flag", repo="mine", min_other=0
+        )
+    }
+    assert "Status command json output lives in cli.py" in got  # same repo
+    assert "Reviewer GLM flags json cli edge cases" in got  # transferable type
+    assert (
+        "Export CLI json flag parsing quirk" not in got
+    )  # other repo's facts don't transfer
+    assert "(repo: other;" in render_for_prompt(
+        [(1.0, got["Reviewer GLM flags json cli edge cases"])]
+    )
 
 
 async def test_agent_gets_wrap_up_call_after_limit(tmp_path):
+    import os
+
     from swarmforge.agent.runtime import AgentSpec, run_agent
     from swarmforge.agent.tools import TerminalTool, ToolContext
+
     from .conftest import FakeProvider, base_raw, tool_call
-    import os
+
     os.environ["FAKE_KEY"] = "k"
     cfg = parse_config(base_raw(tmp_path))
     seen = []
@@ -290,26 +444,54 @@ async def test_agent_gets_wrap_up_call_after_limit(tmp_path):
         names = [t["function"]["name"] for t in body["tools"]]
         seen.append(names)
         if names == ["finish"]:  # wrap-up call: only the terminal tool is offered
-            return {"content": "", "tool_calls": [tool_call("finish", {"summary": "partial: tests not run"})]}
+            return {
+                "content": "",
+                "tool_calls": [
+                    tool_call("finish", {"summary": "partial: tests not run"})
+                ],
+            }
         return {"content": "", "tool_calls": [tool_call("list_files", {})]}
+
     fake = FakeProvider({"deepseek-fake": model})
     llm = LLMClient(cfg, transport=fake.transport)
-    term = TerminalTool("finish", "done", {"type": "object", "properties": {"summary": {"type": "string"}}},
-                        lambda a: (a, None))
-    res = await run_agent(llm, AgentSpec(role="developer_backend", task_key="T1", system_prompt="s",
-                                         user_prompt="u", tools=["list_files"], terminal=term,
-                                         ctx=ToolContext(workspace=tmp_path), max_steps=3, timeout_s=60))
+    term = TerminalTool(
+        "finish",
+        "done",
+        {"type": "object", "properties": {"summary": {"type": "string"}}},
+        lambda a: (a, None),
+    )
+    res = await run_agent(
+        llm,
+        AgentSpec(
+            role="developer_backend",
+            task_key="T1",
+            system_prompt="s",
+            user_prompt="u",
+            tools=["list_files"],
+            terminal=term,
+            ctx=ToolContext(workspace=tmp_path),
+            max_steps=3,
+            timeout_s=60,
+        ),
+    )
     assert res.ok and res.hit_limit and "3 steps" in res.hit_limit
     assert res.value["summary"].startswith("partial")
     assert len(seen) == 4 and seen[-1] == ["finish"]
-    last_user = [m for m in fake.requests[-1]["messages"] if m["role"] == "user"][-1]["content"]
+    last_user = [m for m in fake.requests[-1]["messages"] if m["role"] == "user"][-1][
+        "content"
+    ]
     assert "LIMIT REACHED" in last_user
     # a reminder was appended to a tool result before the limit
-    assert any("Wrap up" in m.get("content", "") for m in fake.requests[-1]["messages"] if m["role"] == "tool")
+    assert any(
+        "Wrap up" in m.get("content", "")
+        for m in fake.requests[-1]["messages"]
+        if m["role"] == "tool"
+    )
 
 
 async def test_busy_model_waits_then_falls_back(cfg, tmp_path):
     from swarmforge.db import Store
+
     cfg.roles["planner"].fallback_models = ["qwen-backup"]
     calls = []
 
@@ -317,16 +499,38 @@ async def test_busy_model_waits_then_falls_back(cfg, tmp_path):
         body = json.loads(req.content)
         calls.append(body["model"])
         if body["model"] == "qwen-fake":
-            return httpx.Response(429, headers={"retry-after": "0"},
-                                  json={"error": {"message": "Model busy, retry later", "code": "engine_overloaded"}})
-        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}],
-                                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "estimated_cost": 0.001}})
+            return httpx.Response(
+                429,
+                headers={"retry-after": "0"},
+                json={
+                    "error": {
+                        "message": "Model busy, retry later",
+                        "code": "engine_overloaded",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "estimated_cost": 0.001,
+                },
+            },
+        )
+
     store = Store(tmp_path / "db.sqlite")
     store.create_run("r")
-    llm = LLMClient(cfg, store, "r", transport=httpx.MockTransport(handler), busy_wait_s=1.5)
+    llm = LLMClient(
+        cfg, store, "r", transport=httpx.MockTransport(handler), busy_wait_s=1.5
+    )
     res = await llm.chat("planner", [{"role": "user", "content": "x"}])
     assert res.content == "ok"
-    assert calls.count("qwen-fake") >= 2 and calls[-1] == "qwen-backup"   # retried, then fell back
+    assert (
+        calls.count("qwen-fake") >= 2 and calls[-1] == "qwen-backup"
+    )  # retried, then fell back
     recorded = store.llm_calls("r")
     assert recorded[-1]["model"] == "qwen-backup" and recorded[-1]["status"] == "ok"
     assert any("falling back to qwen-backup" in e["message"] for e in store.events("r"))
@@ -334,9 +538,13 @@ async def test_busy_model_waits_then_falls_back(cfg, tmp_path):
 
 async def test_all_models_busy_raises_clear_error(cfg):
     def handler(req):
-        return httpx.Response(503, headers={"retry-after": "0"}, json={"error": "overloaded"})
+        return httpx.Response(
+            503, headers={"retry-after": "0"}, json={"error": "overloaded"}
+        )
+
     llm = LLMClient(cfg, transport=httpx.MockTransport(handler), busy_wait_s=0.5)
     from swarmforge.llm import LLMError
+
     with pytest.raises(LLMError, match="every configured model"):
         await llm.chat("planner", [{"role": "user", "content": "x"}])
 
@@ -350,46 +558,109 @@ def test_reviewer_fallback_cannot_overlap_developer(tmp_path):
 
 def test_generous_runtime_default():
     from swarmforge.config import Limits
+
     assert Limits().max_runtime_s >= 6 * 3600 and Limits().busy_wait_s >= 600
 
 
 def test_postmortem_classify_parse_and_escalate(cfg):
-    from swarmforge.postmortem import classify, escalate, parse_diagnosis, rules_diagnosis
+    from swarmforge.postmortem import (
+        classify,
+        escalate,
+        parse_diagnosis,
+        rules_diagnosis,
+    )
+
     run = {"state": "FAILED", "state_reason": "maximum runtime of 5400s exceeded"}
     assert classify(run, [], [], []) == "time_limit"
-    assert classify({"state": "BUDGET_EXCEEDED", "state_reason": "x"}, [], [], []) == "budget"
-    assert classify({"state": "BLOCKED", "state_reason": "Docker is not responding"}, [], [], []) == "environment"
-    assert classify({"state": "BLOCKED", "state_reason": "repository is empty"}, [], [], []) == "repository"
-    assert classify({"state": "FAILED", "state_reason": "planner: model busy (HTTP 429)"}, [], [], []) == "model_unavailable"
+    assert (
+        classify({"state": "BUDGET_EXCEEDED", "state_reason": "x"}, [], [], [])
+        == "budget"
+    )
+    assert (
+        classify(
+            {"state": "BLOCKED", "state_reason": "Docker is not responding"}, [], [], []
+        )
+        == "environment"
+    )
+    assert (
+        classify(
+            {"state": "BLOCKED", "state_reason": "repository is empty"}, [], [], []
+        )
+        == "repository"
+    )
+    assert (
+        classify(
+            {"state": "FAILED", "state_reason": "planner: model busy (HTTP 429)"},
+            [],
+            [],
+            [],
+        )
+        == "model_unavailable"
+    )
     failing = [{"label": "cycle", "exit_code": 1, "failed": 2, "errors": 0}]
-    rl = {"state": "FAILED", "state_reason": "repair limit reached (2 cycle(s)); review still blocking"}
+    rl = {
+        "state": "FAILED",
+        "state_reason": "repair limit reached (2 cycle(s)); review still blocking",
+    }
     assert classify(rl, [], [], failing) == "tests_failing"
     assert classify(rl, [], [], []) == "review_rejected"
-    assert classify({"state": "CANCELLED", "state_reason": ""}, [], [], []) == "cancelled"
+    assert (
+        classify({"state": "CANCELLED", "state_reason": ""}, [], [], []) == "cancelled"
+    )
     fb = rules_diagnosis("environment", {"state_reason": "docker down"})
     assert fb.retry is False
-    d = parse_diagnosis('sure: {"category": "tests_failing", "root_cause": "x", "fix": "y", "retry": true}', fb)
-    assert d.category == "tests_failing" and d.retry is False  # environment problems are never retried
+    d = parse_diagnosis(
+        'sure: {"category": "tests_failing", "root_cause": "x", "fix": "y", "retry": true}',
+        fb,
+    )
+    assert (
+        d.category == "tests_failing" and d.retry is False
+    )  # environment problems are never retried
     assert parse_diagnosis("no json here", fb) is None
-    cfg.limits.max_runtime_s, cfg.limits.budget_usd, cfg.limits.max_repair_cycles = 3600, 4.0, 2
+    cfg.limits.max_runtime_s, cfg.limits.budget_usd, cfg.limits.max_repair_cycles = (
+        3600,
+        4.0,
+        2,
+    )
     steps = cfg.roles["planner"].max_steps
     e2 = escalate(cfg, 2, budget_cap=7.0)
     assert e2.limits.max_runtime_s == int(3600 * 2.25) and e2.limits.budget_usd == 7.0
-    assert e2.limits.max_repair_cycles == 4 and e2.roles["planner"].max_steps == int(steps * 2.25)
+    assert e2.limits.max_repair_cycles == 4 and e2.roles["planner"].max_steps == int(
+        steps * 2.25
+    )
     assert cfg.limits.max_repair_cycles == 2  # original untouched
 
 
 def test_postmortem_stale_base_is_retryable():
     from swarmforge.postmortem import classify, rules_diagnosis
-    run = {"state": "BLOCKED", "state_reason": "cannot continue from 20261031-132618-deaf83: the previous "
-                                               "result swarmforge/task-deaf83 is not based on main; cannot continue from it"}
+
+    run = {
+        "state": "BLOCKED",
+        "state_reason": "cannot continue from 20261031-132618-deaf83: the previous "
+        "result swarmforge/task-deaf83 is not based on main; cannot continue from it",
+    }
     assert classify(run, [], [], []) == "stale_base"
     assert rules_diagnosis("stale_base", run).retry is True
 
 
 def _git(cwd, *args):
     import subprocess
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+
+    for attempt in range(3):
+        proc = subprocess.run(
+            ["git", *args], cwd=str(cwd), check=False, capture_output=True, text=True
+        )
+        if proc.returncode == 0:
+            return
+        err = (proc.stderr or "").lower()
+        if attempt + 1 < 3 and (
+            "resource temporarily unavailable" in err or "unable to fork" in err
+        ):
+            time.sleep(0.5)
+            continue
+        raise subprocess.CalledProcessError(
+            proc.returncode, ["git", *args], output=proc.stdout, stderr=proc.stderr
+        )
 
 
 def _origin(tmp_path, files):
@@ -414,13 +685,15 @@ def _commit(repo, name, text, msg):
 def _retry_on_fork(fn, attempts=3, delay=0.5):
     """Retry fn() on transient fork/thread-exhaustion GitErrors (sandbox pid limits)."""
     from swarmforge.workspace import GitError
+
     for attempt in range(attempts):
         try:
             return fn()
         except GitError as exc:
             msg = str(exc).lower()
-            if attempt + 1 < attempts and ("resource temporarily unavailable" in msg
-                                           or "unable to fork" in msg):
+            if attempt + 1 < attempts and (
+                "resource temporarily unavailable" in msg or "unable to fork" in msg
+            ):
                 time.sleep(delay)
                 continue
             raise
@@ -436,14 +709,19 @@ def _low_git_threads(monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_VALUE_1", "0")
 
 
-
+@pytest.mark.xdist_group("git")
 def test_seed_from_merges_base_that_moved_on(tmp_path):
     from swarmforge.workspace import GitWorkspace
+
     origin = _origin(tmp_path, {"a.txt": "a\n", "b.txt": "b\n"})
     old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
     _retry_on_fork(lambda: old.prepare(str(origin), None))
-    _retry_on_fork(lambda: _commit(old.repo, "a.txt", "a changed by the swarm\n", "swarm work"))
-    _retry_on_fork(lambda: _commit(origin, "b.txt", "b changed on main\n", "main moved"))  # main moves on meanwhile
+    _retry_on_fork(
+        lambda: _commit(old.repo, "a.txt", "a changed by the swarm\n", "swarm work")
+    )
+    _retry_on_fork(
+        lambda: _commit(origin, "b.txt", "b changed on main\n", "main moved")
+    )  # main moves on meanwhile
     new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
     _retry_on_fork(lambda: new.prepare(str(origin), None))
     sha = _retry_on_fork(lambda: new.seed_from(old.repo, old.integration_branch))
@@ -452,8 +730,10 @@ def test_seed_from_merges_base_that_moved_on(tmp_path):
     assert (new.repo / "b.txt").read_text() == "b changed on main\n"
 
 
+@pytest.mark.xdist_group("git")
 def test_seed_from_unchanged_base_is_a_plain_continue(tmp_path):
     from swarmforge.workspace import GitWorkspace
+
     origin = _origin(tmp_path, {"a.txt": "a\n"})
     old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
     _retry_on_fork(lambda: old.prepare(str(origin), None))
@@ -464,8 +744,10 @@ def test_seed_from_unchanged_base_is_a_plain_continue(tmp_path):
     assert new.seed_updated is False and sha == old.head(old.repo)
 
 
+@pytest.mark.xdist_group("git")
 def test_seed_from_conflicting_base_raises_stale_seed_and_resets(tmp_path):
     from swarmforge.workspace import GitWorkspace, StaleSeed
+
     origin = _origin(tmp_path, {"a.txt": "a\n"})
     old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
     _retry_on_fork(lambda: old.prepare(str(origin), None))
@@ -476,5 +758,5 @@ def test_seed_from_conflicting_base_raises_stale_seed_and_resets(tmp_path):
     with pytest.raises(StaleSeed) as e:
         _retry_on_fork(lambda: new.seed_from(old.repo, old.integration_branch))
     assert e.value.conflicts == ["a.txt"]
-    assert new.head(new.repo) == new.base_sha                  # back on a clean, current base
+    assert new.head(new.repo) == new.base_sha  # back on a clean, current base
     assert (new.repo / "a.txt").read_text() == "main version\n"
