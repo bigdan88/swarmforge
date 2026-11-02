@@ -71,6 +71,11 @@ def test_sf_parses_every_command(monkeypatch):
         with pytest.raises(SF.Usage):
             p(bad)
     assert SF.main(["help"]) == 0
+    # `sf` must fail cleanly outside an agent session; make sure a live
+    # session's relay env (present when the suite runs inside SwarmForge)
+    # does not leak into this check.
+    monkeypatch.delenv("SF_TOOLS_URL", raising=False)
+    monkeypatch.delenv("SF_RELAY_TOKEN", raising=False)
     assert SF.main(["symbol", "x"]) == 1          # outside an agent session: a clear error, not a crash
 
 

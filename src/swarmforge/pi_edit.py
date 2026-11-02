@@ -168,6 +168,13 @@ def _apply(path: str | Path, hunks: list[dict[str, Any]]) -> str:
     for i, hunk in enumerate(hunks):
         start, end, old = hunk["start"], hunk["end"], hunk["old"]
         tag = f"lines {start}-{end}:"
+        if start == 0 and old is not None:
+            errors.append(
+                f"hunk #{i + 1}: unified diff creates a new file, but "
+                f"{Path(path).as_posix()} already exists — a new-file hunk "
+                "is only valid when the target file is not found"
+            )
+            continue
         if start < 1 or end < start or end > file_lines:
             errors.append(f"{tag} range out of bounds (file has {file_lines} line(s))")
             continue
