@@ -249,3 +249,22 @@ def test_retry_blocked_puts_failed_blocked_items_back_in_order(tmp_path):
     assert rq.retry_blocked(st) == [ids[0], ids[2]]
     assert [q["id"] for q in st.queue_items() if q["status"] == "queued"] == [ids[0], ids[2]]
     assert st.queue_item(ids[1])["status"] == "failed" and rq.retry_blocked(st, "nope") == []
+
+
+def test_worker_rereads_settings_for_each_task(tmp_path, monkeypatch):
+    import yaml
+
+    from swarmforge.config import load_config
+
+    from .conftest import base_raw
+    monkeypatch.setenv("FAKE_KEY", "k")
+    raw = base_raw(tmp_path / "work", "local")
+    path = tmp_path / "swarmforge.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    cfg = load_config(str(path))
+    raw["limits"]["max_repair_cycles"] = 1
+    path.write_text(yaml.safe_dump(raw))                       # edited while the worker runs
+    assert rq.fresh_config(cfg).limits.max_repair_cycles == 1
+    path.write_text("limits: [not, a, mapping")                # half-saved file: keep the old settings
+    msgs = []
+    assert rq.fresh_config(cfg, msgs.append) is cfg and "could not be re-read" in msgs[0]
