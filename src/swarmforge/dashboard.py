@@ -2132,8 +2132,13 @@ def _chat_load(conv_id: str) -> tuple[list, dict]:
     from swarmforge import chatbot
     _chat_migrate_legacy()
     if st.session_state.get("chat_loaded_conv") != conv_id:
-        st.session_state.chat_history = [{"role": m["role"], "content": m["content"]}
-                                         for m in chatbot.get_messages(store, conv_id)]
+        def _row(m):
+            d = {"role": m["role"], "content": m["content"]}
+            if m.get("tool_calls"):
+                d["tool_calls"] = m["tool_calls"]
+            return d
+
+        st.session_state.chat_history = [_row(m) for m in chatbot.get_messages(store, conv_id)]
         try:
             d = json.loads(store.kv_get(_chat_actions_key(conv_id)) or "{}")
         except json.JSONDecodeError:
@@ -2391,6 +2396,18 @@ def page_chat():
         for n, m in enumerate(history):
             with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
                 if m["role"] == "assistant":
+                    calls = m.get("tool_calls")
+                    if isinstance(calls, str):
+                        try:
+                            calls = json.loads(calls)
+                        except (TypeError, ValueError):
+                            calls = None
+                    for tc in calls or []:
+                        if not isinstance(tc, dict):
+                            continue
+                        a = tc.get("args") or {}
+                        arg = next((str(v) for v in a.values() if v not in (None, "")), "")[:80]
+                        st.caption(f"🔧 {tc.get('name')} · {arg}" if arg else f"🔧 {tc.get('name')}")
                     st.markdown(_chat_md(m["content"]))
                     render_message_actions(n, actions.get(n))
                 else:
@@ -2437,10 +2454,13 @@ def page_chat():
             tools_box = st.container()
             answer_slot = st.empty()
 
+            calls: list[dict] = []
+
             def _on_tool(name, args, output):
                 a = args or {}
                 arg = str(a.get("url") or a.get("path") or next(iter(a.values()), ""))[:80]
                 tools_box.caption(f"🔧 {name} · {arg}" if arg else f"🔧 {name}")
+                calls.append({"name": name, "args": a, "output": output})
 
             try:
                 with st.spinner("Thinking…"):
@@ -2449,8 +2469,12 @@ def page_chat():
                 answer_slot.error(f"Chatbot: {e}")
                 _chat_save(actions, active_id)
                 return
-            history.append({"role": "assistant", "content": res["answer"]})
-            chatbot.add_message(store, active_id, "assistant", res["answer"])
+            entry = {"role": "assistant", "content": res["answer"]}
+            if calls:
+                entry["tool_calls"] = calls
+            history.append(entry)
+            chatbot.add_message(store, active_id, "assistant", res["answer"],
+                                tool_calls=calls or None)
             if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
                 actions[len(history) - 1] = res["actions"]
             _chat_save(actions, active_id)

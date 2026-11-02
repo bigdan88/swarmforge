@@ -80,3 +80,27 @@ def test_no_caption_when_no_tool_is_called(tmp_path, monkeypatch):
     captions = [c.value for c in at.caption]
     assert not any("🔧" in c for c in captions), captions
     assert any("**fake answer**" in m.value for m in at.markdown)
+
+
+def test_persisted_tool_calls_render_as_captions(tmp_path, monkeypatch):
+    """Tool calls persisted with an assistant message render as captions after a fresh load."""
+    from swarmforge.db import Store
+
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    s = Store(cfg.db_path)
+    try:
+        conv = chatbot.ensure_default_conversation(s)
+        chatbot.add_message(s, conv["id"], "user", "list the files")
+        chatbot.add_message(
+            s, conv["id"], "assistant", "here is the listing",
+            tool_calls=[{"name": "list_files", "args": {"path": "."}, "output": "ok"}],
+        )
+    finally:
+        s.close()
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    _chat(at)  # fresh page load, no run performed
+    captions = [c.value for c in at.caption]
+    assert any("🔧 list_files" in c and "· ." in c for c in captions), captions
+    assert any("here is the listing" in m.value for m in at.markdown)
