@@ -411,16 +411,42 @@ def _commit(repo, name, text, msg):
     _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg)
 
 
+def _retry_on_fork(fn, attempts=3, delay=0.5):
+    """Retry fn() on transient fork/thread-exhaustion GitErrors (sandbox pid limits)."""
+    from swarmforge.workspace import GitError
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except GitError as exc:
+            msg = str(exc).lower()
+            if attempt + 1 < attempts and ("resource temporarily unavailable" in msg
+                                           or "unable to fork" in msg):
+                time.sleep(delay)
+                continue
+            raise
+
+
+@pytest.fixture(autouse=True)
+def _low_git_threads(monkeypatch):
+    """Reduce git's thread demand so parallel test runs don't exhaust the sandbox."""
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "pack.threads")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", "core.preloadIndexThreadCount")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", "0")
+
+
+
 def test_seed_from_merges_base_that_moved_on(tmp_path):
     from swarmforge.workspace import GitWorkspace
     origin = _origin(tmp_path, {"a.txt": "a\n", "b.txt": "b\n"})
     old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
-    old.prepare(str(origin), None)
-    _commit(old.repo, "a.txt", "a changed by the swarm\n", "swarm work")
-    _commit(origin, "b.txt", "b changed on main\n", "main moved")   # main moves on meanwhile
+    _retry_on_fork(lambda: old.prepare(str(origin), None))
+    _retry_on_fork(lambda: _commit(old.repo, "a.txt", "a changed by the swarm\n", "swarm work"))
+    _retry_on_fork(lambda: _commit(origin, "b.txt", "b changed on main\n", "main moved"))  # main moves on meanwhile
     new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
-    new.prepare(str(origin), None)
-    sha = new.seed_from(old.repo, old.integration_branch)
+    _retry_on_fork(lambda: new.prepare(str(origin), None))
+    sha = _retry_on_fork(lambda: new.seed_from(old.repo, old.integration_branch))
     assert new.seed_updated is True and sha == new.head(new.repo)
     assert (new.repo / "a.txt").read_text() == "a changed by the swarm\n"
     assert (new.repo / "b.txt").read_text() == "b changed on main\n"
@@ -430,11 +456,11 @@ def test_seed_from_unchanged_base_is_a_plain_continue(tmp_path):
     from swarmforge.workspace import GitWorkspace
     origin = _origin(tmp_path, {"a.txt": "a\n"})
     old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
-    old.prepare(str(origin), None)
-    _commit(old.repo, "a.txt", "swarm\n", "swarm work")
+    _retry_on_fork(lambda: old.prepare(str(origin), None))
+    _retry_on_fork(lambda: _commit(old.repo, "a.txt", "swarm\n", "swarm work"))
     new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
-    new.prepare(str(origin), None)
-    sha = new.seed_from(old.repo, old.integration_branch)
+    _retry_on_fork(lambda: new.prepare(str(origin), None))
+    sha = _retry_on_fork(lambda: new.seed_from(old.repo, old.integration_branch))
     assert new.seed_updated is False and sha == old.head(old.repo)
 
 
@@ -442,13 +468,13 @@ def test_seed_from_conflicting_base_raises_stale_seed_and_resets(tmp_path):
     from swarmforge.workspace import GitWorkspace, StaleSeed
     origin = _origin(tmp_path, {"a.txt": "a\n"})
     old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
-    old.prepare(str(origin), None)
-    _commit(old.repo, "a.txt", "swarm version\n", "swarm work")
-    _commit(origin, "a.txt", "main version\n", "main moved")
+    _retry_on_fork(lambda: old.prepare(str(origin), None))
+    _retry_on_fork(lambda: _commit(old.repo, "a.txt", "swarm version\n", "swarm work"))
+    _retry_on_fork(lambda: _commit(origin, "a.txt", "main version\n", "main moved"))
     new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
-    new.prepare(str(origin), None)
+    _retry_on_fork(lambda: new.prepare(str(origin), None))
     with pytest.raises(StaleSeed) as e:
-        new.seed_from(old.repo, old.integration_branch)
+        _retry_on_fork(lambda: new.seed_from(old.repo, old.integration_branch))
     assert e.value.conflicts == ["a.txt"]
     assert new.head(new.repo) == new.base_sha                  # back on a clean, current base
     assert (new.repo / "a.txt").read_text() == "main version\n"
