@@ -189,8 +189,14 @@ def planner(body):
     if n == 0:
         return {"content": "", "tool_calls": [tool_call("list_files", {"path": "."})]}
     if fix:
+        used = set()
+        m = re.search(r"Task ids already used \(do not reuse\): \[(.*?)\]",
+                      body["messages"][0]["content"])
+        if m:
+            used = {p.strip().strip("'\"") for p in m.group(1).split(",") if p.strip()}
+        fix_id = next(i for i in ("F1", "F2", "F3", "F4") if i not in used)
         plan = {"summary": "Document --format in README.", "acceptance_criteria": [], "tasks": [
-            {"id": "F1", "title": "Document --format", "description": "Add --format docs to README.",
+            {"id": fix_id, "title": "Document --format", "description": "Add --format docs to README.",
              "role": "developer_frontend", "depends_on": ["T2"], "acceptance_criteria": ["README mentions --format"],
              "expected_files": ["README.md"]}]}
     else:
@@ -224,6 +230,9 @@ def developer(body):
     if task.startswith("R"):
         steps = [("write_file", {"path": f"repair/{task}.md",
                                 "content": f"# Repair {task}\n\nAddressed reviewer finding.\n"})]
+    elif task.startswith("F"):
+        steps = [("edit_file", {"path": "README.md", "old_text": "export --output items.csv",
+                                "new_text": "export --output items.csv\npython -m inventory export --output data.out --format json"})]
     else:
         steps = {
             "T1": [("write_file", {"path": "inventory/exporters.py", "content": EXPORTERS}),
@@ -235,8 +244,6 @@ def developer(body):
                    ("edit_file", {"path": "inventory/cli.py", "old_text": "from .store import InventoryStore, StoreError",
                                   "new_text": "from .exporters import ExportError, export_items\nfrom .store import InventoryStore, StoreError"}),
                    ("write_file", {"path": "tests/test_cli_export.py", "content": CLI_TESTS})],
-            "F1": [("edit_file", {"path": "README.md", "old_text": "export --output items.csv",
-                                  "new_text": "export --output items.csv\npython -m inventory export --output data.out --format json"})],
         }[task]
     script = steps + [("run_command", {"command": "python -m pytest -q -p no:cacheprovider"}),
                       ("finish", {"summary": f"{task} done", "tests_run": "pytest"})]
