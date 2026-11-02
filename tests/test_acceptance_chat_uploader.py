@@ -219,13 +219,13 @@ class _Fake(FakeProvider):
     """Also capture the full request body for byte-comparison."""
 
     def __init__(self):
-        super().__init__()
+        super().__init__({"qwen-fake": lambda body: {"role": "assistant", "content": "ok, saw the files"}})
         self.bodies: list[str] = []
 
-    async def handle(self, request):
+    def __call__(self, request):
         body = json.loads(request.content)
         self.bodies.append(json.dumps(body, sort_keys=True))
-        return await super().handle(request)
+        return super().__call__(request)
 
 
 def _fake_cfg(tmp_path, monkeypatch, vision: bool = False):
