@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import socket
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
