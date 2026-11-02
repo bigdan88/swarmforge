@@ -404,6 +404,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("chat.context_max_messages must be between 1 and 200")
     if not 256 <= cfg.chat.context_max_tokens <= 200000:
         raise ConfigError("chat.context_max_tokens must be between 256 and 200000")
+    if cfg.chat.max_tool_rounds < 1:
+        raise ConfigError("chat.max_tool_rounds must be >= 1")
     sh = cfg.self_heal
     if not 0 <= sh.max_attempts <= 5:
         raise ConfigError("self_heal.max_attempts must be between 0 and 5")
