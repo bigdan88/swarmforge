@@ -3,6 +3,7 @@
 LLMs never set states. Only orchestrator code calls `StateMachine.transition`, which
 rejects any transition not listed in TRANSITIONS.
 """
+
 from __future__ import annotations
 
 from enum import StrEnum
@@ -13,26 +14,108 @@ REPAIR_TASK_PREFIX = "R"
 DEFAULT_BLOCKING_SEVERITIES = ("critical", "major")
 
 
-def repair_tasks_from_findings(findings: list[dict], roles: list[str], cycle: int,
-                               severities: set[str] | None = None) -> list[Task]:
+def normalize_scope_path(p: object) -> str:
+    """Normalize a path for deterministic scope matching.
+
+    None/blank -> ''; strip whitespace, backslashes to '/', then drop leading
+    './' and '/' repeatedly until stable. Pure string operations only.
+    """
+    if p is None:
+        return ""
+    s = str(p).strip()
+    if not s:
+        return ""
+    s = s.replace("\\", "/")
+    prev: str | None = None
+    while prev != s:
+        prev = s
+        if s.startswith("./"):
+            s = s.removeprefix("./")
+        if s.startswith("/"):
+            s = s.removeprefix("/")
+    return s
+
+
+def finding_in_scope(finding: dict, scope_files: set[str] | None) -> bool:
+    """Return True if a finding's target file is within the scope set.
+
+    Fails open: None/empty scope matches everything. Findings without a usable
+    'file' stay in scope (they still produce tasks with 'File: unknown').
+    A scope entry ending in '/' matches by directory prefix.
+    """
+    if not scope_files:
+        return True
+    norm = normalize_scope_path(finding.get("file"))
+    if not norm:
+        return True
+    for entry in scope_files:
+        e = normalize_scope_path(entry)
+        if not e:
+            continue
+        if norm == e:
+            return True
+        if e.endswith("/") and norm.startswith(e):
+            return True
+    return False
+
+
+def out_of_scope_findings(
+    findings: list[dict],
+    scope_files: set[str] | None,
+    severities: set[str] | None = None,
+) -> list[dict]:
+    """Return the blocking findings whose target files fall outside scope_files.
+
+    Empty/None scope -> [] (fail open). Non-blocking severities are never
+    returned. Original dicts, input order.
+    """
+    if not scope_files:
+        return []
+    blocking = (
+        severities if severities is not None else set(DEFAULT_BLOCKING_SEVERITIES)
+    )
+    return [
+        f
+        for f in findings
+        if (f.get("severity") or "").lower() in blocking
+        and not finding_in_scope(f, scope_files)
+    ]
+
+
+def repair_tasks_from_findings(
+    findings: list[dict],
+    roles: list[str],
+    cycle: int,
+    severities: set[str] | None = None,
+    scope_files: set[str] | None = None,
+) -> list[Task]:
     """Convert blocking reviewer findings into mandatory developer repair tasks.
 
     Deterministic, LLM-free: each unique blocking finding becomes one Task with
     id R<cycle>F<n>, no dependencies, and acceptance criteria quoting the
     reviewer's exact text so the finding cannot be skipped.
     """
+    blocking = (
+        severities if severities is not None else set(DEFAULT_BLOCKING_SEVERITIES)
+    )
+    in_scope_blocking = [
+        f
+        for f in findings
+        if (f.get("severity") or "").lower() in blocking
+        and finding_in_scope(f, scope_files)
+    ]
     if not roles:
-        if any((f.get("severity") or "").lower() in (severities or set(DEFAULT_BLOCKING_SEVERITIES))
-               for f in findings):
+        if in_scope_blocking:
             raise ValueError("roles must not be empty when blocking findings exist")
         return []
-    blocking = severities if severities is not None else set(DEFAULT_BLOCKING_SEVERITIES)
 
     seen: set[tuple[str, str, str]] = set()
     kept: list[dict] = []
     for f in findings:
         sev = (f.get("severity") or "").lower()
         if sev not in blocking:
+            continue
+        if not finding_in_scope(f, scope_files):
             continue
         key = (sev, str(f.get("file")), str(f.get("title")))
         if key in seen:
@@ -48,8 +131,11 @@ def repair_tasks_from_findings(findings: list[dict], roles: list[str], cycle: in
         title = str(f.get("title") or "")[:120]
         file_ = f.get("file")
         line = f.get("line")
-        loc = f"File: {file_}:{line}" if file_ is not None and line is not None else (
-            f"File: {file_}" if file_ is not None else "File: unknown")
+        loc = (
+            f"File: {file_}:{line}"
+            if file_ is not None and line is not None
+            else (f"File: {file_}" if file_ is not None else "File: unknown")
+        )
         description = str(f.get("description") or "")
         rec = f.get("recommendation")
         desc = (
@@ -64,17 +150,18 @@ def repair_tasks_from_findings(findings: list[dict], roles: list[str], cycle: in
             f'Reviewer said: "{description}" — resolve this finding '
             f"({sev}): {f.get('title')} ({file_}:{line})"
         )
-        tasks.append(Task(
-            id=tid,
-            title=title,
-            description=desc,
-            role=roles[(i - 1) % len(roles)],
-            depends_on=[],
-            acceptance_criteria=[criterion],
-            expected_files=[file_] if file_ is not None else [],
-        ))
+        tasks.append(
+            Task(
+                id=tid,
+                title=title,
+                description=desc,
+                role=roles[(i - 1) % len(roles)],
+                depends_on=[],
+                acceptance_criteria=[criterion],
+                expected_files=[file_] if file_ is not None else [],
+            )
+        )
     return tasks
-
 
 
 class RunState(StrEnum):
@@ -97,8 +184,13 @@ class RunState(StrEnum):
     BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
 
 
-TERMINAL = {RunState.COMPLETED, RunState.FAILED, RunState.BLOCKED,
-            RunState.CANCELLED, RunState.BUDGET_EXCEEDED}
+TERMINAL = {
+    RunState.COMPLETED,
+    RunState.FAILED,
+    RunState.BLOCKED,
+    RunState.CANCELLED,
+    RunState.BUDGET_EXCEEDED,
+}
 
 _S = RunState
 TRANSITIONS: dict[RunState, set[RunState]] = {
@@ -119,7 +211,8 @@ TRANSITIONS: dict[RunState, set[RunState]] = {
 for _st in list(RunState):
     if _st not in TERMINAL:
         TRANSITIONS.setdefault(_st, set()).update(
-            {_S.FAILED, _S.BLOCKED, _S.CANCELLED, _S.BUDGET_EXCEEDED})
+            {_S.FAILED, _S.BLOCKED, _S.CANCELLED, _S.BUDGET_EXCEEDED}
+        )
 
 
 class InvalidTransition(RuntimeError):
@@ -138,10 +231,10 @@ class RunAborted(Exception):
 class TaskState(StrEnum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
-    SUCCEEDED = "SUCCEEDED"   # agent finished and its changes were committed
+    SUCCEEDED = "SUCCEEDED"  # agent finished and its changes were committed
     INTEGRATED = "INTEGRATED"  # merged into the integration branch
     FAILED = "FAILED"
-    BLOCKED = "BLOCKED"        # a dependency failed
+    BLOCKED = "BLOCKED"  # a dependency failed
     CANCELLED = "CANCELLED"
 
 
@@ -158,10 +251,15 @@ class StateMachine:
         fields = {"state": new.value, "state_reason": reason or None}
         if new in TERMINAL:
             import time
+
             fields["finished_at"] = time.time()
         self.store.update_run(self.run_id, **fields)
-        self.store.event(self.run_id, "state", f"{old} -> {new}" + (f": {reason}" if reason else ""),
-                         data={"from": old.value, "to": new.value, "reason": reason})
+        self.store.event(
+            self.run_id,
+            "state",
+            f"{old} -> {new}" + (f": {reason}" if reason else ""),
+            data={"from": old.value, "to": new.value, "reason": reason},
+        )
 
     @property
     def terminal(self) -> bool:
