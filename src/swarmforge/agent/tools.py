@@ -244,6 +244,34 @@ from .navtools import NAV_IMPLS, NAV_SCHEMAS  # noqa: E402
 TOOL_SCHEMAS.update(NAV_SCHEMAS)
 ASYNC_IMPLS.update(NAV_IMPLS)
 
+from .. import pi_skills  # noqa: E402
+
+TOOL_SCHEMAS["load_skill"] = _fn(
+    "load_skill",
+    "Load a reusable playbook distilled from the team's knowledge base (a known pitfall and how "
+    "to avoid it). Call list_skills first if you don't know the exact name.",
+    {"name": S}, ["name"])
+TOOL_SCHEMAS["list_skills"] = _fn(
+    "list_skills", "List the available knowledge-base skills/playbooks (name + summary).", {}, [])
+
+
+def load_skill(ctx: ToolContext, name: str) -> str:
+    try:
+        return pi_skills.load_skill(name)
+    except pi_skills.SkillError as e:
+        raise ToolError(str(e)) from e
+
+
+def list_skills(ctx: ToolContext) -> str:
+    try:
+        return pi_skills.list_skills()
+    except pi_skills.SkillError as e:
+        raise ToolError(str(e)) from e
+
+
+SYNC_IMPLS["load_skill"] = load_skill
+SYNC_IMPLS["list_skills"] = list_skills
+
 READ_TOOLS = ["list_files", "read_file", "search"]
 WRITE_TOOLS = ["write_file", "edit_file", "delete_file"]
 EXEC_TOOLS = ["run_command", "install_dependencies"]

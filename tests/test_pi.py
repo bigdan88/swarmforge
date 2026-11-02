@@ -220,3 +220,38 @@ async def test_full_swarm_run_with_pi_developers(cfg, sample_repo):
     assert dev_calls and all(c["task_key"] for c in dev_calls)          # metered per task through the relay
     assert any("Pi harness" in e["message"] for e in store.events(run_id))
     assert store.test_runs(run_id)[-1]["failed"] == 0
+
+
+async def test_relay_dispatches_skill_tools(cfg, tmp_path, monkeypatch):
+    """load_skill/list_skills are registered tools the Pi relay can run offline."""
+    from swarmforge.agent import tools as agent_tools
+
+    monkeypatch.setenv("FAKE_KEY", "k")
+    for name in ("load_skill", "list_skills"):
+        assert name in PR.SF_TOOLS
+        assert name in agent_tools.TOOL_SCHEMAS
+        assert name in agent_tools.SYNC_IMPLS
+    llm, _ = _llm(cfg, lambda b: {"content": "x"})
+    relay = PR.ModelRelay(llm)
+    await relay.start()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ctx = ToolContext(workspace=ws, sandbox=LocalSandbox(SandboxConfig(mode="local")))
+    tok = relay.register("developer_backend", "T1", max_steps=5, ctx=ctx)
+    try:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{relay.port}") as c:
+            headers = {"Authorization": f"Bearer {tok}"}
+
+            async def call(tool, args):
+                r = await c.post("/sf/tool", json={"tool": tool, "args": args}, headers=headers)
+                return r.json()
+
+            res = await call("load_skill", {"name": "apptest-button-key"})
+            assert res["ok"] and "proto.key" in res["output"]
+            res = await call("load_skill", {"name": "no-such-skill"})
+            assert not res["ok"] and res["output"].startswith("ERROR")
+            assert "apptest-button-key" in res["output"] and "cap-truncation" in res["output"]
+            res = await call("list_skills", {})
+            assert res["ok"] and "cap-truncation" in res["output"]
+    finally:
+        await relay.stop()
