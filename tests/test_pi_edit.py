@@ -206,7 +206,9 @@ def test_missing_file_and_directory(tmp_path: Path) -> None:
         apply_patch(tmp_path, [{"start": 1, "end": 1, "text": "x"}])
 
 
-def test_apply_patch_new_file_hunk_against_existing_file(tmp_path: Path) -> None:
+def test_apply_patch_diff_new_file_hunk(tmp_path: Path) -> None:
+    """A unified diff whose '@@ -0,0' header creates a NEW file is rejected with
+    a helpful 'not found' message when the target already exists (AC2/AC5)."""
     p = write(tmp_path, "a\nb\n")
     diff = f"--- a/{p.name}\n+++ b/{p.name}\n@@ -0,0 +1,2 @@\n+x\n+y\n"
     with pytest.raises(EditConflict, match="not found"):
