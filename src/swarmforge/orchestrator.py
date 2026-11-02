@@ -855,7 +855,14 @@ class Orchestrator:
         self.log("visual", f"{sum(1 for s in shots if s['file'])} screenshot(s) taken (cycle {cycle})",
                  data={"cycle": cycle, "shots": [{k: s[k] for k in ("page", "path", "theme", "file", "problems")}
                                                  for s in shots]})
-        findings = visual.page_error_findings(shots)
+        golden_findings: list[dict] = []
+        try:
+            golden_findings = await asyncio.to_thread(visual.golden_gate, shots, self.ws.repo,
+                                                       threshold=visual.DIFF_THRESHOLD)
+        except (OSError, RuntimeError, visual.PreviewError) as e:
+            self.log("visual", f"golden comparison skipped: {e}"[:800], level="warn")
+        self.log("visual", f"golden diff: {len(shots)} tab(s) checked, {len(golden_findings)} regression(s)")
+        findings = golden_findings + visual.page_error_findings(shots)
         role = self.cfg.visual_role
         if role and role in self.cfg.roles and any(s["file"] for s in shots):
             from .llm import model_supports_vision
@@ -881,7 +888,7 @@ class Orchestrator:
                                       line=None, title=f["title"], description=f["description"],
                                       recommendation=f["recommendation"])
         counts = {sv: sum(1 for f in findings if f["severity"] == sv) for sv in visual.SEVERITIES}
-        self.log("visual", f"visual findings: {counts} (only critical blocks)",
+        self.log("visual", f"visual findings: {counts} (critical and golden regressions block)",
                  level="warn" if counts["critical"] else "info")
         return findings
 
@@ -951,7 +958,7 @@ class Orchestrator:
                     problems.append({"kind": "defect", "summary": f"[defect/{d['severity']}] {d['title']}",
                                      "detail": json.dumps(d, indent=1)})
         for f in getattr(self, "_visual_findings", None) or []:
-            if is_visual_blocking(f["severity"]):
+            if is_visual_blocking(f["severity"]) or f.get("blocking"):
                 problems.append({"kind": "visual", "summary": f"[visual/{f['severity']}] {f['title']}",
                                  "detail": json.dumps(f, indent=1)})
         for tid in failed_tasks:
