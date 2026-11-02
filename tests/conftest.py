@@ -1,13 +1,29 @@
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import httpx
 import pytest
 
 from swarmforge.config import parse_config
+
+# Keep the suite off the real user database. `from swarmforge import dashboard`
+# opens its SQLite store at import time (module-level `store = get_store(db_path)`),
+# and with no explicit path it falls back to ~/.swarmforge/swarmforge.db. Under
+# pytest-xdist several worker processes then create and migrate that same fresh
+# file concurrently and sqlite races ("duplicate column name: ...", "database is
+# locked") surface as unrelated failures in test_theme/test_chat_sidebar/...
+# Point every test process at its own throwaway database; this must happen at
+# conftest import time, before test modules are imported during collection.
+# Tests that want a specific database (dashboard subprocesses, AppTest runs)
+# keep setting or clearing SWARMFORGE_DB themselves, which still works.
+os.environ["SWARMFORGE_DB"] = str(
+    Path(tempfile.mkdtemp(prefix=f"swarmforge-test-db-{os.getpid()}-")) / "swarmforge.db"
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "samples" / "inventory-app"

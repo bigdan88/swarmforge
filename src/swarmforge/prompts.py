@@ -152,6 +152,11 @@ you the team's developer tools. `sf help` lists them all. The ones you will use 
   headless Chromium: the visible text, errors shown on the page, JS/console errors, failed requests
   and the clickable elements (use them as selectors: `text=Save`, `role=button[name="Save"]`).
   Local URLs only.
+- `sf edit FILE --lines A-B --text '...'`: targeted line-range edit (1-based, inclusive). Prefer
+  this over rewriting whole files with write - full-file rewrites are slow and error-prone.
+- `sf patch FILE '<hunks JSON or unified diff>'`: anchored multi-hunk edit; every hunk carries the
+  exact expected line content (anchor) and SwarmForge validates ALL anchors before a single atomic
+  write. On an anchor mismatch, re-read the file and retry with corrected anchors.
 - `sf tests [PATHS] [-k EXPR] [--lf]`: pytest with a short summary of each failure.
 - `sf check [PATHS]` (ruff + mypy) and `sf fmt [PATHS]` (ruff format); default: files you changed.
 - `sf outline FILE`, `sf symbol NAME` (definition + every reference), `sf changes` (your diff),
