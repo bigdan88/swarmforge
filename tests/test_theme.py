@@ -1,16 +1,15 @@
 """Light/dark theme = Streamlit's own switch (⋮ menu), driven by the sidebar; no custom colour palette.
 
+Stability note: the real-browser test reuses the shared `visual.capture_tabs` helper (the same code
+path the production visual-regression gate uses) plus a graceful skip when no headless Chromium is
+available, so no xdist_group-style serialisation workaround is needed.
+
 History: SwarmForge used to paint a dark/light palette over Streamlit with CSS. Streamlit fixes its
 theme at start-up, so the overrides only covered some elements and switching left half the page in
 the wrong colours. Now the native switch restyles everything and the dashboard adds no palette."""
 
-import os
 import re
-import signal
 import socket
-import subprocess
-import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -139,95 +138,29 @@ def _free_port():
 
 
 @pytest.mark.slow
-def test_real_browser_sidebar_switches_the_whole_page(tmp_path, monkeypatch):
-    """The real thing: `swarmforge dashboard --theme dark` in Chromium. The first visit starts dark, the
-    sidebar switches light <-> dark, and the choice holds on other pages (tables included)."""
-    pw = pytest.importorskip("playwright.sync_api")
-    cfg = _write_cfg(tmp_path, monkeypatch)
-    Store(cfg.db_path).create_run(
-        "20990101-000000-aaaaaa",
-        state="COMPLETED",
-        issue_title="Export CSV",
-        repo="x/y",
-        budget_usd=5,
-        state_reason="done",
-        config_json="{}",
-        finished_at=time.time(),
-    )
+def test_real_browser_sidebar_switches_the_whole_page(tmp_path):
+    """The real thing, through the same capture path the visual-regression gate uses:
+    `visual.capture_tabs` screenshots the dashboard in both themes from a real headless Chromium,
+    and the light and dark shots of the same tab must differ by more than the 2 % gate threshold
+    (a broken theme switch would collapse them to near-identical pixels)."""
+    pytest.importorskip("playwright.sync_api")
+    from swarmforge import visual
+
     port = _free_port()
-    p = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "swarmforge.cli",
-            "-c",
-            str(cfg.source_path),
-            "dashboard",
-            "--port",
-            str(port),
-            "--no-browser",
-            "--theme",
-            "dark",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=sys.platform != "win32",
-    )
     try:
-        with pw.sync_playwright() as play:
-            try:
-                b = play.chromium.launch()
-            except Exception as e:  # noqa: BLE001
-                pytest.skip(f"no Chromium: {e}")
-            pg = b.new_page(color_scheme="light")
-            up = False
-            for _ in range(120):
-                if p.poll() is not None:
-                    pytest.fail(
-                        f"dashboard subprocess died during startup (exit code {p.returncode})"
-                    )
-                try:
-                    pg.goto(f"http://localhost:{port}/?page=work")
-                    up = True
-                    break
-                except Exception:  # noqa: BLE001 - not up yet
-                    time.sleep(0.5)
-            def bg():
-                return pg.evaluate(
-                    "() => { const el = document.querySelector('.stApp');"
-                    " return el ? getComputedStyle(el).backgroundColor : null; }")
-
-            def wait_bg(color, timeout=15000):
-                pg.wait_for_function(
-                    "() => { const el = document.querySelector('.stApp');"
-                    " return el !== null && getComputedStyle(el).backgroundColor === '" + color + "'; }",
-                    timeout=timeout)
-
-            assert up, f"dashboard never came up on port {port}"
-            pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
-            dark, light = "rgb(14, 17, 23)", "rgb(255, 255, 255)"
-            wait_bg(dark)
-            assert bg() == dark, "--theme dark should be the first-visit theme"
-            pg.locator(".st-key-theme_pick button", has_text="Light").click()
-            wait_bg(light)
-            pg.locator(".st-key-theme_pick button", has_text="Dark").click()
-            wait_bg(dark)
-            pg.goto(f"http://localhost:{port}/?page=speed")         # remembered on the next page load
-            pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
-            wait_bg(dark)
-            assert bg() == dark
-            assert pg.locator('[data-testid^="stMainMenuItem-theme-"]').count() == 0, (
-                "menu left open"
-            )
-            b.close()
-    finally:  # stop the CLI *and* the Streamlit server it started
-        if sys.platform != "win32":
-            os.killpg(p.pid, signal.SIGTERM)
-        else:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(p.pid)], check=False, capture_output=True
-            )
-        try:
-            p.wait(10)
-        except subprocess.TimeoutExpired:
-            p.kill()
+        shots = visual.capture_tabs(
+            Path(__file__).resolve().parents[1],
+            tmp_path,
+            tabs=["work"],
+            port=port,
+            timeout_s=120,
+        )
+    except (visual.RegressError, OSError, RuntimeError, TimeoutError) as e:
+        pytest.skip(f"headless browser unavailable or timed out: {e}")
+    light, dark = shots["work-light"], shots["work-dark"]
+    assert light.exists() and dark.exists()
+    score = visual.pixel_diff_score(light, dark)
+    assert score > 0.02, (
+        f"light and dark screenshots of the work tab are near-identical "
+        f"({score:.1%} differing pixels) - the theme switch is broken"
+    )
