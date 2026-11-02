@@ -210,3 +210,74 @@ def test_edit_conflict_is_value_error() -> None:
     assert issubclass(EditConflict, ValueError)
     with pytest.raises(ValueError):
         raise EditConflict("boom")
+
+
+# ------------------------------------------------------- agent tool layer
+from swarmforge.agent import pi_runtime as PR
+from swarmforge.agent.tools import ASYNC_IMPLS, TOOL_SCHEMAS, ToolContext, ToolError
+from swarmforge.config import SandboxConfig
+from swarmforge.sandbox import LocalSandbox
+
+
+def _ctx(tmp_path: Path) -> ToolContext:
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    (ws / "target.py").write_text("a\nb\nc\nd\n", encoding="utf-8")
+    return ToolContext(
+        workspace=ws,
+        sandbox=LocalSandbox(SandboxConfig(mode="local")),
+        artifacts_dir=tmp_path / "artifacts",
+    )
+
+
+def test_edit_lines_registered() -> None:
+    assert "edit_lines" in ASYNC_IMPLS and "edit_lines" in TOOL_SCHEMAS
+    assert "apply_patch" in ASYNC_IMPLS and "apply_patch" in TOOL_SCHEMAS
+    assert "edit_lines" in PR.SF_TOOLS and "apply_patch" in PR.SF_TOOLS
+
+
+async def test_tool_edit_lines_applies_and_records(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    msg: str = await ASYNC_IMPLS["edit_lines"](
+        ctx, path="target.py", ranges=[{"start": 2, "end": 3, "text": "B\nC"}]
+    )
+    assert "target.py" in msg and "2 hunk" not in msg
+    assert (ctx.workspace / "target.py").read_text(encoding="utf-8") == "a\nB\nC\nd\n"
+    assert ctx.files_written == {"target.py"}
+
+
+async def test_tool_anchor_mismatch_is_tool_error(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    with pytest.raises(ToolError, match="does not match"):
+        await ASYNC_IMPLS["apply_patch"](
+            ctx,
+            path="target.py",
+            hunks=[{"start": 1, "end": 1, "old": ["WRONG"], "text": "x"}],
+        )
+    assert (ctx.workspace / "target.py").read_text(encoding="utf-8") == "a\nb\nc\nd\n"
+    assert ctx.files_written == set()
+
+
+async def test_tool_rejects_path_escape(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    with pytest.raises(ToolError, match="escapes the workspace"):
+        await ASYNC_IMPLS["edit_lines"](
+            ctx, path="../evil.py", ranges=[{"start": 1, "end": 1, "text": "x"}]
+        )
+
+
+async def test_tool_rejects_bad_arg_shape(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    with pytest.raises(ToolError, match="ranges must be a list"):
+        await ASYNC_IMPLS["edit_lines"](ctx, path="target.py", ranges="nope")
+    with pytest.raises(ToolError, match="hunks must be"):
+        await ASYNC_IMPLS["apply_patch"](ctx, path="target.py", hunks=42)
+
+
+async def test_tool_apply_patch_unified_diff(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    diff = "--- a/target.py\n+++ b/target.py\n@@ -1,4 +1,4 @@\n a\n-b\n+B\n c\n d\n"
+    msg: str = await ASYNC_IMPLS["apply_patch"](ctx, path="target.py", hunks=diff)
+    assert "target.py" in msg
+    assert (ctx.workspace / "target.py").read_text(encoding="utf-8") == "a\nB\nc\nd\n"
+    assert ctx.files_written == {"target.py"}

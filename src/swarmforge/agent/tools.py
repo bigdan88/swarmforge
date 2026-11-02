@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from .. import pi_edit
 from ..sandbox import DockerSandbox, Sandbox
 
 MAX_READ_CHARS = 40_000
@@ -173,6 +174,32 @@ def delete_file(ctx: ToolContext, path: str) -> str:
     return f"deleted {ctx.rel(p)}"
 
 
+async def edit_lines(ctx: ToolContext, path: str, ranges: list) -> str:
+    """Replace line ranges in a file atomically (1-based, inclusive)."""
+    if not isinstance(ranges, list):
+        raise ToolError("ranges must be a list of {start, end, text} objects")
+    p = ctx.resolve(path, must_exist=True)
+    try:
+        msg = pi_edit.edit_lines(p, ranges)
+    except pi_edit.EditConflict as e:
+        raise ToolError(str(e)) from e
+    ctx.files_written.add(ctx.rel(p))
+    return msg.replace(str(p), ctx.rel(p), 1)
+
+
+async def apply_patch(ctx: ToolContext, path: str, hunks: list | str) -> str:
+    """Apply anchored hunks (or a unified diff string) to a file atomically."""
+    if not isinstance(hunks, (list, str)):
+        raise ToolError("hunks must be a list of {start, end, old, text} hunks or a unified diff string")
+    p = ctx.resolve(path, must_exist=True)
+    try:
+        msg = pi_edit.apply_patch(p, hunks)
+    except pi_edit.EditConflict as e:
+        raise ToolError(str(e)) from e
+    ctx.files_written.add(ctx.rel(p))
+    return msg.replace(str(p), ctx.rel(p), 1)
+
+
 async def run_command(ctx: ToolContext, command: str, timeout_s: int | None = None) -> str:
     if ctx.sandbox is None:
         raise ToolError("command execution is not available to this role")
@@ -209,6 +236,27 @@ TOOL_SCHEMAS = {
                       {"path": S, "content": S}, ["path", "content"]),
     "edit_file": _fn("edit_file", "Replace one exact, unique occurrence of old_text with new_text in a file.",
                      {"path": S, "old_text": S, "new_text": S}, ["path", "old_text", "new_text"]),
+    "edit_lines": _fn(
+        "edit_lines",
+        "Replace line ranges in a file with new text, atomically: every range is validated "
+        "first and nothing is written if any range is invalid. Each range is "
+        "{start, end, text} with 1-based inclusive line numbers.",
+        {"path": S,
+         "ranges": {"type": "array",
+                    "items": {"type": "object",
+                              "properties": {"start": I, "end": I, "text": S},
+                              "required": ["start", "end", "text"]}}},
+        ["path", "ranges"]),
+    "apply_patch": _fn(
+        "apply_patch",
+        "Apply validated edit hunks (or a unified diff string) to a file atomically: anchors "
+        "must match exactly or the whole edit is rejected. Each hunk is "
+        "{start, end, old, text} with 1-based inclusive line numbers; 'old' is the optional "
+        "exact content of the replaced lines.",
+        {"path": S,
+         "hunks": {"description": "list of {start, end, old, text} hunks or a unified diff string",
+                   "type": ["array", "string"]}},
+        ["path", "hunks"]),
     "delete_file": _fn("delete_file", "Delete a file in the repository.", {"path": S}, ["path"]),
     "install_dependencies": _fn(
         "install_dependencies",
@@ -232,7 +280,9 @@ async def install_dependencies(ctx: ToolContext) -> str:
 
 
 ASYNC_IMPLS: dict[str, Callable[..., Awaitable[str]]] = {"run_command": run_command,
-                                                        "install_dependencies": install_dependencies}
+                                                        "install_dependencies": install_dependencies,
+                                                        "edit_lines": edit_lines,
+                                                        "apply_patch": apply_patch}
 
 from .devtools import DEV_IMPLS, DEV_SCHEMAS, DEV_TOOLS  # noqa: E402  (needs the names above)
 
@@ -245,7 +295,7 @@ TOOL_SCHEMAS.update(NAV_SCHEMAS)
 ASYNC_IMPLS.update(NAV_IMPLS)
 
 READ_TOOLS = ["list_files", "read_file", "search"]
-WRITE_TOOLS = ["write_file", "edit_file", "delete_file"]
+WRITE_TOOLS = ["write_file", "edit_file", "delete_file", "edit_lines", "apply_patch"]
 EXEC_TOOLS = ["run_command", "install_dependencies"]
 # DEV_TOOLS (start_process, read_process_output, stop_process, browse, check_code) come from devtools
 

@@ -34,7 +34,7 @@ SF_BIN = ".swarmforge/bin"                   # the `sf` command (SwarmForge tool
 # SwarmForge tools offered to Pi developers through `sf` (Pi has its own read/write/edit/bash)
 SF_TOOLS = ("start_process", "read_process_output", "stop_process", "browse", "check_code", "run_tests",
             "outline", "find_symbol", "git_changes", "git_history", "http_request", "format_code",
-            "list_packages")
+            "list_packages", "edit_lines", "apply_patch")
 
 
 def _refresh_changed_files(ctx) -> None:
