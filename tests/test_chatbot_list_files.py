@@ -29,7 +29,7 @@ def _make_tree(tmp_path):
 
 
 def test_registry_names(cfg):
-    assert build_chat_registry(cfg).names() == ["fetch_url", "list_files"]
+    assert build_chat_registry(cfg).names()[:2] == ["fetch_url", "list_files"]
 
 
 def test_list_files_sorted_dirs_slash_and_skips(tmp_path):

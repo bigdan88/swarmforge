@@ -136,16 +136,21 @@ class GitHubConfig:
 class AutoMergeConfig:
     """Merge the swarm's pull requests without waiting for you (off by default).
 
-    Small changes that passed everything merge straight away; larger ones are judged by a model
-    (`judge_role`). Never auto-merged: unresolved [major] findings, conflicts, failing checks, and any
-    file the repository lists under `protected_paths` in swarmforge.project.yml. Nothing restarts:
-    you still pick when to Update & restart."""
+    Small, clean changes merge straight away. Larger ones, ones with unresolved [major] findings and
+    ones touching the repository's protected_paths go to a judge model (protected files need a LOW risk
+    verdict). A conflict is resolved by merging the latest base in and re-testing. A PR that is still
+    held gets one automatic fix-up task that continues its code and replaces it; only then does it
+    wait for you. Nothing restarts: you still pick when to Update & restart."""
     enabled: bool = False
     repos: list[str] = field(default_factory=list)   # owner/name; empty = every repository
     max_lines: int = 400          # added + deleted lines that merge without asking the judge
     judge_role: str = "reviewer"  # model that decides on larger changes
     judge_max_lines: int = 3000   # bigger than this always waits for you
     method: str = "squash"        # squash | merge | rebase
+    protected: str = "judge"      # PRs touching protected_paths: "judge" (needs a LOW-risk verdict) | "hold"
+    major_findings: str = "judge" # PRs with unresolved [major] findings: "judge" (judge sees them) | "hold"
+    auto_fix: bool = True         # a held PR gets one automatic fix-up task that replaces it
+    fix_attempts: int = 1         # fix-up rounds before a PR really waits for you
 
 
 @dataclass

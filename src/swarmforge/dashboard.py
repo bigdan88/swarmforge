@@ -115,6 +115,19 @@ CHAT_CSS = """<style>
 .st-key-chat_chips button:hover { background: rgba(128, 128, 128, 0.1); }
 .st-key-chat_chips button p { font-size: 0.88rem; }
 
+/* ---- transcript scrolls by itself (fills the window), so the page, the rail and the composer stay put */
+[data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) { padding-top: 2.75rem; padding-bottom: 0.75rem; }
+[data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) [data-testid="stElementContainer"]:has(> iframe.stIFrame) { position: absolute; height: 0; overflow: hidden; margin: 0; }
+/* compact composer: a small "Upload" button instead of a big drop zone */
+.st-key-chat_files [data-testid="stFileUploaderDropzone"] { padding: 0; background: transparent; border: 0; }
+.st-key-chat_files [data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
+.st-key-chat_chips { gap: 0.4rem; }
+.st-key-chat_chips button { min-height: 1.9rem !important; padding: 0.15rem 0.75rem !important; }
+div[data-testid="stLayoutWrapper"]:has(> .st-key-chat_scroll) { flex: 0 0 auto !important; height: auto !important; }
+.st-key-chat_scroll { flex: 0 0 auto !important; height: var(--sf-chat-h, calc(100vh - 25rem)) !important; min-height: 10rem; overflow-y: auto;
+                      border: 0 !important; overscroll-behavior: contain; }
+.st-key-chat_rail { position: sticky; top: 3.75rem; max-height: calc(100vh - 9rem); overflow-y: auto; flex-wrap: nowrap; }
+
 /* ---- conversation rail */
 .st-key-chat_rail { background: rgba(128, 128, 128, 0.06); border-radius: 14px; padding: 0.75rem 0.55rem; gap: 0.15rem; }
 .st-key-chat_rail .st-key-chat_new button { justify-content: flex-start; border-radius: 10px; font-weight: 500; }
@@ -143,6 +156,43 @@ CHAT_CSS = """<style>
   .st-key-chat_rail [class*="st-key-chat_row_"] [data-testid="stCaptionContainer"] { display: none; }
 }
 </style>"""
+
+# Keeps the chat transcript scrolled to the newest message (like ChatGPT/Claude): on every render and
+# whenever content grows (the "Thinking…" spinner, a long answer), unless you scrolled up to read.
+CHAT_SCROLL_JS = """<script>
+(function () {
+  // run __N__ (unique per render). One watcher lives on the page itself: it finds the current transcript
+  // box (Streamlit may swap the element on a rerun) and keeps it pinned to the newest message unless the
+  // reader has scrolled up to read older ones.
+  const w = window.parent, d = w.document;
+  const pin = () => { const el = d.querySelector('.st-key-chat_scroll'); if (el && el.scrollTop !== el.scrollHeight) el.scrollTop = el.scrollHeight; };
+  if (w.__sfChatPin) { w.__sfChatPin.stick = true; pin(); setTimeout(pin, 150); setTimeout(pin, 600); return; }
+  const st = w.__sfChatPin = {stick: true, el: null};
+  const onScroll = (e) => { const el = e.target; st.stick = el.scrollHeight - el.scrollTop - el.clientHeight < 80; };
+  w.setInterval(() => {
+    const el = d.querySelector('.st-key-chat_scroll');
+    if (!el) return;
+    if (el !== st.el) { st.el = el; st.stick = true; el.addEventListener('scroll', onScroll, {passive: true}); }
+    // size the transcript so the page itself never scrolls: rail and composer stay in place
+    const main = d.querySelector('[data-testid="stMain"]');
+    const rail = d.querySelector('.st-key-chat_rail');
+    if (rail && main) {  // the conversation list scrolls inside its own panel
+      const h = Math.max(200, Math.floor(main.getBoundingClientRect().bottom - rail.getBoundingClientRect().top - 28));
+      if (Math.abs(h - rail.getBoundingClientRect().height) > 2 || rail.style.maxHeight !== h + 'px') {
+        rail.style.setProperty('max-height', h + 'px', 'important');
+      }
+    }
+    const col = d.querySelector('.st-key-chat_main');
+    if (main && col) {  // fill the window down to the composer; the page itself never scrolls
+      const r = el.getBoundingClientRect(), below = col.getBoundingClientRect().bottom - r.bottom;
+      const want = Math.max(160, Math.floor(main.getBoundingClientRect().bottom - r.top - below - 24));
+      if (Math.abs(want - r.height) > 2) el.style.setProperty('height', want + 'px', 'important');
+    }
+    if (st.stick && el.scrollHeight - el.scrollTop - el.clientHeight > 2) el.scrollTop = el.scrollHeight;
+  }, 200);
+  pin();
+})();
+</script>"""
 
 # Slash-format Material icons for the chat page avatars (colon format raises StreamlitAPIException).
 CHAT_AVATARS = {"user": ":material/person:", "assistant": ":material/auto_awesome:"}
@@ -1197,7 +1247,10 @@ FILTERS = {"All": None, "Active": {"active"}, "Waiting": {"waiting"}, "Finished"
 
 
 def _short_repo(repo: str) -> str:
-    repo = (repo or "").rstrip("/\\")
+    repo = (repo or "").strip().rstrip("/\\")
+    m = re.match(r"(?:https?://|git@)github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$", repo)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
     parts = re.split(r"[/\\]", repo)
     return "/".join(parts[-2:]) if len(parts) > 2 else repo
 
@@ -1215,10 +1268,42 @@ def _run_status(r: dict, approvals: set) -> tuple[str, str, str]:
             return "active", "🩹", f"Self-healing (attempt {r['heal_attempt']})"
         return "active", "🟢", "Running"
     if r["state"] == "COMPLETED" and r.get("heal_attempt"):
-        return "done", "✅", f"Done (fixed itself, attempt {r['heal_attempt']})"
+        return "done", "✅", "Done · self-healed"
     if r["state"] == "COMPLETED":
         return "done", "✅", "Done"
     return "failed", STATE_ICON.get(r["state"], "❌"), r["state"].replace("_", " ").title()
+
+
+def _merge_states() -> dict[str, str]:
+    """Latest auto-merge outcome per run id (merged / waiting for you / being fixed / ...)."""
+    try:
+        from swarmforge import automerge as am
+        kinds = {am.MERGED: "merged", am.MANUAL: "merged", am.HELD: "waiting for you",
+                 am.FIXING: "being fixed", am.CLOSED: "replaced by a fix-up", "auto_merge_reverted": "reverted"}
+        rows = store._all(f"SELECT run_id, kind FROM interventions WHERE kind IN ({','.join('?' * len(kinds))}) "
+                          "ORDER BY id", tuple(kinds))
+    except Exception:
+        return {}
+    return {r["run_id"]: kinds[r["kind"]] for r in rows}
+
+
+def _task_key(w: dict) -> str:
+    return re.sub(r"\s+", " ", (w["title"] or "").strip().lower()) + "|" + _short_repo(w["repo"]).lower()
+
+
+def collapse_attempts(items: list[dict]) -> list[dict]:
+    """One row per task: repeated attempts of the same task (same title and repo) fold into the most
+    relevant one (running, else waiting, else the newest). `items` must already be in display order."""
+    out, by_key = [], {}
+    for w in items:
+        k = _task_key(w)
+        if k in by_key:
+            by_key[k]["attempts"].append(w)
+            continue
+        w = {**w, "attempts": []}
+        by_key[k] = w
+        out.append(w)
+    return out
 
 
 def work_items() -> list[dict]:
@@ -1227,6 +1312,7 @@ def work_items() -> list[dict]:
     by_id = {r["id"]: r for r in runs}
     healed = {r["heal_of"] for r in runs if r.get("heal_of")}  # earlier attempts: shown under Failures
     approvals = {a["run_id"] for a in store.pending_approvals()}
+    merges = _merge_states()
     out, used = [], set()
     queue = store.queue_items()
     from swarmforge.runqueue import lane as _lane
@@ -1255,7 +1341,7 @@ def work_items() -> list[dict]:
         else:
             grp, icon, label = "failed", QSTATUS.get(i["status"], "❌"), i["status"].title()
         out.append({"key": f"q:{i['id']}", "group": grp, "icon": icon, "status": label, "title": i["title"],
-                    "repo": i["repo"], "item": i, "run": r,
+                    "repo": i["repo"], "item": i, "run": r, "merge": merges.get(r["id"]) if r else None,
                     "when": (r["created_at"] if r else i.get("created_at")) or 0,
                     "order": waiting_pos.get(i["id"], 0), "hidden": False,
                     "archived": bool(r.get("archived")) if r else False})
@@ -1265,6 +1351,7 @@ def work_items() -> list[dict]:
         grp, icon, label = _run_status(r, approvals)
         out.append({"key": f"r:{r['id']}", "group": grp, "icon": icon, "status": label,
                     "title": r["issue_title"] or r["issue_url"] or r["id"], "repo": r["repo"] or "",
+                    "merge": merges.get(r["id"]),
                     "item": None, "run": r, "when": r["created_at"] or 0, "order": 0,
                     "hidden": r["id"] in healed, "archived": bool(r.get("archived"))})
     rank = {"active": 0, "waiting": 1}
@@ -1295,13 +1382,14 @@ def queue_bar() -> None:
     running = [i for i in items if i["status"] == "running"]
     if not items:
         return
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 2])
+    with st.container(border=True, key="qbar"):
+        c1, c2, c3, c4 = st.columns([2.6, 1.3, 1.3, 2], vertical_alignment="center")
+        counts = f"{len(running)} running · {len(queued)} waiting"
         if pid:
-            c1.markdown(f"**Queue:** 🟢 working (pid {pid})" + (" — pauses after the current task" if paused else ""))
+            c1.markdown(f"**Queue** 🟢 working · {counts}" + (" · pauses after the current task" if paused else ""),
+                        help=f"Queue worker process {pid}")
         else:
-            c1.markdown("**Queue:** ⚪ stopped" + (" (paused)" if paused and queued else "")
-                        + (f" · {len(queued)} waiting" if queued else ""))
+            c1.markdown("**Queue** ⚪ stopped" + (" (paused)" if paused and queued else "") + f" · {counts}")
         if not pid:
             if c2.button("▶ Start queue", type="primary", disabled=not queued or not cfg, key="qb_start"):
                 rq.resume_all(store)
@@ -1339,22 +1427,21 @@ def queue_bar() -> None:
                                   label_visibility="collapsed")
         if new_policy != policy:
             store.kv_set(rq.POLICY_KEY, new_policy)
-        done = sum(1 for i in items if i["status"] == "done")
-        st.progress(done / len(items), text=f"{done} of {len(items)} queue tasks done · {len(running)} running "
-                                             f"· {len(queued)} waiting")
-        lanes = [n for n in store.queue_names() if any(rq.lane(i) == n for i in items)]
+        lanes = [n for n in store.queue_names()
+                 if any(rq.lane(i) == n and i["status"] in ("queued", "running") for i in items)
+                 or rq.lane_paused(store, n)]
         if len(lanes) > 1 or any(rq.lane_paused(store, n) for n in lanes):
             limit = cfg.limits.max_parallel_queues if cfg else 3
-            st.caption(f"Queues run side by side (up to {limit} at once); each runs its own tasks in order.")
             for n in lanes:
                 mine = [i for i in items if rq.lane(i) == n]
                 run_ = [i for i in mine if i["status"] == "running"]
                 wait_ = [i for i in mine if i["status"] == "queued"]
                 lp = rq.lane_paused(store, n)
-                q1, q2 = st.columns([5, 1.3])
+                q1, q2 = st.columns([5, 1.3], vertical_alignment="center")
                 q1.markdown(f"🗂 **{n}** — " + ("⏸ paused · " if lp else "")
-                            + (f"running: {run_[0]['title'][:60]}" if run_ else "idle")
-                            + (f" · {len(wait_)} waiting" if wait_ else ""))
+                            + (f"running: {run_[0]['title'][:70]}" if run_ else "idle")
+                            + (f" · {len(wait_)} waiting" if wait_ else ""),
+                            help=f"Queues run side by side (up to {limit} at once); each runs its own tasks in order.")
                 env = next((i for i in wait_ if (i.get("note") or "").startswith(rq.ENV_PAUSE_NOTE)), None)
                 if lp and env:
                     q1.warning("Paused because of an environment problem; fix it, then Resume. "
@@ -1379,7 +1466,7 @@ def _wkey(key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", key)
 
 
-ROW_COLS = [0.32, 0.32, 4.4, 2.0, 2.8, 2.0, 0.85, 0.95]
+ROW_COLS = [0.3, 0.3, 4.6, 1.9, 2.6, 1.8, 0.7, 0.85]
 WORK_CSS = """<style>
 [class*="st-key-wr_"] { position: relative; border-bottom: 1px solid rgba(128,128,128,0.18);
                         padding: 0.15rem 0.25rem; border-radius: 0.4rem; }
@@ -1396,23 +1483,52 @@ WORK_CSS = """<style>
 [class*="st-key-ck_"], [class*="st-key-ckall"] { position: relative !important; z-index: 2; }
 [class*="st-key-wr_"] p { margin: 0; font-size: 0.9rem; white-space: nowrap; overflow: hidden;
                           text-overflow: ellipsis; }
-.st-key-whead p { font-size: 0.78rem; opacity: 0.65; margin: 0; }
+.st-key-qbar { gap: 0.4rem; padding-top: 0.6rem; padding-bottom: 0.6rem; }
+.st-key-qbar p { margin: 0; }
+.st-key-whead p { font-size: 0.75rem; opacity: 0.6; margin: 0; letter-spacing: 0.04em; }
+[class*="st-key-wr_"] .sf-tries { font-size: 0.72rem; font-weight: 600; opacity: 0.75; padding: 0.05rem 0.4rem;
+                                  border-radius: 999px; background: rgba(128,128,128,0.18); margin-left: 0.35rem; }
+.sf-wsec { font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.6;
+           margin: 1.1rem 0 0.1rem 0.25rem; }
+[class*="st-key-wr_"] [data-testid="stMarkdownContainer"] p { line-height: 1.6; }
+[class*="st-key-wr_"] [data-testid="stCheckbox"] label { min-height: 0; }
 [class*="st-key-wopen_"] { border-left: 3px solid #ff4b4b; padding-left: 0.9rem; margin: 0.2rem 0 1rem 0.4rem; }
 [class*="st-key-wsel_"] { background: rgba(255, 75, 75, 0.08) !important; }
 </style>"""
 
 
+def _short_result(text: str) -> str:
+    """The run's last word, shortened to what matters in a list."""
+    t = (text or "").strip()
+    low = t.lower()
+    if "queue worker stopped" in low:
+        return "Interrupted (the worker restarted)"
+    if low.startswith("the sandbox image") and "missing" in low:
+        return "Sandbox image is missing a tool"
+    if low.startswith("maximum runtime"):
+        return "Hit the time limit"
+    m = re.match(r"repair limit reached.*?(\d+) unresolved problem", low)
+    if m:
+        return f"Still {m.group(1)} problem(s) after repairs"
+    if low.startswith("unexpected error: giterror"):
+        return "Git error: " + t.split(":", 2)[-1].strip()[:60]
+    return t[:120]
+
+
 def _cells(w: dict) -> dict:
     r, i = w["run"], w["item"]
     now = ""
-    if w["group"] == "active" and r and (r["state_reason"] or "").startswith("waiting for the repository"):
+    pr = re.search(r"/pull/(\d+)", (r.get("pr_url") or r.get("state_reason") or "")) if r else None
+    if pr and w["group"] == "done":
+        now = f"PR #{pr.group(1)}" + (f" · {w['merge']}" if w.get("merge") else "")
+    elif w["group"] == "active" and r and (r["state_reason"] or "").startswith("waiting for the repository"):
         now = r["state_reason"][:120]
     elif w["group"] == "active" and r:
         now = r["state"].replace("_", " ").title() + (f" · repair cycle {r['repair_cycle']}" if r["repair_cycle"] else "")
     elif r and r["state_reason"]:
-        now = r["state_reason"][:120]
+        now = _short_result(r["state_reason"])
     elif i and i["note"]:
-        now = i["note"][:120]
+        now = _short_result(i["note"])
     cost = store.cost_summary(r["id"])["total"] if r else None
     return {"now": now, "cost": f"${cost:.2f}" if cost is not None else "",
             "time": fmt_dur((r["finished_at"] or time.time()) - r["created_at"]) if r else "",
@@ -1516,7 +1632,7 @@ def bulk_bar(shown: list[dict]) -> None:
                                 key="bk_files")
             d1, d2, _ = st.columns([1, 1, 4])
             if d1.button("Yes, delete", type="primary", key="bk_yes"):
-                done, skipped = _delete_items(sel, files)
+                done, skipped = _delete_items(sel + [a for w in sel for a in w.get("attempts") or []], files)
                 st.session_state.confirm_delete = False
                 _clear_checks(shown)
                 if st.session_state.get("sel_item") in {w["key"] for w in sel if w["group"] != "active"}:
@@ -1540,22 +1656,32 @@ def _toggle_all(keys: list[str]) -> None:
         st.session_state[f"ck_{k}"] = v
 
 
-def work_row(w: dict) -> None:
+def _row_cols(show_repo: bool) -> list[float]:
+    return ROW_COLS if show_repo else ROW_COLS[:5] + ROW_COLS[6:]
+
+
+def work_row(w: dict, show_repo: bool = True) -> None:
     k = _wkey(w["key"])
     is_open = st.session_state.get("sel_item") == w["key"]
     cells = _cells(w)
+    tries = len(w.get("attempts") or [])
     with st.container(key=f"wr_{k}"):
-        c = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
+        c = st.columns(_row_cols(show_repo), vertical_alignment="center", gap="small")
         c[0].checkbox("select", key=f"ck_{k}", label_visibility="collapsed")
         c[1].markdown(w["icon"])
         c[2].markdown(f"{'▾' if is_open else '▸'} {'📦 ' if w.get('archived') else ''}"
-                      f"**{w['title'] or '(untitled)'}**")
+                      f"**{w['title'] or '(untitled)'}**"
+                      + (f" <span class='sf-tries' title='earlier attempts of this task are folded into this row'>"
+                         f"×{tries + 1}</span>" if tries else ""), unsafe_allow_html=True)
         c[3].markdown(w["status"])
         c[4].markdown(cells["now"] or " ")
-        c[5].markdown(_short_repo(w["repo"]))
-        c[6].markdown(cells["cost"] or " ")
-        c[7].markdown(cells["time"] or " ")
-        if c[7].button("open", key=f"op_{k}", help="Show / hide details"):
+        rest = c[5:]
+        if show_repo:
+            rest[0].markdown(_short_repo(w["repo"]))
+            rest = rest[1:]
+        rest[0].markdown(cells["cost"] or " ")
+        rest[1].markdown(cells["time"] or " ")
+        if rest[1].button("open", key=f"op_{k}", help="Show / hide details"):
             select_item(None if is_open else w["key"])
             st.rerun(scope="app")
 
@@ -1567,52 +1693,61 @@ def _item_mode(w: dict) -> str | None:
     return w["item"].get("mode") if w["item"] else None
 
 
+SECTIONS = {"active": "Running now", "waiting": "Up next", "finished": "Finished"}
+
+
 def work_list(items: list[dict], every) -> None:
+    st.markdown(WORK_CSS, unsafe_allow_html=True)
     queue_bar()
     visible = [w for w in items if not w["hidden"]]
     if not visible:
         st.info("Nothing here yet. Go to **New task** to start a run or fill the queue.")
         return
-    counts = {g: sum(1 for w in visible if w["group"] == g) for g in ("active", "waiting", "done", "failed")}
-    f1, f2 = st.columns([3, 2])
-    labels = {"All": f"All ({len(visible)})", "Active": f"Active ({counts['active']})",
-              "Waiting": f"Waiting ({counts['waiting']})", "Finished": f"Finished ({counts['done']})",
+    f1, f2, f3 = st.columns([3.2, 2, 1.1], vertical_alignment="center")
+    query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
+                          label_visibility="collapsed").strip().lower()
+    every_try = f3.toggle("Every attempt", key="w_all",
+                          help="Show each attempt of a task as its own row. Off: one row per task, with the "
+                               "number of attempts (×N) next to its title.")
+    with st.expander("More filters"):
+        g1, g2, g3, g4 = st.columns([1.5, 1.5, 1.1, 1.1], vertical_alignment="bottom")
+        states = g1.multiselect("State", sorted({w["run"]["state"] for w in items if w["run"]}),
+                                key="w_state", placeholder="All states")
+        repo_sel = g2.selectbox("Repository", ["All repos"] + sorted({_short_repo(w["repo"]) for w in items
+                                                                     if w["repo"]}), key="w_repo")
+        mode_sel = g3.selectbox("Mode", ["All modes", "swarm", "single"], key="w_mode")
+        show_arch = g4.checkbox("Show archived", key="w_arch",
+                                help="Archived runs stay in the database but are hidden from this list.")
+    base = visible if show_arch else [w for w in visible if not w["archived"]]
+    if states:
+        base = [w for w in base if w["run"] and w["run"]["state"] in states]
+    if repo_sel and repo_sel != "All repos":
+        base = [w for w in base if _short_repo(w["repo"]) == repo_sel]
+    if mode_sel and mode_sel != "All modes":
+        base = [w for w in base if _item_mode(w) == mode_sel]
+    if query:
+        base = [w for w in base if query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower()]
+    if not every_try:
+        base = collapse_attempts(base)
+    counts = {g: sum(1 for w in base if w["group"] == g) for g in ("active", "waiting", "done", "failed")}
+    labels = {"All": f"All ({len(base)})", "Active": f"Running ({counts['active']})",
+              "Waiting": f"Up next ({counts['waiting']})", "Finished": f"Finished ({counts['done']})",
               "Failed": f"Failed ({counts['failed']})"}
     filt = f1.segmented_control("Show", list(FILTERS), key="w_filter", format_func=labels.get,
                                 label_visibility="collapsed", default="All") or "All"
-    query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
-                          label_visibility="collapsed").strip().lower()
-    # filters above the table; options come from the full list so they stay stable while narrowing it
-    g1, g2, g3, g4 = st.columns([1.5, 1.5, 1.1, 1.1])
-    states = g1.multiselect("State", sorted({w["run"]["state"] for w in items if w["run"]}),
-                            key="w_state", placeholder="All states")
-    repo_sel = g2.selectbox("Repository", ["All repos"] + sorted({w["repo"] for w in items if w["repo"]}),
-                            key="w_repo")
-    mode_sel = g3.selectbox("Mode", ["All modes", "swarm", "single"], key="w_mode")
-    show_arch = g4.checkbox("Show archived", key="w_arch",
-                            help="Archived runs stay in the database but are hidden from this list.")
-    base = visible if show_arch else [w for w in visible if not w["archived"]]
     shown = [w for w in base if FILTERS[filt] is None or w["group"] in FILTERS[filt]]
-    if states:
-        shown = [w for w in shown if w["run"] and w["run"]["state"] in states]
-    if repo_sel and repo_sel != "All repos":
-        shown = [w for w in shown if w["repo"] == repo_sel]
-    if mode_sel and mode_sel != "All modes":
-        shown = [w for w in shown if _item_mode(w) == mode_sel]
-    if query:
-        shown = [w for w in shown
-                 if query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower()]
     if not shown:
         st.caption("No tasks match.")
         return
     bulk_bar(shown)
-    st.markdown(WORK_CSS, unsafe_allow_html=True)
+    show_repo = len({_short_repo(w["repo"]).lower() for w in shown}) > 1
     keys = [_wkey(w["key"]) for w in shown]
     with st.container(key="whead"):
-        h = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
+        h = st.columns(_row_cols(show_repo), vertical_alignment="center", gap="small")
         h[0].checkbox("all", key="ckall", label_visibility="collapsed", on_change=_toggle_all, args=(keys,),
                       help="Select all shown")
-        for col, name in zip(h[2:], ["TASK", "STATUS", "NOW / RESULT", "REPO", "COST", "TIME"]):
+        names = ["TASK", "STATUS", "RESULT"] + (["REPO"] if show_repo else []) + ["COST", "TIME"]
+        for col, name in zip(h[2:], names):
             col.markdown(name)
     sel = st.session_state.get("sel_item")
     if sel and sel not in {w["key"] for w in shown}:  # opened from elsewhere (e.g. Failures): show on top
@@ -1623,10 +1758,19 @@ def work_list(items: list[dict], every) -> None:
                     select_item(None)
                     st.rerun(scope="app")
                 item_detail(w, every)
+    section = None
     for w in shown:
-        work_row(w)
+        sec = w["group"] if w["group"] in ("active", "waiting") else "finished"
+        if filt == "All" and sec != section:
+            st.markdown(f"<div class='sf-wsec'>{SECTIONS[sec]}</div>", unsafe_allow_html=True)
+        section = sec
+        work_row(w, show_repo)
         if sel == w["key"]:
             with st.container(key=f"wopen_{_wkey(w['key'])}"):
+                if w.get("attempts"):
+                    st.caption("Earlier attempts of this task: " + " · ".join(
+                        f"{a['icon']} {a['status']} ({fmt_ts(a['when'], True)[5:]})" for a in w["attempts"][:8])
+                        + (" …" if len(w["attempts"]) > 8 else "") + ". Turn on **Every attempt** to open them.")
                 item_detail(w, every)
     st.caption("Click a task to open it. Tick boxes to act on several tasks at once.")
 
@@ -2389,34 +2533,36 @@ def page_chat():
             st.session_state.pop("chat_done", None)
             st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
             _chat_save(actions, active_id)
-        if not history:
-            with st.container(key="chat_empty"):
-                st.markdown("### What should we look at?")
-                st.markdown("Runs and their statuses, failed tasks, cost and speed, or what to build next.")
-            if needs:
-                st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
-                        "Press **Review my failed tasks**.")
-        for n, m in enumerate(history):
-            with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
-                if m["role"] == "assistant":
-                    calls = m.get("tool_calls")
-                    if isinstance(calls, str):
-                        try:
-                            calls = json.loads(calls)
-                        except (TypeError, ValueError):
-                            calls = None
-                    for tc in calls or []:
-                        if not isinstance(tc, dict):
-                            continue
-                        a = tc.get("args") or {}
-                        arg = next((str(v) for v in a.values() if v not in (None, "")), "")[:80]
-                        st.caption(f"🔧 {tc.get('name')} · {arg}" if arg else f"🔧 {tc.get('name')}")
-                    st.markdown(_chat_md(m["content"]))
-                    render_message_actions(n, actions.get(n))
-                else:
-                    st.write(m["content"])
-                _render_chat_attachments(m.get("attachments"))
-        live = st.container()  # the new exchange renders here, above the chips and the input
+        scroll = st.container(key="chat_scroll", height=520)   # the transcript scrolls on its own
+        with scroll:
+            if not history:
+                with st.container(key="chat_empty"):
+                    st.markdown("### What should we look at?")
+                    st.markdown("Runs and their statuses, failed tasks, cost and speed, or what to build next.")
+                if needs:
+                    st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
+                            "Press **Review my failed tasks**.")
+            for n, m in enumerate(history):
+                with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
+                    if m["role"] == "assistant":
+                        calls = m.get("tool_calls")
+                        if isinstance(calls, str):
+                            try:
+                                calls = json.loads(calls)
+                            except (TypeError, ValueError):
+                                calls = None
+                        for tc in calls or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            a = tc.get("args") or {}
+                            arg = next((str(v) for v in a.values() if v not in (None, "")), "")[:80]
+                            st.caption(f"🔧 {tc.get('name')} · {arg}" if arg else f"🔧 {tc.get('name')}")
+                        st.markdown(_chat_md(m["content"]))
+                        render_message_actions(n, actions.get(n))
+                    else:
+                        st.write(m["content"])
+                    _render_chat_attachments(m.get("attachments"))
+            live = st.container()  # the new exchange renders here, at the bottom of the transcript
         pending = None
         with st.container(key="chat_chips", horizontal=True, horizontal_alignment="center" if not history
                           else "left", gap="small"):
@@ -2428,6 +2574,7 @@ def page_chat():
             from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
             uploaded = st.file_uploader(
                 "Attach images or files",
+                label_visibility="collapsed",
                 type=sorted(TEXT_EXTENSIONS | IMAGE_EXTENSIONS),
                 accept_multiple_files=True,
                 key="chat_files",
@@ -2436,6 +2583,7 @@ def page_chat():
         except Exception:
             uploaded = None
         typed = st.chat_input("Ask about runs, failures, or what to improve…")
+    components.html(CHAT_SCROLL_JS.replace("__N__", str(len(history)) + "-" + uuid.uuid4().hex[:6]), height=0)
     prompt = typed or pending
     if not prompt:
         return
@@ -2674,47 +2822,116 @@ def page_benchmarks():
 
 
 # ======================================================== PULL REQUESTS page
-def auto_merge_panel(gh) -> None:
-    """What auto-merge did (merged / waiting for you, and why), with one-click revert of a merge."""
+def _am_latest(rows: list[dict]) -> dict[str, tuple[dict, dict]]:
+    """Latest auto-merge event per PR url -> (row, detail); rows are newest first."""
+    out: dict[str, tuple[dict, dict]] = {}
+    for r in rows:
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if d.get("url") and d["url"] not in out:
+            out[d["url"]] = (r, d)
+    return out
+
+
+def auto_merge_panel(gh, open_urls: set[str] | None = None) -> None:
+    """What auto-merge did, and buttons for everything that waits for you."""
     from swarmforge import automerge as am
     from swarmforge.github import GitHubError
     amc = cfg.auto_merge
-    rows = store._all("SELECT * FROM interventions WHERE kind IN (?, ?, ?) ORDER BY id DESC LIMIT 25",
-                      (am.MERGED, am.HELD, "auto_merge_reverted"))
-    reverted = {json.loads(r["detail"]).get("url") for r in rows if r["kind"] == "auto_merge_reverted"}
+    kinds = (am.MERGED, am.HELD, am.FIXING, am.CLOSED, am.MANUAL, "auto_merge_reverted")
+    rows = store._all(f"SELECT * FROM interventions WHERE kind IN ({','.join('?' * len(kinds))}) "
+                      "ORDER BY id DESC LIMIT 60", kinds)
+    latest = _am_latest(rows)
+    gone = {u for u, (r, _) in latest.items()
+            if r["kind"] == am.HELD and open_urls is not None and u not in open_urls}
+    waiting = [u for u, (r, _) in latest.items() if r["kind"] == am.HELD and u not in gone]
     where = ", ".join(amc.repos) if amc.repos else "every repository"
-    title = (f"🤖 Auto-merge: **on** for {where} · up to {amc.max_lines} lines merge straight away, larger ones "
-             f"(up to {amc.judge_max_lines}) if the {amc.judge_role} model approves" if amc.enabled
-             else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
-    with st.expander(title, expanded=bool(amc.enabled and rows)):
-        st.caption("Never merged automatically: unresolved [major] findings, conflicts, failing checks, and files "
-                   "the repository protects (`protected_paths` in swarmforge.project.yml). SwarmForge doesn't "
-                   "restart after an auto-merge; the new code arrives with your next Update & restart.")
+    title = (f"🤖 Auto-merge: **on** for {where}" + (f" · **{len(waiting)} waiting for you**" if waiting else "")
+             if amc.enabled else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
+    with st.expander(title, expanded=bool(waiting)):
+        st.caption(f"Up to {amc.max_lines} clean lines merge at once. Larger changes, open [major] findings and "
+                   f"core files (protected_paths) go to the {amc.judge_role} model; core files need a low-risk "
+                   "verdict. Conflicts are resolved against the latest main and re-tested. A PR that is still held "
+                   + ("gets one automatic fix-up task that replaces it; after that it waits here."
+                      if amc.auto_fix else "waits here.")
+                   + " Nothing restarts by itself.")
         flash = st.session_state.pop("am_flash", None)
         if flash:
             (st.success if flash[0] else st.error)(flash[1])
-        shown = [r for r in rows if r["kind"] != "auto_merge_reverted"]
-        if not shown:
+        if not latest:
             st.caption("No auto-merge decisions yet.")
-        for r in shown:
-            try:
-                d = json.loads(r["detail"] or "{}")
-            except json.JSONDecodeError:
+        label = {am.MERGED: "✅ merged", am.MANUAL: "✅ merged by you", am.HELD: "⏸ waiting for you",
+                 am.FIXING: "🔧 being fixed", am.CLOSED: "🗑 closed", "auto_merge_reverted": "↩️ reverted"}
+        for url, (r, d) in list(latest.items())[:25]:
+            kind = r["kind"]
+            if url in gone:
+                st.markdown(f"**✔ no longer open** (merged or closed on GitHub) · [{d.get('title') or url}]({url})")
                 continue
-            merged = r["kind"] == am.MERGED
-            url = d.get("url", "")
-            icon = ("↩️ reverted" if url in reverted else "✅ merged") if merged else "⏸ waiting for you"
-            c1, c2 = st.columns([6, 1.3])
-            c1.markdown(f"**{icon}** · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
-                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "") + f"  \n{d.get('reason', '')}")
-            if merged and url not in reverted and d.get("number"):
-                key = f"am_rev_{r['id']}"
+            extra = (f" (task #{d['fix_task']})" if kind == am.FIXING and d.get("fix_task") else "") + \
+                    (f" (run `{d['fix_run']}`)" if kind == am.FIXING and d.get("fix_run") else "") + \
+                    (f" → {d['replaced_by']}" if d.get("replaced_by") else "")
+            st.markdown(f"**{label.get(kind, kind)}**{extra} · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
+                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "")
+                        + (f"  \n{d['reason']}" if d.get("reason") else ""))
+            key = f"am_{r['id']}"
+            if kind == am.HELD and d.get("number"):
+                c1, c2, c3, _ = st.columns([1.2, 1.6, 1, 3])
+                if c1.button("Merge now", key=key + "_merge", type="primary",
+                             help="Merge it as it is (marks a draft ready first)"):
+                    try:
+                        pr = am.get_pr(gh, d["repo"], int(d["number"]))
+                        sha = am.apply(gh, pr, amc.method)
+                        store.record_intervention(r["run_id"], am.MANUAL, json.dumps({**d, "sha": sha,
+                                                                                     "reason": "merged by you"}))
+                        st.session_state.am_flash = (True, f"Merged {url}. Update & restart to pick it up.")
+                    except (GitHubError, Exception) as e:  # noqa: BLE001
+                        st.session_state.am_flash = (False, f"Could not merge {url}: {e}. "
+                                                            "Use **Fix with the swarm** to have it updated.")
+                    st.session_state.pop("pr_cache", None)
+                    st.rerun()
+                if c2.button("Fix with the swarm", key=key + "_fix",
+                             help="Start a run right now that continues this PR's code, fixes why it was held "
+                                  "(and any conflicts with main), then replaces this PR"):
+                    run = store.get_run(r["run_id"]) or {}
+                    item = store._one("SELECT queue FROM queue_items WHERE run_id = ?", (r["run_id"],)) or {}
+                    findings = [f for f in store.findings(r["run_id"])
+                                if f["cycle"] == run.get("repair_cycle") and f["severity"] != "info"]
+                    body = run.get("issue_body") or d.get("title") or ""
+                    if am.fix_depth(body)[0] and "supersedes=" in body:   # allow one more manual round
+                        body = am.FIX_MARK.sub("", body)
+                    args = dict(title=run.get("issue_title") or d.get("title") or "", body=body, repo=d["repo"],
+                                url=url, reason=d.get("reason", ""), findings=findings)
+                    try:
+                        rid = am.start_fix(cfg, r["run_id"], **args)                 # starts right now
+                        store.record_intervention(r["run_id"], am.FIXING, json.dumps({**d, "fix_run": rid}))
+                        st.session_state.am_flash = (True, f"Started fix-up run {rid} now; its PR will replace {url}.")
+                    except Exception as e:  # noqa: BLE001 - fall back to the queue
+                        qid = am.queue_fix(store, r["run_id"], queue=item.get("queue"), **args)
+                        store.record_intervention(r["run_id"], am.FIXING, json.dumps({**d, "fix_task": qid}))
+                        from swarmforge import runqueue as rq
+                        if not rq.worker_pid(store):
+                            rq.start_worker(cfg, store)
+                        st.session_state.am_flash = (True, f"Couldn't start it right away ({e}); queued fix-up "
+                                                           f"task #{qid} at the front instead.")
+                    st.rerun()
+                if c3.button("Close", key=key + "_close", help="Close the PR without merging"):
+                    try:
+                        am.close_pr(gh, d["repo"], int(d["number"]), "Closed from the SwarmForge dashboard.")
+                        store.record_intervention(r["run_id"], am.CLOSED, json.dumps({**d, "reason": "closed by you"}))
+                        st.session_state.am_flash = (True, f"Closed {url}.")
+                    except (GitHubError, Exception) as e:  # noqa: BLE001
+                        st.session_state.am_flash = (False, f"Could not close {url}: {e}")
+                    st.session_state.pop("pr_cache", None)
+                    st.rerun()
+            elif kind in (am.MERGED, am.MANUAL) and d.get("number"):
                 if st.session_state.get(key + "_ask"):
-                    if c2.button("Confirm revert", key=key + "_yes", type="primary"):
+                    if st.button("Confirm revert", key=key + "_yes", type="primary"):
                         try:
-                            rev = am.revert(gh, d["repo"], int(d["number"]), cfg.auto_merge.method)
+                            rev = am.revert(gh, d["repo"], int(d["number"]), amc.method)
                             store.record_intervention(r["run_id"], "auto_merge_reverted",
-                                                      json.dumps({"url": url, "revert_url": rev}))
+                                                      json.dumps({**d, "revert_url": rev}))
                             st.session_state.am_flash = (True, f"Reverted: {rev} is merged. Update & restart to "
                                                                "pick up the change.")
                         except (GitHubError, Exception) as e:  # noqa: BLE001
@@ -2722,7 +2939,7 @@ def auto_merge_panel(gh) -> None:
                         st.session_state.pop(key + "_ask", None)
                         st.session_state.pop("pr_cache", None)
                         st.rerun()
-                elif c2.button("↩ Revert", key=key, help="GitHub creates a revert PR and it is merged at once"):
+                elif st.button("↩ Revert", key=key + "_rev", help="GitHub creates a revert PR and it is merged at once"):
                     st.session_state[key + "_ask"] = True
                     st.rerun()
 
@@ -2776,7 +2993,7 @@ def page_prs():
                 if st.button("⬆️ Update & restart SwarmForge now", type="primary", key="pr_update"):
                     st.session_state.upd_status = None
                     do_update_and_restart()
-    auto_merge_panel(gh)
+    auto_merge_panel(gh, {pr.url for pr in all_prs} if not cache["errors"] else None)
     if not all_prs:
         st.success("No open pull requests. 🎉")
         return

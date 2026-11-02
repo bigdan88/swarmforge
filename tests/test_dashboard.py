@@ -1,4 +1,5 @@
 """Dashboard, launcher and approval-channel tests."""
+import json
 import threading
 import time
 from pathlib import Path
@@ -299,7 +300,7 @@ def test_failures_page_and_hidden_attempts(tmp_path, monkeypatch):
     # the healed attempt is hidden from the Work list; the successful retry says it fixed itself
     rows = [b for b in at.button if (b.key or "").startswith("op_")]
     texts = [m.value for m in at.markdown]
-    assert any("Done (fixed itself, attempt 1)" in t for t in texts) and len(rows) == 2
+    assert any("Done · self-healed" in t for t in texts) and len(rows) == 2
     _go(at, "Failures")
     assert not at.exception, [e.value for e in at.exception]
     metrics = {m.label: m.value for m in at.metric}
@@ -365,3 +366,31 @@ def test_new_task_offers_recent_repos(tmp_path, monkeypatch):
     assert sb.value == "bigdan88/swarmforge" and list(sb.options)[:2] == ["bigdan88/swarmforge", "bigdan88/old"]
     store.remember_repo("bigdan88/old")
     assert store.recent_repos()[:2] == ["bigdan88/old", "bigdan88/swarmforge"]
+
+
+def test_work_list_folds_repeated_attempts_into_one_row(tmp_path, monkeypatch):
+    """Attempts of the same task (same title + repo, however the repo is written) show as one row with ×N;
+    'Every attempt' lists them all. Results are short: the PR number and what auto-merge did."""
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    store = Store(cfg.db_path)
+    store.create_run("20990101-000000-aaaaaa", state="BLOCKED", issue_title="Add export",
+                     repo="https://github.com/x/y.git", budget_usd=5, config_json="{}",
+                     state_reason="the queue worker stopped while this run was going")
+    store.create_run("20990101-010000-bbbbbb", state="COMPLETED", issue_title="Add export ", repo="x/y",
+                     budget_usd=5, config_json="{}", state_reason="draft PR created: https://github.com/x/y/pull/7",
+                     pr_url="https://github.com/x/y/pull/7")
+    store.record_intervention("20990101-010000-bbbbbb", "auto_merge",
+                              json.dumps({"url": "https://github.com/x/y/pull/7", "number": 7}))
+    store.create_run("20990101-020000-cccccc", state="FAILED", issue_title="Other task", repo="x/y",
+                     budget_usd=5, config_json="{}", state_reason="the queue worker stopped while this run was going")
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    rows = [b.key for b in at.button if (b.key or "").startswith("op_")]
+    assert rows == ["op_r_20990101-020000-cccccc", "op_r_20990101-010000-bbbbbb"]
+    texts = [m.value for m in at.markdown]
+    assert any("×2" in t for t in texts)
+    assert "PR #7 · merged" in texts and "Interrupted (the worker restarted)" in texts
+    assert not any("queue tasks done" in t for t in texts)
+    at.toggle(key="w_all").set_value(True).run()
+    assert len([b for b in at.button if (b.key or "").startswith("op_")]) == 3
