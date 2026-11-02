@@ -1,7 +1,11 @@
 """Dashboard Chat page tests: offline, `swarmforge.chatbot.ask` is monkeypatched."""
+import base64
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("streamlit")
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from swarmforge.chatbot import ChatError
@@ -163,3 +167,100 @@ def test_chat_error_is_shown_not_raised(tmp_path, monkeypatch):
     assert any("Chatbot: model provider unavailable" in e.value for e in at.error)
     # the question stays in the conversation so the user can retry after it
     assert at.session_state["chat_history"] == [{"role": "user", "content": "which runs failed?"}]
+
+# ------------------------------------------------------- attachments uploads
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+class FakeFile:
+    """Duck-types streamlit's UploadedFile (name + getvalue)."""
+
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def _fake_ask_recording(calls):
+    def fake_ask(c, store, question, history=None, **kw):
+        calls.append({"question": question, "history": list(history or []), "kw": dict(kw)})
+        return {"answer": "**2 attachments** seen.", "role": "planner", "model": "qwen-fake",
+                "question": question}
+    return fake_ask
+
+
+def test_chat_uploads_attachments_and_renders_them(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    calls = []
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", _fake_ask_recording(calls))
+    monkeypatch.setattr(st, "file_uploader",
+                        lambda *a, **k: [FakeFile("pic.png", PNG_1PX),
+                                         FakeFile("notes.txt", b"hello notes")])
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("what are these files?").run()
+    assert not at.exception, [e.value for e in at.exception]
+    # ask was called once with saved attachment paths
+    assert len(calls) == 1
+    atts = calls[0]["kw"].get("attachments")
+    assert atts and len(atts) == 2
+    saved_dir = (cfg.workdir / "chat_attachments").resolve()
+    assert all(str(saved_dir) in str(Path(p)) for p in atts)
+    assert all(Path(p).is_file() for p in atts)
+    names = {Path(p).name for p in atts}
+    assert names == {"pic.png", "notes.txt"}
+    # the transcript renders an image thumbnail and a chip with the .txt name
+    assert len(at.image) == 1
+    texts = [m.value for m in at.markdown]
+    assert any("notes.txt" in t for t in texts)
+    assert any("**2 attachments** seen." in t for t in texts)
+    # the user message carries attachment metadata for later reruns
+    hist = at.session_state["chat_history"]
+    assert hist[0].get("attachments") and len(hist[0]["attachments"]) == 2
+
+
+def test_chat_without_uploads_calls_ask_without_attachments_kwarg(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    calls = []
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", _fake_ask_recording(calls))
+    monkeypatch.setattr(st, "file_uploader", lambda *a, **k: None)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("how many runs?").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(calls) == 1
+    assert "attachments" not in calls[0]["kw"]  # today's exact call signature
+    assert calls[0]["kw"].get("conversation")
+    assert len(at.image) == 0
+    assert at.session_state["chat_history"][0].get("attachments") is None
+
+
+def test_chat_uploader_failure_degrades_gracefully(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    calls = []
+
+    def broken_uploader(*a, **k):
+        raise RuntimeError("uploader unsupported")
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", _fake_ask_recording(calls))
+    monkeypatch.setattr(st, "file_uploader", broken_uploader)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("still works?").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len(calls) == 1
+    assert "attachments" not in calls[0]["kw"]
+    assert any("still works?" in m.value for m in at.markdown)
