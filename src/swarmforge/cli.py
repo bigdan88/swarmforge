@@ -348,13 +348,14 @@ def cmd_dashboard(args, cfg) -> int:
         threading.Timer(2.5, lambda: webbrowser.open(url)).start()
     cmd = [sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
            "--server.address", address, "--server.headless", "true", "--browser.gatherUsageStats", "false",
-           "--client.toolbarMode", "minimal",
+           # "viewer" keeps the ⋮ menu (its System/Light/Dark theme switch) without developer options;
+           # "minimal" would remove the menu and with it the only working theme switch
+           "--client.toolbarMode", "viewer",
            # code changes arrive through Update & restart; Streamlit's file watcher would otherwise unload
            # SwarmForge modules while a page is running whenever a file changes (e.g. during `git pull`)
-           "--server.fileWatcherType", "none",
-           # Streamlit only accepts light/dark here (anything else is read as a theme FILE);
-           # "auto" = leave it unset so Streamlit follows the system setting
-           *(["--theme.base", theme] if theme in ("light", "dark") else [])]
+           "--server.fileWatcherType", "none"]
+    # No --theme.base: forcing a base theme removes Streamlit's light/dark switch. --theme is only the
+    # starting theme for a browser that hasn't chosen one (the dashboard applies it via that switch).
     p = subprocess.Popen(cmd, env=env)
     try:
         return p.wait()
@@ -614,7 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also serve to other devices (iPad, phone; works over Tailscale too); "
                         "requires SWARMFORGE_DASH_PASSWORD in .env")
     s.add_argument("--theme", choices=["auto", "light", "dark"], default="auto",
-                   help="dashboard color theme; 'dark' = dark mode (you can also switch live from the sidebar)")
+                   help="starting theme for browsers that haven't picked one; switch any time in the sidebar or the ⋮ menu")
     s.set_defaults(fn=cmd_dashboard)
     s = sub.add_parser("metrics", help="where the time went: per-phase timings for one run, or medians "
                                        "over recent runs grouped by settings")
@@ -625,6 +626,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_metrics)
     s = sub.add_parser("update", help="pull the latest SwarmForge code (merged PRs) and restart the queue worker")
     s.set_defaults(fn=cmd_update)
+    s = sub.add_parser("seed-demo", help=argparse.SUPPRESS)          # demo data for UI screenshots
+    s.add_argument("db")
+    s.set_defaults(fn=cmd_seed_demo, no_config=True)
     s = sub.add_parser("restart-dashboard", help=argparse.SUPPRESS)
     s.add_argument("--pid", type=int, required=True)
     s.add_argument("--args", default="{}")
@@ -853,6 +857,12 @@ def cmd_metrics(args, cfg) -> int:
     return 0
 
 
+def cmd_seed_demo(args, cfg) -> int:
+    from .demo import seed
+    print(f"demo data written to {seed(args.db)}")
+    return 0
+
+
 def cmd_update(args, cfg) -> int:
     from . import selfupdate as su
     try:
@@ -881,6 +891,8 @@ def cmd_restart_dashboard(args, cfg) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "no_config", False):           # works without a swarmforge.yaml (e.g. in the sandbox)
+        return args.fn(args, None) or 0
     try:
         cfg = load_config(args.config)
     except ConfigError as e:

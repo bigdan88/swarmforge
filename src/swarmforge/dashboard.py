@@ -18,148 +18,133 @@ from pathlib import Path
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from swarmforge.config import ConfigError, load_config
 from swarmforge.db import Store
 from swarmforge.knowledge import NOTE_TYPES, Vault, WIKILINK_RE
 
 # --------------------------------------------------------------------- theme
-# Streamlit cannot change its base theme mid-session, so `swarmforge dashboard --theme` launches the
-# subprocess with a base theme and exports SWARMFORGE_DASH_THEME; the sidebar control below injects
-# the other palette as CSS on top of it and persists the user's choice under THEME_KEY in the kv store.
-THEME_KEY = "dash_theme"
-THEME_CHOICES = ("auto", "light", "dark")
+# Light/dark is Streamlit's own theme switch (⋮ menu → System / Light / Dark): it restyles every
+# element, tables and charts included, and each browser remembers its choice. SwarmForge adds no
+# colour palette of its own (custom CSS here only uses see-through colours that work in both).
+# The sidebar buttons drive that same native switch; `swarmforge dashboard --theme dark|light` only
+# sets the starting theme for a browser that has not picked one yet.
+THEME_CHOICES = ("System", "Light", "Dark")
 LAUNCH_THEME = os.environ.get("SWARMFORGE_DASH_THEME", "auto")  # set by `swarmforge dashboard --theme`
 
-DARK_CSS = """<style>
-/* Dark palette over Streamlit's base theme. Selectors target data-testids (stable across releases),
-   not internal CSS variable names, which shift between Streamlit versions. */
-.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
-    background-color: #0e1117; color: #fafafa; }
-[data-testid="stSidebar"] { background-color: #16181d; color: #fafafa; }
-[data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
-[data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #fafafa; }
-[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover,
-[data-testid="stSidebar"] .stButton button:hover { background: #16181d; color: #fafafa; }
-h1, h2, h3, h4, h5, h6, p, li, label, span { color: #fafafa; }
-[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
-[data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
-    background-color: #262730; color: #fafafa; border-color: #444; }
-[data-testid="stCode"], pre, code { background-color: #1a1c22; color: #e6e6e6; }
-[data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"],
-[data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
-    background-color: #16181d; color: #fafafa; border-color: #33343d; }
-[data-testid="stButton"] button { color: #fafafa; }
-[data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #fafafa; }
-[data-testid="stCaptionContainer"] { color: #fafafa; }
-[data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
-    background-color: #262730; color: #fafafa; }
-[data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
-    background-color: #ff4b4b; color: #ffffff; }
-a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
-/* status boxes keep their own light backgrounds when the base theme is light: dark text there */
-[data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] span,
-[data-testid="stNotification"] p { color: inherit; }
-/* Claude-style chat bubbles: calm neutral palette, appended after the generic text rule above so
-   the higher specificity wins for bubble text. LIGHT_CSS mirrors these selectors + properties. */
-[data-testid="stChatMessageContent"] { background-color: #16181d; color: #fafafa; border: 1px solid #33343d; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { background-color: #1a1c22; }
-</style>"""
 
-LIGHT_CSS = """<style>
-/* Native light palette pinned, so switching back from a dark launch base works too. Every selector
-   DARK_CSS touches has a reset here: the dark block is replaced wholesale on toggle-back, and this
-   block re-pins the light values even when the launch base theme was dark. */
-.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
-    background-color: #ffffff; color: #31333f; }
-[data-testid="stSidebar"] { background-color: #f0f2f6; color: #31333f; }
-[data-testid="stSidebar"] p, [data-testid="stSidebar"] li, [data-testid="stSidebar"] span,
-[data-testid="stSidebar"] label, [data-testid="stSidebar"] a { color: #31333f; }
-[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover,
-[data-testid="stSidebar"] .stButton button:hover { background: #ffffff; color: #31333f; }
-h1, h2, h3, h4, h5, h6, p, li, label, span { color: #31333f; }
-[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
-[data-testid="stTextArea"] textarea, [role="listbox"], [role="listbox"] * {
-    background-color: #f8f9fa; color: #31333f; border-color: #d5d8e0; }
-[data-testid="stCode"], pre, code { background-color: #f0f2f6; color: #31333f; }
-[data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"],
-[data-testid="stExpander"] details, [data-testid="stExpander"] summary, [data-testid="stTabs"] {
-    background-color: #ffffff; color: #31333f; border-color: #d5d8e0; }
-[data-testid="stButton"] button { color: #31333f; }
-[data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #31333f; }
-[data-testid="stCaptionContainer"] { color: #31333f; }
-[data-testid="stButton"] button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
-    background-color: #f0f2f6; color: #31333f; }
-[data-testid="stButton"] button[kind="primary"], [data-testid="stBaseButton-primary"] {
-    background-color: #ff4b4b; color: #ffffff; }
-a, [data-testid="stMarkdownContainer"] a { color: #ff4b4b; }
-/* status boxes keep their own tinted backgrounds: let them pick their own text colour again */
-[data-testid="stAlert"] p, [data-testid="stAlert"] li, [data-testid="stAlert"] span,
-[data-testid="stNotification"] p { color: inherit; }
-/* Light reset of the chat bubbles: identical selectors + properties as the dark block, so the
-   dark->light toggle leaves no stale dark colours behind. */
-[data-testid="stChatMessageContent"] { background-color: #f5f2ec; color: #31333f; border: 1px solid #dcd3c1; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { background-color: #e9e4d8; }
-</style>"""
+def theme_switch_js(choice: str, only_if_unset: bool = False) -> str:
+    """Script (run in a zero-height component) that picks `choice` in Streamlit's own ⋮ menu theme
+    switch: opens the menu (it reacts to pointer events, not a plain click), clicks the item, closes it."""
+    if choice not in THEME_CHOICES:
+        raise ValueError(choice)
+    guard = ("if (Object.keys(w.localStorage).some(k => k.startsWith('stActiveTheme'))) return;"
+             if only_if_unset else "")
+    return f"""<script>
+(function () {{
+  const w = window.parent, d = w.document;
+  try {{ {guard} }} catch (e) {{}}
+  const sel = '[data-testid="stMainMenuItem-theme-{choice}"]';
+  const press = (el) => {{
+    for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {{
+      const E = t.startsWith('pointer') ? w.PointerEvent : w.MouseEvent;
+      el.dispatchEvent(new E(t, {{bubbles: true, cancelable: true, button: 0}}));
+    }}
+  }};
+  const menuButton = () => d.querySelector('[data-testid="stMainMenu"] button') || d.querySelector('[data-testid="stMainMenu"]');
+  let tries = 0, opened = false;
+  (function go() {{
+    const item = d.querySelector(sel);
+    if (item) {{
+      item.click();
+      setTimeout(() => {{
+        if (opened && d.querySelector(sel) && menuButton()) press(menuButton());
+        if (d.activeElement && d.activeElement.blur) d.activeElement.blur();
+      }}, 150);
+      return;
+    }}
+    const m = menuButton();
+    if (m && !opened) {{ press(m); opened = true; }}
+    if (++tries < 30) setTimeout(go, 100);
+  }})();
+}})();
+</script>"""
 
-# Every dark-palette colour DARK_CSS sets: none of these may appear in LIGHT_CSS (tests scan with it).
-DARK_CSS_COLORS = ("#0e1117", "#16181d", "#1a1c22", "#262730", "#33343d", "#e6e6e6", "#fafafa")
 
 CHAT_CSS = """<style>
-/* Claude-style chat transcript: geometry + typography only. Colours live exclusively in
-   DARK_CSS / LIGHT_CSS so every bubble colour is reversible on the dark->light toggle. */
-[data-testid="stChatMessage"] { align-items: flex-start; }
+/* Claude-style chat page: geometry, typography and see-through tints only, so it works in Streamlit's
+   light and dark theme alike (the theme itself is Streamlit's own switch, no custom palette);
+   the rgba() neutrals below read correctly on either base. Colour defaults sit inside :where() (zero
+   specificity) so an explicit theme block always wins over them. */
+
+/* ---- transcript */
+[data-testid="stChatMessage"] { align-items: flex-start; background: transparent; padding: 0.35rem 0; gap: 0.75rem; }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]), [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) { flex-direction: row-reverse; }
-[data-testid="stChatMessageContent"] { border-radius: 18px; padding: 0.7rem 1.05rem; max-width: 78%; line-height: 1.75; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { border-bottom-right-radius: 6px; }
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from assistant"]) [data-testid="stChatMessageContent"] { border-bottom-left-radius: 6px; }
-[data-testid="stChatMessageContent"] h1, [data-testid="stChatMessageContent"] h2, [data-testid="stChatMessageContent"] h3, [data-testid="stChatMessageContent"] h4 { font-family: Georgia, "Times New Roman", serif; font-weight: 600; letter-spacing: 0.01em; line-height: 1.5; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageAvatarCustom"] { display: none; }
+[data-testid="stChatMessageContent"] { border-radius: 18px; padding: 0.15rem 0.1rem; max-width: 100%; line-height: 1.7; font-size: 1rem; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { padding: 0.65rem 1.1rem; max-width: 78%; flex: 0 1 auto; border-bottom-right-radius: 6px; }
+:where([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) { background-color: rgba(128, 128, 128, 0.12); }
+[data-testid="stChatMessageAvatarCustom"] { opacity: 0.75; margin-top: 0.2rem; background: transparent; border: 0; }
+[data-testid="stChatMessageContent"] h1, [data-testid="stChatMessageContent"] h2, [data-testid="stChatMessageContent"] h3, [data-testid="stChatMessageContent"] h4 { font-family: Georgia, "Times New Roman", serif; font-weight: 600; letter-spacing: 0.01em; line-height: 1.35; padding: 0.9rem 0 0.35rem 0; }
+[data-testid="stChatMessageContent"] h1 { font-size: 1.45rem; }
+[data-testid="stChatMessageContent"] h2 { font-size: 1.3rem; }
+[data-testid="stChatMessageContent"] h3 { font-size: 1.12rem; }
+[data-testid="stChatMessageContent"] h4 { font-size: 1rem; }
+[data-testid="stChatMessageContent"] table { font-size: 0.92rem; border-collapse: collapse; }
+[data-testid="stChatMessageContent"] th, [data-testid="stChatMessageContent"] td { padding: 0.35rem 0.75rem; }
+[data-testid="stChatMessageContent"] code { font-size: 0.85em; border-radius: 4px; padding: 0.05em 0.3em; }
+
+/* ---- page frame */
+.st-key-chat_page h2 { font-size: 1.45rem; font-weight: 600; padding-bottom: 0.1rem; }
+.st-key-chat_main { max-width: 860px; margin: 0 auto; }
+.st-key-chat_topbar { border-bottom: 1px solid rgba(128, 128, 128, 0.2); padding-bottom: 0.4rem; margin-bottom: 0.4rem; }
+.st-key-chat_topbar [data-testid="stMarkdown"] p { font-family: Georgia, "Times New Roman", serif; font-size: 1.1rem; font-weight: 600; margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.st-key-chat_empty { padding: 3.5rem 0 1.5rem 0; }
+.st-key-chat_empty [data-testid="stMarkdownContainer"], .st-key-chat_empty p, .st-key-chat_empty h3 { text-align: center; justify-content: center; }
+.st-key-chat_empty h3 { font-family: Georgia, "Times New Roman", serif; font-weight: 500; font-size: 1.9rem; }
+.st-key-chat_empty p { opacity: 0.7; }
+
+/* ---- composer */
+[data-testid="stChatInput"] { border-radius: 16px; border: 1px solid rgba(128, 128, 128, 0.3); }
+[data-testid="stChatInputTextArea"]::placeholder { color: inherit; opacity: 0.55; }
+
+/* ---- suggestion chips */
+.st-key-chat_chips button { border-radius: 999px; padding: 0.3rem 0.9rem; min-height: 2.1rem; font-size: 0.88rem; border: 1px solid rgba(128, 128, 128, 0.3); background: transparent; }
+.st-key-chat_chips button:hover { background: rgba(128, 128, 128, 0.1); }
+.st-key-chat_chips button p { font-size: 0.88rem; }
+
+/* ---- conversation rail */
+.st-key-chat_rail { background: rgba(128, 128, 128, 0.06); border-radius: 14px; padding: 0.75rem 0.55rem; gap: 0.15rem; }
+.st-key-chat_rail .st-key-chat_new button { justify-content: flex-start; border-radius: 10px; font-weight: 500; }
+.st-key-chat_rail .st-key-chat_new button > div { justify-content: flex-start; }
+.st-key-chat_rail .sf-rail-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; padding: 0.85rem 0 0 0.6rem; height: 2.1rem; line-height: 1; }
+.st-key-chat_rail [class*="st-key-chat_row_"] { border-radius: 9px; padding: 0 0.15rem 0 0; flex-wrap: nowrap; min-height: 2.25rem; }
+.st-key-chat_rail [class*="st-key-chat_row_"]:hover { background: rgba(128, 128, 128, 0.1); }
+.st-key-chat_rail [class*="st-key-chat_row_"]:has([data-testid="stBaseButton-secondary"]) { background: rgba(128, 128, 128, 0.16); }
+.st-key-chat_rail [class*="st-key-chat_sel_"] { min-width: 0; flex: 1 1 0; width: auto; }
+.st-key-chat_rail [class*="st-key-chat_row_"] > div:not([class*="st-key-chat_sel_"]) { flex: 0 0 auto; width: auto; }
+.st-key-chat_rail [class*="st-key-chat_sel_"] button { width: 100%; justify-content: flex-start; border: 0; background: transparent; padding: 0.4rem 0.6rem; min-height: 2.25rem; }
+.st-key-chat_rail [class*="st-key-chat_sel_"] button > div { justify-content: flex-start; min-width: 0; }
+.st-key-chat_rail [class*="st-key-chat_sel_"] button p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; font-size: 0.9rem; }
+.st-key-chat_rail [class*="st-key-chat_sel_"] [data-testid="stBaseButton-secondary"] p { font-weight: 600; }
+.st-key-chat_rail [class*="st-key-chat_row_"] button:hover, .st-key-chat_rail [class*="st-key-chat_row_"] button:hover p, .st-key-chat_rail [class*="st-key-chat_rename_row_"] button:hover { color: inherit; }
+.st-key-chat_rail [data-testid="stMarkdownContainer"]:has(.sf-rail-label) { margin-bottom: 0.35rem; }
+.st-key-chat_rail [class*="st-key-chat_row_"] [data-testid="stCaptionContainer"] { white-space: nowrap; font-size: 0.72rem; opacity: 0.6; padding-right: 0.35rem; }
+.st-key-chat_rail [class*="st-key-chat_edit_"], .st-key-chat_rail [class*="st-key-chat_del_"] { display: none; }
+.st-key-chat_rail [class*="st-key-chat_row_"]:hover [class*="st-key-chat_edit_"], .st-key-chat_rail [class*="st-key-chat_row_"]:hover [class*="st-key-chat_del_"] { display: block; }
+.st-key-chat_rail [class*="st-key-chat_row_"]:hover [data-testid="stCaptionContainer"] { display: none; }
+.st-key-chat_rail [class*="st-key-chat_edit_"] button, .st-key-chat_rail [class*="st-key-chat_del_"] button { padding: 0.2rem 0.3rem; min-height: 1.8rem; opacity: 0.65; }
+.st-key-chat_rail [class*="st-key-chat_edit_"] button:hover, .st-key-chat_rail [class*="st-key-chat_del_"] button:hover { opacity: 1; }
+.st-key-chat_rail [class*="st-key-chat_rename_row_"] { padding: 0.3rem; flex-wrap: nowrap; }
+@media (hover: none) {
+  .st-key-chat_rail [class*="st-key-chat_edit_"], .st-key-chat_rail [class*="st-key-chat_del_"] { display: block; }
+  .st-key-chat_rail [class*="st-key-chat_row_"] [data-testid="stCaptionContainer"] { display: none; }
+}
 </style>"""
 
 # Slash-format Material icons for the chat page avatars (colon format raises StreamlitAPIException).
 CHAT_AVATARS = {"user": ":material/person:", "assistant": ":material/auto_awesome:"}
-
-
-def theme_css(mode: str) -> str:
-    """CSS override for an explicit mode; "auto" follows the Streamlit base theme (no override)."""
-    if mode == "dark":
-        return DARK_CSS
-    if mode == "light":
-        return LIGHT_CSS
-    return ""
-
-
-def effective_theme(sel: str, launch: str) -> str:
-    """The palette actually shown: an explicit choice wins, "auto" follows what the CLI launched."""
-    return "dark" if sel == "dark" or (sel == "auto" and launch == "dark") else "light"
-
-
-def apply_chart_theme(mode: str) -> None:
-    """Match the Altair chart theme to the palette; an unknown theme name must never break the page.
-
-    Uses the modern ``alt.theme`` API (Altair >= 5.5, no deprecation warning). On older Altair there
-    is no safe global switch, so this is a no-op and every chart is styled per-chart by theme_chart().
-    """
-    name = "dark" if mode == "dark" else "default"
-    try:
-        if hasattr(alt, "theme") and hasattr(alt.theme, "enable"):   # Altair >= 5.5
-            alt.theme.enable(name)
-    except Exception:  # noqa: BLE001 - chart styling is decoration
-        pass
-
-
-def theme_chart(chart, mode: str):
-    """Per-chart dark styling so charts follow the palette even without the global Altair theme.
-
-    Light mode returns the chart untouched (the default light theme applies); dark mode layers
-    axis/legend/title/view colours from the dark palette on top of the chart's own config.
-    """
-    if mode != "dark":
-        return chart  # default light theme
-    return (chart.configure_view(strokeWidth=0)
-                 .configure_axis(labelColor="#fafafa", titleColor="#fafafa", gridColor="#262730")
-                 .configure_legend(labelColor="#fafafa", titleColor="#fafafa")
-                 .configure_title(color="#fafafa"))
 
 
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
@@ -218,23 +203,12 @@ db_path = os.environ.get("SWARMFORGE_DB") or (str(cfg.db_path) if cfg else
 store = get_store(db_path)
 vault = Vault(cfg.vault_path) if cfg else None
 
-# theme: the persisted choice wins, else what `swarmforge dashboard --theme` launched with
-if "theme_mode" not in st.session_state:
-    saved = store.kv_get(THEME_KEY)
-    st.session_state["theme_mode"] = saved if saved in THEME_CHOICES else (
-        LAUNCH_THEME if LAUNCH_THEME in THEME_CHOICES else "auto")
-theme_mode = st.session_state.get("theme_mode") or LAUNCH_THEME
-eff_theme = effective_theme(theme_mode, LAUNCH_THEME)
-apply_chart_theme(eff_theme)
-css = theme_css(theme_mode)
-st.session_state["theme_css"] = css  # the active override, inspectable in tests
-if css:  # one keyed element: toggling modes replaces the previous block wholesale, never stacks
-    try:
-        st.markdown(css, key="sf_theme_css", unsafe_allow_html=True)
-    except TypeError:  # Streamlit without keyed markdown: one plain element still replaces the old block
-        st.markdown(css, unsafe_allow_html=True)
-# Chat bubble geometry is theme-neutral (no colours), so it is injected on every render, even in
-# auto mode; keyed so reruns replace the element wholesale, same pattern as sf_theme_css.
+# theme: `swarmforge dashboard --theme dark|light` is the starting theme for a browser that has not
+# picked one (Streamlit remembers each browser's own choice); the sidebar buttons switch it later.
+if LAUNCH_THEME in ("light", "dark") and not st.session_state.get("_theme_default_sent"):
+    st.session_state["_theme_default_sent"] = True
+    components.html(theme_switch_js(LAUNCH_THEME.title(), only_if_unset=True), height=0)
+# Chat bubble styling (see-through tints, so it suits both themes); keyed so reruns replace it.
 try:
     st.markdown(CHAT_CSS, key="sf_chat_css", unsafe_allow_html=True)
 except TypeError:  # Streamlit without keyed markdown: one plain element still replaces the old block
@@ -314,14 +288,6 @@ if "goto" in st.session_state:  # navigation requested by a button on the previo
     st.session_state.page = st.session_state.pop("goto")
 page = st.session_state.page
 pending_all = store.pending_approvals()
-
-
-def _theme_changed() -> None:
-    """Persist the sidebar Theme choice so it survives restarts and other browser sessions."""
-    value = st.session_state.get("theme_mode")
-    if value in THEME_CHOICES and value != store.kv_get(THEME_KEY):
-        store.kv_set(THEME_KEY, value)
-    st.rerun(scope="app")
 
 
 def _nav_badges() -> dict:
@@ -445,9 +411,14 @@ with st.sidebar:
     st.divider()
     auto = st.toggle("Live refresh (3 s)", value=os.environ.get("SWARMFORGE_DASH_AUTOREFRESH", "1") == "1",
                      help="Refreshes the Work list and the open task while something is running.")
-    st.segmented_control("Theme", list(THEME_CHOICES), key="theme_mode",
-                         default=LAUNCH_THEME if "theme_mode" not in st.session_state else None,
-                         on_change=_theme_changed, help="Dark mode for the whole dashboard")
+    st.segmented_control(
+        "Theme", ["Light", "Dark", "System"], key="theme_pick", width="stretch",
+        format_func=lambda c: "Auto" if c == "System" else c,
+        on_change=lambda: st.session_state.update(_theme_pick=st.session_state.get("theme_pick")),
+        help="Streamlit's own light/dark switch (also in the ⋮ menu, top right): it restyles everything, "
+             "tables and charts included, and this browser remembers it. Auto follows your computer.")
+    if st.session_state.get("_theme_pick"):
+        components.html(theme_switch_js(st.session_state.pop("_theme_pick")), height=0)
     update_box()
     if cfg:
         with st.expander("Setup", icon=":material/settings:"):
@@ -845,6 +816,50 @@ def _explain_card(run: dict, events: list[dict], run_id: str) -> None:
             st.rerun()
 
 
+def render_screenshots(run: dict, findings: list[dict], events: list[dict]) -> None:
+    """The app as SwarmForge saw it after each test run (light + dark), with the vision model's notes."""
+    from swarmforge.report import visual_shots
+    shots = visual_shots(run)
+    if not shots:
+        st.caption("No screenshots for this run. SwarmForge takes them when the repository's "
+                   "swarmforge.project.yml has a `preview:` section (how to start the app and which pages "
+                   "to open) and the change touches the files it watches.")
+        return
+    summaries = {}
+    for e in events:
+        if e["kind"] == "visual" and e.get("data"):
+            try:
+                d = json.loads(e["data"]) if isinstance(e["data"], str) else e["data"]
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(d, dict) and d.get("summary"):
+                summaries[d.get("cycle")] = d["summary"]
+    by_cycle: dict[int, dict[str, dict[str, Path]]] = {}
+    for p in shots:
+        m = re.fullmatch(r"c(\d+)-(.+)-(light|dark)\.png", p.name)
+        if m:
+            by_cycle.setdefault(int(m.group(1)), {}).setdefault(m.group(2), {})[m.group(3)] = p
+    cycles = sorted(by_cycle, reverse=True)
+    pick = st.selectbox("Test run", cycles, format_func=lambda c: f"cycle {c}" + (" (latest)" if c == cycles[0] else ""),
+                        key=f"shots_cycle_{run['id']}") if len(cycles) > 1 else cycles[0]
+    if summaries.get(pick):
+        st.info(f"👁 Vision review: {summaries[pick]}")
+    vf = [f for f in findings if f["source"] == "visual" and f["cycle"] == pick]
+    if vf:
+        order = {"critical": 0, "major": 1, "minor": 2, "info": 3}
+        for f in sorted(vf, key=lambda f: order.get(f["severity"], 9)):
+            icon = {"critical": "🔴", "major": "🟠", "minor": "🟡"}.get(f["severity"], "⚪")
+            st.markdown(f"{icon} **{f['title']}** · `{f['file']}`  \n{f['description'] or ''}"
+                        + (f"  \n*Fix:* {f['recommendation']}" if f["recommendation"] else ""))
+    elif summaries.get(pick):
+        st.caption("No visual problems reported.")
+    for page, themes in sorted(by_cycle[pick].items()):
+        st.markdown(f"**{page}**")
+        cols = st.columns(len(themes))
+        for col, theme in zip(cols, [t for t in ("light", "dark") if t in themes]):
+            col.image(str(themes[theme]), caption=f"{page} · {theme}", width="stretch")
+
+
 def run_detail(run_id, header=True):
     run = store.get_run(run_id)
     tasks = store.tasks(run_id)
@@ -922,7 +937,7 @@ def run_detail(run_id, header=True):
     fixes = visited.count("FIX_REQUIRED")
     st.markdown(" → ".join(chips) + (f"  ·  FIX_REQUIRED ×{fixes}" if fixes else ""))
 
-    tabs = st.tabs(["🧭 Delegation", "🤖 Agents & timeline", "💬 Transcripts", "🧪 Tests", "🔍 Review",
+    tabs = st.tabs(["🧭 Delegation", "🤖 Agents & timeline", "💬 Transcripts", "🧪 Tests", "🔍 Review", "🖼 Screenshots",
                     "📚 Knowledge", "💰 Tokens & cost", "🖥 Console", "📜 Events"])
 
     with tabs[0]:
@@ -983,7 +998,7 @@ def run_detail(run_id, header=True):
                 x=alt.X("start:T", title=None), x2="end:T", y=alt.Y("task:N", sort=None, title=None),
                 color=alt.Color("model:N"), tooltip=["task", "model", "state", "start", "end"]
             ).properties(height=36 * len(rows) + 40)
-            st.altair_chart(theme_chart(ch, eff_theme), width="stretch")
+            st.altair_chart(ch, width="stretch")
         st.dataframe(pd.DataFrame([{
             "task": t["task_key"], "cycle": t["cycle"], "kind": t["kind"], "title": t["title"], "role": t["role"],
             "model": t["model"], "depends_on": ", ".join(t["depends_on"]), "state": t["state"],
@@ -1032,6 +1047,9 @@ def run_detail(run_id, header=True):
             st.caption("None.")
 
     with tabs[5]:
+        render_screenshots(run, findings, events)
+
+    with tabs[6]:
         kev = [e for e in events if e["kind"] == "knowledge"]
         if not kev:
             st.caption("No knowledge activity yet (notes are retrieved before planning and written after the run).")
@@ -1045,32 +1063,30 @@ def run_detail(run_id, header=True):
                         with st.expander(f"[{n.type}] {n.title}"):
                             st.markdown(wikilinks_to_md(n.body))
 
-    with tabs[6]:
+    with tabs[7]:
         st.markdown(f"Provider-reported: **${cost['measured']:.4f}** · estimated: **${cost['estimated']:.4f}** · "
                     f"calls without cost info: **{cost['unavailable_calls'] or 0}**")
         br = pd.DataFrame(store.cost_by_role(run_id))
         if not br.empty:
             st.dataframe(br, width="stretch", hide_index=True)
-            st.altair_chart(theme_chart(alt.Chart(br).mark_bar().encode(
-                x=alt.X("cost_usd:Q", title="USD"), y=alt.Y("role:N", sort="-x"), tooltip=list(br.columns)),
-                eff_theme), width="stretch")
+            st.altair_chart(alt.Chart(br).mark_bar().encode(
+                x=alt.X("cost_usd:Q", title="USD"), y=alt.Y("role:N", sort="-x"), tooltip=list(br.columns)), width="stretch")
         calls = store.llm_calls(run_id)
         if calls:
             cdf = pd.DataFrame(calls)
             cdf["t"] = pd.to_datetime(cdf["ended_at"], unit="s")
             cdf["cumulative_cost"] = cdf["cost_usd"].fillna(0).cumsum()
-            st.altair_chart(theme_chart(alt.Chart(cdf).mark_line(point=True).encode(
-                x=alt.X("t:T", title=None), y=alt.Y("cumulative_cost:Q", title="cumulative USD")),
-                eff_theme), width="stretch")
+            st.altair_chart(alt.Chart(cdf).mark_line(point=True).encode(
+                x=alt.X("t:T", title=None), y=alt.Y("cumulative_cost:Q", title="cumulative USD")), width="stretch")
 
-    with tabs[7]:
+    with tabs[8]:
         log = cfg.workdir / "logs" / f"{run_id}.log" if cfg else None
         if log and log.is_file():
             st.code(log.read_text(encoding="utf-8", errors="replace")[-20000:], language=None)
         else:
             st.caption("No console log (this run was started from the command line).")
 
-    with tabs[8]:
+    with tabs[9]:
         kinds = sorted({e["kind"] for e in events})
         pick = st.multiselect("Kinds", kinds, default=kinds)
         rows = [{"time": fmt_ts(e["ts"]), "level": e["level"], "kind": e["kind"], "task": e["task_key"] or "",
@@ -1981,9 +1997,9 @@ def page_failures():
     m[1].metric("Fixed themselves", fixed)
     m[2].metric("Need you", needs)
     chart = pd.DataFrame({"cause": [CATEGORIES.get(c, c) for c in cats.index], "failures": cats.values})
-    st.altair_chart(theme_chart(alt.Chart(chart).mark_bar(color="#e45756").encode(
+    st.altair_chart(alt.Chart(chart).mark_bar(color="#e45756").encode(
         x=alt.X("failures:Q", title=None, axis=alt.Axis(tickMinStep=1)), y=alt.Y("cause:N", sort="-x", title=None),
-        tooltip=["cause", "failures"]).properties(height=max(60, 28 * len(chart))), eff_theme), width="stretch")
+        tooltip=["cause", "failures"]).properties(height=max(60, 28 * len(chart))), width="stretch")
     pick = st.multiselect("Cause", list(cats.index), format_func=lambda c: CATEGORIES.get(c, c), key="f_cat",
                           placeholder="All causes")
     shown = [f for f in fails if not pick or f["category"] in pick]
@@ -2252,69 +2268,94 @@ def _render_chat_attachments(atts):
             continue
 
 
+_UNESCAPED_DOLLAR = re.compile(r"(?<!\\)\$")
+
+
+def _chat_md(text: str) -> str:
+    """Escape bare $ so Streamlit markdown doesn't read "$0.15 ... $0.80" as a LaTeX formula."""
+    return _UNESCAPED_DOLLAR.sub(r"\\$", text or "")
+
+
+def _chat_rail(active_id: str, chatbot) -> dict:
+    """Claude-style conversation list. Returns which rail control (if any) was clicked this pass."""
+    clicked = dict.fromkeys(("new", "sel", "edit", "del", "save", "cancel"))
+    with st.container(key="chat_rail"):
+        clicked["new"] = st.button("New chat", icon=":material/add:", key="chat_new", width="stretch")
+        st.markdown('<div class="sf-rail-label">Recents</div>', unsafe_allow_html=True)
+        renaming = st.session_state.get("chat_renaming")
+        for c in chatbot.list_conversations(store):
+            cid = c["id"]
+            if renaming == cid:
+                with st.container(key=f"chat_rename_row_{cid}", horizontal=True, vertical_alignment="center",
+                                  gap="xxsmall"):
+                    st.text_input("Rename", value=c["title"], key=f"chat_rename_{cid}",
+                                  label_visibility="collapsed")
+                    if st.button("", icon=":material/check:", key=f"chat_rename_save_{cid}", type="tertiary",
+                                 help="Save"):
+                        clicked["save"] = cid
+                    if st.button("", icon=":material/close:", key=f"chat_rename_cancel_{cid}", type="tertiary",
+                                 help="Cancel"):
+                        clicked["cancel"] = cid
+                continue
+            active = cid == active_id
+            with st.container(key=f"chat_row_{cid}", horizontal=True, vertical_alignment="center", gap=None):
+                if st.button(c["title"], key=f"chat_sel_{cid}", type="secondary" if active else "tertiary"):
+                    clicked["sel"] = cid
+                st.caption(_chat_rel_time(c["updated_at"]))
+                if st.button("", icon=":material/edit:", key=f"chat_edit_{cid}", type="tertiary", help="Rename"):
+                    clicked["edit"] = cid
+                if st.button("", icon=":material/delete:", key=f"chat_del_{cid}", type="tertiary", help="Delete"):
+                    clicked["del"] = cid
+    return clicked
+
+
 def page_chat():
     if cfg is None:
         st.error("Configuration not loaded; the chatbot needs a configured model role.")
         return
     from swarmforge import chatbot
-    st.header("Chat: improve SwarmForge and fix failed tasks")
-    st.caption("Ask about runs and statuses, ask what to improve, or review failed tasks. Suggestions come with "
-               "buttons: launch tasks in one click, or pick (or write) how a failed task should be fixed. "
-               "Answers use the run store, failures, lessons in the knowledge base and the platform's own code "
-               "layout. CLI: `swarmforge ask \"…\"`.")
-    active_id = _chat_conv_id()
-    rail, main = st.columns([1, 3])
+    page = st.container(key="chat_page")
+    with page:
+        st.header("Chat: improve SwarmForge and fix failed tasks")
+        st.caption("Ask about runs, failures and what to improve. Suggestions come with buttons to launch tasks "
+                   "or pick how a failed task should be fixed. CLI: `swarmforge ask \"…\"`.")
+        active_id = _chat_conv_id()
+        rail, main = page.columns([1, 3.2], gap="large")
 
     # ------------------------------------------------ conversation rail (left)
     with rail:
-        new_clicked = st.button("+ New chat", key="chat_new")
-        renaming = st.session_state.get("chat_renaming")
-        sel_clicked = edit_clicked = del_clicked = None
-        save_clicked = cancel_clicked = None
-        for c in chatbot.list_conversations(store):
-            if renaming == c["id"]:
-                st.text_input("Rename", value=c["title"], key=f"chat_rename_{c['id']}")
-                save_clicked = c["id"] if st.button("Save", key=f"chat_rename_save_{c['id']}") else save_clicked
-                cancel_clicked = c["id"] if st.button("Cancel", key=f"chat_rename_cancel_{c['id']}") \
-                    else cancel_clicked
-                continue
-            label = ("● " if c["id"] == active_id else "") + c["title"]
-            sel_clicked = c["id"] if st.button(label, key=f"chat_sel_{c['id']}") else sel_clicked
-            st.caption(_chat_rel_time(c["updated_at"]))
-            edit_clicked = c["id"] if st.button("✎", key=f"chat_edit_{c['id']}") else edit_clicked
-            del_clicked = c["id"] if st.button("🗑", key=f"chat_del_{c['id']}") else del_clicked
+        clicked = _chat_rail(active_id, chatbot)
 
     # rail clicks are handled before the transcript renders; each one reruns
-    if new_clicked:
+    if clicked["new"]:
         conv = chatbot.create_conversation(store, "New chat")
         st.session_state.chat_conv_id = conv["id"]
         st.session_state.pop("chat_done", None)
-        st.session_state.pop("chat_done", None)
         st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
         st.rerun()
+    if clicked["sel"] and clicked["sel"] != active_id:
+        st.session_state.chat_conv_id = clicked["sel"]
         st.rerun()
-    if sel_clicked and sel_clicked != active_id:
-        st.session_state.chat_conv_id = sel_clicked
+    if clicked["edit"]:
+        st.session_state.chat_renaming = clicked["edit"]
         st.rerun()
-    if edit_clicked:
-        st.session_state.chat_renaming = edit_clicked
-        st.rerun()
-    if cancel_clicked:
+    if clicked["cancel"]:
         st.session_state.pop("chat_renaming", None)
         st.rerun()
-    if save_clicked:
+    if clicked["save"]:
         convs = {c["id"]: c for c in chatbot.list_conversations(store)}
-        c = convs.get(save_clicked)
+        c = convs.get(clicked["save"])
         if c:
-            txt = st.session_state.get(f"chat_rename_{save_clicked}") or ""
-            chatbot.rename_conversation(store, save_clicked, txt.strip() or c["title"])
+            txt = st.session_state.get(f"chat_rename_{clicked['save']}") or ""
+            chatbot.rename_conversation(store, clicked["save"], txt.strip() or c["title"])
         st.session_state.pop("chat_renaming", None)
         st.rerun()
-    if del_clicked:
-        chatbot.delete_conversation(store, del_clicked)
-        if st.session_state.get("chat_renaming") == del_clicked:
+    if clicked["del"]:
+        del_id = clicked["del"]
+        chatbot.delete_conversation(store, del_id)
+        if st.session_state.get("chat_renaming") == del_id:
             st.session_state.pop("chat_renaming", None)
-        if active_id == del_clicked:
+        if active_id == del_id:
             rest = chatbot.list_conversations(store)
             st.session_state.chat_conv_id = (rest[0]["id"] if rest
                                              else chatbot.ensure_default_conversation(store)["id"])
@@ -2323,15 +2364,13 @@ def page_chat():
     # ------------------------------------------------ transcript (right)
     history, actions = _chat_load(active_id)
     needs = chatbot.failures_needing_attention(store)
-    with main:
-        q1, q2, q3, q4 = st.columns([1.4, 1.4, 1.5, 0.8])
-        pending = None
-        for col, key, (label, prompt_text) in zip((q1, q2, q3), ("improve", "failures", "slow"),
-                                                  QUICK_PROMPTS.items()):
-            lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
-            if col.button(lab, key="chat_q_" + key, width="stretch"):
-                pending = prompt_text
-        if q4.button("Reset conversation", key="chat_reset"):
+    active_conv = chatbot.get_conversation(store, active_id) or {}
+    with main, st.container(key="chat_main"):
+        with st.container(key="chat_topbar", horizontal=True, vertical_alignment="center"):
+            st.markdown(active_conv.get("title") or "New chat", width="stretch")
+            reset = st.button("Clear", icon=":material/restart_alt:", key="chat_reset", type="tertiary",
+                              help="Remove every message in this conversation")
+        if reset:
             chatbot.clear_messages(store, active_id)
             store.kv_set(_chat_actions_key(active_id), None)
             history.clear()
@@ -2339,8 +2378,29 @@ def page_chat():
             st.session_state.pop("chat_done", None)
             st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
             _chat_save(actions, active_id)
-        if needs and not history:
-            st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. Press **Review my failed tasks**.")
+        if not history:
+            with st.container(key="chat_empty"):
+                st.markdown("### What should we look at?")
+                st.markdown("Runs and their statuses, failed tasks, cost and speed, or what to build next.")
+            if needs:
+                st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
+                        "Press **Review my failed tasks**.")
+        for n, m in enumerate(history):
+            with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
+                if m["role"] == "assistant":
+                    st.markdown(_chat_md(m["content"]))
+                    render_message_actions(n, actions.get(n))
+                else:
+                    st.write(m["content"])
+                _render_chat_attachments(m.get("attachments"))
+        live = st.container()  # the new exchange renders here, above the chips and the input
+        pending = None
+        with st.container(key="chat_chips", horizontal=True, horizontal_alignment="center" if not history
+                          else "left", gap="small"):
+            for key, (label, prompt_text) in zip(("improve", "failures", "slow"), QUICK_PROMPTS.items()):
+                lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
+                if st.button(lab, key="chat_q_" + key):
+                    pending = prompt_text
         try:
             from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
             uploaded = st.file_uploader(
@@ -2352,14 +2412,6 @@ def page_chat():
             )
         except Exception:
             uploaded = None
-        for n, m in enumerate(history):
-            with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
-                if m["role"] == "assistant":
-                    st.markdown(m["content"])
-                    render_message_actions(n, actions.get(n))
-                else:
-                    st.write(m["content"])
-                _render_chat_attachments(m.get("attachments"))
         typed = st.chat_input("Ask about runs, failures, or what to improve…")
     prompt = typed or pending
     if not prompt:
@@ -2370,31 +2422,32 @@ def page_chat():
         msg["attachments"] = att_meta
     history.append(msg)
     chatbot.add_message(store, active_id, "user", prompt)
-    with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
-        st.write(prompt)
-        _render_chat_attachments(att_meta)
-    conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
-    kwargs = {"history": history[:-1], "conversation": conv}
-    if att_paths:
-        kwargs["attachments"] = att_paths
-    try:
-        with st.spinner("Thinking…"):
-            res = chatbot.ask(cfg, store, prompt, **kwargs)
-    except chatbot.ChatError as e:
-        st.error(f"Chatbot: {e}")
+    with live:
+        with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
+            st.write(prompt)
+            _render_chat_attachments(att_meta)
+        conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
+        kwargs = {"history": history[:-1], "conversation": conv}
+        if att_paths:
+            kwargs["attachments"] = att_paths
+        try:
+            with st.spinner("Thinking…"):
+                res = chatbot.ask(cfg, store, prompt, **kwargs)
+        except chatbot.ChatError as e:
+            st.error(f"Chatbot: {e}")
+            _chat_save(actions, active_id)
+            return
+        history.append({"role": "assistant", "content": res["answer"]})
+        chatbot.add_message(store, active_id, "assistant", res["answer"])
+        if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
+            actions[len(history) - 1] = res["actions"]
         _chat_save(actions, active_id)
-        return
-    history.append({"role": "assistant", "content": res["answer"]})
-    chatbot.add_message(store, active_id, "assistant", res["answer"])
-    if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
-        actions[len(history) - 1] = res["actions"]
-    _chat_save(actions, active_id)
-    with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
-        st.markdown(res["answer"])
-        st.caption(f"answered by **{res['role']}** · `{res['model']}`")
-        st.caption(f"conversation {res.get('conversation', conv)} · "
-                   f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
-        render_message_actions(len(history) - 1, actions.get(len(history) - 1))
+        with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
+            st.markdown(_chat_md(res["answer"]))
+            st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
+                       f"conversation {res.get('conversation', conv)} · "
+                       f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
+            render_message_actions(len(history) - 1, actions.get(len(history) - 1))
 
 
 # ============================================================ NEW TASK page
@@ -2524,11 +2577,11 @@ def page_speed():
                           "order": mx.PHASES.index(p), "started": r["started"]}
                          for r in rows for p in mx.PHASES if r[f"{p}_min"] > 0.05])
     runs_order = [f"{r['title'][:38]} · {r['run_id'][-6:]}" for r in rows]
-    st.altair_chart(theme_chart(alt.Chart(long).mark_bar().encode(
+    st.altair_chart(alt.Chart(long).mark_bar().encode(
         x=alt.X("sum(minutes):Q", title="minutes"), y=alt.Y("run:N", sort=runs_order, title=None),
         color=alt.Color("phase:N", sort=mx.PHASES, scale=alt.Scale(domain=mx.PHASES)),
         order=alt.Order("order:Q"), tooltip=["run", "phase", alt.Tooltip("minutes:Q", format=".1f")]
-    ).properties(height=max(120, 26 * len(rows))), eff_theme), width="stretch")
+    ).properties(height=max(120, 26 * len(rows))), width="stretch")
     med = pd.DataFrame([{"phase": p, "median minutes": summ.get(f"{p}_min") or 0, "what it is": mx.PHASE_HELP[p]}
                         for p in mx.PHASES])
     st.dataframe(med, hide_index=True, width="stretch",
@@ -2581,6 +2634,59 @@ def page_benchmarks():
 
 
 # ======================================================== PULL REQUESTS page
+def auto_merge_panel(gh) -> None:
+    """What auto-merge did (merged / waiting for you, and why), with one-click revert of a merge."""
+    from swarmforge import automerge as am
+    from swarmforge.github import GitHubError
+    amc = cfg.auto_merge
+    rows = store._all("SELECT * FROM interventions WHERE kind IN (?, ?, ?) ORDER BY id DESC LIMIT 25",
+                      (am.MERGED, am.HELD, "auto_merge_reverted"))
+    reverted = {json.loads(r["detail"]).get("url") for r in rows if r["kind"] == "auto_merge_reverted"}
+    where = ", ".join(amc.repos) if amc.repos else "every repository"
+    title = (f"🤖 Auto-merge: **on** for {where} · up to {amc.max_lines} lines merge straight away, larger ones "
+             f"(up to {amc.judge_max_lines}) if the {amc.judge_role} model approves" if amc.enabled
+             else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
+    with st.expander(title, expanded=bool(amc.enabled and rows)):
+        st.caption("Never merged automatically: unresolved [major] findings, conflicts, failing checks, and files "
+                   "the repository protects (`protected_paths` in swarmforge.project.yml). SwarmForge doesn't "
+                   "restart after an auto-merge; the new code arrives with your next Update & restart.")
+        flash = st.session_state.pop("am_flash", None)
+        if flash:
+            (st.success if flash[0] else st.error)(flash[1])
+        shown = [r for r in rows if r["kind"] != "auto_merge_reverted"]
+        if not shown:
+            st.caption("No auto-merge decisions yet.")
+        for r in shown:
+            try:
+                d = json.loads(r["detail"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            merged = r["kind"] == am.MERGED
+            url = d.get("url", "")
+            icon = ("↩️ reverted" if url in reverted else "✅ merged") if merged else "⏸ waiting for you"
+            c1, c2 = st.columns([6, 1.3])
+            c1.markdown(f"**{icon}** · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
+                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "") + f"  \n{d.get('reason', '')}")
+            if merged and url not in reverted and d.get("number"):
+                key = f"am_rev_{r['id']}"
+                if st.session_state.get(key + "_ask"):
+                    if c2.button("Confirm revert", key=key + "_yes", type="primary"):
+                        try:
+                            rev = am.revert(gh, d["repo"], int(d["number"]), cfg.auto_merge.method)
+                            store.record_intervention(r["run_id"], "auto_merge_reverted",
+                                                      json.dumps({"url": url, "revert_url": rev}))
+                            st.session_state.am_flash = (True, f"Reverted: {rev} is merged. Update & restart to "
+                                                               "pick up the change.")
+                        except (GitHubError, Exception) as e:  # noqa: BLE001
+                            st.session_state.am_flash = (False, f"Could not revert {url}: {e}")
+                        st.session_state.pop(key + "_ask", None)
+                        st.session_state.pop("pr_cache", None)
+                        st.rerun()
+                elif c2.button("↩ Revert", key=key, help="GitHub creates a revert PR and it is merged at once"):
+                    st.session_state[key + "_ask"] = True
+                    st.rerun()
+
+
 def page_prs():
     from swarmforge import prs as P
     from swarmforge import selfupdate as su
@@ -2630,6 +2736,7 @@ def page_prs():
                 if st.button("⬆️ Update & restart SwarmForge now", type="primary", key="pr_update"):
                     st.session_state.upd_status = None
                     do_update_and_restart()
+    auto_merge_panel(gh)
     if not all_prs:
         st.success("No open pull requests. 🎉")
         return

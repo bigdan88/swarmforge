@@ -49,14 +49,17 @@ def test_dashboard_theme_default_auto(tmp_path, monkeypatch):
     assert "--server.headless" in cmd and "--client.toolbarMode" in cmd
 
 
-def test_dashboard_theme_dark(tmp_path, monkeypatch):
+def test_dashboard_theme_dark_is_only_a_starting_theme(tmp_path, monkeypatch):
     calls = _capture(monkeypatch)
     rc = cmd_dashboard(_ns(theme="dark", port=8600), _cfg(tmp_path, monkeypatch))
     assert rc == 0
     cmd, env = calls[0]
-    assert cmd[cmd.index("--theme.base") + 1] == "dark"
+    # a forced base theme removes Streamlit's own light/dark switch, so it is never passed
+    assert "--theme.base" not in cmd
     assert env["SWARMFORGE_DASH_THEME"] == "dark"
     assert cmd[cmd.index("--server.port") + 1] == "8600"
+    # "minimal" would hide the ⋮ menu and with it the theme switch
+    assert cmd[cmd.index("--client.toolbarMode") + 1] == "viewer"
 
 
 def test_dashboard_theme_missing_attr_defaults_auto(tmp_path, monkeypatch):

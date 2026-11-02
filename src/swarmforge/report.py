@@ -7,6 +7,19 @@ from pathlib import Path
 
 
 
+def blocks(f: dict, run: dict) -> bool:
+    """Did this finding block approval? Visual findings only block when critical."""
+    if f.get("source") == "visual":
+        return f["severity"] == "critical"
+    return f["severity"] in blocking_severities(run)
+
+
+def visual_shots(run: dict) -> list[Path]:
+    """Screenshots SwarmForge took of the app during the run (newest cycle last)."""
+    d = Path(run.get("run_dir") or "") / "artifacts" / "visual"
+    return sorted(d.glob("*.png")) if run.get("run_dir") and d.is_dir() else []
+
+
 def blocking_severities(run: dict) -> set[str]:
     """The severities that blocked approval for this run (from its config snapshot)."""
     try:
@@ -167,8 +180,7 @@ def build_report(store, run_id: str) -> str:
     unv = [a for a in acc if a["status"] != "satisfied" and a["cycle"] == max((x["cycle"] for x in acc), default=0)]
     for a in unv:
         lim.append(f"Acceptance criterion {a['criterion_id']} is {a['status']}: {a['evidence']}")
-    block = blocking_severities(run)
-    open_nb = [f for f in findings if f["severity"] not in block and f["severity"] != "info"
+    open_nb = [f for f in findings if not blocks(f, run) and f["severity"] != "info"
                and f["cycle"] == run["repair_cycle"]]
     if open_nb:
         sev = ", ".join(sorted({f["severity"] for f in open_nb}))
@@ -224,14 +236,19 @@ def build_pr_body(store, run_id: str) -> str:
     L += ["", "## Review", ""]
     cur = [f for f in findings if f["cycle"] == run["repair_cycle"]]
     L += [f"- Findings in final review: {len(cur)} "
-          f"({sum(1 for f in cur if f['severity'] in blocking_severities(run))} blocking)",
+          f"({sum(1 for f in cur if blocks(f, run))} blocking)",
           f"- Repair cycles: {run['repair_cycle']}", ""]
     order = {"critical": 0, "major": 1, "minor": 2, "info": 3}
-    nonblocking = sorted((f for f in cur if f["severity"] not in blocking_severities(run)),
+    nonblocking = sorted((f for f in cur if not blocks(f, run)),
                          key=lambda f: order.get(f["severity"], 9))
     if nonblocking:
         L += ["### Known limitations (non-blocking findings — please check these)"] + [
-            f"- **[{f['severity']}]** `{f['file']}`: {f['title']}" for f in nonblocking[:20]] + [""]
+            f"- **[{f['severity']}]**{' 👁 visual' if f.get('source') == 'visual' else ''} `{f['file']}`: "
+            f"{f['title']}" for f in nonblocking[:20]] + [""]
+    shots = visual_shots(run)
+    if shots:
+        L += [f"- Screenshots: {len(shots)} (light + dark) taken by SwarmForge and reviewed by a vision model; "
+              "see the run's **Screenshots** tab in the dashboard.", ""]
     L += ["## Cost & supervision", ""] + cost_lines(store, run_id)
     L += [f"- Human interventions: {len(inter)}", "", f"Run id: `{run_id}`"]
     body = "\n".join(L)
@@ -370,7 +387,7 @@ def build_summary(store, run_id: str, *, lessons: bool = True) -> str:
         L += [f"  - {a['criterion_id']} {a['status']}: {a['text'][:120]}" for a in cur if a["status"] != "satisfied"]
     cur_f = [f for f in findings if f["cycle"] == run["repair_cycle"] and f["source"] == "reviewer"]
     if cur_f or run["repair_cycle"]:
-        blocking = sum(1 for f in cur_f if f["severity"] in blocking_severities(run))
+        blocking = sum(1 for f in cur_f if blocks(f, run))
         L.append(f"- **Review:** {len(cur_f)} finding(s) in the final review ({blocking} blocking) after "
                  f"{run['repair_cycle']} repair cycle(s)")
     L += ["", "### What you need to do", "", next_step(store, run), ""]

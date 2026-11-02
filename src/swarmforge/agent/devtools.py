@@ -367,18 +367,23 @@ def format_browse(data: dict, max_chars: int) -> str:
     return "\n".join(L)
 
 
-async def browse(ctx: ToolContext, url: str, actions: list | None = None, screenshot: bool = False,
-                 max_chars: int = 6000, timeout_s: int = 60) -> str:
+async def browse_raw(ctx: ToolContext, url: str, *, actions: list | None = None, screenshot_name: str | None = None,
+                     color_scheme: str | None = None, viewport: dict | None = None, full_page: bool = True,
+                     timeout_s: int = 60) -> dict:
+    """Load a local page in the sandbox's headless Chromium and return the probe's raw result (text,
+    errors, controls, and `screenshot_file`: the PNG on the host when `screenshot_name` was given)."""
     if not LOCAL_URL_RE.match(url or ""):
         raise ToolError("browse only opens local apps, e.g. http://localhost:8501 (start the app with "
                         "start_process first). The sandbox has no internet access.")
     if actions is not None and not isinstance(actions, list):
         raise ToolError("actions must be a list of objects, e.g. [{\"click\": \"text=Save\"}]")
+    if screenshot_name is not None and not re.fullmatch(r"[\w.-]+/?[\w.-]*\.png", screenshot_name):
+        raise ToolError(f"bad screenshot name {screenshot_name!r}")
     s = open_session(ctx)
-    ctx.browse_count += 1
     args = {"url": url, "actions": actions or [], "timeout_ms": max(5, min(int(timeout_s or 60), 180)) * 1000,
-            "screenshot": (f"{s.artifacts_path}/browser/shot-{ctx.browse_count}.png"
-                           if screenshot and s.artifacts_path else None)}
+            "screenshot": (f"{s.artifacts_path}/{screenshot_name}" if screenshot_name and s.artifacts_path else None),
+            "color_scheme": color_scheme if color_scheme in ("light", "dark") else None,
+            "viewport": viewport or None, "full_page": full_page}
     r = await s.exec(f"{s.python} -", stdin=_browse_script(), env={"SF_BROWSE_ARGS": json.dumps(args)},
                      timeout_s=args["timeout_ms"] // 1000 + 60)
     ctx.commands_run.append({"command": f"[browse] {url}", "exit_code": r.exit_code,
@@ -396,7 +401,19 @@ async def browse(ctx: ToolContext, url: str, actions: list | None = None, screen
         if "Executable doesn't exist" in msg:
             raise ToolError(NO_BROWSER)
         raise ToolError(f"could not load {url}: {msg}")
-    if screenshot and not s.artifacts_path:
+    data["screenshot_file"] = None
+    if data.get("screenshot") and ctx.artifacts_dir is not None and screenshot_name:
+        f = Path(ctx.artifacts_dir) / screenshot_name
+        data["screenshot_file"] = str(f) if f.is_file() else None
+    return data
+
+
+async def browse(ctx: ToolContext, url: str, actions: list | None = None, screenshot: bool = False,
+                 max_chars: int = 6000, timeout_s: int = 60, color_scheme: str | None = None) -> str:
+    ctx.browse_count += 1
+    data = await browse_raw(ctx, url, actions=actions, timeout_s=timeout_s, color_scheme=color_scheme,
+                            screenshot_name=f"browser/shot-{ctx.browse_count}.png" if screenshot else None)
+    if screenshot and not open_session(ctx).artifacts_path:
         data["screenshot"] = None
     return format_browse(data, max(500, min(int(max_chars or 6000), 30000)))
 
@@ -537,6 +554,8 @@ DEV_SCHEMAS = {
         {"url": {"type": "string", "description": "e.g. http://localhost:8501"},
          "actions": {"type": "array", "items": {"type": "object"}},
          "screenshot": {"type": "boolean", "description": "also save a PNG screenshot to the run artifacts"},
+         "color_scheme": {"type": "string", "enum": ["light", "dark"],
+                          "description": "the browser's light/dark preference (pages that follow it switch theme)"},
          "max_chars": I, "timeout_s": I},
         ["url"]),
     "check_code": _fn(

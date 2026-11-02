@@ -63,6 +63,13 @@ def _fake_ask(monkeypatch, answer="**fake answer**"):
     return asked
 
 
+
+def _active(at):
+    """Key of the highlighted rail row (the active conversation renders as a 'secondary' button)."""
+    on = [b.key for b in at.button if (b.key or "").startswith("chat_sel_") and b.proto.type == "secondary"]
+    assert len(on) == 1, on
+    return on[0]
+
 def _sel_buttons(at):
     return [b for b in at.button if (b.key or "").startswith("chat_sel_")]
 
@@ -74,7 +81,7 @@ def _db_msgs(cfg, conv_id):
 
 # ------------------------------------------------------------------ AC1
 def test_ac1_rail_lists_all_conversations_most_recent_first_with_time_and_active_mark(tmp_path, monkeypatch):
-    """The rail renders every conversation, newest first, title + relative time, ● on the active one."""
+    """The rail renders every conversation, newest first, title + relative time, active one highlighted."""
     _fake_ask(monkeypatch)
     cfg, at = _app(tmp_path, monkeypatch)
     now = time.time()
@@ -96,9 +103,9 @@ def test_ac1_rail_lists_all_conversations_most_recent_first_with_time_and_active
     assert "Middle thread" in labels[f"chat_sel_{middle['id']}"]
     assert "Oldest thread" in labels[f"chat_sel_{old['id']}"]
     # the active conversation is highlighted: a fresh session activates the most recent thread
-    assert labels[f"chat_sel_{newest['id']}"].startswith("● ")
-    assert not labels[f"chat_sel_{middle['id']}"].startswith("● ")
-    assert not labels[f"chat_sel_{old['id']}"].startswith("● ")
+    assert _active(at) == f"chat_sel_{newest['id']}"
+    assert _active(at) != f"chat_sel_{middle['id']}"
+    assert _active(at) != f"chat_sel_{old['id']}"
     # relative time shown per row
     captions = [c.value for c in at.caption]
     assert "5 min ago" in captions and "1 h ago" in captions and "1 d ago" in captions
@@ -138,7 +145,7 @@ def test_ac2_new_chat_starts_empty_conversation_and_selects_it(tmp_path, monkeyp
     assert at.session_state["chat_history"] == []
     # the rail marks it active and the old transcript is gone from the page
     sels = {b.key: b.label for b in _sel_buttons(at)}
-    assert sels[f"chat_sel_{fresh[0]['id']}"].startswith("● New chat")
+    assert _active(at) == f"chat_sel_{fresh[0]['id']}" and sels[f"chat_sel_{fresh[0]['id']}"] == "New chat"
     texts = [m.value for m in at.markdown]
     assert not any("remember me" in t for t in texts)
 
@@ -282,5 +289,5 @@ def test_ac4_deleting_the_active_thread_selects_the_next_most_recent(tmp_path, m
     assert at.session_state["chat_history"] == [{"role": "user", "content": "next q"},
                                                 {"role": "assistant", "content": "next a"}]
     sels = {x.key: x.label for x in _sel_buttons(at)}
-    assert sels[f"chat_sel_{b['id']}"].startswith("● ")
+    assert _active(at) == f"chat_sel_{b['id']}"
     assert any("next a" in m.value for m in at.markdown)

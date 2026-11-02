@@ -24,12 +24,13 @@ import yaml
 from . import prompts
 from .agent.runtime import AgentResult, AgentSpec, run_agent
 from .agent.navtools import NAV_READONLY, NAV_TOOLS
-from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext
+from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext, ToolError
 from .config import Config
 from .db import Store
 from .github import GitHubClient, GitHubError, Issue, get_token, load_issue_file, parse_issue_url, push_branch
 from .deps import ensure_deps, plan_install
 from .preflight import environment_problems, sandbox_tool_warnings
+from .visual import is_blocking as is_visual_blocking
 from .repos import RepoError, _redact, auth_args, normalize_repo, preflight
 from .knowledge import NOTES_JSON_SCHEMA, Vault, render_for_prompt, validate_notes, write_distilled
 from .llm import Budget, BudgetExceeded, LLMClient, LLMError
@@ -402,6 +403,7 @@ class Orchestrator:
 
             # -------------------------------------------- review
             self.sm.transition(RunState.CODE_REVIEW)
+            self._visual_findings = await self._visual_review(cycle)
             review = await self._review(cycle, evidence)
 
             problems = self._gate(cycle, evidence, tester_report, review, failed_tasks)
@@ -820,6 +822,61 @@ class Orchestrator:
                                    timed_out=int(ev.timed_out))
 
     # ================================================================== review
+    async def _visual_review(self, cycle: int) -> list[dict]:
+        """Screenshots of the app (light + dark) and a vision model's look at them. Never fails the run
+        by itself: a preview that won't start or a model error is logged and skipped."""
+        from . import visual
+        pv = getattr(self, "preview", None)
+        if self.mode != "swarm" or pv is None:
+            return []
+        changed = await asyncio.to_thread(self.ws.changed_files)
+        if not visual.should_capture(pv, changed):
+            self.log("visual", "no screenshots: the change doesn't touch the files the preview watches")
+            return []
+        ctx = ToolContext(workspace=self.ws.repo, sandbox=self.sandbox, artifacts_dir=self.artifacts,
+                          installer=self._tool_installer(), command_timeout_s=self.cfg.sandbox.command_timeout_s,
+                          test_command=self.cfg.project.test_command, base_sha=self.ws.base_sha)
+        try:
+            shots = await visual.capture(ctx, pv, cycle, log=lambda m: self.log("visual", m))
+        except (ToolError, OSError, RuntimeError) as e:
+            self.log("visual", f"could not take screenshots (review continues without them): {e}"[:1500],
+                     level="warn")
+            return []
+        finally:
+            await ctx.aclose()
+        self.log("visual", f"{sum(1 for s in shots if s['file'])} screenshot(s) taken (cycle {cycle})",
+                 data={"cycle": cycle, "shots": [{k: s[k] for k in ("page", "path", "theme", "file", "problems")}
+                                                 for s in shots]})
+        findings = visual.page_error_findings(shots)
+        role = self.cfg.visual_role
+        if role and role in self.cfg.roles and any(s["file"] for s in shots):
+            from .llm import model_supports_vision
+            if not model_supports_vision(self.cfg.roles[role].model, self.cfg.vision_models):
+                self.log("visual", f"the {role} model ({self.cfg.roles[role].model}) can't see images; add it to "
+                                   "vision_models in swarmforge.yaml if it can", level="warn")
+            else:
+                msgs = visual.review_messages(prompts.VISUAL_REVIEW_SYSTEM, self.issue.title, self.issue.body,
+                                              changed, shots)
+                try:
+                    res = await self.llm.chat(role, msgs, task_key=f"visual-c{cycle}")
+                    summary, more = visual.parse_review(res.content)
+                    findings += more
+                    self.log("visual", f"visual review ({self.cfg.roles[role].model}): {summary}",
+                             data={"cycle": cycle, "summary": summary})
+                except (LLMError, ValueError) as e:
+                    self.log("visual", f"visual review failed (screenshots kept): {e}"[:800], level="warn")
+        elif not role or role not in self.cfg.roles:
+            self.log("visual", "screenshots taken; no vision model configured (roles.designer) to review them")
+        for f in findings:
+            self.store.record_finding(self.run_id, cycle=cycle, source="visual", severity=f["severity"],
+                                      file=f"{f['page']} ({f['theme']})" if f.get("theme") else f["page"],
+                                      line=None, title=f["title"], description=f["description"],
+                                      recommendation=f["recommendation"])
+        counts = {sv: sum(1 for f in findings if f["severity"] == sv) for sv in visual.SEVERITIES}
+        self.log("visual", f"visual findings: {counts} (only critical blocks)",
+                 level="warn" if counts["critical"] else "info")
+        return findings
+
     async def _review(self, cycle: int, ev: TestEvidence) -> dict | None:
         if self.mode == "single":
             self.log("review", "single-agent baseline: independent review skipped by design")
@@ -876,6 +933,10 @@ class Orchestrator:
                 if d["severity"] in blocking:
                     problems.append({"kind": "defect", "summary": f"[defect/{d['severity']}] {d['title']}",
                                      "detail": json.dumps(d, indent=1)})
+        for f in getattr(self, "_visual_findings", None) or []:
+            if is_visual_blocking(f["severity"]):
+                problems.append({"kind": "visual", "summary": f"[visual/{f['severity']}] {f['title']}",
+                                 "detail": json.dumps(f, indent=1)})
         for tid in failed_tasks:
             row = next((t for t in self.store.tasks(self.run_id) if t["task_key"] == tid), {})
             problems.append({"kind": "task", "summary": f"task {tid} did not complete",
@@ -920,8 +981,52 @@ class Orchestrator:
         url = await self.publish(gh, owner, name)
         if url:
             self.sm.transition(RunState.COMPLETED, f"draft PR created: {url}")
+            await self._auto_merge(gh, f"{owner}/{name}", url)
         else:
             self.sm.transition(RunState.COMPLETED, "approved; push declined by user, PR not created")
+
+    async def _auto_merge(self, gh: GitHubClient, repo: str, url: str) -> None:
+        """Merge the PR now if the auto_merge rules (or, for larger changes, the judge model) allow it.
+        Never changes the run's outcome; every decision is recorded for the Pull requests page."""
+        from . import automerge as am
+        amc = self.cfg.auto_merge
+        if not am.repo_enabled(self.cfg, repo):
+            return
+        info: dict = {"repo": repo, "url": url, "title": self.issue.title}
+        try:
+            info["number"] = number = int(url.rstrip("/").split("/")[-1])
+            pr = await asyncio.to_thread(am.get_pr, gh, repo, number)
+            files = await asyncio.to_thread(am.pr_files, gh, repo, number)
+            info["node_id"] = pr.node_id
+            lines = pr.additions + pr.deletions
+            run = self.store.get_run(self.run_id)
+            open_findings = [f for f in self.store.findings(self.run_id) if f["cycle"] == run["repair_cycle"]]
+            tests = [t for t in self.store.test_runs(self.run_id) if t["label"] != "baseline"]
+            tests_ok = bool(tests) and tests[-1]["exit_code"] == 0
+            d = am.rule_decision(run, tests_ok, open_findings, files, lines, getattr(self, "protected_paths", []),
+                                 amc.max_lines, amc.judge_max_lines)
+            if d is None:
+                role = amc.judge_role if amc.judge_role in self.cfg.roles else "planner"
+                t = tests[-1]
+                diff = await asyncio.to_thread(self.ws.diff)
+                msgs = am.judge_messages(prompts.MERGE_JUDGE_SYSTEM, self.issue.title, self.issue.body, files, lines,
+                                         diff, open_findings,
+                                         f"exit {t['exit_code']}: {t['passed']} passed, {t['failed']} failed")
+                res = await self.llm.chat(role, msgs, task_key="merge-judge")
+                ok, risk, why = am.parse_judgement(res.content)
+                d = am.Decision(ok, f"{lines}-line change; {self.cfg.roles[role].model.split('/')[-1]} judged "
+                                    f"risk {risk}: {why}", lines, judged=True, risk=risk)
+            info.update(lines=d.lines, reason=d.reason, judged=d.judged, risk=d.risk)
+            if d.merge:
+                info["sha"] = await asyncio.to_thread(am.apply, gh, pr, amc.method)
+                self.store.record_intervention(self.run_id, am.MERGED, json.dumps(info))
+                self.store.update_run(self.run_id, state_reason=f"draft PR created: {url} · auto-merged")
+                self.log("merge", f"auto-merged {url}: {d.reason}")
+                return
+        except (GitHubError, LLMError, ValueError, KeyError, OSError) as e:
+            info["reason"] = f"could not auto-merge: {e}"[:600]
+        self.store.record_intervention(self.run_id, am.HELD, json.dumps(info))
+        self.log("merge", f"waiting for you to merge {url}: {info.get('reason')}", level="warn")
 
     async def publish(self, gh: GitHubClient, owner: str, name: str) -> str | None:
         issue, ws = self.issue, self.ws
@@ -961,9 +1066,20 @@ class Orchestrator:
             if not isinstance(prof, dict):
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} must be a mapping")
             unknown = set(prof) - {"test_command", "agent_test_command", "agent_env", "sandbox_image",
-                                   "install_command", "description"}
+                                   "install_command", "description", "preview", "protected_paths"}
             if unknown:
                 self.log("project", f"ignoring unsupported keys in {PROJECT_FILE}: {sorted(unknown)}", level="warn")
+        prot = prof.get("protected_paths") or []
+        self.protected_paths = [str(p) for p in prot] if isinstance(prot, list) else []
+        self.preview = None
+        if prof.get("preview") is not None:
+            from .visual import PreviewError, parse_preview
+            try:
+                self.preview = parse_preview(prof["preview"])
+                self.log("project", f"screenshots after each test run: {len(self.preview.pages)} page(s) in "
+                                    f"{'/'.join(self.preview.themes)} (preview in {PROJECT_FILE})")
+            except PreviewError as e:   # a bad preview section only costs the screenshots, not the run
+                self.log("project", f"ignoring preview in {PROJECT_FILE}: {e}", level="warn")
         inst = prof.get("install_command")
         if inst is not None:
             if not isinstance(inst, str) or not inst.strip():

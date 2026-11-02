@@ -126,6 +126,7 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
                    sandbox=None) -> dict:
     from .approvals import dashboard_approver
     from .orchestrator import Orchestrator, new_run_id
+    cfg = fresh_config(cfg, echo)        # settings edited since the worker started apply to this task
     c = copy.deepcopy(cfg)
     if item["budget"]:
         c.limits.budget_usd = float(item["budget"])
@@ -220,6 +221,22 @@ def retry_blocked(store: Store, queue: str | None = None) -> list[int]:
                            note="retried after BLOCKED: " + (i.get("note") or "")[:200])
         out.append(i["id"])
     return out
+
+
+def fresh_config(cfg: Config, echo=None) -> Config:
+    """Re-read swarmforge.yaml so a long-running worker uses the current settings (models, steps,
+    repair cycles...) for each new task and its self-healing retries. Keeps the old config if the
+    file is missing or invalid right now."""
+    path = getattr(cfg, "source_path", None)
+    if not path or not Path(path).exists():
+        return cfg
+    try:
+        from .config import load_config
+        return load_config(str(path))
+    except Exception as e:  # noqa: BLE001 - a half-edited file must not stop the queue
+        if echo:
+            echo(f"swarmforge.yaml could not be re-read ({type(e).__name__}: {e}); using the settings from start-up")
+        return cfg
 
 
 def lane(item: dict) -> str:

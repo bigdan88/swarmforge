@@ -42,6 +42,13 @@ def _sel_keys(at):
     return [b.key for b in at.button if (b.key or "").startswith("chat_sel_")]
 
 
+def _active(at):
+    """Key of the highlighted rail row (the active conversation renders as a 'secondary' button)."""
+    on = [b.key for b in at.button if (b.key or "").startswith("chat_sel_") and b.proto.type == "secondary"]
+    assert len(on) == 1, on
+    return on[0]
+
+
 def _sel_labels(at):
     return [b.label for b in at.button if (b.key or "").startswith("chat_sel_")]
 
@@ -61,8 +68,8 @@ def test_sidebar_lists_conversations_most_recent_first_with_active_marked(tmp_pa
     # most-recent first: Beta was touched last
     assert keys[0] == f"chat_sel_{beta['id']}" and keys[1] == f"chat_sel_{a['id']}"
     labels = _sel_labels(at)
-    assert labels[0].startswith("● ") and "Beta thread" in labels[0]
-    assert not labels[1].startswith("● ") and "Alpha thread" in labels[1]
+    assert _active(at) == keys[0] and labels[0] == "Beta thread"
+    assert labels[1] == "Alpha thread"
     # rail furniture: new-chat button, per-row edit/delete, relative-time captions
     assert any(b.key == "chat_new" for b in at.button)
     assert any(b.key == f"chat_edit_{a['id']}" for b in at.button)
@@ -82,7 +89,7 @@ def test_new_chat_creates_and_selects_empty_conversation(tmp_path, monkeypatch):
     assert not at.exception, [e.value for e in at.exception]
     labels = _sel_labels(at)
     assert len(labels) == 2
-    assert labels[0].startswith("● ") and "New chat" in labels[0]
+    assert _active(at) == _sel_keys(at)[0] and labels[0] == "New chat"
     assert at.session_state["chat_history"] == []
     # the new conversation is the active one and has no messages in the DB
     active = at.session_state["chat_conv_id"]
@@ -114,7 +121,7 @@ def test_selecting_a_conversation_swaps_the_transcript(tmp_path, monkeypatch):
     assert not any("beta question" in t for t in texts)
     # the active marker moved
     labels = _sel_labels(at)
-    assert labels[1].startswith("● ") and "Alpha thread" in labels[1]
+    assert _active(at) == _sel_keys(at)[1] and labels[1] == "Alpha thread"
 
 
 def test_rename_and_delete_update_the_sidebar_immediately(tmp_path, monkeypatch):
@@ -139,7 +146,7 @@ def test_rename_and_delete_update_the_sidebar_immediately(tmp_path, monkeypatch)
     # renaming bumped updated_at, so Alpha moved to the front; the active marker
     # stays on the selected conversation (Beta)
     assert labels[0] == "Renamed title"
-    assert labels[1].startswith("● ") and "Beta thread" in labels[1]
+    assert _active(at) == _sel_keys(at)[1] and labels[1] == "Beta thread"
 
     # delete the non-active conversation: its row disappears at once
     at.button(key=f"chat_del_{beta['id']}").click().run()
@@ -220,3 +227,11 @@ def test_relative_time_formats():
     assert _chat_rel_time(now - 2 * 3600) == "2 h ago"
     assert _chat_rel_time(now - 2 * 86400) == "2 d ago"
     assert _chat_rel_time(now - 30 * 86400) == time.strftime("%Y-%m-%d", time.localtime(now - 30 * 86400))
+
+
+def test_dollar_amounts_are_not_rendered_as_latex():
+    from swarmforge.dashboard import _chat_md
+    assert _chat_md("average $1.06, and only 14/37 at $0.30–$0.50") == \
+        r"average \$1.06, and only 14/37 at \$0.30–\$0.50"
+    assert _chat_md(r"already \$5") == r"already \$5"  # no double escaping
+    assert _chat_md("") == ""
