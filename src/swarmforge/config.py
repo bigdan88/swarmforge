@@ -192,12 +192,19 @@ class ChatConfig:
 
 
 @dataclass
+class ChatbotConfig:
+    """Chatbot feature flags: which tools the chat may register."""
+    tools: list[str] = field(default_factory=lambda: ["fetch_url"])
+
+
+@dataclass
 class Config:
     providers: dict[str, ProviderConfig]
     roles: dict[str, RoleConfig]
     developer_roles: list[str]
     limits: Limits = field(default_factory=Limits)
     chat: ChatConfig = field(default_factory=ChatConfig)
+    chatbot: ChatbotConfig = field(default_factory=ChatbotConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
@@ -283,6 +290,7 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         developer_roles=dev_roles,
         limits=_build(Limits, raw.get("limits"), "limits"),
         chat=_build(ChatConfig, raw.get("chat"), "chat"),
+        chatbot=_build(ChatbotConfig, raw.get("chatbot"), "chatbot"),
         sandbox=_build(SandboxConfig, raw.get("sandbox"), "sandbox"),
         project=_build(ProjectConfig, raw.get("project"), "project"),
         github=_build(GitHubConfig, raw.get("github"), "github"),
