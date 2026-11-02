@@ -128,20 +128,28 @@ def test_real_browser_sidebar_switches_the_whole_page(tmp_path, monkeypatch):
                     break
                 except Exception:  # noqa: BLE001 - not up yet
                     time.sleep(0.5)
-            bg = lambda: pg.evaluate("getComputedStyle(document.querySelector('.stApp')).backgroundColor")  # noqa: E731
+            def bg():
+                return pg.evaluate(
+                    "() => { const el = document.querySelector('.stApp');"
+                    " return el ? getComputedStyle(el).backgroundColor : null; }")
+
+            def wait_bg(color, timeout=15000):
+                pg.wait_for_function(
+                    "() => { const el = document.querySelector('.stApp');"
+                    " return el !== null && getComputedStyle(el).backgroundColor === '" + color + "'; }",
+                    timeout=timeout)
+
             pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
-            pg.wait_for_timeout(2500)
             dark, light = "rgb(14, 17, 23)", "rgb(255, 255, 255)"
+            wait_bg(dark)
             assert bg() == dark, "--theme dark should be the first-visit theme"
             pg.locator(".st-key-theme_pick button", has_text="Light").click()
-            pg.wait_for_function(f"getComputedStyle(document.querySelector('.stApp')).backgroundColor === '{light}'",
-                                 timeout=10000)
+            wait_bg(light)
             pg.locator(".st-key-theme_pick button", has_text="Dark").click()
-            pg.wait_for_function(f"getComputedStyle(document.querySelector('.stApp')).backgroundColor === '{dark}'",
-                                 timeout=10000)
+            wait_bg(dark)
             pg.goto(f"http://localhost:{port}/?page=speed")         # remembered on the next page load
             pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
-            pg.wait_for_timeout(1500)
+            wait_bg(dark)
             assert bg() == dark
             assert pg.locator('[data-testid^="stMainMenuItem-theme-"]').count() == 0, "menu left open"
             b.close()
