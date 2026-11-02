@@ -16,6 +16,7 @@ Store.cost_summary attributes usage and cost per conversation.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from datetime import UTC, datetime
@@ -100,8 +101,39 @@ WEB_TOOL_SCHEMA = {
 }
 
 
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
+"""Directory names never listed by the list_files tool (pruned from the walk)."""
+
+
+def list_files(path: str | Path = ".", max_entries: int = 200) -> str:
+    """List a directory as newline-joined sorted relative paths ('/' separators,
+    directories with a trailing '/'), skipping .git/__pycache__/.pytest_cache.
+    Truncates to `max_entries` entries and appends a final '… (N more)' line.
+    Raises FileNotFoundError for a missing path and NotADirectoryError for a
+    non-directory (the tool registry turns these into ERROR strings)."""
+    root = Path(path)
+    if not root.exists():
+        raise FileNotFoundError(f"no such directory: {path}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"not a directory: {path}")
+    entries: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        rel_dir = Path(dirpath).relative_to(root)
+        prefix = "" if rel_dir == Path(".") else rel_dir.as_posix() + "/"
+        for d in dirnames:
+            entries.append(prefix + d + "/")
+        for f in filenames:
+            entries.append(prefix + f)
+    entries.sort()
+    if len(entries) > max_entries:
+        omitted = len(entries) - max_entries
+        return "\n".join(entries[:max_entries] + [f"… ({omitted} more)"])
+    return "\n".join(entries)
+
+
 def build_chat_registry(cfg: Config) -> ToolRegistry:
-    """Tool registry for the chatbot: currently the web fetch tool."""
+    """Tool registry for the chatbot: web fetch plus directory listing."""
 
     async def _fetch_url(url: str, max_chars: int = 8000, extract: str = "markdown") -> str:
         return await _web.fetch_url(url, max_chars=max_chars, extract=extract)
@@ -114,6 +146,26 @@ def build_chat_registry(cfg: Config) -> ToolRegistry:
         "Respects robots.txt; 10 s timeout.",
         WEB_TOOL_SCHEMA,
         _fetch_url,
+    )
+    registry.register(
+        "list_files",
+        "List the files and subdirectories of a directory as sorted relative paths "
+        "(directories end in '/'). Skips .git, __pycache__ and .pytest_cache.",
+        {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory to list, relative to the current working directory",
+                },
+                "max_entries": {
+                    "type": "integer",
+                    "description": "Maximum number of entries to return (default 200)",
+                },
+            },
+            "required": [],
+        },
+        list_files,
     )
     return registry
 
@@ -321,11 +373,22 @@ def _dict_attachments(attachments) -> bool:
     return bool(attachments) and isinstance(attachments[0], dict)
 
 
+async def _run_chat(cfg: Config, llm, role: str, messages: list[dict], on_tool=None) -> str:
+    """One chat turn: the tool loop when chat tools are enabled, a plain
+    llm.chat call otherwise (no tools in the request at all)."""
+    if cfg.chat.tools_enabled:
+        return await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
+                                     max_rounds=cfg.chat.max_tool_rounds,
+                                     task_key="chatbot", on_tool=on_tool)
+    resp = await llm.chat(role, messages, task_key="chatbot")
+    return resp.message.get("content") or ""
+
+
 async def answer(cfg: Config, store: Store, question: str,
                  history: list[dict] | None = None, *, conversation: str | None = None,
                  transport: httpx.AsyncBaseTransport | None = None,
                  max_runs: int = 12, budget=None,
-                 attachments: list | None = None) -> dict:
+                 attachments: list | None = None, on_tool=None) -> dict:
     """Ask the status chatbot a question; returns {answer, role, model, question}.
 
     With `conversation` set, the question and reply are persisted to that
@@ -371,8 +434,7 @@ async def answer(cfg: Config, store: Store, question: str,
         try:
             llm = LLMClient(cfg, store=store, run_id=run_id, budget=llm_budget, transport=transport,
                           record_errors=False)
-            text = await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
-                                         task_key="chatbot")
+            text = await _run_chat(cfg, llm, role, messages, on_tool)
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e
         text, actions = parse_actions(text, store)
@@ -392,8 +454,7 @@ async def answer(cfg: Config, store: Store, question: str,
         messages.append({"role": "user", "content": build_user_content(question, attachments)})
     try:
         llm = LLMClient(cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport)
-        text = await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
-                                     task_key="chatbot")
+        text = await _run_chat(cfg, llm, role, messages, on_tool)
     except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
         raise ChatError(str(e)) from e
     text, actions = parse_actions(text, store)
@@ -403,11 +464,11 @@ async def answer(cfg: Config, store: Store, question: str,
 
 def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = None, *,
         conversation: str | None = None, transport: httpx.AsyncBaseTransport | None = None,
-        max_runs: int = 12, attachments: list | None = None) -> dict:
+        max_runs: int = 12, attachments: list | None = None, on_tool=None) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
     return asyncio.run(answer(cfg, store, question, history, conversation=conversation,
                               transport=transport, max_runs=max_runs,
-                              attachments=attachments))
+                              attachments=attachments, on_tool=on_tool))
 
 
 # ======================================================== conversation persistence
