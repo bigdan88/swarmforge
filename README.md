@@ -225,7 +225,16 @@ sf browse http://localhost:8501 --click 'text=Settings' --screenshot   # headles
 sf stop web
 sf tests tests/test_x.py     sf check     sf fmt     sf changes
 sf outline FILE     sf symbol NAME     sf http GET http://localhost:8000/api     sf help
+sf edit app.py --lines 12-15 --text 'new code'     # targeted line-range edit (1-based, inclusive)
+sf patch app.py '<json hunks or a unified diff>'   # anchored edits; '-' reads the diff from stdin
 ```
+
+`sf edit` and `sf patch` make **targeted, anchor-validated edits** instead of rewriting whole files:
+every hunk carries the exact expected line content (anchor), and SwarmForge validates ALL anchors
+against the current file before a single atomic write. Any mismatch rejects the whole edit with a
+line-by-line expected-vs-actual error, so a failed edit can never leave a file half-written. The
+underlying pure module is `src/swarmforge/pi_edit.py` (`apply_patch` / `edit_lines`), which built-in
+agents also get as tools.
 
 For any UI change the developer must open the pages it changed with `sf browse` (screenshots go to the
 run's artifacts) before finishing; the tester must do the same for UI acceptance criteria. Tool use is

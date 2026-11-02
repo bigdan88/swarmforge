@@ -112,6 +112,8 @@ async def test_run_screenshots_light_and_dark_and_vision_review_is_listed_not_bl
     orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider(seen).transport)
     run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
     run = store.get_run(run_id)
+    # any capture failure (missing browser, slow/overloaded box, preview not serving) skips the test;
+    # the pipeline logged it and continued on purpose, so don't fail on the environment
     if any("could not take screenshots" in e["message"] or "could not load the page" in e["message"]
            for e in store.events(run_id)):
         pytest.skip("no headless Chromium / preview serving here")
