@@ -121,30 +121,53 @@ def test_real_browser_sidebar_switches_the_whole_page(tmp_path, monkeypatch):
                 b = play.chromium.launch()
             except Exception as e:  # noqa: BLE001
                 pytest.skip(f"no Chromium: {e}")
-            pg = b.new_page(color_scheme="light")
-            for _ in range(60):
-                try:
-                    pg.goto(f"http://localhost:{port}/?page=work")
-                    break
-                except Exception:  # noqa: BLE001 - not up yet
-                    time.sleep(0.5)
-            bg = lambda: pg.evaluate("getComputedStyle(document.querySelector('.stApp')).backgroundColor")  # noqa: E731
-            pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
-            pg.wait_for_timeout(2500)
             dark, light = "rgb(14, 17, 23)", "rgb(255, 255, 255)"
-            assert bg() == dark, "--theme dark should be the first-visit theme"
-            pg.locator(".st-key-theme_pick button", has_text="Light").click()
-            pg.wait_for_function(f"getComputedStyle(document.querySelector('.stApp')).backgroundColor === '{light}'",
-                                 timeout=10000)
-            pg.locator(".st-key-theme_pick button", has_text="Dark").click()
-            pg.wait_for_function(f"getComputedStyle(document.querySelector('.stApp')).backgroundColor === '{dark}'",
-                                 timeout=10000)
-            pg.goto(f"http://localhost:{port}/?page=speed")         # remembered on the next page load
-            pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
-            pg.wait_for_timeout(1500)
-            assert bg() == dark
-            assert pg.locator('[data-testid^="stMainMenuItem-theme-"]').count() == 0, "menu left open"
+
+            def color_when(expected):
+                # Null-guard: Streamlit detaches .stApp during re-runs; a throw inside
+                # wait_for_function aborts polling, so return false instead.
+                return ("() => { const el = document.querySelector('.stApp'); "
+                        "return !!el && getComputedStyle(el).backgroundColor === '" + expected + "'; }")
+
+            def bg():
+                return pg.evaluate("() => { const el = document.querySelector('.stApp'); "
+                                   "return el ? getComputedStyle(el).backgroundColor : null; }")
+
+            last_err = None
+            for attempt in range(2):  # bounded retry for transient browser/DOM races
+                try:
+                    pg = b.new_page(color_scheme="light")
+                    for _ in range(60):
+                        try:
+                            pg.goto(f"http://localhost:{port}/?page=work")
+                            break
+                        except Exception:  # noqa: BLE001 - not up yet
+                            time.sleep(0.5)
+                    pg.wait_for_selector(".stApp", state="attached", timeout=30000)
+                    pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
+                    pg.wait_for_function(color_when(dark), timeout=30000)
+                    assert bg() == dark, "--theme dark should be the first-visit theme"
+                    pg.locator(".st-key-theme_pick button", has_text="Light").click()
+                    pg.wait_for_function(color_when(light), timeout=30000)
+                    pg.locator(".st-key-theme_pick button", has_text="Dark").click()
+                    pg.wait_for_function(color_when(dark), timeout=30000)
+                    pg.goto(f"http://localhost:{port}/?page=speed")     # remembered on the next page load
+                    pg.wait_for_selector(".stApp", state="attached", timeout=30000)
+                    pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
+                    pg.wait_for_function(color_when(dark), timeout=30000)
+                    assert bg() == dark
+                    assert pg.locator('[data-testid^="stMainMenuItem-theme-"]').count() == 0, "menu left open"
+                    last_err = None
+                    break
+                except (AssertionError, pw.Error) as e:
+                    last_err = e
+                    try:
+                        pg.close()
+                    except Exception:  # noqa: BLE001, S110 - best-effort cleanup before retry
+                        pass
             b.close()
+            if last_err is not None:
+                raise last_err
     finally:                     # stop the CLI *and* the Streamlit server it started
         if sys.platform != "win32":
             os.killpg(p.pid, signal.SIGTERM)
