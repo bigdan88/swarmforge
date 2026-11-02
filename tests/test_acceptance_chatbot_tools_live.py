@@ -318,7 +318,7 @@ def test_ac5_on_tool_fires_after_each_tool_in_call_order():
 
     llm = FakeLLM()
     out = asyncio.run(chat_with_tools(llm, "planner", [{"role": "user", "content": "go"}],
-                                      registry, on_tool=lambda n, a, o: events.append((n, a, o)))
+                                      registry, on_tool=lambda n, a, o: events.append((n, a, o))))
     assert out == "final"
     assert events == [("echo", {"text": "a"}, "out:a"), ("echo", {"text": "b"}, "out:b")]
     assert llm.rounds == 2
