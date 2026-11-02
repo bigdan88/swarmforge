@@ -116,7 +116,7 @@ def _seed_chat(st: Store) -> None:
     shows a real caption. Guarded so seeding never breaks the demo CLI."""
     try:
         from . import chatbot
-        conv = chatbot.create_conversation(st, "Tool demo")
+        conv = chatbot.ensure_default_conversation(st)
         chatbot.add_message(st, conv["id"], "user", "What files are in the repo?")
         chatbot.add_message(
             st, conv["id"], "assistant",
