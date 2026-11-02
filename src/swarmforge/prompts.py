@@ -156,6 +156,9 @@ you the team's developer tools. `sf help` lists them all. The ones you will use 
 - `sf check [PATHS]` (ruff + mypy) and `sf fmt [PATHS]` (ruff format); default: files you changed.
 - `sf outline FILE`, `sf symbol NAME` (definition + every reference), `sf changes` (your diff),
   `sf history FILE`, `sf http METHOD URL [--json ...]` (call a local API), `sf packages [MODULE]`.
+- `sf skills` lists the team's playbooks distilled from past failures; `sf skill NAME` prints one
+  (e.g. `sf skill apptest-button-key`). Read the matching playbook BEFORE writing Streamlit AppTest
+  tests, icon strings or long-output assertions.
 """
 
 COORDINATOR_SYSTEM = """You are the engineering manager of a software team that has several pieces of work

@@ -18,7 +18,9 @@ from swarmforge.sandbox import LocalSandbox
 from .test_pi import _llm
 
 
-def test_sf_parses_every_command():
+def test_sf_parses_every_command(monkeypatch):
+    monkeypatch.delenv("SF_TOOLS_URL", raising=False)
+    monkeypatch.delenv("SF_RELAY_TOKEN", raising=False)
     p = SF.parse
     assert p(["start", "web", "--port", "8501", "--", "streamlit", "run", "app.py", "--server.port", "8501"]) == (
         "start_process", {"name": "web", "ready_port": 8501, "command": "streamlit run app.py --server.port 8501"})
@@ -41,11 +43,14 @@ def test_sf_parses_every_command():
     assert p(["http", "post", "http://localhost:8000/x", "--json", '{"a": 1}', "-H", "X-Y: z"]) == (
         "http_request", {"method": "POST", "url": "http://localhost:8000/x", "json": {"a": 1}, "headers": {"X-Y": "z"}})
     assert p(["call", "outline", '{"path": "a.py"}']) == ("outline", {"path": "a.py"})
-    for bad in (["start", "web"], ["browse"], ["fill"], ["browse", "u", "--fill", "noequals"], ["nope"]):
+    assert p(["skill", "apptest-button-key"]) == ("load_skill", {"name": "apptest-button-key"})
+    assert p(["skills"]) == ("list_skills", {})
+    for bad in (["start", "web"], ["browse"], ["fill"], ["browse", "u", "--fill", "noequals"], ["nope"], ["skill"]):
         with pytest.raises(SF.Usage):
             p(bad)
     assert SF.main(["help"]) == 0
     assert SF.main(["symbol", "x"]) == 1          # outside an agent session: a clear error, not a crash
+    assert SF.main(["skills"]) == 1
 
 
 def _ctx(tmp_path):
@@ -102,6 +107,7 @@ def test_pi_prompt_teaches_sf_and_requires_browsing_ui_changes():
     s = prompts.PI_DEVELOPER_SYSTEM
     assert "sf browse" in s and "sf start" in s and "MUST look at the result" in s and "sf help" in s
     assert "MUST also start the app" in prompts.TESTER_SYSTEM
+    assert "sf skill" in prompts.PI_DEVELOPER_SYSTEM and "sf skills" in prompts.PI_DEVELOPER_SYSTEM
 
 
 def _free_port():

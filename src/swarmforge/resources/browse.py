@@ -103,7 +103,15 @@ with sync_playwright() as p:
         page.on("requestfailed", lambda r: result["failed_requests"].append(f"FAILED {r.url[:200]} ({r.failure})")
                 if len(result["failed_requests"]) < 20 else None)
         timeout_ms = int(args.get("timeout_ms") or 60000)
-        resp = page.goto(args["url"], timeout=timeout_ms, wait_until="load")
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = page.goto(args["url"], timeout=timeout_ms, wait_until="load")
+                break
+            except Exception:  # transient cold-start / port race: back off and retry
+                if attempt == 2:
+                    raise
+                time.sleep(1.0)
         result["status"] = resp.status if resp else None
         settle(page, timeout_ms)
         for i, a in enumerate(args.get("actions") or []):

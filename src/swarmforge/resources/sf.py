@@ -21,6 +21,8 @@
   sf history PATH [--max N] [--lines A-B]       git log (and blame for a line range) of a file
   sf http METHOD URL [--json JSON] [-H 'Name: value']...   call a local API
   sf packages [MODULE]                          installed packages / where a module comes from
+  sf skills                                     list available skills/playbooks
+  sf skill NAME                                 print a knowledge-base playbook (reusable lesson)
   sf call TOOL '{"json": "args"}'               any tool with raw JSON arguments
 
 Example for a UI change:
@@ -194,6 +196,12 @@ def parse(argv):
         return "http_request", a
     if cmd == "packages":
         return "list_packages", ({"name": rest[0]} if rest else {})
+    if cmd == "skills":
+        return "list_skills", {}
+    if cmd == "skill":
+        if len(rest) != 1:
+            raise Usage("sf skill NAME")
+        return "load_skill", {"name": rest[0]}
     raise Usage(f"unknown command '{cmd}'")
 
 
