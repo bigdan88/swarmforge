@@ -2065,6 +2065,10 @@ def _chat_actions_key(conv_id: str) -> str:
     return f"chat_actions_v1:{conv_id}"
 
 
+def _chat_tools_key(conv_id: str) -> str:
+    return f"chat_tools_v1:{conv_id}"
+
+
 def _chat_rel_time(ts: float) -> str:
     d = time.time() - ts
     if d < 60:
@@ -2127,8 +2131,16 @@ def _chat_save(actions: dict, conv_id: str) -> None:
         pass
 
 
-def _chat_load(conv_id: str) -> tuple[list, dict]:
-    """Session chat_history/chat_actions for the active conversation, loading it on switch."""
+def _chat_save_traces(traces: dict, conv_id: str) -> None:
+    """Persist the per-conversation tool traces shown under 'Tools used'."""
+    try:
+        store.kv_set(_chat_tools_key(conv_id), json.dumps({str(k): v for k, v in traces.items()}))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _chat_load(conv_id: str) -> tuple[list, dict, dict]:
+    """Session chat_history/chat_actions/chat_tools for the active conversation, loading it on switch."""
     from swarmforge import chatbot
     _chat_migrate_legacy()
     if st.session_state.get("chat_loaded_conv") != conv_id:
@@ -2139,9 +2151,15 @@ def _chat_load(conv_id: str) -> tuple[list, dict]:
         except json.JSONDecodeError:
             d = {}
         st.session_state.chat_actions = {int(k): v for k, v in (d or {}).items()}
+        try:
+            t = json.loads(store.kv_get(_chat_tools_key(conv_id)) or "{}")
+        except json.JSONDecodeError:
+            t = {}
+        st.session_state.chat_tools = {int(k): v for k, v in (t or {}).items()}
         st.session_state.chat_loaded_conv = conv_id
         st.session_state.pop("chat_done", None)
-    return st.session_state.chat_history, st.session_state.setdefault("chat_actions", {})
+    return (st.session_state.chat_history, st.session_state.setdefault("chat_actions", {}),
+            st.session_state.setdefault("chat_tools", {}))
 
 
 def _chat_note(key: str, msg: str, ok: bool = True) -> None:
@@ -2239,6 +2257,19 @@ def render_message_actions(i: int, actions: dict | None) -> None:
         render_fix_actions(i, actions["fixes"])
     if actions.get("tasks"):
         render_task_actions(i, actions["tasks"])
+
+
+def _render_tools_used(used: list) -> None:
+    """Collapsible tool transcript for one assistant message (live bubble or history)."""
+    if not used:
+        return
+    with st.expander(f"🔧 Tools used ({len(used)})", expanded=False):
+        for t in used:
+            st.markdown(f"**{t.get('name', '?')}** — "
+                        + ("✅ ok" if t.get("ok") else "⚠️ error"))
+            st.code(json.dumps(t.get("args") or {}, default=str), language="json")
+            if t.get("preview"):
+                st.caption(t["preview"])
 
 
 def _chat_save_attachments(uploaded):
@@ -2365,7 +2396,7 @@ def page_chat():
         st.rerun()
 
     # ------------------------------------------------ transcript (right)
-    history, actions = _chat_load(active_id)
+    history, actions, traces = _chat_load(active_id)
     needs = chatbot.failures_needing_attention(store)
     active_conv = chatbot.get_conversation(store, active_id) or {}
     with main, st.container(key="chat_main"):
@@ -2378,6 +2409,8 @@ def page_chat():
             store.kv_set(_chat_actions_key(active_id), None)
             history.clear()
             actions.clear()
+            st.session_state.chat_tools = {}
+            store.kv_set(_chat_tools_key(active_id), None)
             st.session_state.pop("chat_done", None)
             st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
             _chat_save(actions, active_id)
@@ -2392,6 +2425,7 @@ def page_chat():
             with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
                 if m["role"] == "assistant":
                     st.markdown(_chat_md(m["content"]))
+                    _render_tools_used(traces.get(n) or [])
                     render_message_actions(n, actions.get(n))
                 else:
                     st.write(m["content"])
@@ -2404,6 +2438,12 @@ def page_chat():
                 lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
                 if st.button(lab, key="chat_q_" + key):
                     pending = prompt_text
+        tools_cfg = getattr(cfg.chatbot, "tools", None) or []
+        parts = []
+        if "fetch_url" in tools_cfg:
+            parts.append("paste a URL and the assistant fetches it with the fetch_url tool")
+        parts.append("use /repo <owner/name>, /code <topic>, /issues <owner/name>")
+        st.caption("💡 Quick actions: " + " — or ".join(parts) + ".")
         try:
             from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
             uploaded = st.file_uploader(
@@ -2449,7 +2489,10 @@ def page_chat():
         chatbot.add_message(store, active_id, "assistant", res["answer"])
         if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
             actions[len(history) - 1] = res["actions"]
+        if res.get("tools_used"):
+            traces[len(history) - 1] = res["tools_used"]
         _chat_save(actions, active_id)
+        _chat_save_traces(traces, active_id)
         with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
             st.markdown(_chat_md(res["answer"]))
             st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
@@ -2457,13 +2500,7 @@ def page_chat():
                        f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
             used = res.get("tools_used") or []
             if used:
-                with st.expander(f"🔧 Tools used ({len(used)})", expanded=False):
-                    for t in used:
-                        st.markdown(f"**{t.get('name', '?')}** — "
-                                    + ("✅ ok" if t.get("ok") else "⚠️ error"))
-                        st.code(json.dumps(t.get("args") or {}, default=str), language="json")
-                        if t.get("preview"):
-                            st.caption(t["preview"])
+                _render_tools_used(used)
             render_message_actions(len(history) - 1, actions.get(len(history) - 1))
 
 
