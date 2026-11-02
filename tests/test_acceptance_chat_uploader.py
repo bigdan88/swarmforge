@@ -350,10 +350,11 @@ def test_ac5_ask_and_answer_gained_exactly_one_optional_keyword_only_param():
         assert params["attachments"].kind is inspect.Parameter.KEYWORD_ONLY
         assert params["attachments"].default is None
     assert set(inspect.signature(chatbot.ask).parameters) == {
-        "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "attachments"}
+        "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "attachments",
+        "on_tool"}
     assert set(inspect.signature(chatbot.answer).parameters) == {
         "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "budget",
-        "attachments"}
+        "attachments", "on_tool"}
 
 
 def test_ac5_only_one_new_module_and_no_attachments_outside_the_three_files():
