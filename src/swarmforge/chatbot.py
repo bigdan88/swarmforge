@@ -101,20 +101,27 @@ WEB_TOOL_SCHEMA = {
 
 
 def build_chat_registry(cfg: Config) -> ToolRegistry:
-    """Tool registry for the chatbot: currently the web fetch tool."""
+    """Tool registry for the chatbot, gated by cfg.chatbot.tools.
+
+    Only tools named in the list are registered; unknown names are ignored.
+    An empty list yields an empty registry (llm.py skips falsy `tools`, so the
+    loop degrades to a plain chat call).
+    """
+    enabled = list(getattr(cfg.chatbot, "tools", None) or [])
 
     async def _fetch_url(url: str, max_chars: int = 8000, extract: str = "markdown") -> str:
         return await _web.fetch_url(url, max_chars=max_chars, extract=extract)
 
     registry = ToolRegistry()
-    registry.register(
-        "fetch_url",
-        "Fetch any URL and return its content as clean Markdown. GitHub repository "
-        "links (github.com/<owner>/<repo>) resolve to the repository's README. "
-        "Respects robots.txt; 10 s timeout.",
-        WEB_TOOL_SCHEMA,
-        _fetch_url,
-    )
+    if "fetch_url" in enabled:
+        registry.register(
+            "fetch_url",
+            "Fetch any URL and return its content as clean Markdown. GitHub repository "
+            "links (github.com/<owner>/<repo>) resolve to the repository's README. "
+            "Respects robots.txt; 10 s timeout.",
+            WEB_TOOL_SCHEMA,
+            _fetch_url,
+        )
     return registry
 
 IMPROVE_PROMPT = """
@@ -346,6 +353,7 @@ async def answer(cfg: Config, store: Store, question: str,
     from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 
     role = resolve_role(cfg)
+    trace: list = []
     messages: list[dict] = [{"role": "system",
                  "content": SYSTEM_PROMPT + "\n" + IMPROVE_PROMPT + "\n\n<status>\n" + status_snapshot(store, max_runs)
                  + "\n</status>\n\n<improvement_context>\n" + improvement_context(cfg, store)
@@ -372,14 +380,14 @@ async def answer(cfg: Config, store: Store, question: str,
             llm = LLMClient(cfg, store=store, run_id=run_id, budget=llm_budget, transport=transport,
                           record_errors=False)
             text = await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
-                                         task_key="chatbot")
+                                         task_key="chatbot", trace=trace)
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e
         text, actions = parse_actions(text, store)
         store.conversation_append(conversation, "assistant", text)
         return {"answer": text, "role": role, "model": cfg.roles[role].model, "question": question,
                 "actions": actions, "conversation": conversation,
-                "usage": store.cost_summary(run_id)}
+                "usage": store.cost_summary(run_id), "tools_used": trace}
     for m in (history or []):
         if m.get("role") in ("user", "assistant") and m.get("content"):
             messages.append({"role": m["role"], "content": str(m["content"])})
@@ -393,12 +401,12 @@ async def answer(cfg: Config, store: Store, question: str,
     try:
         llm = LLMClient(cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport)
         text = await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
-                                     task_key="chatbot")
+                                     task_key="chatbot", trace=trace)
     except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
         raise ChatError(str(e)) from e
     text, actions = parse_actions(text, store)
     return {"answer": text, "role": role, "model": cfg.roles[role].model, "question": question,
-            "actions": actions}
+            "actions": actions, "tools_used": trace}
 
 
 def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = None, *,
