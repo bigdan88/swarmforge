@@ -21,7 +21,12 @@
   sf history PATH [--max N] [--lines A-B]       git log (and blame for a line range) of a file
   sf http METHOD URL [--json JSON] [-H 'Name: value']...   call a local API
   sf packages [MODULE]                          installed packages / where a module comes from
+  sf edit PATH --lines A-B --text '...'   targeted line-range edit (1-based, inclusive; atomic)
+  sf patch PATH '<hunks JSON or unified diff>'   anchored hunks / diff; '-' or no arg reads stdin
   sf call TOOL '{"json": "args"}'               any tool with raw JSON arguments
+
+Prefer `sf edit` / `sf patch` over whole-file rewrites: they validate every anchor first and
+apply atomically, so a mismatched edit is rejected instead of corrupting the file.
 
 Example for a UI change:
   sf start web --port 8501 -- streamlit run app.py --server.headless true --server.port 8501
@@ -192,6 +197,40 @@ def parse(argv):
                 raise Usage(f"unknown option {f}")
             i += 2
         return "http_request", a
+    if cmd == "edit":
+        if not rest:
+            raise Usage("sf edit PATH --lines A-B --text '...'")
+        a = {"path": rest[0], "ranges": []}
+        i = 1
+        while i < len(rest):
+            if rest[i] != "--lines":
+                raise Usage(f"unknown option {rest[i]}")
+            lo, _, hi = _take(rest, i, "--lines").partition("-")
+            try:
+                start, end = int(lo), int(hi or lo)
+            except ValueError:
+                raise Usage("--lines expects A-B with integer line numbers")
+            if start > end:
+                raise Usage("--lines expects A <= B")
+            text = _take(rest, i + 2, "--text")
+            a["ranges"].append({"start": start, "end": end, "text": text})
+            i += 4
+        if not a["ranges"]:
+            raise Usage("sf edit needs at least one --lines A-B --text '...' pair")
+        return "edit_lines", a
+    if cmd == "patch":
+        if not rest:
+            raise Usage("sf patch PATH '<hunks JSON or unified diff>'")
+        payload = rest[1] if len(rest) > 1 else None
+        if payload is None or payload == "-":
+            payload = sys.stdin.read()
+        try:
+            hunks = json.loads(payload)
+        except json.JSONDecodeError:
+            hunks = payload
+        if not isinstance(hunks, list):
+            hunks = payload
+        return "apply_patch", {"path": rest[0], "hunks": hunks}
     if cmd == "packages":
         return "list_packages", ({"name": rest[0]} if rest else {})
     raise Usage(f"unknown command '{cmd}'")
