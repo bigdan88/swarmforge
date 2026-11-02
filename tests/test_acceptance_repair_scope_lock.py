@@ -44,6 +44,13 @@ THEME_FINDING = {"severity": "major", "file": "src/swarmforge/theme.py", "line":
                  "recommendation": "guard the lookup."}
 
 
+@pytest.fixture
+def store(cfg):
+    from swarmforge.db import Store
+
+    return Store(cfg.db_path)
+
+
 def _finding(file="src/swarmforge/theme.py", severity="major", title="crash",
              description="d", recommendation="r"):
     return {"severity": severity, "file": file, "line": 10, "title": title,
@@ -60,10 +67,7 @@ def _ev():
                         duration_s=1.0, passed=10, junit_found=True)
 
 
-def _plan_orch(cfg, expected_files):
-    from swarmforge.db import Store
-
-    store = Store(cfg.db_path)
+def _plan_orch(cfg, store, expected_files):
     orch = Orchestrator(cfg, store, echo=None)
     if expected_files is None:
         orch.plan = None
