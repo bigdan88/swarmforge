@@ -18,7 +18,15 @@ from swarmforge.sandbox import LocalSandbox
 from .test_pi import _llm
 
 
-def test_sf_parses_every_command():
+class _FakeStdin:
+    def __init__(self, text):
+        self._text = text
+
+    def read(self):
+        return self._text
+
+
+def test_sf_parses_every_command(monkeypatch):
     p = SF.parse
     assert p(["start", "web", "--port", "8501", "--", "streamlit", "run", "app.py", "--server.port", "8501"]) == (
         "start_process", {"name": "web", "ready_port": 8501, "command": "streamlit run app.py --server.port 8501"})
@@ -41,7 +49,25 @@ def test_sf_parses_every_command():
     assert p(["http", "post", "http://localhost:8000/x", "--json", '{"a": 1}', "-H", "X-Y: z"]) == (
         "http_request", {"method": "POST", "url": "http://localhost:8000/x", "json": {"a": 1}, "headers": {"X-Y": "z"}})
     assert p(["call", "outline", '{"path": "a.py"}']) == ("outline", {"path": "a.py"})
-    for bad in (["start", "web"], ["browse"], ["fill"], ["browse", "u", "--fill", "noequals"], ["nope"]):
+    assert p(["edit", "a.py", "--lines", "3-5", "--text", "x = 1\n"]) == (
+        "edit_lines", {"path": "a.py", "ranges": [{"start": 3, "end": 5, "text": "x = 1\n"}]})
+    assert p(["edit", "a.py", "--lines", "3-5", "--text", "a", "--lines", "7-7", "--text", "b"]) == (
+        "edit_lines", {"path": "a.py", "ranges": [{"start": 3, "end": 5, "text": "a"},
+                                                      {"start": 7, "end": 7, "text": "b"}]})
+    assert p(["edit", "a.py", "--lines", "3", "--text", "a"]) == (
+        "edit_lines", {"path": "a.py", "ranges": [{"start": 3, "end": 3, "text": "a"}]})
+    hunks = [{"start": 1, "end": 2, "text": "new\n", "anchor": "old"}]
+    assert p(["patch", "a.py", json.dumps(hunks)]) == ("apply_patch", {"path": "a.py", "hunks": hunks})
+    diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n"
+    assert p(["patch", "a.py", diff]) == ("apply_patch", {"path": "a.py", "hunks": diff})
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(json.dumps(hunks)))
+    assert p(["patch", "a.py"]) == ("apply_patch", {"path": "a.py", "hunks": hunks})
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(diff))
+    assert p(["patch", "a.py", "-"]) == ("apply_patch", {"path": "a.py", "hunks": diff})
+    for bad in (["start", "web"], ["browse"], ["fill"], ["browse", "u", "--fill", "noequals"], ["nope"],
+                ["edit"], ["edit", "a.py"], ["edit", "a.py", "--lines", "3"],
+                ["edit", "a.py", "--lines", "x-5", "--text", "a"],
+                ["edit", "a.py", "--lines", "5-3", "--text", "a"], ["patch"]):
         with pytest.raises(SF.Usage):
             p(bad)
     assert SF.main(["help"]) == 0
