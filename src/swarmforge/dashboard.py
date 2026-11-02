@@ -2419,15 +2419,20 @@ def page_chat():
     prompt = typed or pending
     if not prompt:
         return
+    from swarmforge import chat_quick
+    question = chat_quick.expand_prompt(prompt)
+    hint = chat_quick.hint_for(prompt)
     att_meta, att_paths = _chat_save_attachments(uploaded)
-    msg = {"role": "user", "content": prompt}
+    msg = {"role": "user", "content": question}
     if att_meta:
         msg["attachments"] = att_meta
     history.append(msg)
-    chatbot.add_message(store, active_id, "user", prompt)
+    chatbot.add_message(store, active_id, "user", question)
     with live:
         with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
             st.write(prompt)
+            if hint:
+                st.caption(hint)
             _render_chat_attachments(att_meta)
         conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
         kwargs = {"history": history[:-1], "conversation": conv}
@@ -2435,7 +2440,7 @@ def page_chat():
             kwargs["attachments"] = att_paths
         try:
             with st.spinner("Thinking…"):
-                res = chatbot.ask(cfg, store, prompt, **kwargs)
+                res = chatbot.ask(cfg, store, question, **kwargs)
         except chatbot.ChatError as e:
             st.error(f"Chatbot: {e}")
             _chat_save(actions, active_id)
@@ -2450,6 +2455,15 @@ def page_chat():
             st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
                        f"conversation {res.get('conversation', conv)} · "
                        f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
+            used = res.get("tools_used") or []
+            if used:
+                with st.expander(f"🔧 Tools used ({len(used)})", expanded=False):
+                    for t in used:
+                        st.markdown(f"**{t.get('name', '?')}** — "
+                                    + ("✅ ok" if t.get("ok") else "⚠️ error"))
+                        st.code(json.dumps(t.get("args") or {}, default=str), language="json")
+                        if t.get("preview"):
+                            st.caption(t["preview"])
             render_message_actions(len(history) - 1, actions.get(len(history) - 1))
 
 
