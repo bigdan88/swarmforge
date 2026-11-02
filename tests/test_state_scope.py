@@ -90,3 +90,34 @@ class TestRepairTasksScope:
 
     def test_regression_empty_roles_no_blocking(self):
         assert repair_tasks_from_findings([finding("a.py", sev="minor")], [], 1) == []
+
+
+class TestPartitionRobustness:
+    def test_duplicate_equal_findings_classified_independently(self):
+        # Two distinct dicts with identical content must each be classified
+        # on their own (no id()-based identity matching). Equal dicts dedup
+        # to one (existing semantics), so use distinct titles to observe both.
+        f1 = finding("src/swarmforge/repos.py", "dup-a")
+        f2 = finding("src/swarmforge/repos.py", "dup-b")
+        assert f1 is not f2
+        out = out_of_scope_findings([f1, f2], SCOPE)
+        assert out == [f1, f2]
+        assert repair_tasks_from_findings([f1, f2], [], 1, scope_files=SCOPE) == []
+
+        g1 = finding("src/swarmforge/dashboard.py", "dup-a")
+        g2 = finding("src/swarmforge/dashboard.py", "dup-b")
+        tasks = repair_tasks_from_findings([g1, g2], ["dev"], 1, scope_files=SCOPE)
+        assert [t.id for t in tasks] == ["R1F1", "R1F2"]
+
+    def test_repair_tasks_deterministic_across_calls(self):
+        from dataclasses import asdict
+
+        findings = [
+            finding("src/swarmforge/dashboard.py", "in-one"),
+            finding("src/swarmforge/repos.py", "out-one"),
+            finding("src/swarmforge/cli.py", "in-two"),
+        ]
+        first = repair_tasks_from_findings(findings, ["dev"], 2, scope_files=SCOPE)
+        second = repair_tasks_from_findings(findings, ["dev"], 2, scope_files=SCOPE)
+        assert [asdict(t) for t in first] == [asdict(t) for t in second]
+        assert [t.id for t in first] == ["R2F1", "R2F2"]
