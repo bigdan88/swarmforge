@@ -48,9 +48,20 @@ def _fake_devtools(monkeypatch, browse_calls):
     async def fake_stop(ctx, name):
         return f"stopped '{name}'"
 
+    class _FakeSession:
+        python = "python"
+
+        async def exec(self, command, **kw):
+            from swarmforge.sandbox import CommandResult
+            return CommandResult(command, 0, "", 0.0)
+
+    def fake_open_session(ctx):
+        return _FakeSession()
+
     monkeypatch.setattr(devtools, "start_process", fake_start)
     monkeypatch.setattr(devtools, "browse_raw", fake_browse)
     monkeypatch.setattr(devtools, "stop_process", fake_stop)
+    monkeypatch.setattr(devtools, "open_session", fake_open_session)
 
 
 def test_capture_names_screenshots_with_the_cycle_it_is_given(monkeypatch):
@@ -86,6 +97,48 @@ def test_capture_raises_tool_error_when_the_app_never_comes_up(monkeypatch):
     monkeypatch.setattr(devtools, "start_process", failing_start)
     with pytest.raises(ToolError):
         asyncio.run(visual.capture(object(), _pv(), 1))
+
+
+def test_capture_raises_preview_error_when_the_port_never_answers_http(monkeypatch):
+    """An open port that never answers HTTP becomes a PreviewError (a skip), not critical findings."""
+    from swarmforge.agent import devtools
+    from swarmforge.sandbox import CommandResult
+
+    calls = []
+    _fake_devtools(monkeypatch, calls)
+
+    class _DeafSession:
+        python = "python"
+
+        async def exec(self, command, **kw):
+            return CommandResult(command, 1, "URLError: connection refused", 0.0)
+
+    monkeypatch.setattr(devtools, "open_session", lambda ctx: _DeafSession())
+    with pytest.raises(visual.PreviewError, match="not answering HTTP"):
+        asyncio.run(visual.capture(object(), _pv(), 1))
+    assert not calls  # no screenshots were attempted against the unusable preview
+
+
+def test_capture_polls_http_readiness_before_the_first_screenshot(monkeypatch):
+    """The first shots wait until the preview actually answers an HTTP request."""
+    from swarmforge.agent import devtools
+    from swarmforge.sandbox import CommandResult
+
+    calls = []
+    _fake_devtools(monkeypatch, calls)
+    attempts = []
+
+    class _WarmingSession:
+        python = "python"
+
+        async def exec(self, command, **kw):
+            attempts.append(command)
+            # the server needs a couple of polls before it answers
+            return CommandResult(command, 0 if len(attempts) >= 3 else 1, "", 0.0)
+
+    monkeypatch.setattr(devtools, "open_session", lambda ctx: _WarmingSession())
+    shots = asyncio.run(visual.capture(object(), _pv(), 1))
+    assert len(attempts) == 3 and shots
 
 
 # ------------------------------------------------- orchestrator skips when Chromium is unavailable
