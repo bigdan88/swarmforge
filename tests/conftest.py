@@ -1,13 +1,84 @@
+import functools
+import inspect
 import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
 from swarmforge.config import parse_config
+
+# Signatures of *environmental* transient failures: fork/thread/PID exhaustion under parallel
+# load (jemalloc "can't start new thread", EAGAIN on fork, BlockingIOError) and Chromium dying
+# mid-test because the box is saturated. The heavy end-to-end/browser tests wrap themselves in
+# `retry_transient` below so a saturated worker reruns the whole test instead of failing the
+# suite; genuine regressions reproduce on every attempt and still fail. Skips are never retried.
+TRANSIENT_FAILURE_SIGNS = (
+    "resource temporarily unavailable",
+    "can't start new thread",
+    "unable to fork",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "did not finish within",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    texts: list[str] = []
+
+    def walk(e: BaseException | None, seen: set[int]) -> None:
+        if e is None or id(e) in seen:
+            return
+        seen.add(id(e))
+        texts.append(str(e))
+        walk(e.__cause__, seen)
+        walk(e.__context__, seen)
+        for sub in getattr(e, "exceptions", ()) or ():  # ExceptionGroup
+            walk(sub, seen)
+
+    walk(exc, set())
+    blob = " ".join(texts).lower()
+    return any(sign in blob for sign in TRANSIENT_FAILURE_SIGNS)
+
+
+def retry_transient(attempts: int = 3, delay_s: float = 2.0):
+    """Decorator that reruns a test from scratch when it fails with a transient
+    resource-exhaustion error (see TRANSIENT_FAILURE_SIGNS). Works on sync and async
+    test functions; assertions themselves are never weakened — every attempt runs the
+    full test body, and a real failure repeats on all attempts and still fails."""
+
+    def deco(fn):
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def awrapper(*args, **kwargs):
+                for i in range(attempts):
+                    try:
+                        return await fn(*args, **kwargs)
+                    except BaseException as exc:  # noqa: BLE001 - filtered re-raise below
+                        if not _is_transient(exc) or i == attempts - 1:
+                            raise
+                        time.sleep(delay_s)
+
+            return awrapper
+
+        @functools.wraps(fn)
+        def swrapper(*args, **kwargs):
+            for i in range(attempts):
+                try:
+                    return fn(*args, **kwargs)
+                except BaseException as exc:  # noqa: BLE001 - filtered re-raise below
+                    if not _is_transient(exc) or i == attempts - 1:
+                        raise
+                    time.sleep(delay_s)
+
+        return swrapper
+
+    return deco
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "samples" / "inventory-app"

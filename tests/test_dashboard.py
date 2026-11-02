@@ -135,7 +135,16 @@ def test_start_run_button_switches_to_runs(tmp_path, monkeypatch, sample_repo):
     assert not at.exception, [e.value for e in at.exception]
     assert at.session_state["page"] == "Work"
     assert at.session_state["sel_item"].startswith("r:")
-    runs = Store(cfg.db_path).list_runs()
+    # The run row is registered asynchronously by the detached background process; the
+    # dashboard's fixed 1.5 s grace is not enough when the box is busy (xdist workers +
+    # e2e swarm runs). Poll generously for the registration instead of racing it once.
+    runs = []
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        runs = Store(cfg.db_path).list_runs()
+        if runs and runs[0]["issue_title"] == "Add export":
+            break
+        time.sleep(0.5)
     assert runs and runs[0]["issue_title"] == "Add export"
     from swarmforge.launcher import pid_alive
     for _ in range(240):  # let the background run (which fails on the fake provider) finish
