@@ -39,7 +39,8 @@ from .plan import (PLAN_JSON_SCHEMA, REVIEW_JSON_SCHEMA, TEST_REPORT_JSON_SCHEMA
 from .report import build_pr_body, build_summary, write_report, write_summary
 from .sandbox import Sandbox, make_sandbox
 from .scheduler import Scheduler
-from .state import RunAborted, RunState, StateMachine, TaskState, repair_tasks_from_findings
+from .state import (RunAborted, RunState, StateMachine, TaskState, normalize_scope_path,
+                   out_of_scope_findings, repair_tasks_from_findings)
 from .testing import TestEvidence, evaluate_criteria, run_tests
 from .repolock import blocking_runs, repo_key as lock_key
 from .workspace import EmptyRepository, GitError, GitWorkspace, StaleSeed, git
@@ -424,9 +425,7 @@ class Orchestrator:
                                  + "; ".join(p["summary"] for p in problems)[:800])
             cycle += 1
             self.store.update_run(self.run_id, repair_cycle=cycle)
-            blocking = set(self.cfg.review.blocking_severities)
-            repair_tasks = repair_tasks_from_findings((review or {}).get("findings") or [],
-                                                      self.cfg.developer_roles, cycle, blocking)
+            repair_tasks = self._repair_tasks_from_review(review, cycle)
             if repair_tasks:
                 self._register_tasks(repair_tasks, cycle=cycle, kind="fix")
                 self.log("plan", f"cycle {cycle}: {len(repair_tasks)} mandatory repair task(s) "
@@ -910,6 +909,36 @@ class Orchestrator:
                 return rv
             self.log("review", f"review attempt {attempt} failed: {res.error}", level="warn")
         raise RunAborted(RunState.FAILED, "independent reviewer failed to produce a review; cannot approve")
+
+    # ================================================== repair-task scoping
+    def _repair_scope_files(self) -> set[str]:
+        """Union of expected_files over the ORIGINAL plan's tasks (normalized).
+
+        The plan is set once during planning and never mutated; with no plan
+        (e.g. single-agent mode) the scope is empty, which disables filtering.
+        """
+        plan = getattr(self, "plan", None)
+        if plan is None:
+            return set()
+        return {p for t in plan.tasks for p in (normalize_scope_path(f) for f in t.expected_files) if p}
+
+    def _repair_tasks_from_review(self, review: dict | None, cycle: int) -> list[Task]:
+        """Repair tasks from blocking findings, scope-locked to the original plan.
+
+        Findings whose target file was not in the plan's task file set are
+        skipped (logged as 'out-of-scope' scope events) rather than silently
+        dropped; they still surface via _gate for the fix planner.
+        """
+        blocking = set(self.cfg.review.blocking_severities)
+        findings = (review or {}).get("findings") or []
+        scope = self._repair_scope_files()
+        for f in out_of_scope_findings(findings, scope, blocking):
+            self.log("scope",
+                     f"skipped out-of-scope finding: [{f.get('severity')}] {f.get('title')} "
+                     f"(file {f.get('file')}) is not in the original plan's task file set",
+                     level="warn", data=f)
+        return repair_tasks_from_findings(findings, self.cfg.developer_roles, cycle, blocking,
+                                          scope_files=scope)
 
     # ==================================================================== gate
     def _gate(self, cycle, ev: TestEvidence, tester_report, review, failed_tasks) -> list[dict]:

@@ -85,15 +85,15 @@ def test_missing_file_and_line():
 
 # ------------------------------------------------- full-pipeline wiring tests
 MAJOR_FINDINGS = [
-    {"severity": "major", "file": "src/swarmforge/explain.py", "line": 395,
+    {"severity": "major", "file": "inventory/exporters.py", "line": 395,
      "title": "budget_usd is NULL crash",
      "description": "explain_run crashes with TypeError: unsupported format string when budget_usd is NULL",
      "recommendation": "use `run.get('budget_usd') or 0`"},
-    {"severity": "major", "file": "src/swarmforge/dashboard.py", "line": 567,
+    {"severity": "major", "file": "README.md", "line": 567,
      "title": "missing null guard",
      "description": "dashboard renders a NULL budget without a null guard in the run table",
      "recommendation": "guard the value before formatting"},
-    {"severity": "major", "file": "src/swarmforge/report.py", "line": 215,
+    {"severity": "major", "file": "inventory/cli.py", "line": 215,
      "title": "unhandled None budget",
      "description": "report generation raises on unhandled None budget values",
      "recommendation": "coalesce None to 0"},
