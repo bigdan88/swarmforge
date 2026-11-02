@@ -52,6 +52,39 @@ def _blocking_findings(findings: list[dict], severities: set[str] | None) -> lis
     return kept
 
 
+def _partition_findings(
+    findings: list[dict],
+    severities: set[str] | None,
+    scope_files: set[str] | tuple[str, ...] | None,
+) -> tuple[list[dict], list[dict]]:
+    """Single-pass partition of blocking findings into (in_scope, out_of_scope).
+
+    Applies the `_blocking_findings` severity filter first, then splits the
+    kept list using `normalize_scope_path` prefix rules: an empty scope set or
+    an empty/missing finding file means in-scope; a finding file equal to or
+    under a scope path is in-scope; anything else is out-of-scope.
+    """
+    kept = _blocking_findings(findings, severities)
+    if scope_files is None:
+        return kept, []
+    scope = {normalize_scope_path(f) for f in scope_files if str(f or "").strip()}
+    if not scope:
+        return kept, []
+    in_scope: list[dict] = []
+    out_of_scope: list[dict] = []
+    for f in kept:
+        fp = normalize_scope_path(f.get("file"))
+        if not fp or (
+            fp in scope
+            or any(fp.startswith(s + "/") for s in scope)
+            or any(s.endswith("/") and fp.startswith(s) for s in scope)
+        ):
+            in_scope.append(f)
+        else:
+            out_of_scope.append(f)
+    return in_scope, out_of_scope
+
+
 def out_of_scope_findings(
     findings: list[dict],
     scope_files: set[str] | tuple[str, ...] | None,
@@ -62,25 +95,7 @@ def out_of_scope_findings(
     Findings without a file are considered in scope (never returned). An empty
     or None scope disables filtering entirely (returns []).
     """
-    kept = _blocking_findings(findings, severities)
-    if scope_files is None:
-        return []
-    scope = {normalize_scope_path(f) for f in scope_files if str(f or "").strip()}
-    if not scope:
-        return []
-    out: list[dict] = []
-    for f in kept:
-        fp = normalize_scope_path(f.get("file"))
-        if not fp:
-            continue
-        if (
-            fp in scope
-            or any(fp.startswith(s + "/") for s in scope)
-            or any(s.endswith("/") and fp.startswith(s) for s in scope)
-        ):
-            continue
-        out.append(f)
-    return out
+    return _partition_findings(findings, severities, scope_files)[1]
 
 
 def repair_tasks_from_findings(
@@ -99,10 +114,7 @@ def repair_tasks_from_findings(
     When `scope_files` is given (and non-empty), findings whose file lies outside
     that scope are excluded from repair tasks.
     """
-    kept = _blocking_findings(findings, severities)
-    out_of_scope = out_of_scope_findings(findings, scope_files, severities)
-    out_ids = {id(f) for f in out_of_scope}
-    kept = [f for f in kept if id(f) not in out_ids]
+    kept, _ = _partition_findings(findings, severities, scope_files)
     if not roles:
         if kept:
             raise ValueError("roles must not be empty when blocking findings exist")
@@ -207,7 +219,7 @@ class InvalidTransition(RuntimeError):
 class RunAborted(Exception):
     """Raised to stop a run and move it to a terminal state (budget, cancel, block)."""
 
-    def __init__(self, state: "RunState", reason: str):
+    def __init__(self, state: RunState, reason: str):
         super().__init__(reason)
         self.state = state
         self.reason = reason
@@ -233,7 +245,7 @@ class StateMachine:
         if new not in TRANSITIONS.get(self.state, set()):
             raise InvalidTransition(f"{self.state} -> {new} is not allowed")
         old, self.state = self.state, new
-        fields = {"state": new.value, "state_reason": reason or None}
+        fields: dict[str, object] = {"state": new.value, "state_reason": reason or None}
         if new in TERMINAL:
             import time
 
