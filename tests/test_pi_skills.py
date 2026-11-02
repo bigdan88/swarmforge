@@ -91,7 +91,10 @@ def test_vault_enrichment_appends_related_note(tmp_path):
     assert "Related knowledge-base notes" in skill.playbook
     assert "Button.key not Button.proto.key" in skill.playbook
     assert "b.proto.key raises AttributeError" in skill.playbook
-    assert any("app-test-button-key-not-button-proto-key" in s or "Button.key" in s for s in skill.sources)
+    assert any(
+        "app-test-button-key-not-button-proto-key" in s or "Button.key" in s
+        for s in skill.sources
+    )
     # unrelated note must not leak into this skill
     assert "deployment" not in skill.playbook
 
