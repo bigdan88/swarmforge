@@ -13,11 +13,14 @@ truncated to the newest `chat.context_max_messages` messages and then to the
 kept). LLM calls are recorded with run_id "chat:<conversation_id>" so
 Store.cost_summary attributes usage and cost per conversation.
 """
+
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -47,8 +50,13 @@ def estimate_tokens(messages: list[dict]) -> int:
     return sum(max(1, len(str(m.get("content") or "")) // 4) for m in messages)
 
 
-def truncate_context(messages: list[dict], max_messages: int,
-                      max_tokens: int | None = None, *, reserved_tokens: int = 0) -> list[dict]:
+def truncate_context(
+    messages: list[dict],
+    max_messages: int,
+    max_tokens: int | None = None,
+    *,
+    reserved_tokens: int = 0,
+) -> list[dict]:
     """Deterministically keep the newest messages: drop from the front until
     len(kept) <= max_messages, then (while over the token budget and more than
     one message remains) drop the oldest. The budget covers the ENTIRE request:
@@ -68,6 +76,127 @@ def truncate_context(messages: list[dict], max_messages: int,
 
 class ChatError(RuntimeError):
     """Friendly, user-presentable chatbot failure."""
+
+
+# ====================================================================== tools
+class ToolRegistry:
+    """Named chatbot tools: name -> (callable, description, JSON-schema parameters).
+
+    `execute` never raises: unknown tools and exceptions become "ERROR: ..." strings
+    the model can react to."""
+
+    def __init__(self) -> None:
+        self._tools: dict[str, tuple[Callable[..., str], str, dict]] = {}
+
+    def register(
+        self, name: str, fn: Callable[..., str], description: str, parameters: dict
+    ) -> None:
+        self._tools[name] = (fn, description, parameters)
+
+    def names(self) -> list[str]:
+        return list(self._tools)
+
+    def has(self, name: str) -> bool:
+        return name in self._tools
+
+    def schemas(self) -> list[dict]:
+        """OpenAI function-tool schemas (same shape as agent/tools.py `_fn`)."""
+        return [
+            {
+                "type": "function",
+                "function": {"name": name, "description": desc, "parameters": params},
+            }
+            for name, (_, desc, params) in self._tools.items()
+        ]
+
+    async def execute(self, name: str, args: dict) -> str:
+        if name not in self._tools:
+            return f"ERROR: unknown tool '{name}'"
+        fn = self._tools[name][0]
+        try:
+            out = fn(**(args or {}))
+            if asyncio.iscoroutine(out) or hasattr(out, "__await__"):
+                out = await out
+            return str(out)
+        except Exception as e:  # noqa: BLE001 - never raise out of the loop
+            return f"ERROR: {type(e).__name__}: {e}"
+
+
+def fetch_url(
+    url: str,
+    max_chars: int = 4000,
+    timeout_s: int = 15,
+    transport: httpx.BaseTransport | None = None,
+) -> str:
+    """GET a URL and return "HTTP <status>\n<body>" capped at max_chars.
+
+    `transport` allows offline testing (httpx.MockTransport). Raises on network
+    errors and invalid URLs; the ToolRegistry converts that to an ERROR string."""
+    with httpx.Client(
+        transport=transport, follow_redirects=True, timeout=timeout_s
+    ) as client:
+        r = client.get(url)
+    body = r.text[:max_chars]
+    if len(r.text) > max_chars:
+        body += "\n…[truncated]…"
+    return f"HTTP {r.status_code}\n{body}"
+
+
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
+
+
+def list_files(path: str = ".", max_entries: int = 200) -> str:
+    """Sorted relative paths under `path` (dirs suffixed '/'), skipping VCS/cache
+    directories, capped at max_entries. Raises for missing or non-directory paths."""
+    root = Path(path)
+    if not root.exists():
+        raise FileNotFoundError(f"no such directory: {path}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"not a directory: {path}")
+    entries: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        rel = Path(dirpath).relative_to(root)
+        for d in dirnames:
+            entries.append((rel / d).as_posix() + "/")
+        for f in sorted(filenames):
+            entries.append((rel / f).as_posix())
+    entries.sort()
+    if len(entries) > max_entries:
+        return (
+            "\n".join(entries[:max_entries])
+            + f"\n… (truncated, {len(entries) - max_entries} more)"
+        )
+    return "\n".join(entries)
+
+
+def build_tools(cfg: Config) -> ToolRegistry:
+    """The chatbot's tool registry (built per call; opt-in via chat.tools_enabled)."""
+    registry = ToolRegistry()
+    registry.register(
+        "fetch_url",
+        fetch_url,
+        "Fetch a web page or API by URL and return its text (truncated).",
+        {
+            "type": "object",
+            "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}},
+            "required": ["url"],
+        },
+    )
+    registry.register(
+        "list_files",
+        list_files,
+        "List files under a directory of the local filesystem (recursive, sorted).",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "max_entries": {"type": "integer"},
+            },
+            "required": [],
+        },
+    )
+    return registry
 
 
 SYSTEM_PROMPT = """You are the SwarmForge status chatbot. You answer questions about SwarmForge runs \
@@ -105,7 +234,6 @@ smaller scope, specific technical fix, continue from the code already written); 
 only when that option changes them; continue_code=true only if the run is marked resumable.
 Leave "tasks" or "fixes" as an empty list when not relevant. Omit the block entirely for plain status
 questions."""
-
 
 
 def resolve_role(cfg: Config) -> str:
@@ -153,21 +281,31 @@ def status_snapshot(store: Store, max_runs: int = 12) -> str:
         elapsed = ((finished or time.time()) - created) / 60 if created else 0
         cost = store.cost_summary(run["id"]).get("total") or 0
         L.append("")
-        L.append(f"Run {rid}: {run.get('state') or '-'}"
-                 f"{' - ' + run['state_reason'] if run.get('state_reason') else ''}")
-        L.append(f"  mode: {run.get('mode') or '-'} | issue: {run.get('issue_title') or '-'} "
-                 f"| repo: {run.get('repo') or '-'}")
-        L.append(f"  created: {datetime.fromtimestamp(created, UTC).strftime('%Y-%m-%d %H:%M') if created else '-'}"
-                 f" | finished: {datetime.fromtimestamp(finished, UTC).strftime('%Y-%m-%d %H:%M') if finished else '-'}"
-                 f" | elapsed: {elapsed:.0f} min")
-        L.append(f"  cost: ${cost:.3f} of ${run.get('budget_usd') or 0:.2f} "
-                 f"| repair cycle: {run.get('repair_cycle') or 0} "
-                 f"| pr: {run.get('pr_url') or '-'}")
+        L.append(
+            f"Run {rid}: {run.get('state') or '-'}"
+            f"{' - ' + run['state_reason'] if run.get('state_reason') else ''}"
+        )
+        L.append(
+            f"  mode: {run.get('mode') or '-'} | issue: {run.get('issue_title') or '-'} "
+            f"| repo: {run.get('repo') or '-'}"
+        )
+        L.append(
+            f"  created: {datetime.fromtimestamp(created, UTC).strftime('%Y-%m-%d %H:%M') if created else '-'}"
+            f" | finished: {datetime.fromtimestamp(finished, UTC).strftime('%Y-%m-%d %H:%M') if finished else '-'}"
+            f" | elapsed: {elapsed:.0f} min"
+        )
+        L.append(
+            f"  cost: ${cost:.3f} of ${run.get('budget_usd') or 0:.2f} "
+            f"| repair cycle: {run.get('repair_cycle') or 0} "
+            f"| pr: {run.get('pr_url') or '-'}"
+        )
         tasks = store.tasks(run["id"])
         for t in tasks:
-            L.append(f"  [{t.get('state')}] {t.get('task_key')} "
-                     f"({t.get('role')}, {t.get('model')}, cycle {t.get('cycle')}): "
-                     f"{t.get('title') or ''}")
+            L.append(
+                f"  [{t.get('state')}] {t.get('task_key')} "
+                f"({t.get('role')}, {t.get('model')}, cycle {t.get('cycle')}): "
+                f"{t.get('title') or ''}"
+            )
             if t.get("error"):
                 L.append(f"    error: {_trunc(t['error'])}")
             if t.get("summary"):
@@ -179,16 +317,20 @@ def status_snapshot(store: Store, max_runs: int = 12) -> str:
     if not failures:
         L.append("  none")
     for f in failures:
-        L.append(f"  - run {(f.get('run_id') or '')[:8]}: {f.get('category') or '-'} "
-                 f"| root cause: {_trunc(f.get('root_cause'))} "
-                 f"| outcome: {f.get('outcome') or '-'} | retry: {bool(f.get('retry'))}")
+        L.append(
+            f"  - run {(f.get('run_id') or '')[:8]}: {f.get('category') or '-'} "
+            f"| root cause: {_trunc(f.get('root_cause'))} "
+            f"| outcome: {f.get('outcome') or '-'} | retry: {bool(f.get('retry'))}"
+        )
 
     L.append("Queue:")
     items = store.queue_items()
     if not items:
         L.append("  empty")
     for q in items:
-        L.append(f"  - [{q.get('status')}] {q.get('title') or '-'} (repo: {q.get('repo') or '-'})")
+        L.append(
+            f"  - [{q.get('status')}] {q.get('title') or '-'} (repo: {q.get('repo') or '-'})"
+        )
 
     approvals = len(store.pending_approvals())
     L.append(f"Pending approvals: {approvals}")
@@ -220,8 +362,12 @@ def build_user_content(question: str, attachments) -> str | list[dict]:
             else:
                 lines.append(f"- {path.name} ({kind})")
             if kind == "image":
-                image_blocks.append({"type": "image_url",
-                                     "image_url": {"url": att.image_data_url(path)}})
+                image_blocks.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": att.image_data_url(path)},
+                    }
+                )
         except OSError:
             continue
     blocks: list[dict] = [{"type": "text", "text": "\n".join(lines)}]
@@ -229,8 +375,9 @@ def build_user_content(question: str, attachments) -> str | list[dict]:
     return blocks
 
 
-def build_attachment_message(cfg: Config, attachments: list[dict] | None,
-                             conversation: str | None) -> dict | None:
+def build_attachment_message(
+    cfg: Config, attachments: list[dict] | None, conversation: str | None
+) -> dict | None:
     """Build an extra user message carrying the request's DICT attachments
     ({"name": str, "data": bytes}).
 
@@ -250,7 +397,7 @@ def build_attachment_message(cfg: Config, attachments: list[dict] | None,
     saved = save_attachments(target, attachments)
     texts: list[str] = []
     images: list[dict] = []
-    for attachment, path in zip(attachments[:len(saved)], saved):
+    for attachment, path in zip(attachments[: len(saved)], saved):
         name = str(attachment.get("name") or "file")
         data = attachment.get("data", b"")
         if not isinstance(data, bytes):
@@ -258,20 +405,32 @@ def build_attachment_message(cfg: Config, attachments: list[dict] | None,
         kind = classify(name)
         if kind == "image":
             if len(images) >= MAX_CHAT_IMAGES:
-                texts.append(f'Image attachment "{name}" skipped (more than {MAX_CHAT_IMAGES} images); '
-                             f"stored at {path}.")
+                texts.append(
+                    f'Image attachment "{name}" skipped (more than {MAX_CHAT_IMAGES} images); '
+                    f"stored at {path}."
+                )
             elif len(data) > MAX_IMAGE_BYTES:
-                texts.append(f'Image attachment "{name}" is too large to forward '
-                             f"({len(data)} bytes > {MAX_IMAGE_BYTES}); stored at {path}.")
+                texts.append(
+                    f'Image attachment "{name}" is too large to forward '
+                    f"({len(data)} bytes > {MAX_IMAGE_BYTES}); stored at {path}."
+                )
             else:
-                images.append({"type": "image_url", "image_url": {"url": data_url(name, data)}})
+                images.append(
+                    {"type": "image_url", "image_url": {"url": data_url(name, data)}}
+                )
             continue
         if kind == "text":
-            content = _cap(data.decode("utf-8", errors="replace"), MAX_INLINE_ATTACHMENT_BYTES)
-            texts.append(f'Attached file "{name}" (first {MAX_INLINE_ATTACHMENT_BYTES} bytes):\n{content}')
+            content = _cap(
+                data.decode("utf-8", errors="replace"), MAX_INLINE_ATTACHMENT_BYTES
+            )
+            texts.append(
+                f'Attached file "{name}" (first {MAX_INLINE_ATTACHMENT_BYTES} bytes):\n{content}'
+            )
         else:
-            texts.append(f'Attachment "{name}" stored at {path} '
-                         "(not inlined: binary or oversized).")
+            texts.append(
+                f'Attachment "{name}" stored at {path} '
+                "(not inlined: binary or oversized)."
+            )
     if not images:
         return {"role": "user", "content": "\n\n".join(texts)}
     text = "\n\n".join(texts + ["See the image attachments below."])
@@ -284,11 +443,19 @@ def _dict_attachments(attachments) -> bool:
     return bool(attachments) and isinstance(attachments[0], dict)
 
 
-async def answer(cfg: Config, store: Store, question: str,
-                 history: list[dict] | None = None, *, conversation: str | None = None,
-                 transport: httpx.AsyncBaseTransport | None = None,
-                 max_runs: int = 12, budget=None,
-                 attachments: list | None = None) -> dict:
+async def answer(
+    cfg: Config,
+    store: Store,
+    question: str,
+    history: list[dict] | None = None,
+    *,
+    conversation: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    max_runs: int = 12,
+    budget=None,
+    attachments: list | None = None,
+    on_tool: Callable | None = None,
+) -> dict:
     """Ask the status chatbot a question; returns {answer, role, model, question}.
 
     With `conversation` set, the question and reply are persisted to that
@@ -309,16 +476,29 @@ async def answer(cfg: Config, store: Store, question: str,
     from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 
     role = resolve_role(cfg)
-    messages: list[dict] = [{"role": "system",
-                 "content": SYSTEM_PROMPT + "\n" + IMPROVE_PROMPT + "\n\n<status>\n" + status_snapshot(store, max_runs)
-                 + "\n</status>\n\n<improvement_context>\n" + improvement_context(cfg, store)
-                 + "\n</improvement_context>"}]
+    messages: list[dict] = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT
+            + "\n"
+            + IMPROVE_PROMPT
+            + "\n\n<status>\n"
+            + status_snapshot(store, max_runs)
+            + "\n</status>\n\n<improvement_context>\n"
+            + improvement_context(cfg, store)
+            + "\n</improvement_context>",
+        }
+    ]
     if conversation:
         store.conversation_append(conversation, "user", question)
         msgs = store.conversation_messages(conversation)
         reserved = estimate_tokens(messages)
-        context = truncate_context(msgs, cfg.chat.context_max_messages,
-                                   cfg.chat.context_max_tokens, reserved_tokens=reserved)
+        context = truncate_context(
+            msgs,
+            cfg.chat.context_max_messages,
+            cfg.chat.context_max_tokens,
+            reserved_tokens=reserved,
+        )
         for m in context:
             messages.append({"role": m["role"], "content": m["content"]})
         if attachments:
@@ -327,22 +507,54 @@ async def answer(cfg: Config, store: Store, question: str,
                 if att_msg is not None:
                     messages.append(att_msg)
             else:
-                messages[-1] = {"role": "user", "content": build_user_content(question, attachments)}
+                messages[-1] = {
+                    "role": "user",
+                    "content": build_user_content(question, attachments),
+                }
         run_id = CHAT_RUN_PREFIX + conversation
-        llm_budget = budget if budget is not None else Budget(
-            max(2.0, cfg.limits.budget_usd), store.cost_summary(run_id)["total"])
+        llm_budget = (
+            budget
+            if budget is not None
+            else Budget(
+                max(2.0, cfg.limits.budget_usd), store.cost_summary(run_id)["total"]
+            )
+        )
         try:
-            llm = LLMClient(cfg, store=store, run_id=run_id, budget=llm_budget, transport=transport,
-                          record_errors=False)
-            res = await llm.chat(role, messages, task_key="chatbot")
+            llm = LLMClient(
+                cfg,
+                store=store,
+                run_id=run_id,
+                budget=llm_budget,
+                transport=transport,
+                record_errors=False,
+            )
+            if cfg.chat.tools_enabled:
+                registry = build_tools(cfg)
+                res = await llm.chat_with_tools(
+                    role,
+                    messages,
+                    registry.schemas(),
+                    registry.execute,
+                    max_rounds=cfg.chat.max_tool_rounds,
+                    task_key="chatbot",
+                    on_tool=on_tool,
+                )
+            else:
+                res = await llm.chat(role, messages, task_key="chatbot")
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e
         text, actions = parse_actions(res.content or "", store)
         store.conversation_append(conversation, "assistant", text)
-        return {"answer": text, "role": role, "model": cfg.roles[role].model, "question": question,
-                "actions": actions, "conversation": conversation,
-                "usage": store.cost_summary(run_id)}
-    for m in (history or []):
+        return {
+            "answer": text,
+            "role": role,
+            "model": cfg.roles[role].model,
+            "question": question,
+            "actions": actions,
+            "conversation": conversation,
+            "usage": store.cost_summary(run_id),
+        }
+    for m in history or []:
         if m.get("role") in ("user", "assistant") and m.get("content"):
             messages.append({"role": m["role"], "content": str(m["content"])})
     if attachments and _dict_attachments(attachments):
@@ -351,32 +563,75 @@ async def answer(cfg: Config, store: Store, question: str,
         if att_msg is not None:
             messages.append(att_msg)
     else:
-        messages.append({"role": "user", "content": build_user_content(question, attachments)})
+        messages.append(
+            {"role": "user", "content": build_user_content(question, attachments)}
+        )
     try:
-        llm = LLMClient(cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport)
-        res = await llm.chat(role, messages, task_key="chatbot")
+        llm = LLMClient(
+            cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport
+        )
+        if cfg.chat.tools_enabled:
+            registry = build_tools(cfg)
+            res = await llm.chat_with_tools(
+                role,
+                messages,
+                registry.schemas(),
+                registry.execute,
+                max_rounds=cfg.chat.max_tool_rounds,
+                task_key="chatbot",
+                on_tool=on_tool,
+            )
+        else:
+            res = await llm.chat(role, messages, task_key="chatbot")
     except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
         raise ChatError(str(e)) from e
     text, actions = parse_actions(res.content or "", store)
-    return {"answer": text, "role": role, "model": cfg.roles[role].model, "question": question,
-            "actions": actions}
+    return {
+        "answer": text,
+        "role": role,
+        "model": cfg.roles[role].model,
+        "question": question,
+        "actions": actions,
+    }
 
 
-def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = None, *,
-        conversation: str | None = None, transport: httpx.AsyncBaseTransport | None = None,
-        max_runs: int = 12, attachments: list | None = None) -> dict:
+def ask(
+    cfg: Config,
+    store: Store,
+    question: str,
+    history: list[dict] | None = None,
+    *,
+    conversation: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    max_runs: int = 12,
+    attachments: list | None = None,
+    on_tool: Callable | None = None,
+) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
-    return asyncio.run(answer(cfg, store, question, history, conversation=conversation,
-                              transport=transport, max_runs=max_runs,
-                              attachments=attachments))
+    return asyncio.run(
+        answer(
+            cfg,
+            store,
+            question,
+            history,
+            conversation=conversation,
+            transport=transport,
+            max_runs=max_runs,
+            attachments=attachments,
+            on_tool=on_tool,
+        )
+    )
 
 
 # ======================================================== conversation persistence
 DEFAULT_CONVERSATION_TITLE = "General"
 
 
-def create_conversation(store: Store, title: str = DEFAULT_CONVERSATION_TITLE,
-                        last_run_id: str | None = None) -> dict:
+def create_conversation(
+    store: Store,
+    title: str = DEFAULT_CONVERSATION_TITLE,
+    last_run_id: str | None = None,
+) -> dict:
     """Create a new conversation and return it as a dict."""
     conv_id = uuid.uuid4().hex
     now = time.time()
@@ -397,7 +652,9 @@ def get_conversation(store: Store, conversation_id: str) -> dict | None:
 def list_conversations(store: Store, limit: int = 50) -> list[dict]:
     """Conversations most-recent first (by updated_at, then id)."""
     return store._all(
-        "SELECT * FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ?", (limit,))
+        "SELECT * FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ?",
+        (limit,),
+    )
 
 
 def add_message(store: Store, conversation_id: str, role: str, content: str) -> dict:
@@ -412,7 +669,9 @@ def add_message(store: Store, conversation_id: str, role: str, content: str) -> 
             (conversation_id, role, content, now),
         )
         store.conn.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (now, conversation_id),
+        )
         store.conn.commit()
         msg_id = cur.lastrowid
     msg = store._one("SELECT * FROM chat_messages WHERE id = ?", (msg_id,))
@@ -420,15 +679,20 @@ def add_message(store: Store, conversation_id: str, role: str, content: str) -> 
     return msg
 
 
-def get_messages(store: Store, conversation_id: str, limit: int | None = None) -> list[dict]:
+def get_messages(
+    store: Store, conversation_id: str, limit: int | None = None
+) -> list[dict]:
     """Messages of a conversation, oldest first. With limit, the last `limit` messages."""
     if limit is None:
         return store._all(
             "SELECT * FROM chat_messages WHERE conversation_id = ? ORDER BY id",
-            (conversation_id,))
+            (conversation_id,),
+        )
     rows = store._all(
         "SELECT * FROM chat_messages WHERE conversation_id = ? "
-        "ORDER BY id DESC LIMIT ?", (conversation_id, limit))
+        "ORDER BY id DESC LIMIT ?",
+        (conversation_id, limit),
+    )
     return list(reversed(rows))
 
 
@@ -442,7 +706,8 @@ def clear_messages(store: Store, conversation_id: str) -> int:
         raise ChatError(f"unknown conversation {conversation_id}")
     with store._lock:
         cur = store.conn.execute(
-            "DELETE FROM chat_messages WHERE conversation_id = ?", (conversation_id,))
+            "DELETE FROM chat_messages WHERE conversation_id = ?", (conversation_id,)
+        )
         store.conn.commit()
         return cur.rowcount
 
@@ -463,10 +728,12 @@ def rename_conversation(store: Store, conversation_id: str, title: str) -> dict:
 def delete_conversation(store: Store, conversation_id: str) -> bool:
     """Delete a conversation and all its messages. Returns True if it existed."""
     with store._lock:
-        store.conn.execute("DELETE FROM chat_messages WHERE conversation_id = ?",
-                           (conversation_id,))
-        cur = store.conn.execute("DELETE FROM conversations WHERE id = ?",
-                                 (conversation_id,))
+        store.conn.execute(
+            "DELETE FROM chat_messages WHERE conversation_id = ?", (conversation_id,)
+        )
+        cur = store.conn.execute(
+            "DELETE FROM conversations WHERE id = ?", (conversation_id,)
+        )
         store.conn.commit()
         return cur.rowcount > 0
 
@@ -489,13 +756,14 @@ SIZES = ("S", "M", "L")
 
 def _platform_root():
     from .selfupdate import ROOT
+
     return ROOT
 
 
 def failures_needing_attention(store: Store, limit: int = 10) -> list[dict]:
     out = []
     for f in store.failures(limit=200):
-        outcome = (f.get("outcome") or "")
+        outcome = f.get("outcome") or ""
         if outcome.startswith(NEEDS_YOU) or (not outcome and not f.get("heal_run_id")):
             if "dismissed" in outcome or "retried from chat" in outcome:
                 continue
@@ -508,24 +776,32 @@ def failures_needing_attention(store: Store, limit: int = 10) -> list[dict]:
 def improvement_context(cfg: Config, store: Store) -> str:
     """Evidence for suggesting platform improvements and failure fixes. Never raises."""
     import re
-    from pathlib import Path
+
     L: list[str] = []
     try:
         from .selfupdate import own_repo
+
         L.append(f"Platform repository (SwarmForge itself): {own_repo() or 'unknown'}")
     except Exception:  # noqa: BLE001
         pass
     root = _platform_root()
     try:
-        heads = [h[3:].strip() for h in (root / "README.md").read_text(encoding="utf-8").splitlines()
-                 if h.startswith("## ")]
+        heads = [
+            h[3:].strip()
+            for h in (root / "README.md").read_text(encoding="utf-8").splitlines()
+            if h.startswith("## ")
+        ]
         L.append("Features (README sections): " + "; ".join(heads[:40]))
     except OSError:
         pass
     mods = []
     for f in sorted((root / "src" / "swarmforge").glob("*.py")):
         try:
-            m = re.match(r'\s*(?:from __future__[^\n]*\n)?\s*"""(.*?)(?:\n|""")', f.read_text(encoding="utf-8"), re.S)
+            m = re.match(
+                r'\s*(?:from __future__[^\n]*\n)?\s*"""(.*?)(?:\n|""")',
+                f.read_text(encoding="utf-8"),
+                re.DOTALL,
+            )
             mods.append(f"{f.stem}: {_trunc(m.group(1), 110) if m else ''}")
         except OSError:
             continue
@@ -536,41 +812,62 @@ def improvement_context(cfg: Config, store: Store) -> str:
     done = [r for r in runs if r["state"] in TERMINAL]
     if done:
         ok = sum(1 for r in done if r["state"] == "COMPLETED")
-        durs = sorted(((r.get("finished_at") or r["created_at"]) - r["created_at"]) / 60 for r in done)
+        durs = sorted(
+            ((r.get("finished_at") or r["created_at"]) - r["created_at"]) / 60
+            for r in done
+        )
         costs = [store.cost_summary(r["id"]).get("total") or 0 for r in done]
         cats: dict[str, int] = {}
         for f in store.failures(limit=100):
             cats[f.get("category") or "?"] = cats.get(f.get("category") or "?", 0) + 1
-        L.append(f"Last {len(done)} finished runs: {ok} completed, {len(done) - ok} not; median "
-                 f"{durs[len(durs) // 2]:.0f} min; average ${sum(costs) / len(costs):.2f}. Failure categories: "
-                 + ", ".join(f"{k}={v}" for k, v in sorted(cats.items(), key=lambda kv: -kv[1])))
+        L.append(
+            f"Last {len(done)} finished runs: {ok} completed, {len(done) - ok} not; median "
+            f"{durs[len(durs) // 2]:.0f} min; average ${sum(costs) / len(costs):.2f}. Failure categories: "
+            + ", ".join(
+                f"{k}={v}" for k, v in sorted(cats.items(), key=lambda kv: -kv[1])
+            )
+        )
     # failures that need a decision
     fails = failures_needing_attention(store)
     if fails:
         from .postmortem import resumable
+
         L.append("Failures needing Dan's decision (use these full run ids in fixes):")
         for f in fails:
             run = store.get_run(f["run_id"]) or {}
-            L.append(f"- run {f['run_id']} | task: {_trunc(f.get('title') or run.get('issue_title'), 120)} | "
-                     f"repo: {f.get('repo') or run.get('repo')} | category: {f.get('category')} | "
-                     f"time limit {((run.get('max_runtime_s') or 0) / 3600):.1f} h, budget ${run.get('budget_usd') or 0:.0f}, "
-                     f"repair cycles {run.get('max_repair_cycles')} | resumable: {resumable(store, f['run_id'])}\n"
-                     f"  root cause: {_trunc(f.get('root_cause'), 400)}\n  suggested fix: {_trunc(f.get('fix'), 300)}")
+            L.append(
+                f"- run {f['run_id']} | task: {_trunc(f.get('title') or run.get('issue_title'), 120)} | "
+                f"repo: {f.get('repo') or run.get('repo')} | category: {f.get('category')} | "
+                f"time limit {((run.get('max_runtime_s') or 0) / 3600):.1f} h, budget ${run.get('budget_usd') or 0:.0f}, "
+                f"repair cycles {run.get('max_repair_cycles')} | resumable: {resumable(store, f['run_id'])}\n"
+                f"  root cause: {_trunc(f.get('root_cause'), 400)}\n  suggested fix: {_trunc(f.get('fix'), 300)}"
+            )
     # lessons from the knowledge base
     try:
         from .knowledge import Vault
-        notes = [n for n in Vault(cfg.vault_path).notes() if n.type in ("pitfall", "review-lesson", "failure",
-                                                                         "user-note", "model-behavior")]
+
+        notes = [
+            n
+            for n in Vault(cfg.vault_path).notes()
+            if n.type
+            in ("pitfall", "review-lesson", "failure", "user-note", "model-behavior")
+        ]
         notes.sort(key=lambda n: n.created or "", reverse=True)
         if notes:
             L.append("Lessons learned (newest first):")
-            L += [f"- [{n.type}] {n.title}: {_trunc(n.body.replace(chr(10), ' '), 160)}" for n in notes[:15]]
+            L += [
+                f"- [{n.type}] {n.title}: {_trunc(n.body.replace(chr(10), ' '), 160)}"
+                for n in notes[:15]
+            ]
     except Exception:  # noqa: BLE001
         pass
     # don't suggest what's already planned
-    planned = [q["title"] for q in store.queue_items() if q["status"] in ("queued", "running")]
+    planned = [
+        q["title"] for q in store.queue_items() if q["status"] in ("queued", "running")
+    ]
     try:
         from .runqueue import parse_backlog
+
         bl = root / "docs" / "SELF_IMPROVEMENT_BACKLOG.md"
         if bl.is_file():
             planned += [b.title for b in parse_backlog(bl.read_text(encoding="utf-8"))]
@@ -578,9 +875,15 @@ def improvement_context(cfg: Config, store: Store) -> str:
         pass
     recent = [r.get("issue_title") for r in runs if r.get("issue_title")]
     if planned:
-        L.append("Already queued or in the backlog (don't duplicate): " + "; ".join(_trunc(t, 80) for t in planned[:30]))
+        L.append(
+            "Already queued or in the backlog (don't duplicate): "
+            + "; ".join(_trunc(t, 80) for t in planned[:30])
+        )
     if recent:
-        L.append("Recently worked on: " + "; ".join(_trunc(t, 80) for t in dict.fromkeys(recent).keys()))
+        L.append(
+            "Recently worked on: "
+            + "; ".join(_trunc(t, 80) for t in dict.fromkeys(recent).keys())
+        )
     return _cap("\n".join(L), 12_000)
 
 
@@ -596,36 +899,64 @@ def parse_actions(text: str, store: Store | None = None) -> tuple[str, dict]:
     """Split the reply into (markdown shown to Dan, validated actions)."""
     import json
     import re
+
     actions: dict = {"tasks": [], "fixes": []}
-    m = re.search(r"```actions\s*(\{.*?\})\s*```", text or "", re.S)
+    m = re.search(r"```actions\s*(\{.*?\})\s*```", text or "", re.DOTALL)
     if not m:
         return (text or "").strip(), actions
-    shown = ((text[:m.start()] + text[m.end():]) if text else "").strip()
+    shown = ((text[: m.start()] + text[m.end() :]) if text else "").strip()
     try:
         data = json.loads(m.group(1))
     except json.JSONDecodeError:
         return shown, actions
     for t in (data.get("tasks") or [])[:8]:
-        if isinstance(t, dict) and str(t.get("title") or "").strip() and str(t.get("description") or "").strip():
-            actions["tasks"].append({"title": str(t["title"]).strip()[:150],
-                                     "description": str(t["description"]).strip()[:6000],
-                                     "why": str(t.get("why") or "").strip()[:800],
-                                     "size": str(t.get("size") or "M").upper()[:1] if str(t.get("size") or "M").upper()[:1] in SIZES else "M",
-                                     "repo": str(t.get("repo") or "").strip()[:200]})
+        if (
+            isinstance(t, dict)
+            and str(t.get("title") or "").strip()
+            and str(t.get("description") or "").strip()
+        ):
+            actions["tasks"].append(
+                {
+                    "title": str(t["title"]).strip()[:150],
+                    "description": str(t["description"]).strip()[:6000],
+                    "why": str(t.get("why") or "").strip()[:800],
+                    "size": str(t.get("size") or "M").upper()[:1]
+                    if str(t.get("size") or "M").upper()[:1] in SIZES
+                    else "M",
+                    "repo": str(t.get("repo") or "").strip()[:200],
+                }
+            )
     for f in (data.get("fixes") or [])[:10]:
         if not isinstance(f, dict):
             continue
-        run = store.get_run(str(f.get("run_id") or "")) if store is not None else {"id": f.get("run_id")}
+        run = (
+            store.get_run(str(f.get("run_id") or ""))
+            if store is not None
+            else {"id": f.get("run_id")}
+        )
         if not run:
             continue
         opts = []
         for o in (f.get("options") or [])[:5]:
             if isinstance(o, dict) and str(o.get("instructions") or "").strip():
-                opts.append({"label": str(o.get("label") or "Retry")[:80], "instructions": str(o["instructions"])[:3000],
-                             "time_limit_h": _num(o.get("time_limit_h"), 0.1, 72),
-                             "budget_usd": _num(o.get("budget_usd"), 0.5, 500),
-                             "max_cycles": int(_num(o.get("max_cycles"), 0, 10)) if _num(o.get("max_cycles"), 0, 10) is not None else None,
-                             "continue_code": bool(o.get("continue_code"))})
+                opts.append(
+                    {
+                        "label": str(o.get("label") or "Retry")[:80],
+                        "instructions": str(o["instructions"])[:3000],
+                        "time_limit_h": _num(o.get("time_limit_h"), 0.1, 72),
+                        "budget_usd": _num(o.get("budget_usd"), 0.5, 500),
+                        "max_cycles": int(_num(o.get("max_cycles"), 0, 10))
+                        if _num(o.get("max_cycles"), 0, 10) is not None
+                        else None,
+                        "continue_code": bool(o.get("continue_code")),
+                    }
+                )
         if opts:
-            actions["fixes"].append({"run_id": run["id"], "summary": str(f.get("summary") or "")[:300], "options": opts})
+            actions["fixes"].append(
+                {
+                    "run_id": run["id"],
+                    "summary": str(f.get("summary") or "")[:300],
+                    "options": opts,
+                }
+            )
     return shown, actions

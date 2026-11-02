@@ -3,6 +3,7 @@
 All settings live in one YAML file (see swarmforge.example.yaml). Secrets are never
 stored in the YAML: providers reference an environment variable *name* instead.
 """
+
 from __future__ import annotations
 
 import os
@@ -55,20 +56,26 @@ class RoleConfig:
 @dataclass
 class Limits:
     budget_usd: float = 20.0
-    max_runtime_s: int = 21600     # 6 hours
-    busy_wait_s: int = 900         # keep retrying a busy/rate-limited model this long before falling back
+    max_runtime_s: int = 21600  # 6 hours
+    busy_wait_s: int = (
+        900  # keep retrying a busy/rate-limited model this long before falling back
+    )
     max_concurrent_agents: int = 2
-    one_run_per_repo: bool = True     # false = runs on the same repository never wait for each other
+    one_run_per_repo: bool = (
+        True  # false = runs on the same repository never wait for each other
+    )
     # several runs on one repository: "coordinate" (a manager checks the tasks are different enough,
     # each run works on its own branch and is updated with the latest base before its PR),
     # "serial" (one run per repository at a time) or "parallel" (no checks)
     same_repo: str = "coordinate"
-    max_parallel_queues: int = 3      # queues ("piles") the worker runs side by side
+    max_parallel_queues: int = 3  # queues ("piles") the worker runs side by side
     max_repair_cycles: int = 3
-    tester_every_cycle: bool = False   # repair cycles re-run the tests but skip the tester agent
+    tester_every_cycle: bool = (
+        False  # repair cycles re-run the tests but skip the tester agent
+    )
     max_tasks: int = 8
     max_conflict_resolutions: int = 3
-    task_retries: int = 1          # extra attempts for a coding task whose agent failed
+    task_retries: int = 1  # extra attempts for a coding task whose agent failed
     max_planning_attempts: int = 2
 
 
@@ -83,43 +90,61 @@ class SandboxConfig:
     pids_limit: int = 256
     command_timeout_s: int = 300
     docker_binary: str = "docker"
-    dependency_install: bool = True   # install the project's declared packages (network only for that step)
+    dependency_install: bool = (
+        True  # install the project's declared packages (network only for that step)
+    )
     install_network: str = "bridge"
     install_timeout_s: int = 900
-    reuse_container: bool = True      # agents' run_command execs into one long-lived container per agent
-    dev_tools: bool = True            # processes, headless browser and check_code for developers/tester
+    reuse_container: bool = (
+        True  # agents' run_command execs into one long-lived container per agent
+    )
+    dev_tools: bool = (
+        True  # processes, headless browser and check_code for developers/tester
+    )
 
 
 @dataclass
 class PiConfig:
     """Pi (pi.dev) as the harness for roles with `runtime: pi`."""
-    command: str = "pi"                 # inside the sandbox image; on the host in local mode
-    network: str = "bridge"             # the Pi container must reach SwarmForge's model relay on the host
-    relay_host: str | None = None       # relay bind address (default: 127.0.0.1; 0.0.0.0 on Linux+Docker)
+
+    command: str = "pi"  # inside the sandbox image; on the host in local mode
+    network: str = (
+        "bridge"  # the Pi container must reach SwarmForge's model relay on the host
+    )
+    relay_host: str | None = (
+        None  # relay bind address (default: 127.0.0.1; 0.0.0.0 on Linux+Docker)
+    )
     extra_args: list = field(default_factory=list)
 
 
 @dataclass
 class WatchConfig:
     """`swarmforge watch`: turn labelled GitHub issues into queued runs."""
-    repos: list = field(default_factory=list)   # e.g. ["bigdan88/swarmforge"]
-    label: str = "swarmforge"                   # add this label to an issue to hand it to the swarm
+
+    repos: list = field(default_factory=list)  # e.g. ["bigdan88/swarmforge"]
+    label: str = "swarmforge"  # add this label to an issue to hand it to the swarm
     interval_s: int = 120
-    approval: str = "dashboard"                 # dashboard (ask before pushing) | yes (push the draft PR)
+    approval: str = (
+        "dashboard"  # dashboard (ask before pushing) | yes (push the draft PR)
+    )
     budget_usd: float | None = None
     max_cycles: int | None = None
-    comment: bool = True                        # comment on the issue when queued / finished
-    queue: str = "github"                       # which queue ("pile") labelled issues go to
+    comment: bool = True  # comment on the issue when queued / finished
+    queue: str = "github"  # which queue ("pile") labelled issues go to
 
 
 @dataclass
 class ProjectConfig:
     test_command: str = "python -m pytest -q"
-    agent_test_command: str | None = None  # quicker suite agents run while working (optional)
+    agent_test_command: str | None = (
+        None  # quicker suite agents run while working (optional)
+    )
     # extra environment for the AGENTS' sandbox only (not the orchestrator's evidence runs), e.g.
     # PYTEST_ADDOPTS: "-m 'not slow'" so every pytest an agent starts skips the slow tests
     agent_env: dict = field(default_factory=dict)
-    reuse_baseline: bool = True   # skip the baseline test run when the same commit passed it before
+    reuse_baseline: bool = (
+        True  # skip the baseline test run when the same commit passed it before
+    )
     setup_command: str | None = None
 
 
@@ -140,25 +165,32 @@ class AutoMergeConfig:
     (`judge_role`). Never auto-merged: unresolved [major] findings, conflicts, failing checks, and any
     file the repository lists under `protected_paths` in swarmforge.project.yml. Nothing restarts:
     you still pick when to Update & restart."""
+
     enabled: bool = False
-    repos: list[str] = field(default_factory=list)   # owner/name; empty = every repository
-    max_lines: int = 400          # added + deleted lines that merge without asking the judge
+    repos: list[str] = field(
+        default_factory=list
+    )  # owner/name; empty = every repository
+    max_lines: int = 400  # added + deleted lines that merge without asking the judge
     judge_role: str = "reviewer"  # model that decides on larger changes
-    judge_max_lines: int = 3000   # bigger than this always waits for you
-    method: str = "squash"        # squash | merge | rebase
+    judge_max_lines: int = 3000  # bigger than this always waits for you
+    method: str = "squash"  # squash | merge | rebase
 
 
 @dataclass
 class ReviewConfig:
-    blocking_severities: list[str] = field(default_factory=lambda: ["critical", "major"])
+    blocking_severities: list[str] = field(
+        default_factory=lambda: ["critical", "major"]
+    )
     allow_same_model_review: bool = False
 
 
 @dataclass
 class KnowledgeConfig:
     enabled: bool = True
-    vault: str = "knowledge"           # folder of Markdown notes; relative to the config file
-    librarian_role: str = "librarian"  # role that distills notes after a run (falls back to planner)
+    vault: str = "knowledge"  # folder of Markdown notes; relative to the config file
+    librarian_role: str = (
+        "librarian"  # role that distills notes after a run (falls back to planner)
+    )
     max_notes_in_prompt: int = 6
     max_notes_per_run: int = 6
 
@@ -168,27 +200,36 @@ class KnowledgeConfig:
 @dataclass
 class SelfHealConfig:
     enabled: bool = True
-    max_attempts: int = 2              # automatic retries after a failure (0 = never retry)
-    time_factor: float = 1.5           # each retry gets this much more time (compounding) ...
-    budget_factor: float = 1.5         # ... and budget ...
-    extra_repair_cycles: int = 1       # ... and repair cycles ...
-    steps_factor: float = 1.5          # ... and agent steps per session
-    max_total_budget_usd: float = 0.0  # cap for a run plus all its retries; 0 = 3x the first run's budget
-    diagnose: bool = True              # ask a model why a run failed (cheap, ~1 call)
+    max_attempts: int = 2  # automatic retries after a failure (0 = never retry)
+    time_factor: float = 1.5  # each retry gets this much more time (compounding) ...
+    budget_factor: float = 1.5  # ... and budget ...
+    extra_repair_cycles: int = 1  # ... and repair cycles ...
+    steps_factor: float = 1.5  # ... and agent steps per session
+    max_total_budget_usd: float = (
+        0.0  # cap for a run plus all its retries; 0 = 3x the first run's budget
+    )
+    diagnose: bool = True  # ask a model why a run failed (cheap, ~1 call)
     diagnosis_role: str = "planner"
     diagnosis_budget_usd: float = 0.5
 
 
 @dataclass
 class ApprovalConfig:
-    timeout_s: int = 3600              # how long a dashboard approval request waits before declining
+    timeout_s: int = (
+        3600  # how long a dashboard approval request waits before declining
+    )
 
 
 @dataclass
 class ChatConfig:
     """Chatbot per-conversation context window."""
+
     context_max_messages: int = 12
     context_max_tokens: int = 4000
+    tools_enabled: bool = (
+        False  # opt-in: let the chatbot call registered tools mid-answer
+    )
+    max_tool_rounds: int = 5  # LLM calls in the tool-calling loop
 
 
 @dataclass
@@ -208,12 +249,24 @@ class Config:
     watch: WatchConfig = field(default_factory=WatchConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     pi: PiConfig = field(default_factory=PiConfig)
-    reasoning_effort: str | None = None          # default thinking level for every role (none|low|medium|high)
-    vision_models: list[str] = field(default_factory=list)  # models that accept image blocks (exact or substring match)
-    visual_role: str = "designer"                # role that reviews screenshots of UI changes (skipped if absent)
-    active_variant: str | None = None            # variant id from `swarmforge variants` applied to every run
-    prompt_addenda: dict = field(default_factory=dict)   # filled from the active variant (role group -> text)
-    variant_applied: bool = False                # runtime flag: the variant overlay is already applied
+    reasoning_effort: str | None = (
+        None  # default thinking level for every role (none|low|medium|high)
+    )
+    vision_models: list[str] = field(
+        default_factory=list
+    )  # models that accept image blocks (exact or substring match)
+    visual_role: str = (
+        "designer"  # role that reviews screenshots of UI changes (skipped if absent)
+    )
+    active_variant: str | None = (
+        None  # variant id from `swarmforge variants` applied to every run
+    )
+    prompt_addenda: dict = field(
+        default_factory=dict
+    )  # filled from the active variant (role group -> text)
+    variant_applied: bool = (
+        False  # runtime flag: the variant overlay is already applied
+    )
     workdir: Path = field(default_factory=lambda: Path("~/.swarmforge").expanduser())
     source_path: Path | None = None
 
@@ -256,7 +309,9 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         raise ConfigError("config root must be a mapping")
     providers = {}
     for name, p in (raw.get("providers") or {}).items():
-        providers[name] = _build(ProviderConfig, {"name": name, **(p or {})}, f"providers.{name}")
+        providers[name] = _build(
+            ProviderConfig, {"name": name, **(p or {})}, f"providers.{name}"
+        )
     if not providers:
         raise ConfigError("at least one provider is required")
 
@@ -264,7 +319,9 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
     for name, r in (raw.get("roles") or {}).items():
         roles[name] = _build(RoleConfig, {"name": name, **(r or {})}, f"roles.{name}")
         if roles[name].provider not in providers:
-            raise ConfigError(f"roles.{name}: unknown provider '{roles[name].provider}'")
+            raise ConfigError(
+                f"roles.{name}: unknown provider '{roles[name].provider}'"
+            )
 
     dev_roles = list(raw.get("developer_roles") or [])
     if not dev_roles:
@@ -273,7 +330,9 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         if r not in roles:
             raise ConfigError(f"role '{r}' must be configured under roles:")
 
-    workdir = Path(os.path.expandvars(str(raw.get("workdir", "~/.swarmforge")))).expanduser()
+    workdir = Path(
+        os.path.expandvars(str(raw.get("workdir", "~/.swarmforge")))
+    ).expanduser()
     if not workdir.is_absolute() and source_path is not None:
         workdir = (source_path.parent / workdir).resolve()
 
@@ -293,8 +352,12 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         watch=_build(WatchConfig, raw.get("watch"), "watch"),
         auto_merge=_build(AutoMergeConfig, raw.get("auto_merge"), "auto_merge"),
         pi=_build(PiConfig, raw.get("pi"), "pi"),
-        active_variant=(str(raw["active_variant"]) if raw.get("active_variant") else None),
-        reasoning_effort=(str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None),
+        active_variant=(
+            str(raw["active_variant"]) if raw.get("active_variant") else None
+        ),
+        reasoning_effort=(
+            str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None
+        ),
         vision_models=[str(m) for m in (raw.get("vision_models") or [])],
         visual_role=str(raw.get("visual_role") or "designer"),
         workdir=workdir,
@@ -312,8 +375,13 @@ EFFORTS = ("none", "low", "medium", "high")
 
 
 def validate_config(cfg: Config) -> None:
-    for where, eff in [("reasoning_effort", cfg.reasoning_effort),
-                       *[(f"roles.{n}.reasoning_effort", r.reasoning_effort) for n, r in cfg.roles.items()]]:
+    for where, eff in [
+        ("reasoning_effort", cfg.reasoning_effort),
+        *[
+            (f"roles.{n}.reasoning_effort", r.reasoning_effort)
+            for n, r in cfg.roles.items()
+        ],
+    ]:
         if eff is not None and eff not in EFFORTS:
             raise ConfigError(f"{where} must be one of {', '.join(EFFORTS)}")
     for n, r in cfg.roles.items():
@@ -322,7 +390,9 @@ def validate_config(cfg: Config) -> None:
     if cfg.limits.same_repo not in ("coordinate", "serial", "parallel"):
         raise ConfigError("limits.same_repo must be coordinate, serial or parallel")
     if cfg.pi.network not in ("bridge", "none"):
-        raise ConfigError("pi.network must be 'bridge' (needed to reach the model relay) or 'none'")
+        raise ConfigError(
+            "pi.network must be 'bridge' (needed to reach the model relay) or 'none'"
+        )
     lim = cfg.limits
     if lim.budget_usd <= 0:
         raise ConfigError("limits.budget_usd must be > 0")
@@ -348,10 +418,14 @@ def validate_config(cfg: Config) -> None:
     if cfg.sandbox.network not in ("none", "bridge"):
         raise ConfigError("sandbox.network must be 'none' or 'bridge'")
     if not cfg.github.branch_prefix or cfg.github.branch_prefix in ("main", "master"):
-        raise ConfigError("github.branch_prefix must be a non-protected prefix like 'swarmforge/'")
+        raise ConfigError(
+            "github.branch_prefix must be a non-protected prefix like 'swarmforge/'"
+        )
     sev = {"critical", "major", "minor", "info"}
     if not set(cfg.review.blocking_severities) <= sev:
-        raise ConfigError(f"review.blocking_severities must be a subset of {sorted(sev)}")
+        raise ConfigError(
+            f"review.blocking_severities must be a subset of {sorted(sev)}"
+        )
     if not cfg.review.allow_same_model_review:
         rev = cfg.roles["reviewer"]
         rev_models = {rev.model, *rev.fallback_models}
@@ -361,7 +435,8 @@ def validate_config(cfg: Config) -> None:
             if dr.provider == rev.provider and overlap:
                 raise ConfigError(
                     f"reviewer and developer role '{d}' share model(s) {sorted(overlap)} (including fallbacks); "
-                    "an implementation model must not approve its own work.")
+                    "an implementation model must not approve its own work."
+                )
             if (dr.provider, dr.model) == (rev.provider, rev.model):
                 raise ConfigError(
                     f"reviewer uses the same model as developer role '{d}' ({rev.model}). "
@@ -386,11 +461,15 @@ def load_dotenv(path: Path) -> None:
 
 
 def find_config(explicit: str | None) -> Path:
-    candidates = [Path(explicit)] if explicit else [
-        Path("swarmforge.yaml"),
-        Path("swarmforge.yml"),
-        Path("~/.swarmforge/swarmforge.yaml").expanduser(),
-    ]
+    candidates = (
+        [Path(explicit)]
+        if explicit
+        else [
+            Path("swarmforge.yaml"),
+            Path("swarmforge.yml"),
+            Path("~/.swarmforge/swarmforge.yaml").expanduser(),
+        ]
+    )
     for c in candidates:
         if c.is_file():
             return c.resolve()
