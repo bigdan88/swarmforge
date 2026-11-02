@@ -264,3 +264,25 @@ def test_chat_uploader_failure_degrades_gracefully(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert "attachments" not in calls[0]["kw"]
     assert any("still works?" in m.value for m in at.markdown)
+
+
+def test_chat_tool_status_chip(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+
+    def fake_ask(c, store, question, history=None, **kw):
+        kw["on_tool"]("fetch_url", {"url": "https://example.com"})
+        return {"answer": "Fetched the page.", "role": "planner", "model": "qwen-fake",
+                "question": question}
+
+    from swarmforge import chatbot
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _open_chat(at)
+    at.chat_input[0].set_value("fetch example.com").run()
+    assert not at.exception, [e.value for e in at.exception]
+    chips = [m.value for m in at.markdown if "🔧 calling" in m.value]
+    assert chips, "expected a tool status chip to render"
+    assert any("fetch_url" in v for v in chips)
+    assert any("Fetched the page." in m.value for m in at.markdown)
