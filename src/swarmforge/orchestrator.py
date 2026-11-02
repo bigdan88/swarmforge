@@ -39,7 +39,8 @@ from .plan import (PLAN_JSON_SCHEMA, REVIEW_JSON_SCHEMA, TEST_REPORT_JSON_SCHEMA
 from .report import build_pr_body, build_summary, write_report, write_summary
 from .sandbox import Sandbox, make_sandbox
 from .scheduler import Scheduler
-from .state import RunAborted, RunState, StateMachine, TaskState, repair_tasks_from_findings
+from .state import (RunAborted, RunState, StateMachine, TaskState, finding_in_scope,
+                    normalize_scope_path, out_of_scope_findings, repair_tasks_from_findings)
 from .testing import TestEvidence, evaluate_criteria, run_tests
 from .repolock import blocking_runs, repo_key as lock_key
 from .workspace import EmptyRepository, GitError, GitWorkspace, StaleSeed, git
@@ -425,8 +426,15 @@ class Orchestrator:
             cycle += 1
             self.store.update_run(self.run_id, repair_cycle=cycle)
             blocking = set(self.cfg.review.blocking_severities)
-            repair_tasks = repair_tasks_from_findings((review or {}).get("findings") or [],
-                                                      self.cfg.developer_roles, cycle, blocking)
+            review_findings = (review or {}).get("findings") or []
+            scope = self._repair_scope()
+            for f in out_of_scope_findings(review_findings, scope, blocking):
+                self.log("scope", f"out-of-scope finding skipped from repair creation "
+                         f"(not in original plan file set): {f.get('title')} ({f.get('file')})",
+                         level="warn", data=f)
+            repair_tasks = repair_tasks_from_findings(review_findings,
+                                                      self.cfg.developer_roles, cycle, blocking,
+                                                      scope_files=scope)
             if repair_tasks:
                 self._register_tasks(repair_tasks, cycle=cycle, kind="fix")
                 self.log("plan", f"cycle {cycle}: {len(repair_tasks)} mandatory repair task(s) "
@@ -912,6 +920,14 @@ class Orchestrator:
         raise RunAborted(RunState.FAILED, "independent reviewer failed to produce a review; cannot approve")
 
     # ==================================================================== gate
+    def _repair_scope(self) -> set[str]:
+        """Normalized set of files the original plan's tasks declared as expected."""
+        plan = getattr(self, "plan", None)
+        if plan is None:
+            return set()
+        return {normalize_scope_path(f) for t in plan.tasks for f in t.expected_files
+                if normalize_scope_path(f)}
+
     def _gate(self, cycle, ev: TestEvidence, tester_report, review, failed_tasks) -> list[dict]:
         """Deterministic approval gate. Returns blocking problems (empty == approved)."""
         problems = []
@@ -924,8 +940,9 @@ class Orchestrator:
                                  "detail": f"{r['criterion_id']}: {r['text']}\nEvidence: {r['evidence']}"})
         blocking = set(self.cfg.review.blocking_severities)
         if review:
+            scope = self._repair_scope()
             for f in review["findings"]:
-                if f["severity"] in blocking:
+                if f["severity"] in blocking and finding_in_scope(f, scope):
                     problems.append({"kind": "review", "summary": f"[{f['severity']}] {f['title']} ({f.get('file')})",
                                      "detail": json.dumps(f, indent=1)})
         if tester_report:
