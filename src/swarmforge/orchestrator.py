@@ -987,6 +987,10 @@ class Orchestrator:
                     return
                 except GitError as e:
                     self.log("pr", f"could not deliver branch to {src}: {e}", level="warn")
+                    self.sm.transition(RunState.COMPLETED,
+                                        f"approved; local run, branch {self.ws.integration_branch} "
+                                        f"(delivery into {src} failed: {str(e)[:200]})")
+                    return
             self.log("pr", f"local issue: no PR. Result is on branch {self.ws.integration_branch} in {self.ws.repo}")
             self.sm.transition(RunState.COMPLETED, f"approved; local run, branch {self.ws.integration_branch}")
             return
