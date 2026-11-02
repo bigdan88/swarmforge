@@ -29,6 +29,13 @@ TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
 
 MAX_SNAPSHOT_CHARS = 14_000
 
+MAX_INLINE_ATTACHMENT_BYTES = 8192
+"""Maximum bytes of a text attachment inlined into the chat prompt."""
+MAX_CHAT_IMAGES = 4
+"""Maximum image attachments forwarded to the model per chat request."""
+MAX_IMAGE_BYTES = 4_000_000
+"""Maximum size of a single image attachment (bytes)."""
+
 CHAT_RUN_PREFIX = "chat:"
 """llm_calls for a conversation are recorded under this prefix + conversation id,
 so Store.cost_summary attributes usage and cost per conversation."""
@@ -117,11 +124,15 @@ def _trunc(s: str | None, n: int = 200) -> str:
 
 
 def _cap(text: str, limit: int = MAX_SNAPSHOT_CHARS) -> str:
-    """Cap total length; truncate the middle (like postmortem.evidence)."""
+    """Cap total length at `limit` characters (result is ALWAYS <= limit);
+    truncate the middle (like postmortem.evidence)."""
     if len(text) <= limit:
         return text
-    half = limit // 2
-    return text[:half] + "\n…[snapshot truncated]…\n" + text[-half:]
+    marker = "\n…[snapshot truncated]…\n"
+    if limit <= len(marker):
+        return text[:limit]
+    keep = max(0, (limit - len(marker)) // 2)
+    return (text[:keep] + marker + text[-keep:])[:limit]
 
 
 def status_snapshot(store: Store, max_runs: int = 12) -> str:
@@ -184,17 +195,72 @@ def status_snapshot(store: Store, max_runs: int = 12) -> str:
     return _cap("\n".join(L))
 
 
+def build_attachment_message(cfg: Config, attachments: list[dict] | None,
+                             conversation: str | None) -> dict | None:
+    """Build an extra user message carrying the request's attachments.
+
+    Returns None when there are no attachments (zero behavior change).
+    Files are persisted via swarmforge.attachments.save_attachments under
+    `<workdir>/chat/attachments/<conversation-or-uuid>/`. Text files are
+    inlined (capped at MAX_INLINE_ATTACHMENT_BYTES); images become OpenAI-style
+    image_url data-URL blocks (up to MAX_CHAT_IMAGES, each <= MAX_IMAGE_BYTES);
+    other/oversized/over-quota files get a short stored-path note. Never raises
+    on undecodable content.
+    """
+    from .attachments import classify, data_url, save_attachments
+
+    if not attachments:
+        return None
+    target = cfg.workdir / "chat" / "attachments" / (conversation or uuid.uuid4().hex)
+    saved = save_attachments(target, attachments)
+    texts: list[str] = []
+    images: list[dict] = []
+    for attachment, path in zip(attachments[:len(saved)], saved):
+        name = str(attachment.get("name") or "file")
+        data = attachment.get("data", b"")
+        if not isinstance(data, bytes):
+            data = str(data).encode("utf-8")
+        kind = classify(name)
+        if kind == "image":
+            if len(images) >= MAX_CHAT_IMAGES:
+                texts.append(f'Image attachment "{name}" skipped (more than {MAX_CHAT_IMAGES} images); '
+                             f"stored at {path}.")
+            elif len(data) > MAX_IMAGE_BYTES:
+                texts.append(f'Image attachment "{name}" is too large to forward '
+                             f"({len(data)} bytes > {MAX_IMAGE_BYTES}); stored at {path}.")
+            else:
+                images.append({"type": "image_url", "image_url": {"url": data_url(name, data)}})
+            continue
+        if kind == "text":
+            content = _cap(data.decode("utf-8", errors="replace"), MAX_INLINE_ATTACHMENT_BYTES)
+            texts.append(f'Attached file "{name}" (first {MAX_INLINE_ATTACHMENT_BYTES} bytes):\n{content}')
+        else:
+            texts.append(f'Attachment "{name}" stored at {path} '
+                         "(not inlined: binary or oversized).")
+    if not images:
+        return {"role": "user", "content": "\n\n".join(texts)}
+    text = "\n\n".join(texts + ["See the image attachments below."])
+    return {"role": "user", "content": [{"type": "text", "text": text}, *images]}
+
+
 async def answer(cfg: Config, store: Store, question: str,
                  history: list[dict] | None = None, *, conversation: str | None = None,
                  transport: httpx.AsyncBaseTransport | None = None,
-                 max_runs: int = 12, budget=None) -> dict:
+                 max_runs: int = 12, budget=None, attachments: list[dict] | None = None) -> dict:
     """Ask the status chatbot a question; returns {answer, role, model, question}.
 
     With `conversation` set, the question and reply are persisted to that
     conversation, the prompt context comes only from that conversation's stored
     messages (truncated to the configured window; `history` is ignored), and the
     result additionally carries "conversation" and "usage" (per-conversation
-    cost summary)."""
+    cost summary).
+
+    `attachments` is an optional list of {"name": str, "data": bytes} dicts.
+    Text files are inlined into the prompt (size-capped); images are forwarded
+    as image_url blocks — vision models receive them unchanged, non-vision
+    models get a placeholder note via llm.py message normalization. Attachments
+    are per-request and are NOT stored in the conversation DB; they are saved to
+    disk under <workdir>/chat/attachments/."""
     from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 
     role = resolve_role(cfg)
@@ -210,6 +276,9 @@ async def answer(cfg: Config, store: Store, question: str,
                                    cfg.chat.context_max_tokens, reserved_tokens=reserved)
         for m in context:
             messages.append({"role": m["role"], "content": m["content"]})
+        att_msg = build_attachment_message(cfg, attachments, conversation)
+        if att_msg is not None:
+            messages.append(att_msg)
         run_id = CHAT_RUN_PREFIX + conversation
         llm_budget = budget if budget is not None else Budget(
             max(2.0, cfg.limits.budget_usd), store.cost_summary(run_id)["total"])
@@ -228,6 +297,9 @@ async def answer(cfg: Config, store: Store, question: str,
         if m.get("role") in ("user", "assistant") and m.get("content"):
             messages.append({"role": m["role"], "content": str(m["content"])})
     messages.append({"role": "user", "content": question})
+    att_msg = build_attachment_message(cfg, attachments, conversation)
+    if att_msg is not None:
+        messages.append(att_msg)
     try:
         llm = LLMClient(cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport)
         res = await llm.chat(role, messages, task_key="chatbot")
@@ -240,10 +312,10 @@ async def answer(cfg: Config, store: Store, question: str,
 
 def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = None, *,
         conversation: str | None = None, transport: httpx.AsyncBaseTransport | None = None,
-        max_runs: int = 12) -> dict:
+        max_runs: int = 12, attachments: list[dict] | None = None) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
     return asyncio.run(answer(cfg, store, question, history, conversation=conversation,
-                               transport=transport, max_runs=max_runs))
+                               transport=transport, max_runs=max_runs, attachments=attachments))
 
 
 # ======================================================== conversation persistence
