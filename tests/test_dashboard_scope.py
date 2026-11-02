@@ -83,6 +83,38 @@ def test_review_tab_shows_out_of_scope_caption(tmp_path, monkeypatch):
     assert any(c.value == "skipped out-of-scope findings: 2" for c in at.caption)
 
 
+def test_review_tab_ignores_non_finding_scope_events(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    store = Store(cfg.db_path)
+    run_id = "20990101-020000-cccccc"
+    _seed(store, run_id)
+    store.event(run_id, "review", "review cycle 1", level="info")
+    store.record_finding(
+        run_id,
+        cycle=1,
+        source="review",
+        severity="major",
+        file="src/swarmforge/ui.py",
+        line=10,
+        title="bad contrast",
+        description="text unreadable",
+        recommendation="fix",
+    )
+    store.event(run_id, "scope", "scope files: 3", level="info")
+    store.event(
+        run_id,
+        "scope",
+        "skipped out-of-scope finding: [major] ruff (file Dockerfile)",
+        level="warn",
+    )
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    _open(at, run_id)
+    assert not at.exception, [e.value for e in at.exception]
+    assert any(c.value == "skipped out-of-scope findings: 1" for c in at.caption)
+
+
 def test_review_tab_no_out_of_scope_caption_without_scope_events(tmp_path, monkeypatch):
     cfg = _write_cfg(tmp_path, monkeypatch)
     store = Store(cfg.db_path)
