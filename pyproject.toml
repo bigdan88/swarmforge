@@ -19,6 +19,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-xdist>=3.5"]
 # agent developer tools in `sandbox.mode: local` (the Docker sandbox image already has them);
 # after installing, run `python -m playwright install chromium`
 tools = ["ruff>=0.6", "mypy>=1.11", "playwright>=1.45"]
+web = ["trafilatura>=2.0", "readability-lxml>=0.16"]
 
 [project.scripts]
 swarmforge = "swarmforge.cli:main"
