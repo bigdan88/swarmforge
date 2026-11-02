@@ -87,7 +87,12 @@ Web access:
 and answer from the Markdown it returns, citing the URL.
 - The tool fetches any URL as clean Markdown and resolves GitHub repo links to their README;
 it respects robots.txt and has a 10 s timeout.
-- If the tool returns an ERROR string, explain the failure briefly instead of inventing content."""
+- If the tool returns an ERROR string, explain the failure briefly instead of inventing content.
+
+Local project inspection (only when the operator enables them):
+- `read_file`, `grep` and `run_command` inspect the local project. Paths are relative to the
+project root (the directory where SwarmForge runs); traversal outside it is refused.
+- `run_command` runs in a read-only, no-network sandbox with a 30 s timeout."""
 
 WEB_TOOL_SCHEMA = {
     "type": "object",
@@ -100,8 +105,42 @@ WEB_TOOL_SCHEMA = {
 }
 
 
+RUN_COMMAND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string",
+                     "description": "Shell command to run in the sandbox (read-only, no network)"},
+        "timeout_s": {"type": "integer", "description": "Timeout in seconds (default 30)"},
+    },
+    "required": ["command"],
+}
+
+READ_FILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string",
+                 "description": "File path relative to the project root"},
+        "max_chars": {"type": "integer"},
+    },
+    "required": ["path"],
+}
+
+GREP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pattern": {"type": "string", "description": "Regex to search for (ripgrep syntax)"},
+        "path": {"type": "string",
+                 "description": "File or directory to search, relative to the project root; default ."},
+    },
+    "required": ["pattern"],
+}
+
+
 def build_chat_registry(cfg: Config) -> ToolRegistry:
-    """Tool registry for the chatbot: currently the web fetch tool."""
+    """Tool registry for the chatbot: the web fetch tool, plus the sandbox
+    shell/file tools when the operator opts in via chatbot.enable_shell. The
+    sandbox tools are scoped to the current working directory (the project
+    root where SwarmForge runs)."""
 
     async def _fetch_url(url: str, max_chars: int = 8000, extract: str = "markdown") -> str:
         return await _web.fetch_url(url, max_chars=max_chars, extract=extract)
@@ -115,6 +154,31 @@ def build_chat_registry(cfg: Config) -> ToolRegistry:
         WEB_TOOL_SCHEMA,
         _fetch_url,
     )
+    if getattr(cfg.chatbot, "enable_shell", False):
+        from .tools import sandbox as _sandbox
+
+        tools = _sandbox.ChatSandboxTools(Path.cwd(), cfg.sandbox)
+        registry.register(
+            "run_command",
+            "Run a shell command in the sandbox (read-only, no network, 30 s timeout) "
+            "and return stdout+stderr.",
+            RUN_COMMAND_SCHEMA,
+            tools.run_command,
+        )
+        registry.register(
+            "read_file",
+            "Read a text file under the project root (paths relative to the root; "
+            "traversal outside it is refused).",
+            READ_FILE_SCHEMA,
+            tools.read_file,
+        )
+        registry.register(
+            "grep",
+            "Search for a regex pattern under a path in the project (ripgrep syntax), "
+            "results truncated to 200 lines.",
+            GREP_SCHEMA,
+            tools.grep,
+        )
     return registry
 
 IMPROVE_PROMPT = """
