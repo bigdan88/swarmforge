@@ -189,7 +189,7 @@ def _provider(seen):
 
 @pytest.mark.slow
 async def test_run_screenshots_light_and_dark_and_vision_review_is_listed_not_blocking(
-    tmp_path, monkeypatch, sample_repo
+    tmp_path, monkeypatch, sample_repo, browser_slot
 ):
     pytest.importorskip("playwright")
     _repo_with_preview(sample_repo, PAGE_OK)
@@ -199,7 +199,8 @@ async def test_run_screenshots_light_and_dark_and_vision_review_is_listed_not_bl
     orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider(seen).transport)
     run_id = None
     try:
-        run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+        with browser_slot():
+            run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
     except (OSError, RuntimeError, visual.RegressError, ToolError, TimeoutError) as e:
         if "Playwright browser is not installed" in str(e):
             pytest.skip(f"no headless Chromium here: {e}")
@@ -271,7 +272,7 @@ async def test_run_screenshots_light_and_dark_and_vision_review_is_listed_not_bl
 
 @pytest.mark.slow
 async def test_error_on_the_page_blocks_without_asking_the_model(
-    tmp_path, monkeypatch, sample_repo
+    tmp_path, monkeypatch, sample_repo, browser_slot
 ):
     pytest.importorskip("playwright")
     _repo_with_preview(sample_repo, PAGE_BROKEN)
@@ -280,7 +281,8 @@ async def test_error_on_the_page_blocks_without_asking_the_model(
     orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider([]).transport)
     run_id = None
     try:
-        run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+        with browser_slot():
+            run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
     except (OSError, RuntimeError, visual.RegressError, ToolError, TimeoutError) as e:
         if "Playwright browser is not installed" in str(e):
             pytest.skip(f"no headless Chromium here: {e}")

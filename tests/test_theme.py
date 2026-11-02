@@ -138,7 +138,7 @@ def _free_port():
 
 
 @pytest.mark.slow
-def test_real_browser_sidebar_switches_the_whole_page(tmp_path):
+def test_real_browser_sidebar_switches_the_whole_page(tmp_path, browser_slot):
     """The real thing, through the same capture path the visual-regression gate uses:
     `visual.capture_tabs` screenshots the dashboard in both themes from a real headless Chromium,
     and the light and dark shots of the same tab must differ by more than the 2 % gate threshold
@@ -148,13 +148,14 @@ def test_real_browser_sidebar_switches_the_whole_page(tmp_path):
 
     port = _free_port()
     try:
-        shots = visual.capture_tabs(
-            Path(__file__).resolve().parents[1],
-            tmp_path,
-            tabs=["work"],
-            port=port,
-            timeout_s=120,
-        )
+        with browser_slot():
+            shots = visual.capture_tabs(
+                Path(__file__).resolve().parents[1],
+                tmp_path,
+                tabs=["work"],
+                port=port,
+                timeout_s=120,
+            )
     except (visual.RegressError, OSError, RuntimeError, TimeoutError) as e:
         pytest.skip(f"headless browser unavailable or timed out: {e}")
     light, dark = shots["work-light"], shots["work-dark"]
