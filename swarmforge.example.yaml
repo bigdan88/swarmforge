@@ -173,10 +173,10 @@ pi:
 # Where clones, worktrees, transcripts, logs and the SQLite DB live.
 workdir: ~/.swarmforge
 
-# Merge the swarm's pull requests without waiting for you (off by default). Small changes that passed
-# everything merge at once; larger ones only if the judge model approves. Never merged automatically:
-# unresolved [major] findings, conflicts, failing checks, and the repository's protected_paths
-# (swarmforge.project.yml). SwarmForge doesn't restart afterwards. Decisions + Revert: Pull requests page.
+# Merge the swarm's pull requests without waiting for you (off by default). Small clean changes merge
+# at once; larger ones, open [major] findings and core files (protected_paths in swarmforge.project.yml)
+# go to the judge model. Conflicts are resolved against the latest base and re-tested. A held PR gets
+# one fix-up task that replaces it. No restart. Decisions + Merge/Fix/Close/Revert: Pull requests page.
 auto_merge:
   enabled: false
   repos: []              # owner/name; empty = every repository
@@ -184,3 +184,7 @@ auto_merge:
   judge_role: reviewer   # decides on larger changes
   judge_max_lines: 3000  # bigger than this always waits for you
   method: squash
+  protected: judge       # PRs touching protected_paths: judge (needs a LOW-risk verdict) | hold
+  major_findings: judge  # PRs with open [major] findings: judge (sees them) | hold
+  auto_fix: true         # a held PR gets one fix-up task that continues its code and replaces it
+  fix_attempts: 1

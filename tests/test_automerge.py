@@ -59,7 +59,7 @@ def test_repo_enabled(tmp_path, monkeypatch):
 class FakeGitHub:
     def __init__(self, additions, files, state="clean"):
         self.additions, self.files, self.state = additions, files, state
-        self.merged, self.calls = [], []
+        self.merged, self.calls, self.closed = [], [], []
 
     def __call__(self, request: httpx.Request):
         path, method = request.url.path, request.method
@@ -79,23 +79,28 @@ class FakeGitHub:
             return httpx.Response(200, json={"sha": "m1", "merged": True})
         if method == "DELETE":
             return httpx.Response(204)
+        if method == "POST" and path.endswith("/comments"):
+            return httpx.Response(201, json={})
+        if method == "PATCH" and path.startswith("/repos/o/r/pulls/"):
+            self.closed.append(int(path.rsplit("/", 1)[1]))
+            return httpx.Response(200, json={"state": "closed"})
         return httpx.Response(404, json={"message": f"unexpected {method} {path}"})
 
 
-def _orch(tmp_path, monkeypatch, judge_answer=None, protected=()):
+def _orch(tmp_path, monkeypatch, judge_answer=None, paths=(), body="Please add CSV export.", **am_cfg):
     monkeypatch.setenv("FAKE_KEY", "k")
     monkeypatch.setenv("GITHUB_TOKEN", "t")
     raw = base_raw(tmp_path / "w")
-    raw["auto_merge"] = {"enabled": True, "max_lines": 400}
+    raw["auto_merge"] = {"enabled": True, "max_lines": 400, **am_cfg}
     cfg = parse_config(raw)
     store = Store(cfg.db_path)
     store.create_run("r1", state="COMPLETED", repair_cycle=0)
     store.record_test_run("r1", label="cycle0", cycle=0, exit_code=0, passed=10, failed=0, errors=0, skipped=0)
     o = Orchestrator.__new__(Orchestrator)
     o.cfg, o.store, o.run_id, o.echo = cfg, store, "r1", None
-    o.issue = SimpleNamespace(title="Add export", body="Please add CSV export.")
+    o.issue = SimpleNamespace(title="Add export", body=body)
     o.ws = SimpleNamespace(diff=lambda: "diff --git a/x b/x\n+print('hi')\n")
-    o.protected_paths = list(protected)
+    o.protected_paths = list(paths)
     seen = []
 
     def judge(body):
@@ -139,19 +144,89 @@ async def test_large_change_merges_only_when_the_judge_says_so(tmp_path, monkeyp
     o2, store2, _ = _orch(tmp_path / "b", monkeypatch)                   # judge says hold
     gh2 = FakeGitHub(additions=900, files=["src/app/ui.py"])
     await o2._auto_merge(_gh(gh2), "o/r", "https://github.com/o/r/pull/7")
-    assert not gh2.merged and _last(store2, am.HELD)["judged"]
+    assert not gh2.merged and _last(store2, am.FIXING)["judged"]         # held -> automatic fix-up task
 
 
-async def test_protected_files_and_conflicts_wait_for_you(tmp_path, monkeypatch):
-    o, store, seen = _orch(tmp_path, monkeypatch, protected=["src/swarmforge/orchestrator.py"])
+async def test_core_files_need_a_low_risk_verdict(tmp_path, monkeypatch):
+    o, store, seen = _orch(tmp_path, monkeypatch, judge_answer={"decision": "merge", "risk": "medium", "reason": "ok"},
+                           paths=["src/swarmforge/orchestrator.py"], auto_fix=False)
     gh_fake = FakeGitHub(additions=5, files=["src/swarmforge/orchestrator.py"])
     await o._auto_merge(_gh(gh_fake), "o/r", "https://github.com/o/r/pull/7")
-    assert not gh_fake.merged and not seen and "protected" in _last(store, am.HELD)["reason"]
-
-    o2, store2, _ = _orch(tmp_path / "b", monkeypatch)
-    gh2 = FakeGitHub(additions=5, files=["a.py"], state="dirty")
+    user = seen[0]["messages"][1]["content"]
+    assert "CORE FILES touched" in user and not gh_fake.merged                  # medium isn't enough for core
+    assert "core files need low" in _last(store, am.HELD)["reason"]
+    o2, store2, _ = _orch(tmp_path / "b", monkeypatch, judge_answer={"decision": "merge", "risk": "low", "reason": "tiny"},
+                          paths=["src/swarmforge/orchestrator.py"])
+    gh2 = FakeGitHub(additions=5, files=["src/swarmforge/orchestrator.py"])
     await o2._auto_merge(_gh(gh2), "o/r", "https://github.com/o/r/pull/7")
-    assert not gh2.merged and "conflicts" in _last(store2, am.HELD)["reason"]
+    assert gh2.merged
+    o3, store3, seen3 = _orch(tmp_path / "c", monkeypatch, paths=["src/swarmforge/orchestrator.py"],
+                              protected="hold")
+    gh3 = FakeGitHub(additions=5, files=["src/swarmforge/orchestrator.py"])
+    await o3._auto_merge(_gh(gh3), "o/r", "https://github.com/o/r/pull/7")
+    assert not seen3 and "protected" in _last(store3, am.FIXING)["reason"]       # hold mode: no judge
+
+
+async def test_major_findings_go_to_the_judge_with_their_details(tmp_path, monkeypatch):
+    o, store, seen = _orch(tmp_path, monkeypatch, judge_answer={"decision": "merge", "risk": "low",
+                                                                "reason": "the finding is cosmetic"})
+    store.record_finding("r1", cycle=0, source="reviewer", severity="major", file="ui.py", line=1,
+                         title="Tools section not rendered", description="never shown", recommendation="render it")
+    gh_fake = FakeGitHub(additions=50, files=["ui.py"])
+    await o._auto_merge(_gh(gh_fake), "o/r", "https://github.com/o/r/pull/7")
+    assert "Tools section not rendered" in seen[0]["messages"][1]["content"] and gh_fake.merged
+
+
+async def test_held_pr_gets_one_fix_up_task_that_replaces_it(tmp_path, monkeypatch):
+    o, store, _ = _orch(tmp_path, monkeypatch)                               # judge says hold
+    store.queue_add("Add export", "Please add CSV export.", "o/r", queue="self-improvement")
+    store.queue_update(1, status="done", run_id="r1")
+    store.queue_add("Next thing", "b", "o/r", queue="self-improvement")
+    store.record_finding("r1", cycle=0, source="reviewer", severity="minor", file="a.py", line=1, title="naming",
+                         description="d", recommendation="rename")
+    gh_fake = FakeGitHub(additions=900, files=["a.py"])
+    await o._auto_merge(_gh(gh_fake), "o/r", "https://github.com/o/r/pull/7")
+    info = _last(store, am.FIXING)
+    fix = store.queue_item(info["fix_task"])
+    assert fix["title"] == "Fix up: Add export" and fix["seed_run_id"] == "r1" and fix["queue"] == "self-improvement"
+    assert "why https://github.com/o/r/pull/7 was not merged" in fix["body"] and "naming" in fix["body"]
+    assert am.fix_depth(fix["body"]) == (1, "https://github.com/o/r/pull/7")
+    waiting = [q["title"] for q in store.queue_items() if q["status"] == "queued"]
+    assert waiting[0] == "Fix up: Add export"                                # front of the line
+    # the fix-up's own run: its PR closes the one it replaces; a second hold waits for you
+    o2, store2, _ = _orch(tmp_path / "b", monkeypatch, body=fix["body"])
+    gh2 = FakeGitHub(additions=900, files=["a.py"])
+    await o2._auto_merge(_gh(gh2), "o/r", "https://github.com/o/r/pull/8")
+    assert gh2.closed == [7] and _last(store2, am.CLOSED)["replaced_by"] == "https://github.com/o/r/pull/8"
+    assert _last(store2, am.HELD) and not _last(store2, am.FIXING)
+
+
+async def test_conflict_is_resolved_against_main_then_merged(tmp_path, monkeypatch):
+    from swarmforge import orchestrator as orch_mod
+    o, store, _ = _orch(tmp_path, monkeypatch)
+    gh_fake = FakeGitHub(additions=5, files=["a.py"], state="dirty")
+    calls = []
+
+    async def update(cycle):
+        calls.append(cycle)
+        return []
+    o._update_with_base = update
+    o.ws = SimpleNamespace(diff=lambda: "", repo=tmp_path, integration_branch="swarmforge/task-x", base_branch="main")
+    monkeypatch.setattr(orch_mod, "push_branch", lambda *a, **k: setattr(gh_fake, "state", "clean"))
+    real_sleep = orch_mod.asyncio.sleep
+    monkeypatch.setattr(orch_mod.asyncio, "sleep", lambda s: real_sleep(0))
+    await o._auto_merge(_gh(gh_fake), "o/r", "https://github.com/o/r/pull/7")
+    assert calls == [0] and gh_fake.merged and _last(store, am.MERGED)
+
+    o2, store2, _ = _orch(tmp_path / "b", monkeypatch, auto_fix=False)       # resolution fails: hold
+    gh2 = FakeGitHub(additions=5, files=["a.py"], state="dirty")
+
+    async def broken(cycle):
+        return [{"summary": "could not merge the latest main into this branch"}]
+    o2._update_with_base = broken
+    o2.ws = o.ws
+    await o2._auto_merge(_gh(gh2), "o/r", "https://github.com/o/r/pull/7")
+    assert not gh2.merged and "resolving it failed" in _last(store2, am.HELD)["reason"]
 
 
 async def test_disabled_does_nothing(tmp_path, monkeypatch):
@@ -199,7 +274,7 @@ def test_unknown_keys_are_rejected(tmp_path, monkeypatch, bad):
         parse_config(raw)
 
 
-def test_pull_requests_page_lists_decisions_and_reverts(tmp_path, monkeypatch):
+def test_pull_requests_page_lists_decisions_with_buttons(tmp_path, monkeypatch):
     import streamlit as st_
     import yaml
     from streamlit.testing.v1 import AppTest
@@ -217,11 +292,22 @@ def test_pull_requests_page_lists_decisions_and_reverts(tmp_path, monkeypatch):
     cfg = parse_config(raw)
     store = Store(cfg.db_path)
     store.create_run("r1", state="COMPLETED", pr_url="https://github.com/o/r/pull/7")
+    store.create_run("r2", state="COMPLETED", pr_url="https://github.com/o/r/pull/9", issue_title="Rework queue",
+                     issue_body="Make the queue faster.", repair_cycle=0)
+    store.create_run("r3", state="COMPLETED", pr_url="https://github.com/o/r/pull/5")
     store.record_intervention("r1", am.MERGED, json.dumps({"repo": "o/r", "number": 7, "title": "Add export",
                               "url": "https://github.com/o/r/pull/7", "reason": "small change (50 lines)"}))
-    store.record_intervention("r1", am.HELD, json.dumps({"repo": "o/r", "number": 9, "title": "Rework queue",
+    store.record_intervention("r2", am.HELD, json.dumps({"repo": "o/r", "number": 9, "title": "Rework queue",
                               "url": "https://github.com/o/r/pull/9", "reason": "touches protected file(s) x"}))
-    monkeypatch.setattr(prs, "list_prs", lambda gh, repo, store=None, details=True: [])
+    store.record_intervention("r3", am.HELD, json.dumps({"repo": "o/r", "number": 5, "title": "Old one",
+                              "url": "https://github.com/o/r/pull/5", "reason": "x"}))
+    open_pr = prs.PR(repo="o/r", number=9, title="Rework queue", url="https://github.com/o/r/pull/9", head="h",
+                     base="main", draft=True, author="o", created_at="", node_id="PR_9", head_sha="s", state="clean",
+                     mergeable=True)
+    monkeypatch.setattr(prs, "list_prs", lambda gh, repo, store=None, details=True: [open_pr])
+    from swarmforge import runqueue as rq
+    started = []
+    monkeypatch.setattr(rq, "start_worker", lambda c, s, keep_pause=False: started.append(1) or 4242)
     reverted = []
     monkeypatch.setattr(am, "revert", lambda gh, repo, n, method="squash": reverted.append(n) or "https://github.com/o/r/pull/10")
     at = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "src" / "swarmforge" / "dashboard.py"),
@@ -230,10 +316,17 @@ def test_pull_requests_page_lists_decisions_and_reverts(tmp_path, monkeypatch):
     at.button(key="nav_pull-requests").click().run()
     assert not at.exception, [e.value for e in at.exception]
     md = " ".join(m.value for m in at.markdown)
-    assert "✅ merged" in md and "small change (50 lines)" in md and "⏸ waiting for you" in md and "protected" in md
-    rev = [b for b in at.button if (b.key or "").startswith("am_rev_") and not b.key.endswith("_yes")]
-    assert len(rev) == 1                                              # only the merged one can be reverted
-    rev[0].click().run()
+    assert "✅ merged" in md and "⏸ waiting for you" in md and "protected" in md
+    assert "no longer open" in md                                    # #5 isn't open on GitHub any more
+    keys = [b.key or "" for b in at.button]
+    assert sum(k.endswith("_merge") for k in keys) == 1 and sum(k.endswith("_fix") for k in keys) == 1
+    # Fix with the swarm: a fix-up task continuing r2's code, replacing #9
+    next(b for b in at.button if (b.key or "").endswith("_fix")).click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    fix = [q for q in store.queue_items() if q["title"] == "Fix up: Rework queue"][0]
+    assert fix["seed_run_id"] == "r2" and am.fix_depth(fix["body"]) == (1, "https://github.com/o/r/pull/9")
+    assert "🔧 fix-up queued" in " ".join(m.value for m in at.markdown) and started
+    # revert the merged one
+    next(b for b in at.button if (b.key or "").endswith("_rev")).click().run()
     next(b for b in at.button if (b.key or "").endswith("_yes")).click().run()
-    assert reverted == [7] and any(i["kind"] == "auto_merge_reverted" for i in store.interventions("r1"))
-    assert "↩️ reverted" in " ".join(m.value for m in at.markdown)
+    assert reverted == [7] and "↩️ reverted" in " ".join(m.value for m in at.markdown)

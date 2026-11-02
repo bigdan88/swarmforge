@@ -2637,47 +2637,109 @@ def page_benchmarks():
 
 
 # ======================================================== PULL REQUESTS page
-def auto_merge_panel(gh) -> None:
-    """What auto-merge did (merged / waiting for you, and why), with one-click revert of a merge."""
+def _am_latest(rows: list[dict]) -> dict[str, tuple[dict, dict]]:
+    """Latest auto-merge event per PR url -> (row, detail); rows are newest first."""
+    out: dict[str, tuple[dict, dict]] = {}
+    for r in rows:
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if d.get("url") and d["url"] not in out:
+            out[d["url"]] = (r, d)
+    return out
+
+
+def auto_merge_panel(gh, open_urls: set[str] | None = None) -> None:
+    """What auto-merge did, and buttons for everything that waits for you."""
     from swarmforge import automerge as am
     from swarmforge.github import GitHubError
     amc = cfg.auto_merge
-    rows = store._all("SELECT * FROM interventions WHERE kind IN (?, ?, ?) ORDER BY id DESC LIMIT 25",
-                      (am.MERGED, am.HELD, "auto_merge_reverted"))
-    reverted = {json.loads(r["detail"]).get("url") for r in rows if r["kind"] == "auto_merge_reverted"}
+    kinds = (am.MERGED, am.HELD, am.FIXING, am.CLOSED, am.MANUAL, "auto_merge_reverted")
+    rows = store._all(f"SELECT * FROM interventions WHERE kind IN ({','.join('?' * len(kinds))}) "
+                      "ORDER BY id DESC LIMIT 60", kinds)
+    latest = _am_latest(rows)
+    gone = {u for u, (r, _) in latest.items()
+            if r["kind"] == am.HELD and open_urls is not None and u not in open_urls}
+    waiting = [u for u, (r, _) in latest.items() if r["kind"] == am.HELD and u not in gone]
     where = ", ".join(amc.repos) if amc.repos else "every repository"
-    title = (f"🤖 Auto-merge: **on** for {where} · up to {amc.max_lines} lines merge straight away, larger ones "
-             f"(up to {amc.judge_max_lines}) if the {amc.judge_role} model approves" if amc.enabled
-             else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
-    with st.expander(title, expanded=bool(amc.enabled and rows)):
-        st.caption("Never merged automatically: unresolved [major] findings, conflicts, failing checks, and files "
-                   "the repository protects (`protected_paths` in swarmforge.project.yml). SwarmForge doesn't "
-                   "restart after an auto-merge; the new code arrives with your next Update & restart.")
+    title = (f"🤖 Auto-merge: **on** for {where}" + (f" · **{len(waiting)} waiting for you**" if waiting else "")
+             if amc.enabled else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
+    with st.expander(title, expanded=bool(waiting)):
+        st.caption(f"Up to {amc.max_lines} clean lines merge at once. Larger changes, open [major] findings and "
+                   f"core files (protected_paths) go to the {amc.judge_role} model; core files need a low-risk "
+                   "verdict. Conflicts are resolved against the latest main and re-tested. A PR that is still held "
+                   + ("gets one automatic fix-up task that replaces it; after that it waits here."
+                      if amc.auto_fix else "waits here.")
+                   + " Nothing restarts by itself.")
         flash = st.session_state.pop("am_flash", None)
         if flash:
             (st.success if flash[0] else st.error)(flash[1])
-        shown = [r for r in rows if r["kind"] != "auto_merge_reverted"]
-        if not shown:
+        if not latest:
             st.caption("No auto-merge decisions yet.")
-        for r in shown:
-            try:
-                d = json.loads(r["detail"] or "{}")
-            except json.JSONDecodeError:
+        label = {am.MERGED: "✅ merged", am.MANUAL: "✅ merged by you", am.HELD: "⏸ waiting for you",
+                 am.FIXING: "🔧 fix-up queued", am.CLOSED: "🗑 closed", "auto_merge_reverted": "↩️ reverted"}
+        for url, (r, d) in list(latest.items())[:25]:
+            kind = r["kind"]
+            if url in gone:
+                st.markdown(f"**✔ no longer open** (merged or closed on GitHub) · [{d.get('title') or url}]({url})")
                 continue
-            merged = r["kind"] == am.MERGED
-            url = d.get("url", "")
-            icon = ("↩️ reverted" if url in reverted else "✅ merged") if merged else "⏸ waiting for you"
-            c1, c2 = st.columns([6, 1.3])
-            c1.markdown(f"**{icon}** · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
-                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "") + f"  \n{d.get('reason', '')}")
-            if merged and url not in reverted and d.get("number"):
-                key = f"am_rev_{r['id']}"
+            extra = (f" (task #{d['fix_task']})" if kind == am.FIXING and d.get("fix_task") else "") + \
+                    (f" → {d['replaced_by']}" if d.get("replaced_by") else "")
+            st.markdown(f"**{label.get(kind, kind)}**{extra} · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
+                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "")
+                        + (f"  \n{d['reason']}" if d.get("reason") else ""))
+            key = f"am_{r['id']}"
+            if kind == am.HELD and d.get("number"):
+                c1, c2, c3, _ = st.columns([1.2, 1.6, 1, 3])
+                if c1.button("Merge now", key=key + "_merge", type="primary",
+                             help="Merge it as it is (marks a draft ready first)"):
+                    try:
+                        pr = am.get_pr(gh, d["repo"], int(d["number"]))
+                        sha = am.apply(gh, pr, amc.method)
+                        store.record_intervention(r["run_id"], am.MANUAL, json.dumps({**d, "sha": sha,
+                                                                                     "reason": "merged by you"}))
+                        st.session_state.am_flash = (True, f"Merged {url}. Update & restart to pick it up.")
+                    except (GitHubError, Exception) as e:  # noqa: BLE001
+                        st.session_state.am_flash = (False, f"Could not merge {url}: {e}. "
+                                                            "Use **Fix with the swarm** to have it updated.")
+                    st.session_state.pop("pr_cache", None)
+                    st.rerun()
+                if c2.button("Fix with the swarm", key=key + "_fix",
+                             help="Queue a task that continues this PR's code, fixes why it was held "
+                                  "(and any conflicts with main), then replaces this PR"):
+                    run = store.get_run(r["run_id"]) or {}
+                    item = store._one("SELECT queue FROM queue_items WHERE run_id = ?", (r["run_id"],)) or {}
+                    findings = [f for f in store.findings(r["run_id"])
+                                if f["cycle"] == run.get("repair_cycle") and f["severity"] != "info"]
+                    body = run.get("issue_body") or d.get("title") or ""
+                    if am.fix_depth(body)[0] and "supersedes=" in body:   # allow one more manual round
+                        body = am.FIX_MARK.sub("", body)
+                    qid = am.queue_fix(store, r["run_id"], title=run.get("issue_title") or d.get("title") or "",
+                                       body=body, repo=d["repo"], url=url, reason=d.get("reason", ""),
+                                       findings=findings, queue=item.get("queue"))
+                    store.record_intervention(r["run_id"], am.FIXING, json.dumps({**d, "fix_task": qid}))
+                    from swarmforge import runqueue as rq
+                    if not rq.worker_pid(store):
+                        rq.start_worker(cfg, store)
+                    st.session_state.am_flash = (True, f"Queued fix-up task #{qid}; its PR will replace {url}.")
+                    st.rerun()
+                if c3.button("Close", key=key + "_close", help="Close the PR without merging"):
+                    try:
+                        am.close_pr(gh, d["repo"], int(d["number"]), "Closed from the SwarmForge dashboard.")
+                        store.record_intervention(r["run_id"], am.CLOSED, json.dumps({**d, "reason": "closed by you"}))
+                        st.session_state.am_flash = (True, f"Closed {url}.")
+                    except (GitHubError, Exception) as e:  # noqa: BLE001
+                        st.session_state.am_flash = (False, f"Could not close {url}: {e}")
+                    st.session_state.pop("pr_cache", None)
+                    st.rerun()
+            elif kind in (am.MERGED, am.MANUAL) and d.get("number"):
                 if st.session_state.get(key + "_ask"):
-                    if c2.button("Confirm revert", key=key + "_yes", type="primary"):
+                    if st.button("Confirm revert", key=key + "_yes", type="primary"):
                         try:
-                            rev = am.revert(gh, d["repo"], int(d["number"]), cfg.auto_merge.method)
+                            rev = am.revert(gh, d["repo"], int(d["number"]), amc.method)
                             store.record_intervention(r["run_id"], "auto_merge_reverted",
-                                                      json.dumps({"url": url, "revert_url": rev}))
+                                                      json.dumps({**d, "revert_url": rev}))
                             st.session_state.am_flash = (True, f"Reverted: {rev} is merged. Update & restart to "
                                                                "pick up the change.")
                         except (GitHubError, Exception) as e:  # noqa: BLE001
@@ -2685,7 +2747,7 @@ def auto_merge_panel(gh) -> None:
                         st.session_state.pop(key + "_ask", None)
                         st.session_state.pop("pr_cache", None)
                         st.rerun()
-                elif c2.button("↩ Revert", key=key, help="GitHub creates a revert PR and it is merged at once"):
+                elif st.button("↩ Revert", key=key + "_rev", help="GitHub creates a revert PR and it is merged at once"):
                     st.session_state[key + "_ask"] = True
                     st.rerun()
 
@@ -2739,7 +2801,7 @@ def page_prs():
                 if st.button("⬆️ Update & restart SwarmForge now", type="primary", key="pr_update"):
                     st.session_state.upd_status = None
                     do_update_and_restart()
-    auto_merge_panel(gh)
+    auto_merge_panel(gh, {pr.url for pr in all_prs} if not cache["errors"] else None)
     if not all_prs:
         st.success("No open pull requests. 🎉")
         return
