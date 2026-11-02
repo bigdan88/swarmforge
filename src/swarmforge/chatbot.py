@@ -16,6 +16,7 @@ Store.cost_summary attributes usage and cost per conversation.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -500,16 +501,21 @@ def list_conversations(store: Store, limit: int = 50) -> list[dict]:
         "SELECT * FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ?", (limit,))
 
 
-def add_message(store: Store, conversation_id: str, role: str, content: str) -> dict:
-    """Append a message to a conversation; bumps the conversation's updated_at."""
+def add_message(store: Store, conversation_id: str, role: str, content: str,
+                tool_calls: list[dict] | None = None) -> dict:
+    """Append a message to a conversation; bumps the conversation's updated_at.
+
+    `tool_calls` is an optional list of {"name", "args", "output"} dicts stored
+    as JSON in the chat_messages.tool_calls column (NULL when omitted)."""
     if get_conversation(store, conversation_id) is None:
         raise ChatError(f"unknown conversation {conversation_id}")
     now = time.time()
+    calls_json = json.dumps(tool_calls) if tool_calls else None
     with store._lock:
         cur = store.conn.execute(
-            "INSERT INTO chat_messages (conversation_id, role, content, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (conversation_id, role, content, now),
+            "INSERT INTO chat_messages (conversation_id, role, content, created_at, tool_calls) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (conversation_id, role, content, now, calls_json),
         )
         store.conn.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
