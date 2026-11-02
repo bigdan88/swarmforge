@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 
@@ -389,7 +390,17 @@ def test_postmortem_stale_base_is_retryable():
 
 def _git(cwd, *args):
     import subprocess
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+    transient = re.compile(
+        r"unable to create thread|Resource temporarily unavailable|fork failed|cannot fork|"
+        r"Cannot allocate memory|git-pack-objects died|bad pack header|upload-pack: aborting")
+    for attempt in range(5):
+        p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+        if p.returncode == 0 or not transient.search(p.stdout + p.stderr):
+            p.check_returncode()
+            return
+        if attempt < 4:
+            time.sleep(0.1 * (2 ** attempt))
+    p.check_returncode()
 
 
 def _origin(tmp_path, files):
@@ -451,4 +462,94 @@ def test_seed_from_conflicting_base_raises_stale_seed_and_resets(tmp_path):
         new.seed_from(old.repo, old.integration_branch)
     assert e.value.conflicts == ["a.txt"]
     assert new.head(new.repo) == new.base_sha                  # back on a clean, current base
+    assert (new.repo / "a.txt").read_text() == "main version\n"
+
+
+class _FakeCompleted:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _patch_git(monkeypatch, responses, sleeps=None):
+    """Patch subprocess.run and time.sleep in swarmforge.workspace with a scripted
+    sequence of CompletedProcess results; returns the call count."""
+    import swarmforge.workspace as ws
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        i = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        return responses[i]
+
+    def fake_sleep(s):
+        if sleeps is not None:
+            sleeps.append(s)
+
+    monkeypatch.setattr(ws.subprocess, "run", fake_run)
+    monkeypatch.setattr(ws.time, "sleep", fake_sleep)
+    return calls
+
+
+def test_git_retries_transient_thread_failures_then_succeeds(tmp_path, monkeypatch):
+    import swarmforge.workspace as ws
+    transient = _FakeCompleted(128, stderr="remote: fatal: unable to create thread: "
+                                           "Resource temporarily unavailable\n")
+    ok = _FakeCompleted(0, stdout="ref\n")
+    calls = _patch_git(monkeypatch, [transient, transient, ok])
+    out = ws.git(tmp_path, "rev-parse", "HEAD")
+    assert out == "ref\n"
+    assert calls["n"] == 3
+
+
+def test_git_raises_giterror_for_genuine_failure_after_retries(tmp_path, monkeypatch):
+    import swarmforge.workspace as ws
+    bad = _FakeCompleted(128, stderr="fatal: not a git repository\n")
+    calls = _patch_git(monkeypatch, [bad])
+    with pytest.raises(ws.GitError):
+        ws.git(tmp_path, "status")
+    assert calls["n"] == 1  # non-transient errors are not retried at all
+
+    transient = _FakeCompleted(128, stderr="git-pack-objects died of signal 9\n")
+    calls = _patch_git(monkeypatch, [transient])
+    with pytest.raises(ws.GitError):
+        ws.git(tmp_path, "fetch")
+    assert calls["n"] == 5  # transient errors exhaust the bounded retry budget
+
+
+def test_git_rc_returns_last_result_after_transient_retries(tmp_path, monkeypatch):
+    import swarmforge.workspace as ws
+    transient = _FakeCompleted(128, stderr="upload-pack: aborting\n")
+    calls = _patch_git(monkeypatch, [transient])
+    rc, out = ws.git_rc(tmp_path, "merge", "--no-ff")
+    assert rc == 128 and "upload-pack: aborting" in out
+    assert calls["n"] == 5
+
+
+def test_stale_seed_conflicts_fall_back_to_merge_output(tmp_path, monkeypatch):
+    """When `git diff --diff-filter=U` yields nothing, conflicts come from the
+    'CONFLICT (...): Merge conflict in <path>' lines of the merge output."""
+    import swarmforge.workspace as ws
+    from swarmforge.workspace import GitWorkspace, StaleSeed
+    origin = _origin(tmp_path, {"a.txt": "a\n"})
+    old = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
+    old.prepare(str(origin), None)
+    _commit(old.repo, "a.txt", "swarm version\n", "swarm work")
+    _commit(origin, "a.txt", "main version\n", "main moved")
+    new = GitWorkspace(tmp_path / "run2", "run-2-bbbbbbbb")
+    new.prepare(str(origin), None)
+
+    real_git = ws.git
+
+    def fake_git(cwd, *args, **kwargs):
+        if args[:2] == ("diff", "--name-only"):
+            return ""  # index query fails / returns nothing
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(ws, "git", fake_git)
+    with pytest.raises(StaleSeed) as e:
+        new.seed_from(old.repo, old.integration_branch)
+    assert e.value.conflicts == ["a.txt"]
+    assert new.head(new.repo) == new.base_sha
     assert (new.repo / "a.txt").read_text() == "main version\n"
