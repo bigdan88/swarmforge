@@ -2433,20 +2433,28 @@ def page_chat():
         kwargs = {"history": history[:-1], "conversation": conv}
         if att_paths:
             kwargs["attachments"] = att_paths
-        try:
-            with st.spinner("Thinking…"):
-                res = chatbot.ask(cfg, store, prompt, **kwargs)
-        except chatbot.ChatError as e:
-            st.error(f"Chatbot: {e}")
-            _chat_save(actions, active_id)
-            return
-        history.append({"role": "assistant", "content": res["answer"]})
-        chatbot.add_message(store, active_id, "assistant", res["answer"])
-        if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
-            actions[len(history) - 1] = res["actions"]
-        _chat_save(actions, active_id)
         with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
-            st.markdown(_chat_md(res["answer"]))
+            tools_box = st.container()
+            answer_slot = st.empty()
+
+            def _on_tool(name, args, output):
+                a = args or {}
+                arg = str(a.get("url") or a.get("path") or next(iter(a.values()), ""))[:80]
+                tools_box.caption(f"🔧 {name} · {arg}" if arg else f"🔧 {name}")
+
+            try:
+                with st.spinner("Thinking…"):
+                    res = chatbot.ask(cfg, store, prompt, on_tool=_on_tool, **kwargs)
+            except chatbot.ChatError as e:
+                answer_slot.error(f"Chatbot: {e}")
+                _chat_save(actions, active_id)
+                return
+            history.append({"role": "assistant", "content": res["answer"]})
+            chatbot.add_message(store, active_id, "assistant", res["answer"])
+            if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
+                actions[len(history) - 1] = res["actions"]
+            _chat_save(actions, active_id)
+            answer_slot.markdown(_chat_md(res["answer"]))
             st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
                        f"conversation {res.get('conversation', conv)} · "
                        f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
