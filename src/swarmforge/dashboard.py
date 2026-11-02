@@ -1039,6 +1039,9 @@ def run_detail(run_id, header=True):
             st.dataframe(df, width="stretch", hide_index=True)
         else:
             st.caption("No findings recorded.")
+        scope_skipped = [e for e in events if e.get("kind") == "scope"]
+        if scope_skipped:
+            st.caption(f"skipped out-of-scope findings: {len(scope_skipped)}")
         st.markdown("#### Human interventions")
         if inter:
             st.dataframe(pd.DataFrame([{"time": fmt_ts(i["ts"]), "kind": i["kind"], "detail": i["detail"]} for i in inter]),
