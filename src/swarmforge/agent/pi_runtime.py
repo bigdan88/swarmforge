@@ -9,7 +9,8 @@ key: it talks to a small OpenAI-compatible **model relay** that SwarmForge runs 
   * enforces the role's step limit and cancellation by answering with a final "stop" message, and
   * writes the agent transcript the dashboard shows.
 Pi itself is started with project-local extensions, skills, MCP and prompt templates disabled, so a
-repository can't inject code into the harness.
+repository can't inject code into the harness. Knowledge-base playbooks are instead exposed as
+SwarmForge tools (`sf`): `load_skill` loads a playbook by name, `list_skills` lists them.
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ SF_BIN = ".swarmforge/bin"                   # the `sf` command (SwarmForge tool
 # SwarmForge tools offered to Pi developers through `sf` (Pi has its own read/write/edit/bash)
 SF_TOOLS = ("start_process", "read_process_output", "stop_process", "browse", "check_code", "run_tests",
             "outline", "find_symbol", "git_changes", "git_history", "http_request", "format_code",
-            "list_packages", "edit_lines", "apply_patch")
+            "list_packages", "edit_lines", "apply_patch", "load_skill", "list_skills")
 
 
 def _refresh_changed_files(ctx) -> None:
@@ -183,9 +184,9 @@ class ModelRelay:
         """Run one SwarmForge developer tool for a Pi agent (called by the `sf` command in its sandbox).
         Same implementations and the same per-agent context (sandbox session, artifacts, base commit)
         as built-in agents get."""
-        from .tools import ASYNC_IMPLS, ToolError
+        from .tools import ASYNC_IMPLS, SYNC_IMPLS, ToolError
         name, args = str(req.get("tool") or ""), req.get("args") or {}
-        if agent.ctx is None or name not in SF_TOOLS:
+        if agent.ctx is None or name not in SF_TOOLS or (name not in ASYNC_IMPLS and name not in SYNC_IMPLS):
             return {"ok": False, "output": f"ERROR: unknown tool '{name}'. Run `sf help`."}
         if agent.stopped or (agent.should_cancel and agent.should_cancel()):
             return {"ok": False, "output": "ERROR: this agent has been stopped; finish now."}
@@ -197,7 +198,10 @@ class ModelRelay:
         if agent.on_event:
             agent.on_event("tool", f"sf {name}: {json.dumps(args)[:160]}", {"tool": name, "via": "sf"})
         try:
-            out = await ASYNC_IMPLS[name](agent.ctx, **args)
+            if name in ASYNC_IMPLS:
+                out = await ASYNC_IMPLS[name](agent.ctx, **args)
+            else:
+                out = await asyncio.to_thread(SYNC_IMPLS[name], agent.ctx, **args)
         except ToolError as e:
             out, ok = f"ERROR: {e}", False
         except TypeError as e:

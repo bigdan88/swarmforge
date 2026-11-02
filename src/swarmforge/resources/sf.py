@@ -23,6 +23,8 @@
   sf packages [MODULE]                          installed packages / where a module comes from
   sf edit PATH --lines A-B --text '...'   targeted line-range edit (1-based, inclusive; atomic)
   sf patch PATH '<hunks JSON or unified diff>'   anchored hunks / diff; '-' or no arg reads stdin
+  sf skills                                     list available skills/playbooks
+  sf skill NAME                                 print a knowledge-base playbook (reusable lesson)
   sf call TOOL '{"json": "args"}'               any tool with raw JSON arguments
 
 Prefer `sf edit` / `sf patch` over whole-file rewrites: they validate every anchor first and
@@ -240,6 +242,12 @@ def parse(argv):
         return "apply_patch", {"path": rest[0], "hunks": hunks}
     if cmd == "packages":
         return "list_packages", ({"name": rest[0]} if rest else {})
+    if cmd == "skills":
+        return "list_skills", {}
+    if cmd == "skill":
+        if len(rest) != 1:
+            raise Usage("sf skill NAME")
+        return "load_skill", {"name": rest[0]}
     raise Usage(f"unknown command '{cmd}'")
 
 

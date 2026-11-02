@@ -1,5 +1,6 @@
 """Tests for swarmforge.state.repair_tasks_from_findings."""
 import json
+from typing import ClassVar
 
 import pytest
 
@@ -85,15 +86,15 @@ def test_missing_file_and_line():
 
 # ------------------------------------------------- full-pipeline wiring tests
 MAJOR_FINDINGS = [
-    {"severity": "major", "file": "src/swarmforge/explain.py", "line": 395,
+    {"severity": "major", "file": "inventory/exporters.py", "line": 395,
      "title": "budget_usd is NULL crash",
      "description": "explain_run crashes with TypeError: unsupported format string when budget_usd is NULL",
      "recommendation": "use `run.get('budget_usd') or 0`"},
-    {"severity": "major", "file": "src/swarmforge/dashboard.py", "line": 567,
+    {"severity": "major", "file": "inventory/cli.py", "line": 567,
      "title": "missing null guard",
      "description": "dashboard renders a NULL budget without a null guard in the run table",
      "recommendation": "guard the value before formatting"},
-    {"severity": "major", "file": "src/swarmforge/report.py", "line": 215,
+    {"severity": "major", "file": "README.md", "line": 215,
      "title": "unhandled None budget",
      "description": "report generation raises on unhandled None budget values",
      "recommendation": "coalesce None to 0"},
@@ -185,3 +186,91 @@ async def test_pipeline_repair_tasks_from_major_findings(cfg, sample_repo):
 def test_no_findings_registers_nothing():
     """Wiring invariant: empty findings (single-agent / clean review) -> no repair tasks."""
     assert repair_tasks_from_findings([], ["developer_backend"], cycle=1) == []
+
+
+class MixedScopeReviewer:
+    """Session 1 rejects with 1 in-scope + 1 out-of-scope major finding; later approves."""
+
+    IN_SCOPE: ClassVar[dict] = {"severity": "major", "file": "inventory/cli.py", "line": 12,
+                               "title": "cli export crash",
+                               "description": "cli export crashes on empty inventory",
+                               "recommendation": "guard the empty case"}
+    OUT_OF_SCOPE: ClassVar[dict] = {"severity": "major", "file": "src/swarmforge/repos.py", "line": 99,
+                                    "title": "GIT env leak",
+                                    "description": "repos.py passes GIT env vars into subprocess",
+                                    "recommendation": "strip GIT env vars"}
+
+    def __init__(self):
+        self.sessions = 0
+
+    def __call__(self, body):
+        from . import fake_team
+        n = fake_team._n_assistant(body)
+        if n == 0:
+            self.sessions += 1
+            return {"content": "", "tool_calls": [
+                fake_team.tool_call("read_file", {"path": "README.md"})]}
+        if self.sessions > 1:
+            rv = {"verdict": "approve", "summary": "All findings fixed.", "findings": []}
+        else:
+            rv = {"verdict": "request_changes", "summary": "2 blocking findings.",
+                  "findings": [self.IN_SCOPE, self.OUT_OF_SCOPE]}
+        return {"content": "", "tool_calls": [fake_team.tool_call("submit_review", rv)]}
+
+
+async def test_pipeline_out_of_scope_findings_skipped(cfg, sample_repo):
+    """Out-of-scope blocking findings create no repair tasks and are logged as scope skips."""
+    from swarmforge.db import Store
+    from swarmforge.orchestrator import Orchestrator
+
+    from . import fake_team
+    from .conftest import ISSUE, FakeProvider
+
+    cfg.limits.max_runtime_s = 600
+    store = Store(cfg.db_path)
+    reviewer = MixedScopeReviewer()
+    fake = FakeProvider({
+        "qwen-fake": fake_team.planner,
+        "deepseek-fake": fake_team.developer,
+        "kimi-fake": fake_team.developer,
+        "minimax-fake": fake_team.tester,
+        "glm-fake": reviewer,
+    })
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=fake.transport)
+    run_id = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+
+    run = store.get_run(run_id)
+    assert run["state"] == "COMPLETED", run["state_reason"]
+
+    tasks = store.tasks(run_id)
+    repair = [t for t in tasks if t["task_key"].startswith("R1F")]
+    assert len(repair) == 1
+    assert repair[0]["title"] == MixedScopeReviewer.IN_SCOPE["title"]
+    assert not any("repos.py" in (t["description"] or "") for t in tasks)
+
+    scope_events = [e for e in store.events(run_id) if e["kind"] == "scope"
+                    and "out-of-scope" in e["message"]]
+    assert len(scope_events) == 1
+    data = scope_events[0]["data"]
+    if isinstance(data, str):
+        data = json.loads(data)
+    assert data["title"] == MixedScopeReviewer.OUT_OF_SCOPE["title"]
+
+
+def test_gate_fails_open_without_plan(cfg):
+    """A plan-less Orchestrator (empty scope) still blocks on every blocking finding."""
+    from swarmforge.db import Store
+    from swarmforge.orchestrator import Orchestrator
+    from swarmforge.testing import TestEvidence
+
+    store = Store(cfg.db_path)
+    orch = Orchestrator(cfg, store, echo=None)
+    assert orch._repair_scope() == set()
+    ev = TestEvidence(label="final", command="pytest", exit_code=0, timed_out=False,
+                      duration_s=1.0, passed=10, junit_found=True)
+    review = {"verdict": "request_changes", "summary": "nope",
+              "findings": [finding(file="src/swarmforge/repos.py", title="GIT env leak"),
+                           finding(file="anything.py", severity="critical", title="boom")]}
+    problems = orch._gate(0, ev, None, review, [])
+    assert len(problems) == 2
+    assert all(p["kind"] == "review" for p in problems)

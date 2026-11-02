@@ -27,6 +27,8 @@ class _FakeStdin:
 
 
 def test_sf_parses_every_command(monkeypatch):
+    monkeypatch.delenv("SF_TOOLS_URL", raising=False)
+    monkeypatch.delenv("SF_RELAY_TOKEN", raising=False)
     p = SF.parse
     assert p(["start", "web", "--port", "8501", "--", "streamlit", "run", "app.py", "--server.port", "8501"]) == (
         "start_process", {"name": "web", "ready_port": 8501, "command": "streamlit run app.py --server.port 8501"})
@@ -64,10 +66,12 @@ def test_sf_parses_every_command(monkeypatch):
     assert p(["patch", "a.py"]) == ("apply_patch", {"path": "a.py", "hunks": hunks})
     monkeypatch.setattr(sys, "stdin", _FakeStdin(diff))
     assert p(["patch", "a.py", "-"]) == ("apply_patch", {"path": "a.py", "hunks": diff})
+    assert p(["skill", "apptest-button-key"]) == ("load_skill", {"name": "apptest-button-key"})
+    assert p(["skills"]) == ("list_skills", {})
     for bad in (["start", "web"], ["browse"], ["fill"], ["browse", "u", "--fill", "noequals"], ["nope"],
                 ["edit"], ["edit", "a.py"], ["edit", "a.py", "--lines", "3"],
                 ["edit", "a.py", "--lines", "x-5", "--text", "a"],
-                ["edit", "a.py", "--lines", "5-3", "--text", "a"], ["patch"]):
+                ["edit", "a.py", "--lines", "5-3", "--text", "a"], ["patch"], ["skill"]):
         with pytest.raises(SF.Usage):
             p(bad)
     assert SF.main(["help"]) == 0
@@ -77,6 +81,7 @@ def test_sf_parses_every_command(monkeypatch):
     monkeypatch.delenv("SF_TOOLS_URL", raising=False)
     monkeypatch.delenv("SF_RELAY_TOKEN", raising=False)
     assert SF.main(["symbol", "x"]) == 1          # outside an agent session: a clear error, not a crash
+    assert SF.main(["skills"]) == 1
 
 
 def _ctx(tmp_path):
@@ -133,6 +138,7 @@ def test_pi_prompt_teaches_sf_and_requires_browsing_ui_changes():
     s = prompts.PI_DEVELOPER_SYSTEM
     assert "sf browse" in s and "sf start" in s and "MUST look at the result" in s and "sf help" in s
     assert "MUST also start the app" in prompts.TESTER_SYSTEM
+    assert "sf skill" in prompts.PI_DEVELOPER_SYSTEM and "sf skills" in prompts.PI_DEVELOPER_SYSTEM
 
 
 def _free_port():
