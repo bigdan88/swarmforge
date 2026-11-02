@@ -359,8 +359,9 @@ def test_ac4_no_upload_send_calls_ask_with_exactly_todays_arguments(
     assert len(calls) == 1
     kw = calls[0]["kw"]
     assert "attachments" not in kw
-    # exactly today's call shape: history + conversation, nothing else
-    assert set(kw) == {"conversation"}
+    # exactly today's call shape: history + conversation + on_tool, nothing else
+    assert set(kw) == {"conversation", "on_tool"}
+    assert callable(kw["on_tool"])
     assert calls[0]["history"] == []
     # nothing image-like is rendered, and the answer still comes through
     assert not at.image

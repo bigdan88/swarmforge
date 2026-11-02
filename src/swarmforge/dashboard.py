@@ -2430,6 +2430,13 @@ def page_chat():
         kwargs = {"history": history[:-1], "conversation": conv}
         if att_paths:
             kwargs["attachments"] = att_paths
+        tool_box = st.container(key=f"chat_tools_{conv}")
+
+        def _on_tool(name, args):
+            with tool_box:
+                st.markdown(f"🔧 calling `{name}`…")
+
+        kwargs["on_tool"] = _on_tool
         try:
             with st.spinner("Thinking…"):
                 res = chatbot.ask(cfg, store, prompt, **kwargs)

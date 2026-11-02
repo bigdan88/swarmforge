@@ -359,7 +359,8 @@ def test_ac6_dashboard_chat_session_conversation_and_reset(tmp_path, monkeypatch
 
     calls = []
 
-    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12,
+                 **kw):
         calls.append({"question": question, "conversation": conversation})
         return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question,
                 "conversation": conversation, "usage": {"cost_usd": 0.02, "total_tokens": 10}}
