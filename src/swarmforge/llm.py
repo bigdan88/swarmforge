@@ -11,6 +11,8 @@ Cost accounting distinguishes three sources, recorded per call:
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import random
 import threading
 import time
@@ -166,6 +168,21 @@ def model_supports_vision(model: str, vision_models: list[str] | None = None) ->
         if e == low or e in low:
             return True
     return any(h in low for h in VISION_MODEL_HINTS)
+
+
+def parse_tool_args(raw) -> dict:
+    """Parse a tool call's `function.arguments` JSON string into a dict.
+
+    Tolerates double-encoded JSON strings (a dict encoded twice). Empty/None
+    yields {}. Invalid JSON raises ValueError (callers catch it)."""
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    args = json.loads(raw)
+    if isinstance(args, str):
+        args = json.loads(args)
+    return args if isinstance(args, dict) else {}
 
 
 def messages_contain_images(messages: list[dict]) -> bool:
@@ -331,6 +348,49 @@ class LLMClient:
         msg.setdefault("role", "assistant")
         self._record(role, model, pc, task_key, started, usage, "ok", None)
         return ChatResult(message=msg, finish_reason=choice.get("finish_reason"), usage=usage, raw=data)
+
+    async def chat_with_tools(self, role: str, messages: list[dict], tools: list[dict],
+                              execute, *, max_rounds: int = 5, task_key: str | None = None,
+                              on_tool=None) -> ChatResult:
+        """Function-calling loop: call the model, execute requested tools, feed
+        results back as role='tool' messages, and repeat until the model returns
+        plain text or `max_rounds` LLM calls have been made.
+
+        `messages` is mutated in place (assistant and tool messages are appended).
+        `execute(name, args)` may be sync or async; exceptions are converted to
+        `"ERROR: ..."` tool messages and never raised out of the loop. `on_tool(name,
+        args)` fires before each execution (sync or async) and its errors are
+        swallowed."""
+        res: ChatResult | None = None
+        for _ in range(max_rounds):
+            res = await self.chat(role, messages, tools=tools, task_key=task_key)
+            messages.append(res.message)
+            if not res.tool_calls:
+                return res
+            for tc in res.tool_calls:
+                name = tc["function"]["name"]
+                try:
+                    args = parse_tool_args(tc["function"].get("arguments"))
+                except ValueError as e:
+                    args = {}
+                    out = f"ERROR: ValueError: invalid tool arguments: {e}"
+                else:
+                    if on_tool is not None:
+                        try:
+                            cb = on_tool(name, args)
+                            if inspect.isawaitable(cb):
+                                await cb
+                        except Exception:
+                            pass
+                    try:
+                        out = execute(name, args)
+                        if inspect.isawaitable(out):
+                            out = await out
+                    except Exception as e:
+                        out = f"ERROR: {type(e).__name__}: {e}"
+                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": str(out)})
+        assert res is not None  # loop ran at least once when max_rounds >= 1
+        return res
 
     def _event(self, message: str, task_key, role, level: str = "info") -> None:
         if self.store and self.run_id:
