@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import socket
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ from swarmforge.agent import devtools
 from swarmforge.agent.tools import TOOL_SCHEMAS, ToolContext, ToolError
 from swarmforge.config import SandboxConfig
 from swarmforge.sandbox import DockerSandbox, LocalSandbox
+
+from .conftest import browser_lock
 
 PY = f'"{sys.executable}"'
 
@@ -109,13 +112,20 @@ def _has_browser() -> bool:
         return False
     try:
         from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            p.chromium.launch(args=["--no-sandbox"]).close()
-        return True
-    except Exception:
+        with browser_lock():  # don't probe while another worker is inside its own browser test
+            for _ in range(2):  # a second chance: a launch can still lose a race for /dev/shm
+                try:
+                    with sync_playwright() as p:
+                        p.chromium.launch(args=["--no-sandbox"]).close()
+                    return True
+                except Exception:  # noqa: BLE001 - retry once, then treat as "no browser"
+                    time.sleep(0.5)
+    except Exception:  # noqa: BLE001
         return False
+    return False
 
 
+@pytest.mark.browser
 @pytest.mark.skipif(not _has_browser(), reason="playwright/chromium not installed")
 async def test_browse_reports_page_text_errors_and_actions(ctx):
     port = free_port()

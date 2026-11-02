@@ -1,7 +1,11 @@
+import contextlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -12,6 +16,71 @@ from swarmforge.config import parse_config
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "samples" / "inventory-app"
 ISSUE = ROOT / "samples" / "issues" / "export-csv-json.md"
+
+# ------------------------------------------------- one real browser at a time
+# Chromium instances do not cope with starting side by side in the small sandbox the suite runs in
+# (/dev/shm is 64 MB here): with `pytest -n 6` several workers launch a browser at once and Chromium
+# dies mid-test with "BrowserType.launch: Target page, context or browser has been closed" or
+# "Target crashed" - failures that have nothing to do with the code under test (this bit the theme
+# E2E test and the visual-review tests). Tests tagged `@pytest.mark.browser` therefore hold an
+# exclusive *cross-process* lock, so xdist workers take turns instead of racing.
+BROWSER_LOCK = Path(os.environ.get("SWARMFORGE_BROWSER_LOCK") or
+                    Path(tempfile.gettempdir()) / "swarmforge-tests" / "browser.lock")
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platforms without flock (Windows dev boxes have no such limit)
+    fcntl = None  # type: ignore[assignment]
+
+_HELD: set[str] = set()  # lock paths this process already holds (browser_lock is re-entrant)
+
+
+@contextlib.contextmanager
+def browser_lock(timeout_s: float = 600.0):
+    """Wait for the shared browser lock, run the body, release it.
+
+    Never breaks the suite: it is re-entrant within one process (a marked test may call a helper that
+    locks again), it gives up waiting after `timeout_s` and runs the body unlocked, and if the lock
+    file cannot be created at all (read-only temp dir) it just runs unlocked. All three are strictly
+    better than the alternative - Chromium instances started side by side."""
+    path = str(BROWSER_LOCK)
+    if fcntl is None or path in _HELD:
+        yield
+        return
+    try:
+        BROWSER_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        yield
+        return
+    _HELD.add(path)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.2)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - we never got the lock
+            pass
+        os.close(fd)
+        _HELD.discard(path)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Serialise real-browser tests across pytest/xdist worker processes."""
+    if item.get_closest_marker("browser") is None:
+        return (yield)
+    with browser_lock():
+        return (yield)
 
 
 def base_raw(workdir: Path, sandbox_mode: str = "local") -> dict:
