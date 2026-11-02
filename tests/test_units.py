@@ -452,3 +452,56 @@ def test_seed_from_conflicting_base_raises_stale_seed_and_resets(tmp_path):
     assert e.value.conflicts == ["a.txt"]
     assert new.head(new.repo) == new.base_sha                  # back on a clean, current base
     assert (new.repo / "a.txt").read_text() == "main version\n"
+
+
+def test_deliver_to_local_retries_transient_push_failures(tmp_path, monkeypatch):
+    import swarmforge.workspace as ws_mod
+    from swarmforge.workspace import GitWorkspace
+    origin = _origin(tmp_path, {"a.txt": "a\n"})
+    ws = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
+    ws.prepare(str(origin), None)
+    _commit(ws.repo, "a.txt", "swarm\n", "swarm work")
+
+    calls = []
+    real_git_rc = ws_mod.git_rc
+
+    def flaky_git_rc(path, *args):
+        if args[0] == "push":
+            calls.append(args)
+            if len(calls) < 3:
+                return 128, "fatal: transient network error"
+            return real_git_rc(path, *args)
+        return real_git_rc(path, *args)
+
+    sleeps = []
+    monkeypatch.setattr(ws_mod, "git_rc", flaky_git_rc)
+    monkeypatch.setattr(ws_mod.time, "sleep", lambda s: sleeps.append(s))
+    branch = ws.deliver_to_local(origin)
+    assert branch == ws.integration_branch
+    assert len(calls) == 3
+    assert sleeps == [0.5, 1.0]
+
+
+def test_deliver_to_local_raises_git_error_with_output_after_retries(tmp_path, monkeypatch):
+    import swarmforge.workspace as ws_mod
+    from swarmforge.workspace import GitError, GitWorkspace
+    origin = _origin(tmp_path, {"a.txt": "a\n"})
+    ws = GitWorkspace(tmp_path / "run1", "run-1-aaaaaaaa")
+    ws.prepare(str(origin), None)
+    _commit(ws.repo, "a.txt", "swarm\n", "swarm work")
+
+    calls = []
+    real_git_rc = ws_mod.git_rc
+
+    def failing_git_rc(path, *args):
+        if args[0] == "push":
+            calls.append(args)
+            return 128, "fatal: unable to access remote"
+        return real_git_rc(path, *args)
+
+    monkeypatch.setattr(ws_mod, "git_rc", failing_git_rc)
+    monkeypatch.setattr(ws_mod.time, "sleep", lambda s: None)
+    with pytest.raises(GitError) as e:
+        ws.deliver_to_local(origin)
+    assert len(calls) == 3
+    assert "unable to access remote" in str(e.value)
