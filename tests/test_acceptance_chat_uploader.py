@@ -22,6 +22,7 @@ AC5  Scope: one new module (attachments.py), one optional keyword-only kwarg on
 Everything is offline: `chatbot.ask` is monkeypatched for AppTest runs, and the real
 ask uses tests/test_chatbot.py's FakeProvider transport.
 """
+
 import base64
 import inspect
 import json
@@ -70,16 +71,27 @@ class FakeFile:
 def _seed(cfg) -> Store:
     """One finished run in the store the dashboard reads (same as tests/test_dashboard_chat.py)."""
     store = Store(cfg.db_path)
-    store.create_run("20990101-000000-aaaaaa", state="COMPLETED", issue_title="Export CSV", repo="x/y",
-                     budget_usd=5, state_reason="done", config_json="{}")
+    store.create_run(
+        "20990101-000000-aaaaaa",
+        state="COMPLETED",
+        issue_title="Export CSV",
+        repo="x/y",
+        budget_usd=5,
+        state_reason="done",
+        config_json="{}",
+    )
     return store
 
 
 def _recording_ask(calls: list):
     def fake_ask(c, store, question, history=None, **kw):
         calls.append({"question": question, "history": list(history or []), "kw": kw})
-        return {"answer": "FAKE-ANSWER: both files received", "role": "planner", "model": "qwen-fake",
-                "question": question}
+        return {
+            "answer": "FAKE-ANSWER: both files received",
+            "role": "planner",
+            "model": "qwen-fake",
+            "question": question,
+        }
 
     return fake_ask
 
@@ -93,7 +105,9 @@ def _open_chat(at) -> "AppTest":
 # ============================================================ AC1: AppTest upload -> transcript
 
 
-def test_ac1_chat_upload_png_and_txt_renders_thumbnail_chip_and_answer(tmp_path, monkeypatch):
+def test_ac1_chat_upload_png_and_txt_renders_thumbnail_chip_and_answer(
+    tmp_path, monkeypatch
+):
     cfg = _write_cfg(tmp_path, monkeypatch)
     _seed(cfg)
     calls: list = []
@@ -155,7 +169,9 @@ def test_ac1_attachments_re_render_from_history_on_next_rerun(tmp_path, monkeypa
 
 def test_ac2_save_attachments_collision_safe_names(tmp_path):
     d = tmp_path / "chat_attachments"
-    out = save_attachments([FakeFile("report.txt", b"one"), FakeFile("report.txt", b"two")], d)
+    out = save_attachments(
+        [FakeFile("report.txt", b"one"), FakeFile("report.txt", b"two")], d
+    )
     assert [p.name for p in out] == ["report.txt", "report_1.txt"]
     assert out[0].read_bytes() == b"one" and out[1].read_bytes() == b"two"
     # a third same-named file -> name_2.txt
@@ -187,13 +203,17 @@ def test_ac2_save_attachments_sanitizes_upload_names(tmp_path):
     assert out[0].is_file() and out[0].read_bytes() == PNG_1PX
 
 
-def test_ac2_dashboard_sends_uploads_to_workdir_chat_attachments_collision_safe(tmp_path, monkeypatch):
+def test_ac2_dashboard_sends_uploads_to_workdir_chat_attachments_collision_safe(
+    tmp_path, monkeypatch
+):
     """End-to-end through the Chat page: two sends of the same filename save name.txt then name_1.txt."""
     cfg = _write_cfg(tmp_path, monkeypatch)
     _seed(cfg)
     calls: list = []
     monkeypatch.setattr(chatbot, "ask", _recording_ask(calls))
-    monkeypatch.setattr(st, "file_uploader", lambda *a, **k: [FakeFile("notes.txt", b"hello")])
+    monkeypatch.setattr(
+        st, "file_uploader", lambda *a, **k: [FakeFile("notes.txt", b"hello")]
+    )
 
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
@@ -219,7 +239,14 @@ class _Fake(FakeProvider):
     """Also capture the full request body for byte-comparison."""
 
     def __init__(self):
-        super().__init__({"qwen-fake": lambda body: {"role": "assistant", "content": "ok, saw the files"}})
+        super().__init__(
+            {
+                "qwen-fake": lambda body: {
+                    "role": "assistant",
+                    "content": "ok, saw the files",
+                }
+            }
+        )
         self.bodies: list[str] = []
 
     def __call__(self, request):
@@ -244,7 +271,13 @@ def test_ac3_ask_sends_image_data_url_block_and_inlines_text(tmp_path, monkeypat
     txt = tmp_path / "notes.txt"
     txt.write_bytes(b"hello notes")
     fake = _Fake()
-    res = chatbot.ask(cfg, store, "what do these show?", attachments=[png, txt], transport=fake.transport)
+    res = chatbot.ask(
+        cfg,
+        store,
+        "what do these show?",
+        attachments=[png, txt],
+        transport=fake.transport,
+    )
     assert res["answer"] == "ok, saw the files"
     user = fake.requests[-1]["messages"][-1]
     assert user["role"] == "user" and isinstance(user["content"], list)
@@ -272,22 +305,35 @@ def test_ac3_inline_text_limit_exact(tmp_path):
     assert "- over.txt (text)" in text  # ...but still listed by name
 
 
-def test_ac3_no_attachments_user_content_is_plain_string_and_payload_byte_identical(tmp_path, monkeypatch):
+def test_ac3_no_attachments_user_content_is_plain_string_and_payload_byte_identical(
+    tmp_path, monkeypatch
+):
     cfg = _fake_cfg(tmp_path, monkeypatch)
     store = Store(cfg.db_path)
     fake = _Fake()
     # freeze the time-dependent snapshot so bodies can be compared byte-for-byte
-    monkeypatch.setattr(chatbot, "status_snapshot", lambda store_, max_runs=12: "FROZEN-SNAPSHOT")
-    monkeypatch.setattr(chatbot, "improvement_context", lambda cfg_, store_: "FROZEN-IMPROVEMENT")
+    monkeypatch.setattr(
+        chatbot, "status_snapshot", lambda store_, max_runs=12: "FROZEN-SNAPSHOT"
+    )
+    monkeypatch.setattr(
+        chatbot, "improvement_context", lambda cfg_, store_: "FROZEN-IMPROVEMENT"
+    )
 
     chatbot.ask(cfg, store, "how are the runs?", transport=fake.transport)
-    chatbot.ask(cfg, store, "how are the runs?", transport=fake.transport, attachments=None)
-    chatbot.ask(cfg, store, "how are the runs?", transport=fake.transport, attachments=[])
+    chatbot.ask(
+        cfg, store, "how are the runs?", transport=fake.transport, attachments=None
+    )
+    chatbot.ask(
+        cfg, store, "how are the runs?", transport=fake.transport, attachments=[]
+    )
 
     assert len(fake.bodies) == 3
     assert fake.bodies[0] == fake.bodies[1] == fake.bodies[2]  # byte-identical
     msgs = fake.requests[0]["messages"]
-    assert msgs[-1] == {"role": "user", "content": "how are the runs?"}  # plain string, as today
+    assert msgs[-1] == {
+        "role": "user",
+        "content": "how are the runs?",
+    }  # plain string, as today
     assert all(isinstance(m["content"], str) for m in msgs)
     assert "image_url" not in fake.bodies[0]
 
@@ -295,7 +341,9 @@ def test_ac3_no_attachments_user_content_is_plain_string_and_payload_byte_identi
 # ============================================================ AC4: no-upload regression
 
 
-def test_ac4_no_upload_send_calls_ask_with_exactly_todays_arguments(tmp_path, monkeypatch):
+def test_ac4_no_upload_send_calls_ask_with_exactly_todays_arguments(
+    tmp_path, monkeypatch
+):
     cfg = _write_cfg(tmp_path, monkeypatch)
     _seed(cfg)
     calls: list = []
@@ -328,9 +376,23 @@ def test_ac4_cli_ask_never_passes_attachments(tmp_path, monkeypatch):
     cfg_path.write_text(yaml.safe_dump(base_raw(tmp_path / "work")))
     recorded = {}
 
-    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
+    def fake_ask(
+        cfg,
+        store,
+        question,
+        history=None,
+        *,
+        conversation=None,
+        transport=None,
+        max_runs=12,
+    ):
         recorded["ok"] = True
-        return {"answer": "All good.", "role": "chat", "model": "m1", "question": question}
+        return {
+            "answer": "All good.",
+            "role": "chat",
+            "model": "m1",
+            "question": question,
+        }
 
     monkeypatch.setattr(chatbot, "ask", fake_ask)
     monkeypatch.setenv("FAKE_KEY", "test-key")
@@ -350,10 +412,32 @@ def test_ac5_ask_and_answer_gained_exactly_one_optional_keyword_only_param():
         assert params["attachments"].kind is inspect.Parameter.KEYWORD_ONLY
         assert params["attachments"].default is None
     assert set(inspect.signature(chatbot.ask).parameters) == {
-        "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "attachments"}
+        "cfg",
+        "store",
+        "question",
+        "history",
+        "conversation",
+        "transport",
+        "max_runs",
+        "attachments",
+        "on_tool",
+    }
     assert set(inspect.signature(chatbot.answer).parameters) == {
-        "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "budget",
-        "attachments"}
+        "cfg",
+        "store",
+        "question",
+        "history",
+        "conversation",
+        "transport",
+        "max_runs",
+        "budget",
+        "attachments",
+        "on_tool",
+    }
+    for fn in (chatbot.ask, chatbot.answer):
+        params = inspect.signature(fn).parameters
+        assert params["on_tool"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["on_tool"].default is None
 
 
 def test_ac5_only_one_new_module_and_no_attachments_outside_the_three_files():
@@ -364,9 +448,12 @@ def test_ac5_only_one_new_module_and_no_attachments_outside_the_three_files():
         if f.name == "__init__.py" or f.name in touched:
             continue
         assert "attachments" not in f.read_text(encoding="utf-8"), (
-            f"{f}: attachment pipeline must stay out of {f.name}")
+            f"{f}: attachment pipeline must stay out of {f.name}"
+        )
     # ...and the two consumers really import it (single shared module, no duplication)
-    assert "from . import attachments" in (pkg / "chatbot.py").read_text(encoding="utf-8")
+    assert "from . import attachments" in (pkg / "chatbot.py").read_text(
+        encoding="utf-8"
+    )
     dash = (pkg / "dashboard.py").read_text(encoding="utf-8")
     assert "from swarmforge.attachments import" in dash
 
@@ -375,10 +462,13 @@ def test_ac5_dashboard_attachment_code_is_chat_page_only():
     from swarmforge import dashboard
 
     lines = Path(dashboard.__file__).read_text(encoding="utf-8").splitlines()
-    start = next(i for i, l in enumerate(lines) if l.startswith("def _chat_save_attachments"))
+    start = next(
+        i for i, l in enumerate(lines) if l.startswith("def _chat_save_attachments")
+    )
     end = next(i for i, l in enumerate(lines) if "NEW TASK page" in l)
     assert start < end
     hits = [i for i, l in enumerate(lines) if "attachment" in l.lower()]
     assert hits, "expected the attachment pipeline in the dashboard"
     assert all(start <= i < end for i in hits), [
-        (i + 1, lines[i]) for i in hits if not (start <= i < end)]
+        (i + 1, lines[i]) for i in hits if not (start <= i < end)
+    ]
