@@ -305,9 +305,8 @@ def test_pull_requests_page_lists_decisions_with_buttons(tmp_path, monkeypatch):
                      base="main", draft=True, author="o", created_at="", node_id="PR_9", head_sha="s", state="clean",
                      mergeable=True)
     monkeypatch.setattr(prs, "list_prs", lambda gh, repo, store=None, details=True: [open_pr])
-    from swarmforge import runqueue as rq
-    started = []
-    monkeypatch.setattr(rq, "start_worker", lambda c, s, keep_pause=False: started.append(1) or 4242)
+    launched = []
+    monkeypatch.setattr(am, "start_fix", lambda c, run_id, **kw: launched.append((run_id, kw)) or "20990101-fix")
     reverted = []
     monkeypatch.setattr(am, "revert", lambda gh, repo, n, method="squash": reverted.append(n) or "https://github.com/o/r/pull/10")
     at = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "src" / "swarmforge" / "dashboard.py"),
@@ -320,13 +319,27 @@ def test_pull_requests_page_lists_decisions_with_buttons(tmp_path, monkeypatch):
     assert "no longer open" in md                                    # #5 isn't open on GitHub any more
     keys = [b.key or "" for b in at.button]
     assert sum(k.endswith("_merge") for k in keys) == 1 and sum(k.endswith("_fix") for k in keys) == 1
-    # Fix with the swarm: a fix-up task continuing r2's code, replacing #9
+    # Fix with the swarm: starts a fix-up run right away, continuing r2's code, replacing #9
     next(b for b in at.button if (b.key or "").endswith("_fix")).click().run()
     assert not at.exception, [e.value for e in at.exception]
-    fix = [q for q in store.queue_items() if q["title"] == "Fix up: Rework queue"][0]
-    assert fix["seed_run_id"] == "r2" and am.fix_depth(fix["body"]) == (1, "https://github.com/o/r/pull/9")
-    assert "🔧 fix-up queued" in " ".join(m.value for m in at.markdown) and started
+    assert launched[0][0] == "r2" and launched[0][1]["url"] == "https://github.com/o/r/pull/9"
+    md = " ".join(m.value for m in at.markdown)
+    assert "🔧 being fixed" in md and "20990101-fix" in md
     # revert the merged one
     next(b for b in at.button if (b.key or "").endswith("_rev")).click().run()
     next(b for b in at.button if (b.key or "").endswith("_yes")).click().run()
     assert reverted == [7] and "↩️ reverted" in " ".join(m.value for m in at.markdown)
+
+
+def test_fix_up_starts_right_away_with_the_right_content(tmp_path, monkeypatch):
+    from swarmforge import launcher
+    calls = []
+    monkeypatch.setattr(launcher, "start_run", lambda cfg, **kw: calls.append(kw) or ("20990101-x", tmp_path / "l"))
+    o, store, _ = _orch(tmp_path, monkeypatch)                               # judge says hold
+    gh_fake = FakeGitHub(additions=900, files=["a.py"])
+    await_ = __import__("asyncio").run
+    await_(o._auto_merge(_gh(gh_fake), "o/r", "https://github.com/o/r/pull/7"))
+    kw = calls[0]
+    assert kw["seed_run_id"] == "r1" and kw["approval"] == "yes" and kw["repo"] == "o/r"
+    assert kw["issue_title"] == "Fix up: Add export" and am.fix_depth(kw["issue_body"]) == (1, "https://github.com/o/r/pull/7")
+    assert _last(store, am.FIXING)["fix_run"] == "20990101-x" and not store.queue_items()
