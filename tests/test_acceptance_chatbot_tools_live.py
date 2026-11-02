@@ -19,6 +19,7 @@ Covers, one test (or small group) per criterion of the issue:
 
 Everything runs offline: FakeProvider / httpx.MockTransport only.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +37,7 @@ from swarmforge.chat_tools import ToolRegistry, chat_with_tools
 from swarmforge.chatbot import build_chat_registry, list_files
 from swarmforge.config import ConfigError, parse_config
 from swarmforge.db import Store
+from swarmforge.workspace import _TRANSIENT_GIT_ERRORS
 
 from .conftest import FakeProvider, base_raw, tool_call
 
@@ -60,6 +62,7 @@ def make_cfg(tmp_path: Path, workdir_name: str = "work", **chat: Any):
 
 def tree(root: Path) -> Path:
     """A small directory tree with the skip-dirs present at the root and nested."""
+    root.mkdir(parents=True, exist_ok=True)
     (root / "alpha.txt").write_text("a", encoding="utf-8")
     (root / "zeta.md").write_text("z", encoding="utf-8")
     pkg = root / "pkg"
@@ -86,13 +89,13 @@ def test_ac1_exactly_one_tool_registry_and_one_tool_loop_in_src():
     for py in sorted(SRC.rglob("*.py")):
         text = py.read_text(encoding="utf-8")
         rel = str(py.relative_to(SRC))
-        if re.search(r"^\s*class ToolRegistry\b", text, re.M):
+        if re.search(r"^\s*class ToolRegistry\b", text, re.MULTILINE):
             registries.append(rel)
-        if re.search(r"^\s*(?:async )?def chat_with_tools\b", text, re.M):
+        if re.search(r"^\s*(?:async )?def chat_with_tools\b", text, re.MULTILINE):
             loops.append(rel)
-        if re.search(r"^\s*(?:async )?def fetch_url\b", text, re.M):
+        if re.search(r"^\s*(?:async )?def fetch_url\b", text, re.MULTILINE):
             fetches.append(rel)
-        if re.search(r"^\s*(?:async )?def build_chat_registry\b", text, re.M):
+        if re.search(r"^\s*(?:async )?def build_chat_registry\b", text, re.MULTILINE):
             builders.append(rel)
     assert registries == ["swarmforge/chat_tools.py"], registries
     assert loops == ["swarmforge/chat_tools.py"], loops
@@ -136,7 +139,7 @@ def test_ac3_sorted_relative_paths_with_directories_ending_in_slash(key, tmp_pat
     assert "pkg/" in lines and "pkg/sub/" in lines
     assert {"alpha.txt", "zeta.md", "pkg/beta.py", "pkg/sub/deep.txt"} <= set(lines)
     # relative paths only: never an absolute path, never the root itself
-    assert not any(line.startswith("/") or line.startswith(str(root)) for line in lines)
+    assert not any(line.startswith(("/", str(root))) for line in lines)
 
 
 def test_ac3_skips_git_pycache_and_pytest_cache(key, tmp_path):
@@ -193,9 +196,13 @@ def test_ac3_defaults_path_and_max_entries(key, tmp_path, monkeypatch):
 
 # ============================================================================ AC4
 def test_ac4_tools_disabled_sends_no_tools_in_the_request(key, tmp_path):
-    fake = FakeProvider(["no tools here"])
-    cfg = make_cfg(tmp_path, tools_enabled=False, transport=fake.transport)
-    res = chatbot.ask(cfg, Store(tmp_path / "db.sqlite"), "hi", transport=fake.transport)
+    fake = FakeProvider(
+        {"qwen-fake": lambda body: {"role": "assistant", "content": "no tools here"}}
+    )
+    cfg = make_cfg(tmp_path, tools_enabled=False)
+    res = chatbot.ask(
+        cfg, Store(tmp_path / "db.sqlite"), "hi", transport=fake.transport
+    )
     assert res["answer"] == "no tools here"
     assert len(fake.requests) == 1
     assert "tools" not in fake.requests[0]
@@ -210,46 +217,71 @@ def test_ac4_tools_disabled_skips_the_tool_loop_entirely(key, tmp_path, monkeypa
         return "from the loop"
 
     monkeypatch.setattr(chatbot, "chat_with_tools", spy)
-    fake = FakeProvider(["plain answer"])
+    fake = FakeProvider(
+        {"qwen-fake": lambda body: {"role": "assistant", "content": "plain answer"}}
+    )
     cfg = make_cfg(tmp_path, tools_enabled=False)
     store = Store(tmp_path / "db.sqlite")
     out = asyncio.run(chatbot.answer(cfg, store, "hi", transport=fake.transport))
-    assert out == "plain answer"
+    assert out["answer"] == "plain answer"
     assert seen == []
     assert "tools" not in fake.requests[0]
     assert len(fake.requests) == 1
 
 
 def test_ac4_tools_enabled_by_default_sends_the_two_tools(key, tmp_path):
-    fake = FakeProvider(["answer"])
-    cfg = make_cfg(tmp_path, transport=fake.transport)
+    fake = FakeProvider(
+        {"qwen-fake": lambda body: {"role": "assistant", "content": "answer"}}
+    )
+    cfg = make_cfg(tmp_path)
     chatbot.ask(cfg, Store(tmp_path / "db.sqlite"), "hi", transport=fake.transport)
     offered = [t["function"]["name"] for t in fake.requests[0]["tools"]]
     assert offered == ["fetch_url", "list_files"]
 
 
 def test_ac4_conversation_branch_also_sends_no_tools(key, tmp_path):
-    fake = FakeProvider(["answer"])
+    fake = FakeProvider(
+        {"qwen-fake": lambda body: {"role": "assistant", "content": "answer"}}
+    )
     cfg = make_cfg(tmp_path, tools_enabled=False)
     store = Store(tmp_path / "db.sqlite")
     conv = chatbot.create_conversation(store, "tools off")
-    asyncio.run(chatbot.answer(cfg, store, "hi", conversation=conv["id"],
-                               transport=fake.transport))
+    asyncio.run(
+        chatbot.answer(
+            cfg, store, "hi", conversation=conv["id"], transport=fake.transport
+        )
+    )
     assert len(fake.requests) == 1 and "tools" not in fake.requests[0]
 
 
 # ============================================================================ AC5
-def test_ac5_model_calls_list_files_then_answers(key, tmp_path):
+def test_ac5_model_calls_list_files_then_answers(key, tmp_path, monkeypatch):
     root = tree(tmp_path / "work")
     (root / "readme.md").write_text("hello", encoding="utf-8")
-    fake = FakeProvider([
-        tool_call("list_files", {"path": "."}),
-        "There is a readme.md and a pkg directory.",
-    ])
-    cfg = make_cfg(tmp_path, transport=fake.transport)
+    monkeypatch.chdir(root)
+
+    def handler(body):
+        if not any(m.get("role") == "tool" for m in body["messages"]):
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tool_call("list_files", {"path": "."})],
+            }
+        return {
+            "role": "assistant",
+            "content": "There is a readme.md and a pkg directory.",
+        }
+
+    fake = FakeProvider({"qwen-fake": handler})
+    cfg = make_cfg(tmp_path)
     calls: list[tuple] = []
-    res = chatbot.ask(cfg, Store(tmp_path / "db.sqlite"), "what files are here?",
-                      on_tool=calls.append, transport=fake.transport)
+    res = chatbot.ask(
+        cfg,
+        Store(tmp_path / "db.sqlite"),
+        "what files are here?",
+        on_tool=lambda *a: calls.append(a),
+        transport=fake.transport,
+    )
 
     assert res["answer"] == "There is a readme.md and a pkg directory."
     # the tool really ran: the model sees its output in a tool message
@@ -264,25 +296,58 @@ def test_ac5_model_calls_list_files_then_answers(key, tmp_path):
     assert "readme.md" in output and "pkg/" in output
 
 
-def test_ac5_answer_async_path_reports_the_tool_call(key, tmp_path):
+def test_ac5_answer_async_path_reports_the_tool_call(key, tmp_path, monkeypatch):
     root = tree(tmp_path / "work")
-    fake = FakeProvider([tool_call("list_files", {}), "done"])
+    monkeypatch.chdir(root)
+
+    def handler(body):
+        if not any(m.get("role") == "tool" for m in body["messages"]):
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tool_call("list_files", {})],
+            }
+        return {"role": "assistant", "content": "done"}
+
+    fake = FakeProvider({"qwen-fake": handler})
     cfg = make_cfg(tmp_path)
     calls: list[tuple] = []
-    out = asyncio.run(chatbot.answer(cfg, Store(tmp_path / "db.sqlite"), "list the files",
-                                     transport=fake.transport, on_tool=calls.append))
-    assert out == "done"
+    out = asyncio.run(
+        chatbot.answer(
+            cfg,
+            Store(tmp_path / "db.sqlite"),
+            "list the files",
+            transport=fake.transport,
+            on_tool=lambda *a: calls.append(a),
+        )
+    )
+    assert out["answer"] == "done"
     assert [c[0] for c in calls] == ["list_files"]
     assert "alpha.txt" in calls[0][2]
 
 
 def test_ac5_tool_error_reaches_callback_and_model_without_raising(key, tmp_path):
     tree(tmp_path / "work")
-    fake = FakeProvider([tool_call("list_files", {"path": "nope"}), "sorry"])
-    cfg = make_cfg(tmp_path, transport=fake.transport)
+
+    def handler(body):
+        if not any(m.get("role") == "tool" for m in body["messages"]):
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tool_call("list_files", {"path": "nope"})],
+            }
+        return {"role": "assistant", "content": "sorry"}
+
+    fake = FakeProvider({"qwen-fake": handler})
+    cfg = make_cfg(tmp_path)
     calls: list[tuple] = []
-    res = chatbot.ask(cfg, Store(tmp_path / "db.sqlite"), "list nope",
-                      on_tool=calls.append, transport=fake.transport)
+    res = chatbot.ask(
+        cfg,
+        Store(tmp_path / "db.sqlite"),
+        "list nope",
+        on_tool=lambda *a: calls.append(a),
+        transport=fake.transport,
+    )
     assert res["answer"] == "sorry"
     assert calls[0][2].startswith("ERROR:")
     tool_msgs = [m for m in fake.requests[1]["messages"] if m.get("role") == "tool"]
@@ -290,17 +355,25 @@ def test_ac5_tool_error_reaches_callback_and_model_without_raising(key, tmp_path
 
 
 def test_ac5_on_tool_is_optional_and_gets_nothing_without_calls(key, tmp_path):
-    fake = FakeProvider(["just an answer"])
-    cfg = make_cfg(tmp_path, transport=fake.transport)
-    res = chatbot.ask(cfg, Store(tmp_path / "db.sqlite"), "hi", transport=fake.transport)
+    fake = FakeProvider(
+        {"qwen-fake": lambda body: {"role": "assistant", "content": "just an answer"}}
+    )
+    cfg = make_cfg(tmp_path)
+    res = chatbot.ask(
+        cfg, Store(tmp_path / "db.sqlite"), "hi", transport=fake.transport
+    )
     assert res["answer"] == "just an answer"
 
 
 def test_ac5_on_tool_fires_after_each_tool_in_call_order():
     """The single tool loop calls on_tool(name, args, output) after every tool runs."""
     registry = ToolRegistry()
-    registry.register("echo", "echo back", {"type": "object", "properties": {}},
-                      lambda text="": f"out:{text}")
+    registry.register(
+        "echo",
+        "echo back",
+        {"type": "object", "properties": {}},
+        lambda text="": f"out:{text}",
+    )
     events: list[tuple] = []
 
     class FakeLLM:
@@ -310,38 +383,88 @@ def test_ac5_on_tool_fires_after_each_tool_in_call_order():
         async def chat(self, role, messages, **kw):
             self.rounds += 1
             if not any(m.get("role") == "tool" for m in messages):
-                return SimpleNamespace(message={"tool_calls": [
-                    {"id": "c1", "function": {"name": "echo", "arguments": '{"text": "a"}'}},
-                    {"id": "c2", "function": {"name": "echo", "arguments": '{"text": "b"}'}},
-                ]})
+                return SimpleNamespace(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"text": "a"}',
+                                },
+                            },
+                            {
+                                "id": "c2",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"text": "b"}',
+                                },
+                            },
+                        ]
+                    }
+                )
             return SimpleNamespace(message={"content": "final"})
 
     llm = FakeLLM()
-    out = asyncio.run(chat_with_tools(llm, "planner", [{"role": "user", "content": "go"}],
-                                      registry, on_tool=lambda n, a, o: events.append((n, a, o))))
+    out = asyncio.run(
+        chat_with_tools(
+            llm,
+            "planner",
+            [{"role": "user", "content": "go"}],
+            registry,
+            on_tool=lambda n, a, o: events.append((n, a, o)),
+        )
+    )
     assert out == "final"
-    assert events == [("echo", {"text": "a"}, "out:a"), ("echo", {"text": "b"}, "out:b")]
+    assert events == [
+        ("echo", {"text": "a"}, "out:a"),
+        ("echo", {"text": "b"}, "out:b"),
+    ]
     assert llm.rounds == 2
 
 
 def test_ac5_a_broken_on_tool_callback_does_not_break_the_loop():
     registry = ToolRegistry()
-    registry.register("echo", "echo back", {"type": "object", "properties": {}},
-                      lambda text="": f"out:{text}")
+    registry.register(
+        "echo",
+        "echo back",
+        {"type": "object", "properties": {}},
+        lambda text="": f"out:{text}",
+    )
 
     class FakeLLM:
         async def chat(self, role, messages, **kw):
             if not any(m.get("role") == "tool" for m in messages):
-                return SimpleNamespace(message={"tool_calls": [
-                    {"id": "c1", "function": {"name": "echo", "arguments": '{"text": "a"}'}}]})
+                return SimpleNamespace(
+                    message={
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"text": "a"}',
+                                },
+                            }
+                        ]
+                    }
+                )
             return SimpleNamespace(message={"content": "final"})
 
     def explode(name, args, output):
         raise RuntimeError("widget gone missing")
 
-    assert asyncio.run(chat_with_tools(FakeLLM(), "planner",
-                                       [{"role": "user", "content": "go"}], registry,
-                                       on_tool=explode)) == "final"
+    assert (
+        asyncio.run(
+            chat_with_tools(
+                FakeLLM(),
+                "planner",
+                [{"role": "user", "content": "go"}],
+                registry,
+                on_tool=explode,
+            )
+        )
+        == "final"
+    )
 
 
 # ============================================================================ AC6
@@ -349,9 +472,13 @@ def test_ac6_ask_and_answer_pass_max_rounds_from_config(key, tmp_path, monkeypat
     seen: list[dict] = []
 
     async def spy(llm, role, messages, registry, **kw):
-        seen.append({"max_rounds": kw.get("max_rounds"),
-                     "on_tool": kw.get("on_tool"),
-                     "names": registry.names()})
+        seen.append(
+            {
+                "max_rounds": kw.get("max_rounds"),
+                "on_tool": kw.get("on_tool"),
+                "names": registry.names(),
+            }
+        )
         return "spied"
 
     monkeypatch.setattr(chatbot, "chat_with_tools", spy)
@@ -360,11 +487,14 @@ def test_ac6_ask_and_answer_pass_max_rounds_from_config(key, tmp_path, monkeypat
     res = chatbot.ask(cfg, store, "hi", on_tool=lambda *a: None)
     assert res["answer"] == "spied"
     assert seen[0]["max_rounds"] == 3
-    assert callable(seen[0]["on_tool"]) and seen[0]["names"] == ["fetch_url", "list_files"]
+    assert callable(seen[0]["on_tool"]) and seen[0]["names"] == [
+        "fetch_url",
+        "list_files",
+    ]
 
     seen.clear()
     out = asyncio.run(chatbot.answer(cfg, store, "hi", on_tool=lambda *a: None))
-    assert out == "spied" and seen[0]["max_rounds"] == 3
+    assert out["answer"] == "spied" and seen[0]["max_rounds"] == 3
 
 
 def test_ac6_default_max_rounds_is_five(key, tmp_path, monkeypatch):
@@ -406,14 +536,16 @@ def test_ac6_defaults_and_one_is_accepted(key, tmp_path):
 
 def test_ac6_example_yaml_documents_both_settings():
     text = EXAMPLE_YAML.read_text(encoding="utf-8")
-    section = re.search(r"^chat:\n(?:[ \t]+.*\n|\n)*", text, re.M)
+    section = re.search(r"^chat:.*\n(?:[ \t]+.*\n|\n)*", text, re.MULTILINE)
     assert section, "no top-level chat: section in swarmforge.example.yaml"
     block = section.group(0)
     loaded = yaml.safe_load(block)
     assert loaded["chat"]["tools_enabled"] is True
     assert loaded["chat"]["max_tool_rounds"] == 5
     for name in ("tools_enabled", "max_tool_rounds"):
-        line = next((ln for ln in block.splitlines() if ln.strip().startswith(name + ":")), "")
+        line = next(
+            (ln for ln in block.splitlines() if ln.strip().startswith(name + ":")), ""
+        )
         assert "#" in line, f"{name} is not documented in swarmforge.example.yaml"
         assert len(line.split("#", 1)[1].strip()) > 15, line
 
@@ -442,22 +574,35 @@ def app_test(tmp_path, monkeypatch):
 def _fake_ask(emit_tools):
     asked: list[dict] = []
 
-    def fake(cfg, store, question, *, history=None, conversation=None, on_tool=None, **kw):
-        asked.append({"question": question, "conversation": conversation, "on_tool": on_tool})
+    def fake(
+        cfg, store, question, *, history=None, conversation=None, on_tool=None, **kw
+    ):
+        asked.append(
+            {"question": question, "conversation": conversation, "on_tool": on_tool}
+        )
         if on_tool:
             for name, args in emit_tools:
                 on_tool(name, args, "tool output")
-        return {"answer": "**fake answer**", "actions": {}, "role": "planner",
-                "model": "qwen-fake", "usage": {"cost_usd": 0.0},
-                "conversation": conversation or "c1"}
+        return {
+            "answer": "**fake answer**",
+            "actions": {},
+            "role": "planner",
+            "model": "qwen-fake",
+            "usage": {"cost_usd": 0.0},
+            "conversation": conversation or "c1",
+        }
 
     fake.asked = asked  # type: ignore[attr-defined]
     return fake
 
 
 def test_ac7_tool_calls_appear_as_captions_in_the_assistant_bubble(app_test):
-    fake = _fake_ask([("fetch_url", {"url": "https://example.com/page"}),
-                      ("list_files", {"path": "src"})])
+    fake = _fake_ask(
+        [
+            ("fetch_url", {"url": "https://example.com/page"}),
+            ("list_files", {"path": "src"}),
+        ]
+    )
     at = app_test(fake)
     at.chat_input[0].set_value("what is on disk?").run()
     assert not at.exception, [e.value for e in at.exception]
@@ -482,7 +627,9 @@ def test_ac7_no_caption_without_tool_calls(app_test):
     at.chat_input[0].set_value("plain question").run()
     assert not at.exception, [e.value for e in at.exception]
     bubble = assistant_bubbles(at)[-1]
-    assert not any("🔧" in c.value for c in bubble.caption), [c.value for c in bubble.caption]
+    assert not any("🔧" in c.value for c in bubble.caption), [
+        c.value for c in bubble.caption
+    ]
     assert any("**fake answer**" in m.value for m in bubble.markdown)
 
 
@@ -491,14 +638,16 @@ def test_ac9_all_git_calls_go_through_the_retry_helper():
     """No git subprocess is started anywhere in workspace.py except the retry helper,
     and both public entry points (git / git_rc) route through it."""
     text = (SRC / "swarmforge" / "workspace.py").read_text(encoding="utf-8")
-    launches = re.findall(r"subprocess\.(?:run|Popen|call|check_output|check_call)", text)
+    launches = re.findall(
+        r"subprocess\.(?:run|Popen|call|check_output|check_call)", text
+    )
     assert len(launches) == 1, launches  # one helper, one launch site
-    body = text[text.index("def _run_git_subprocess("):text.index("def git(")]
+    body = text[text.index("def _run_git_subprocess(") : text.index("def git(")]
     assert "subprocess.run" in body  # the only launch site lives in the helper
     assert "for attempt in range(1, _GIT_MAX_ATTEMPTS + 1)" in body
     assert "time.sleep(min(0.1 * 2 ** (attempt - 1), 1.6))" in body  # 0.1s -> 1.6s
     assert "_GIT_MAX_ATTEMPTS = 5" in text
-    for transient in _TRANSIENT:
+    for transient in _TRANSIENT_GIT_ERRORS:
         assert f'"{transient}"' in text, transient
     assert text.count("_run_git_subprocess(") >= 3  # def + git + git_rc
 
@@ -511,12 +660,16 @@ def test_ac9_transient_failure_is_retried_until_it_succeeds(tmp_path, monkeypatc
     monkeypatch.setattr("swarmforge.workspace.time.sleep", lambda s: calls.append(s))
 
     class Res:
-        def __init__(self, code, out):
-            self.returncode, self.stdout, self.stderr = code, out, ""
+        def __init__(self, code, out, err=""):
+            self.returncode, self.stdout, self.stderr = code, out, err
 
     def fake_run(cmd, *a, **kw):
         attempts.append(tuple(cmd))
-        return Res(128, "") if len(attempts) < 3 else Res(0, "7.2.1\n")
+        return (
+            Res(128, "", "unable to create thread")
+            if len(attempts) < 3
+            else Res(0, "7.2.1\n")
+        )
 
     monkeypatch.setattr("swarmforge.workspace.subprocess.run", fake_run)
     assert git(tmp_path, "version").strip() == "7.2.1"
@@ -537,7 +690,11 @@ def test_ac10_non_transient_failure_raises_after_one_attempt(tmp_path, monkeypat
 
     def fake_run(cmd, *a, **kw):
         attempts.append(tuple(cmd))
-        return Res(128, "", "fatal: not a git repository (or any of the parent directories): .git")
+        return Res(
+            128,
+            "",
+            "fatal: not a git repository (or any of the parent directories): .git",
+        )
 
     monkeypatch.setattr("swarmforge.workspace.subprocess.run", fake_run)
     with pytest.raises(GitError):
@@ -557,7 +714,11 @@ def test_ac10_merge_conflict_is_never_retried(tmp_path, monkeypatch):
 
     def fake_run(cmd, *a, **kw):
         attempts.append(1)
-        return Res(1, "", "error: Your local changes to the following files would be overwritten by merge")
+        return Res(
+            1,
+            "",
+            "error: Your local changes to the following files would be overwritten by merge",
+        )
 
     monkeypatch.setattr("swarmforge.workspace.subprocess.run", fake_run)
     with pytest.raises(GitError):
