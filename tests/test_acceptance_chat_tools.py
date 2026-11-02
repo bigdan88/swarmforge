@@ -401,3 +401,16 @@ def test_ac4_all_offline_no_real_network(monkeypatch):
     assert out == "HTTP 200\nok"
     # and list_files works too
     assert "test_acceptance_chat_tools.py" in list_files(str(Path(__file__).parent))
+
+
+def test_chat_with_tools_rejects_max_rounds_below_one(cfg):
+    """Regression: max_rounds=0 used to skip the loop and crash on an assert;
+    it must raise ValueError before any LLM call is made."""
+    fake = FakeProvider({"qwen-fake": lambda body: {"role": "assistant", "content": "x"}})
+    client = _client(cfg, fake)
+    messages = [{"role": "user", "content": "hi"}]
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            _run(client.chat_with_tools("planner", messages, [], lambda n, a: "x", max_rounds=bad))
+    assert fake.requests == []
+    assert messages == [{"role": "user", "content": "hi"}]
