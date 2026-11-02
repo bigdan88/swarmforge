@@ -229,3 +229,338 @@ def parse_review(text: str) -> tuple[str, list[dict]]:
 def is_blocking(severity: str) -> bool:
     """Visual findings block only on obvious breakage, whatever review.blocking_severities says."""
     return severity == "critical"
+
+
+# ---------------------------------------------------------------------------
+# Visual-regression snapshot gate
+# ---------------------------------------------------------------------------
+
+GOLDEN_SUBDIR = "tests/golden"
+DEFAULT_TABS = ["work", "new-task", "failures", "speed", "chat", "knowledge", "settings"]
+DIFF_THRESHOLD = 0.02
+
+
+class RegressError(RuntimeError):
+    """The visual-regression gate could not run (bad branch, no browser, ...)."""
+
+
+def slugify(page: str) -> str:
+    """Same slug the dashboard uses for its tabs (dashboard.SLUG)."""
+    return str(page).lower().replace(" ", "-")
+
+
+def golden_dir(repo: str | Path = ".") -> Path:
+    return Path(repo) / GOLDEN_SUBDIR
+
+
+def _png_bytes(x) -> bytes:
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    return Path(x).read_bytes()
+
+
+def pixel_diff_score(a, b, *, tol: int = 16) -> float:
+    """Fraction of pixels whose grayscale difference exceeds `tol` (0.0 identical, 1.0 opposite).
+
+    `a` and `b` are PNG file paths or PNG bytes. Images of different sizes are maximally
+    different (1.0). Pillow is imported lazily so the module works without it installed.
+    """
+    from PIL import Image, ImageChops
+
+    def load(x):
+        return Image.open(__import__("io").BytesIO(_png_bytes(x))).convert("L")
+
+    ia, ib = load(a), load(b)
+    if ia.size != ib.size:
+        return 1.0
+    diff = ImageChops.difference(ia, ib)
+    hist = diff.histogram()  # 256 bins of per-pixel difference
+    total = ia.size[0] * ia.size[1]
+    changed = sum(hist[tol + 1:])
+    if total == 0:
+        return 0.0
+    return changed / total
+
+
+def _run(cmd: list[str], *, cwd: str | Path | None = None, env: dict | None = None) -> None:
+    import subprocess
+
+    r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        raise RegressError(f"command failed ({' '.join(cmd)}):\n{r.stderr[-1500:] or r.stdout[-1500:]}")
+
+
+def _streamlit_env(repo_dir: Path, db: Path) -> dict:
+    import os
+
+    env = dict(os.environ)
+    env.update({
+        "SWARMFORGE_CONFIG": str(repo_dir / "swarmforge.project.yml"),
+        "SWARMFORGE_DB": str(db),
+        "SWARMFORGE_DASH_UPDATE_CHECK": "0",
+        "SWARMFORGE_DASH_AUTOREFRESH": "0",
+        "PYTHONPATH": str(repo_dir / "src") + os.pathsep + env.get("PYTHONPATH", ""),
+    })
+    return env
+
+
+def _wait_http(port: int, timeout_s: float = 60.0) -> None:
+    import time
+    import urllib.request
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2)
+            return
+        except OSError:
+            time.sleep(0.5)
+    raise RegressError(f"dashboard on port {port} did not answer HTTP within {timeout_s:.0f}s")
+
+
+def capture_tabs(repo_dir: str | Path, out_dir: str | Path, *, tabs=None, themes=("light", "dark"),
+                 port: int = 8699, timeout_s: int = 180, viewport=None) -> dict[str, Path]:
+    """Screenshot every dashboard tab in every theme from a real headless Chromium.
+
+    Seeds demo data, starts the Streamlit dashboard from `repo_dir`, and saves one full-page
+    PNG per tab+theme to `out_dir/{slug}-{theme}.png`. Returns {"slug-theme": Path}.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    repo_dir = Path(repo_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tabs = [slugify(t) for t in (tabs if tabs is not None else DEFAULT_TABS)]
+    themes = tuple(themes) or ("light", "dark")
+    db = repo_dir / ".swarmforge" / "visual-demo.sqlite"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    if db.exists():
+        db.unlink()
+    env = _streamlit_env(repo_dir, db)
+    _run([sys.executable, "-m", "swarmforge.cli", "seed-demo", str(db)], cwd=repo_dir, env=env)
+    cmd = [sys.executable, "-m", "streamlit", "run", "src/swarmforge/dashboard.py",
+           "--server.headless", "true", "--server.port", str(port), "--server.address", "127.0.0.1",
+           "--client.toolbarMode", "viewer", "--server.fileWatcherType", "none",
+           "--browser.gatherUsageStats", "false"]
+    proc = subprocess.Popen(cmd, cwd=repo_dir, env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    shots: dict[str, Path] = {}
+    try:
+        _wait_http(port, timeout_s=min(timeout_s, 60))
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as e:  # pragma: no cover - depends on the sandbox
+            raise RegressError("playwright is not installed; run `playwright install chromium`") from e
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                for theme in themes:
+                    for tab in tabs:
+                        page = browser.new_page(color_scheme=theme,
+                                                viewport=viewport or {"width": 1400, "height": 1000})  # type: ignore[arg-type]
+                        try:
+                            page.goto(f"http://127.0.0.1:{port}/?page={tab}",
+                                      wait_until="networkidle", timeout=timeout_s * 1000)
+                            page.wait_for_timeout(1500)  # let Streamlit settle
+                            path = out_dir / f"{tab}-{theme}.png"
+                            page.screenshot(path=str(path), full_page=True)
+                            shots[f"{tab}-{theme}"] = path
+                        finally:
+                            page.close()
+            finally:
+                browser.close()
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        proc.wait()
+    return shots
+
+
+def _default_capture(repo_dir, out_dir, *, tabs, themes, port=None):
+    return capture_tabs(repo_dir, out_dir, tabs=tabs, themes=themes, port=port or 8699)
+
+
+def _worktree(repo: str | Path, branch: str, name: str) -> Path:
+    import subprocess
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix=f"sf-visual-{name}-"))
+    tmp.rmdir()  # git wants to create it
+    r = subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(tmp), branch],
+                       capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        raise RegressError(f"cannot check out branch '{branch}' for visual regression:\n{r.stderr[-1500:]}")
+    return tmp
+
+
+def _remove_worktree(repo: str | Path, wt: Path) -> None:
+    import subprocess
+
+    subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)],
+                   capture_output=True, text=True, check=False)
+
+
+def _finding(slug: str, theme: str, score: float, threshold: float) -> dict:
+    pct = score * 100
+    return {
+        "severity": "major", "page": slug, "theme": theme, "blocking": True,
+        "golden_regression": True,
+        "title": (f"visual regression on tab '{slug}' ({theme}): {pct:.1f}% of pixels differ "
+                  f"(> {threshold * 100:.0f}%)"),
+        "description": (f"Tab '{slug}' in the {theme} theme changed by {pct:.1f}% of pixels, above the "
+                        f"{threshold * 100:.0f}% visual-regression threshold."),
+        "recommendation": ("if the change is intended run `swarmforge visual update-golden`; "
+                           "otherwise fix the UI"),
+    }
+
+
+def regress(pr_branch: str, base_branch: str, *, repo: str | Path = ".", golden_path=None,
+            tabs=None, themes=("light", "dark"), threshold: float = DIFF_THRESHOLD,
+            port=None, capture=None, keep_dirs: bool = False) -> dict:
+    """Screenshot every tab on both branches and diff the pixels.
+
+    Returns {ok, threshold, max_score, tabs, findings, shots}. Any tab whose diff (vs the base
+    branch, and vs the golden PNG when one exists) exceeds `threshold` gets a blocking [major]
+    finding. `capture` overrides the real browser capture (tests use it to stay offline).
+    """
+    repo = Path(repo)
+    capture = capture or _default_capture
+    tabs = [slugify(t) for t in (tabs if tabs is not None else DEFAULT_TABS)]
+    themes = tuple(themes) or ("light", "dark")
+    pr_wt = _worktree(repo, pr_branch, "pr")
+    base_wt = _worktree(repo, base_branch, "base")
+    try:
+        import shutil
+        import tempfile
+
+        pr_dir = Path(tempfile.mkdtemp(prefix="sf-visual-pr-shots-"))
+        base_dir = Path(tempfile.mkdtemp(prefix="sf-visual-base-shots-"))
+        try:
+            pr_shots = capture(pr_wt, pr_dir, tabs=tabs, themes=themes, port=port)
+            base_shots = capture(base_wt, base_dir, tabs=tabs, themes=themes, port=port)
+            findings: list[dict] = []
+            rows: list[dict] = []
+            scores: list[float] = []
+            shots_out: dict[str, str] = {}
+            gdir = Path(golden_path) if golden_path else golden_dir(repo)
+            for theme in themes:
+                for tab in tabs:
+                    key = f"{tab}-{theme}"
+                    pr_shot = pr_shots.get(key)
+                    base_shot = base_shots.get(key)
+                    if pr_shot is None:
+                        continue
+                    shots_out[key] = str(pr_shot)
+                    if base_shot is None:
+                        score, status = 1.0, "missing"
+                    else:
+                        score = pixel_diff_score(pr_shot, base_shot)
+                        status = "clean" if score <= threshold else "diff"
+                    golden = gdir / f"{key}.png"
+                    if golden.exists():
+                        score = max(score, pixel_diff_score(pr_shot, golden))
+                        if score > threshold:
+                            status = "diff"
+                    scores.append(score)
+                    rows.append({"tab": tab, "theme": theme, "score": score, "status": status})
+                    if score > threshold:
+                        findings.append(_finding(tab, theme, score, threshold))
+            result = {"ok": not findings, "threshold": threshold,
+                      "max_score": max(scores or [0.0]), "tabs": rows, "findings": findings,
+                      "shots": shots_out}
+        finally:
+            if not keep_dirs:
+                shutil.rmtree(base_dir, ignore_errors=True)
+        return result
+    finally:
+        if not keep_dirs:
+            _remove_worktree(repo, pr_wt)
+            _remove_worktree(repo, base_wt)
+
+
+def update_golden(*, repo: str | Path = ".", branch: str | None = None, tabs=None,
+                  themes=("light", "dark"), port=None, capture=None) -> list[Path]:
+    """Refresh the golden PNGs under tests/golden from `branch` (or the current checkout)."""
+    import shutil
+
+    repo = Path(repo)
+    capture = capture or _default_capture
+    tabs = [slugify(t) for t in (tabs if tabs is not None else DEFAULT_TABS)]
+    themes = tuple(themes) or ("light", "dark")
+    gdir = golden_dir(repo)
+    gdir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    if branch:
+        src_wt = _worktree(repo, branch, "golden")
+        try:
+            import tempfile
+
+            shots_dir = Path(tempfile.mkdtemp(prefix="sf-visual-golden-"))
+            try:
+                shots = capture(src_wt, shots_dir, tabs=tabs, themes=themes, port=port)
+                for key, src_png in shots.items():
+                    dst = gdir / f"{key}.png"
+                    shutil.copyfile(src_png, dst)
+                    written.append(dst)
+            finally:
+                shutil.rmtree(shots_dir, ignore_errors=True)
+        finally:
+            _remove_worktree(repo, src_wt)
+    else:
+        import tempfile
+
+        shots_dir = Path(tempfile.mkdtemp(prefix="sf-visual-golden-"))
+        try:
+            shots = capture(repo, shots_dir, tabs=tabs, themes=themes, port=port)
+            for key, src_png in shots.items():
+                dst = gdir / f"{key}.png"
+                shutil.copyfile(src_png, dst)
+                written.append(dst)
+        finally:
+            shutil.rmtree(shots_dir, ignore_errors=True)
+    return written
+
+
+def golden_gate(shots: list[dict], repo: str | Path = ".", *, threshold: float = DIFF_THRESHOLD) -> list[dict]:
+    """Orchestrator hook: compare capture() shots against the golden PNGs, if any.
+
+    `shots` are the dicts `capture()` returns (keys page/theme/file). With no golden images
+    the gate is a no-op; a shot whose golden is missing is skipped silently.
+    """
+    repo = Path(repo)
+    gdir = golden_dir(repo)
+    if not gdir.is_dir() or not any(gdir.glob("*.png")):
+        return []
+    findings: list[dict] = []
+    for s in shots or []:
+        slug = slugify(s.get("page") or "")
+        theme = str(s.get("theme") or "light")
+        golden = gdir / f"{slug}-{theme}.png"
+        shot_file = s.get("file")
+        if not golden.exists() or not shot_file or not Path(shot_file).exists():
+            continue
+        score = pixel_diff_score(shot_file, golden)
+        if score > threshold:
+            findings.append(_finding(slug, theme, score, threshold))
+    return findings
+
+
+def maybe_refresh_golden_after_update(repo: str | Path = ".", *, capture=None) -> dict | None:
+    """After merged main arrives: refresh the goldens, but only if the repo already has some.
+
+    Returns None when there is nothing to refresh, {'refreshed': True, 'files': [...]} on
+    success, or {'refreshed': False, 'reason': ...} when the refresh failed.
+    """
+    gdir = golden_dir(repo)
+    if not gdir.is_dir() or not any(gdir.glob("*.png")):
+        return None
+    try:
+        files = update_golden(repo=repo, capture=capture)
+        return {"refreshed": True, "files": [str(f) for f in files]}
+    except (RegressError, OSError) as e:
+        return {"refreshed": False, "reason": str(e)}
