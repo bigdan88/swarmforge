@@ -2,11 +2,13 @@
 
 The dashboard calls these functions via module attributes (``welcome.health_checks`` etc.) so
 tests can monkeypatch them. All checks are cheap and non-network except where unavoidable."""
+
 from __future__ import annotations
 
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,8 +34,12 @@ def docker_running(cfg: Config) -> bool:
     if not shutil.which(d):
         return False
     try:
-        info = subprocess.run([d, "info", "--format", "{{.ServerVersion}}"], check=False,
-                              capture_output=True, timeout=10)
+        info = subprocess.run(
+            [d, "info", "--format", "{{.ServerVersion}}"],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
         return info.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -44,15 +50,30 @@ def image_built(cfg: Config) -> bool:
         return True
     d = cfg.sandbox.docker_binary
     try:
-        return subprocess.run([d, "image", "inspect", cfg.sandbox.image],
-                              check=False, capture_output=True).returncode == 0
+        return (
+            subprocess.run(
+                [d, "image", "inspect", cfg.sandbox.image],
+                check=False,
+                capture_output=True,
+            ).returncode
+            == 0
+        )
     except OSError:
         return False
 
 
 def missing_api_keys(cfg: Config) -> list[str]:
-    used = {cfg.roles[r].provider for r in ["planner", "reviewer", "tester", cfg.librarian_role,
-                                            *cfg.developer_roles] if r in cfg.roles}
+    used = {
+        cfg.roles[r].provider
+        for r in [
+            "planner",
+            "reviewer",
+            "tester",
+            cfg.librarian_role,
+            *cfg.developer_roles,
+        ]
+        if r in cfg.roles
+    }
     missing: list[str] = []
     for name in sorted(used):
         p = cfg.providers[name]
@@ -64,6 +85,7 @@ def missing_api_keys(cfg: Config) -> list[str]:
 def github_logged_in(cfg: Config) -> bool:
     try:
         from . import github
+
         return github.get_token(cfg.github) is not None
     except Exception:
         return False
@@ -76,23 +98,37 @@ def health_checks(cfg: Config) -> list[CheckItem]:
         try:
             ok = bool(fn(cfg))
         except Exception as exc:  # a broken check must never crash the panel
-            items.append(CheckItem(name, False, optional, f"Check failed: {exc}. {fix}"))
+            items.append(
+                CheckItem(name, False, optional, f"Check failed: {exc}. {fix}")
+            )
             return
         items.append(CheckItem(name, ok, optional, "" if ok else fix))
 
-    add("Docker running", docker_running,
-        "Start Docker Desktop and wait for 'Engine running'; verify with `docker info`")
+    add(
+        "Docker running",
+        docker_running,
+        "Start Docker Desktop and wait for 'Engine running'; verify with `docker info`",
+    )
     add("Sandbox image built", image_built, "`swarmforge sandbox build`")
     env_file = str(cfg.source_path or "swarmforge.yaml")
     for env in missing_api_keys(cfg):
-        items.append(CheckItem(f"API key ({env})", False, False,
-                                f"add `{env}=...` to the .env file next to {env_file} "
-                                "and restart the dashboard"))
+        items.append(
+            CheckItem(
+                f"API key ({env})",
+                False,
+                False,
+                f"add `{env}=...` to the .env file next to {env_file} "
+                "and restart the dashboard",
+            )
+        )
     if not missing_api_keys(cfg):
         items.append(CheckItem("API keys", True))
-    add("GitHub login", github_logged_in,
+    add(
+        "GitHub login",
+        github_logged_in,
         "`gh auth login` or set `GITHUB_TOKEN=...` in .env (only needed for draft pull requests)",
-        optional=True)
+        optional=True,
+    )
     return items
 
 
@@ -101,7 +137,12 @@ def sample_repo_path() -> Path:
 
 
 def sample_issue_text() -> tuple[str, str]:
-    path = Path(__file__).resolve().parents[2] / "samples" / "issues" / "export-csv-json.md"
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "samples"
+        / "issues"
+        / "export-csv-json.md"
+    )
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -109,7 +150,7 @@ def sample_issue_text() -> tuple[str, str]:
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if line.startswith("# "):
-            return line[2:].strip(), "\n".join(lines[i + 1:]).strip()
+            return line[2:].strip(), "\n".join(lines[i + 1 :]).strip()
     return "Sample issue", text.strip()
 
 
@@ -118,19 +159,37 @@ def prepare_sample_repo(dest: Path | None = None) -> Path:
     if (dest / ".git").is_dir():
         return dest
     script = Path(__file__).resolve().parents[2] / "samples" / "make_sample_repo.py"
-    result = subprocess.run([sys.executable, str(script), str(dest)],
-                            check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"failed to prepare the sample repository: {result.stderr.strip()}")
-    return dest
+    last_err = ""
+    for attempt in range(3):
+        result = subprocess.run(
+            [sys.executable, str(script), str(dest)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return dest
+        last_err = result.stderr.strip()
+        if attempt + 1 < 3:
+            shutil.rmtree(dest, ignore_errors=True)
+            time.sleep(0.5)
+    raise RuntimeError(f"failed to prepare the sample repository: {last_err}")
 
 
 def start_sample_run(cfg: Config, store) -> str:
     dest = prepare_sample_repo()
     title, body = sample_issue_text()
     from . import launcher
-    run_id, _ = launcher.start_run(cfg, repo=str(dest), issue_title=title, issue_body=body,
-                                   mode="swarm", budget=SAMPLE_BUDGET_USD,
-                                   max_cycles=SAMPLE_MAX_CYCLES, approval="dashboard")
+
+    run_id, _ = launcher.start_run(
+        cfg,
+        repo=str(dest),
+        issue_title=title,
+        issue_body=body,
+        mode="swarm",
+        budget=SAMPLE_BUDGET_USD,
+        max_cycles=SAMPLE_MAX_CYCLES,
+        approval="dashboard",
+    )
     store.remember_repo(str(dest))
     return run_id

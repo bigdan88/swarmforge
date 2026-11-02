@@ -58,8 +58,10 @@ def test_health_checks_uses_module_attributes(tmp_path, monkeypatch):
 
 def test_health_checks_broken_helper_never_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_KEY", "k")
+
     def boom(cfg):
         raise RuntimeError("boom")
+
     monkeypatch.setattr(welcome, "docker_running", boom)
     cfg = make_cfg(tmp_path, "docker")
     items = welcome.health_checks(cfg)
@@ -68,6 +70,7 @@ def test_health_checks_broken_helper_never_raises(tmp_path, monkeypatch):
     assert "docker info" in item.fix
 
 
+@pytest.mark.xdist_group("git")
 def test_prepare_sample_repo(tmp_path):
     dest = tmp_path / "sample"
     welcome.prepare_sample_repo(dest)
@@ -79,8 +82,10 @@ def test_prepare_sample_repo(tmp_path):
 
 def test_prepare_sample_repo_failure(tmp_path, monkeypatch):
     dest = tmp_path / "sample"
+
     def fake_run(*a, **kw):
         return subprocess.CompletedProcess(a, 1, "", "boom")
+
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(RuntimeError, match="boom"):
         welcome.prepare_sample_repo(dest)
@@ -108,10 +113,13 @@ def test_start_sample_run(tmp_path, monkeypatch):
         return "run-123", Path("/tmp/x")
 
     from swarmforge import launcher
+
     monkeypatch.setattr(launcher, "start_run", fake_start_run)
 
     remembered = []
-    store = type("Store", (), {"remember_repo": lambda self, r, limit=15: remembered.append(r)})()
+    store = type(
+        "Store", (), {"remember_repo": lambda self, r, limit=15: remembered.append(r)}
+    )()
 
     run_id = welcome.start_sample_run(cfg, store)
     assert run_id == "run-123"
