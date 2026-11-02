@@ -2634,6 +2634,59 @@ def page_benchmarks():
 
 
 # ======================================================== PULL REQUESTS page
+def auto_merge_panel(gh) -> None:
+    """What auto-merge did (merged / waiting for you, and why), with one-click revert of a merge."""
+    from swarmforge import automerge as am
+    from swarmforge.github import GitHubError
+    amc = cfg.auto_merge
+    rows = store._all("SELECT * FROM interventions WHERE kind IN (?, ?, ?) ORDER BY id DESC LIMIT 25",
+                      (am.MERGED, am.HELD, "auto_merge_reverted"))
+    reverted = {json.loads(r["detail"]).get("url") for r in rows if r["kind"] == "auto_merge_reverted"}
+    where = ", ".join(amc.repos) if amc.repos else "every repository"
+    title = (f"🤖 Auto-merge: **on** for {where} · up to {amc.max_lines} lines merge straight away, larger ones "
+             f"(up to {amc.judge_max_lines}) if the {amc.judge_role} model approves" if amc.enabled
+             else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
+    with st.expander(title, expanded=bool(amc.enabled and rows)):
+        st.caption("Never merged automatically: unresolved [major] findings, conflicts, failing checks, and files "
+                   "the repository protects (`protected_paths` in swarmforge.project.yml). SwarmForge doesn't "
+                   "restart after an auto-merge; the new code arrives with your next Update & restart.")
+        flash = st.session_state.pop("am_flash", None)
+        if flash:
+            (st.success if flash[0] else st.error)(flash[1])
+        shown = [r for r in rows if r["kind"] != "auto_merge_reverted"]
+        if not shown:
+            st.caption("No auto-merge decisions yet.")
+        for r in shown:
+            try:
+                d = json.loads(r["detail"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            merged = r["kind"] == am.MERGED
+            url = d.get("url", "")
+            icon = ("↩️ reverted" if url in reverted else "✅ merged") if merged else "⏸ waiting for you"
+            c1, c2 = st.columns([6, 1.3])
+            c1.markdown(f"**{icon}** · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
+                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "") + f"  \n{d.get('reason', '')}")
+            if merged and url not in reverted and d.get("number"):
+                key = f"am_rev_{r['id']}"
+                if st.session_state.get(key + "_ask"):
+                    if c2.button("Confirm revert", key=key + "_yes", type="primary"):
+                        try:
+                            rev = am.revert(gh, d["repo"], int(d["number"]), cfg.auto_merge.method)
+                            store.record_intervention(r["run_id"], "auto_merge_reverted",
+                                                      json.dumps({"url": url, "revert_url": rev}))
+                            st.session_state.am_flash = (True, f"Reverted: {rev} is merged. Update & restart to "
+                                                               "pick up the change.")
+                        except (GitHubError, Exception) as e:  # noqa: BLE001
+                            st.session_state.am_flash = (False, f"Could not revert {url}: {e}")
+                        st.session_state.pop(key + "_ask", None)
+                        st.session_state.pop("pr_cache", None)
+                        st.rerun()
+                elif c2.button("↩ Revert", key=key, help="GitHub creates a revert PR and it is merged at once"):
+                    st.session_state[key + "_ask"] = True
+                    st.rerun()
+
+
 def page_prs():
     from swarmforge import prs as P
     from swarmforge import selfupdate as su
@@ -2683,6 +2736,7 @@ def page_prs():
                 if st.button("⬆️ Update & restart SwarmForge now", type="primary", key="pr_update"):
                     st.session_state.upd_status = None
                     do_update_and_restart()
+    auto_merge_panel(gh)
     if not all_prs:
         st.success("No open pull requests. 🎉")
         return

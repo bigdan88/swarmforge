@@ -133,6 +133,22 @@ class GitHubConfig:
 
 
 @dataclass
+class AutoMergeConfig:
+    """Merge the swarm's pull requests without waiting for you (off by default).
+
+    Small changes that passed everything merge straight away; larger ones are judged by a model
+    (`judge_role`). Never auto-merged: unresolved [major] findings, conflicts, failing checks, and any
+    file the repository lists under `protected_paths` in swarmforge.project.yml. Nothing restarts:
+    you still pick when to Update & restart."""
+    enabled: bool = False
+    repos: list[str] = field(default_factory=list)   # owner/name; empty = every repository
+    max_lines: int = 400          # added + deleted lines that merge without asking the judge
+    judge_role: str = "reviewer"  # model that decides on larger changes
+    judge_max_lines: int = 3000   # bigger than this always waits for you
+    method: str = "squash"        # squash | merge | rebase
+
+
+@dataclass
 class ReviewConfig:
     blocking_severities: list[str] = field(default_factory=lambda: ["critical", "major"])
     allow_same_model_review: bool = False
@@ -190,6 +206,7 @@ class Config:
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     self_heal: SelfHealConfig = field(default_factory=SelfHealConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
+    auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     pi: PiConfig = field(default_factory=PiConfig)
     reasoning_effort: str | None = None          # default thinking level for every role (none|low|medium|high)
     vision_models: list[str] = field(default_factory=list)  # models that accept image blocks (exact or substring match)
@@ -274,6 +291,7 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         approval=_build(ApprovalConfig, raw.get("approval"), "approval"),
         self_heal=_build(SelfHealConfig, raw.get("self_heal"), "self_heal"),
         watch=_build(WatchConfig, raw.get("watch"), "watch"),
+        auto_merge=_build(AutoMergeConfig, raw.get("auto_merge"), "auto_merge"),
         pi=_build(PiConfig, raw.get("pi"), "pi"),
         active_variant=(str(raw["active_variant"]) if raw.get("active_variant") else None),
         reasoning_effort=(str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None),

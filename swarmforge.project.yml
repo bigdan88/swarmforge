@@ -30,3 +30,24 @@ preview:
                  "src/swarmforge/welcome.py", "src/swarmforge/resources/*.css"]
   viewport: {width: 1400, height: 1400}
   max_shots: 12
+
+# Core files: a pull request that touches any of these is never merged automatically (auto_merge in
+# swarmforge.yaml), because one bad merge here can stop every task. Includes this file itself.
+protected_paths:
+  - swarmforge.project.yml
+  - pyproject.toml
+  - src/swarmforge/orchestrator.py
+  - src/swarmforge/runqueue.py
+  - src/swarmforge/preflight.py
+  - src/swarmforge/config.py
+  - src/swarmforge/db.py
+  - src/swarmforge/sandbox.py
+  - src/swarmforge/workspace.py
+  - src/swarmforge/repos.py
+  - src/swarmforge/github.py
+  - src/swarmforge/llm.py
+  - src/swarmforge/selfupdate.py
+  - src/swarmforge/launcher.py
+  - src/swarmforge/automerge.py
+  - src/swarmforge/agent/*
+  - src/swarmforge/resources/Dockerfile*

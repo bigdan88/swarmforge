@@ -270,6 +270,25 @@ SwarmForge's own project file screenshots the dashboard on demo data (`swarmforg
 pages are filled with runs, queues and failures rather than empty. Without a `designer` role you still
 get the screenshots and the automatic error check.
 
+## Auto-merge
+
+Turn on `auto_merge` in swarmforge.yaml and the swarm's pull requests merge themselves when it is safe:
+
+* **Small changes** (up to `max_lines`, default 400 lines added + deleted) merge as soon as the run
+  completes with passing tests and no unresolved [major] findings (code review, tester, screenshots).
+* **Larger changes** go to a judge model (`judge_role`, default the reviewer). It reads the task, the
+  diff, the test result and the remaining findings, and answers merge or hold with a risk level; only
+  "merge" at low or medium risk is merged. Above `judge_max_lines` (3000) a change always waits for you.
+* **Never automatic:** conflicts, failing checks or branch protection, and any file the repository lists
+  under `protected_paths` in its swarmforge.project.yml. SwarmForge protects its own core this way
+  (orchestrator, queue, preflight, config, sandbox, agent harness, Dockerfiles...): one bad merge
+  there stops every task, so those PRs wait for you whatever their size.
+* **No surprise restarts:** merged code reaches the running SwarmForge only with your next Update &
+  restart.
+
+The **Pull requests** page lists every decision (merged / waiting for you, with the reason and whether
+the judge decided) and has a **Revert** button: GitHub creates a revert PR and it is merged at once.
+
 ## Several queues (one per project)
 
 Every queued task belongs to a **queue** ("pile"); pick it when you add the task (dashboard: *Queue

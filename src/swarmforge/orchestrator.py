@@ -981,8 +981,52 @@ class Orchestrator:
         url = await self.publish(gh, owner, name)
         if url:
             self.sm.transition(RunState.COMPLETED, f"draft PR created: {url}")
+            await self._auto_merge(gh, f"{owner}/{name}", url)
         else:
             self.sm.transition(RunState.COMPLETED, "approved; push declined by user, PR not created")
+
+    async def _auto_merge(self, gh: GitHubClient, repo: str, url: str) -> None:
+        """Merge the PR now if the auto_merge rules (or, for larger changes, the judge model) allow it.
+        Never changes the run's outcome; every decision is recorded for the Pull requests page."""
+        from . import automerge as am
+        amc = self.cfg.auto_merge
+        if not am.repo_enabled(self.cfg, repo):
+            return
+        info: dict = {"repo": repo, "url": url, "title": self.issue.title}
+        try:
+            info["number"] = number = int(url.rstrip("/").split("/")[-1])
+            pr = await asyncio.to_thread(am.get_pr, gh, repo, number)
+            files = await asyncio.to_thread(am.pr_files, gh, repo, number)
+            info["node_id"] = pr.node_id
+            lines = pr.additions + pr.deletions
+            run = self.store.get_run(self.run_id)
+            open_findings = [f for f in self.store.findings(self.run_id) if f["cycle"] == run["repair_cycle"]]
+            tests = [t for t in self.store.test_runs(self.run_id) if t["label"] != "baseline"]
+            tests_ok = bool(tests) and tests[-1]["exit_code"] == 0
+            d = am.rule_decision(run, tests_ok, open_findings, files, lines, getattr(self, "protected_paths", []),
+                                 amc.max_lines, amc.judge_max_lines)
+            if d is None:
+                role = amc.judge_role if amc.judge_role in self.cfg.roles else "planner"
+                t = tests[-1]
+                diff = await asyncio.to_thread(self.ws.diff)
+                msgs = am.judge_messages(prompts.MERGE_JUDGE_SYSTEM, self.issue.title, self.issue.body, files, lines,
+                                         diff, open_findings,
+                                         f"exit {t['exit_code']}: {t['passed']} passed, {t['failed']} failed")
+                res = await self.llm.chat(role, msgs, task_key="merge-judge")
+                ok, risk, why = am.parse_judgement(res.content)
+                d = am.Decision(ok, f"{lines}-line change; {self.cfg.roles[role].model.split('/')[-1]} judged "
+                                    f"risk {risk}: {why}", lines, judged=True, risk=risk)
+            info.update(lines=d.lines, reason=d.reason, judged=d.judged, risk=d.risk)
+            if d.merge:
+                info["sha"] = await asyncio.to_thread(am.apply, gh, pr, amc.method)
+                self.store.record_intervention(self.run_id, am.MERGED, json.dumps(info))
+                self.store.update_run(self.run_id, state_reason=f"draft PR created: {url} · auto-merged")
+                self.log("merge", f"auto-merged {url}: {d.reason}")
+                return
+        except (GitHubError, LLMError, ValueError, KeyError, OSError) as e:
+            info["reason"] = f"could not auto-merge: {e}"[:600]
+        self.store.record_intervention(self.run_id, am.HELD, json.dumps(info))
+        self.log("merge", f"waiting for you to merge {url}: {info.get('reason')}", level="warn")
 
     async def publish(self, gh: GitHubClient, owner: str, name: str) -> str | None:
         issue, ws = self.issue, self.ws
@@ -1022,9 +1066,11 @@ class Orchestrator:
             if not isinstance(prof, dict):
                 raise RunAborted(RunState.BLOCKED, f"{PROJECT_FILE} must be a mapping")
             unknown = set(prof) - {"test_command", "agent_test_command", "agent_env", "sandbox_image",
-                                   "install_command", "description", "preview"}
+                                   "install_command", "description", "preview", "protected_paths"}
             if unknown:
                 self.log("project", f"ignoring unsupported keys in {PROJECT_FILE}: {sorted(unknown)}", level="warn")
+        prot = prof.get("protected_paths") or []
+        self.protected_paths = [str(p) for p in prot] if isinstance(prot, list) else []
         self.preview = None
         if prof.get("preview") is not None:
             from .visual import PreviewError, parse_preview
