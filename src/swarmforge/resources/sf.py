@@ -212,7 +212,14 @@ def parse(argv):
                 raise Usage("--lines expects A-B with integer line numbers")
             if start > end:
                 raise Usage("--lines expects A <= B")
-            text = _take(rest, i + 2, "--text")
+            if rest[i + 2 : i + 3] != ["--text"]:
+                raise Usage(
+                    "sf edit: each --lines needs a --text 'content' "
+                    "(use --text '' to delete lines)"
+                )
+            if len(rest) < i + 4:
+                raise Usage("sf edit: --text needs a value")
+            text = rest[i + 3]
             a["ranges"].append({"start": start, "end": end, "text": text})
             i += 4
         if not a["ranges"]:
