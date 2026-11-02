@@ -23,8 +23,10 @@ from pathlib import Path
 
 import httpx
 
+from .chat_tools import ToolRegistry, chat_with_tools
 from .config import Config, ConfigError
 from .db import Store
+from .tools import web as _web
 
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
 
@@ -78,7 +80,42 @@ Rules:
 Never invent runs, tasks, states, costs or failures.
 - Cite run ids (first 8 characters) and their states when you mention a run.
 - Be concise and use Markdown (short bullets, bold states).
-- If the snapshot does not contain the answer, say you do not know instead of guessing."""
+- If the snapshot does not contain the answer, say you do not know instead of guessing.
+
+Web access:
+- When the user shares a link (GitHub repository, documentation, article), call the `fetch_url` tool
+and answer from the Markdown it returns, citing the URL.
+- The tool fetches any URL as clean Markdown and resolves GitHub repo links to their README;
+it respects robots.txt and has a 10 s timeout.
+- If the tool returns an ERROR string, explain the failure briefly instead of inventing content."""
+
+WEB_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "The URL to fetch (http/https)"},
+        "max_chars": {"type": "integer", "description": "Maximum characters to return (default 8000)"},
+        "extract": {"type": "string", "description": "Extraction mode: markdown (default), text or html"},
+    },
+    "required": ["url"],
+}
+
+
+def build_chat_registry(cfg: Config) -> ToolRegistry:
+    """Tool registry for the chatbot: currently the web fetch tool."""
+
+    async def _fetch_url(url: str, max_chars: int = 8000, extract: str = "markdown") -> str:
+        return await _web.fetch_url(url, max_chars=max_chars, extract=extract)
+
+    registry = ToolRegistry()
+    registry.register(
+        "fetch_url",
+        "Fetch any URL and return its content as clean Markdown. GitHub repository "
+        "links (github.com/<owner>/<repo>) resolve to the repository's README. "
+        "Respects robots.txt; 10 s timeout.",
+        WEB_TOOL_SCHEMA,
+        _fetch_url,
+    )
+    return registry
 
 IMPROVE_PROMPT = """
 You are also the team lead who helps Dan improve SwarmForge itself (the platform) and get failed tasks
@@ -334,10 +371,11 @@ async def answer(cfg: Config, store: Store, question: str,
         try:
             llm = LLMClient(cfg, store=store, run_id=run_id, budget=llm_budget, transport=transport,
                           record_errors=False)
-            res = await llm.chat(role, messages, task_key="chatbot")
+            text = await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
+                                         task_key="chatbot")
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e
-        text, actions = parse_actions(res.content or "", store)
+        text, actions = parse_actions(text, store)
         store.conversation_append(conversation, "assistant", text)
         return {"answer": text, "role": role, "model": cfg.roles[role].model, "question": question,
                 "actions": actions, "conversation": conversation,
@@ -354,10 +392,11 @@ async def answer(cfg: Config, store: Store, question: str,
         messages.append({"role": "user", "content": build_user_content(question, attachments)})
     try:
         llm = LLMClient(cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport)
-        res = await llm.chat(role, messages, task_key="chatbot")
+        text = await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
+                                     task_key="chatbot")
     except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
         raise ChatError(str(e)) from e
-    text, actions = parse_actions(res.content or "", store)
+    text, actions = parse_actions(text, store)
     return {"answer": text, "role": role, "model": cfg.roles[role].model, "question": question,
             "actions": actions}
 
