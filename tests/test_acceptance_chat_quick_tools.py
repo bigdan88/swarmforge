@@ -62,7 +62,9 @@ class _ScriptedLLM:
         self.calls: list[dict] = []
 
     async def chat(self, role, messages, tools=None, task_key=None):
-        self.calls.append({"role": role, "messages": messages, "tools": tools, "task_key": task_key})
+        self.calls.append(
+            {"role": role, "messages": messages, "tools": tools, "task_key": task_key}
+        )
         assert self._messages, "scripted LLM responses exhausted"
         return type("Resp", (), {"message": self._messages.pop(0)})()
 
@@ -91,12 +93,19 @@ def test_ac1_plain_input_is_untouched():
     assert chat_quick.hint_for("plain question") is None
 
 
-def test_ac1_apptest_url_paste_sends_expanded_question_and_hint_caption(tmp_path, monkeypatch):
+def test_ac1_apptest_url_paste_sends_expanded_question_and_hint_caption(
+    tmp_path, monkeypatch
+):
     calls = []
 
     def fake_ask(c, s, question, history=None, **kw):
         calls.append(question)
-        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+        return {
+            "answer": "ok",
+            "role": "planner",
+            "model": "qwen-fake",
+            "question": question,
+        }
 
     cfg = _write_cfg(tmp_path, monkeypatch)
     _seed(cfg)
@@ -149,7 +158,12 @@ def test_ac2_apptest_slash_commands_expand_via_recorded_ask(tmp_path, monkeypatc
 
     def fake_ask(c, s, question, history=None, **kw):
         calls.append(question)
-        return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question}
+        return {
+            "answer": "ok",
+            "role": "planner",
+            "model": "qwen-fake",
+            "question": question,
+        }
 
     cfg = _write_cfg(tmp_path, monkeypatch)
     _seed(cfg)
@@ -201,10 +215,18 @@ def test_ac3_apptest_tools_used_expander_lists_calls(tmp_path, monkeypatch):
         {
             "answer": "done",
             "tools_used": [
-                {"name": "fetch_url", "args": {"url": "https://x.example/a"},
-                 "ok": True, "preview": "# Doc"},
-                {"name": "fetch_url", "args": {"url": "https://y.example/b"},
-                 "ok": False, "preview": "ERROR: boom"},
+                {
+                    "name": "fetch_url",
+                    "args": {"url": "https://x.example/a"},
+                    "ok": True,
+                    "preview": "# Doc",
+                },
+                {
+                    "name": "fetch_url",
+                    "args": {"url": "https://y.example/b"},
+                    "ok": False,
+                    "preview": "ERROR: boom",
+                },
             ],
         },
     )
@@ -233,7 +255,9 @@ def test_ac3_apptest_no_expander_when_result_lacks_tools(tmp_path, monkeypatch):
 
 
 def test_ac3_apptest_no_expander_when_tools_used_empty(tmp_path, monkeypatch):
-    at = _chat_app_with_answer(tmp_path, monkeypatch, {"answer": "done", "tools_used": []})
+    at = _chat_app_with_answer(
+        tmp_path, monkeypatch, {"answer": "done", "tools_used": []}
+    )
     at.chat_input[0].set_value("another plain question").run()
     assert not at.exception, [e.value for e in at.exception]
     assert not [e for e in at.expander if "Tools used" in e.label]
@@ -317,7 +341,9 @@ def test_ac5_chat_with_tools_trace_flags_error_calls(cfg, monkeypatch):
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [tool_call("fetch_url", {"url": "https://x.example"}, "c1")],
+                "tool_calls": [
+                    tool_call("fetch_url", {"url": "https://x.example"}, "c1")
+                ],
             },
             {"role": "assistant", "content": "sorry"},
         ]
@@ -345,13 +371,17 @@ def test_ac5_chat_with_tools_without_trace_is_unchanged(cfg, monkeypatch):
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [tool_call("fetch_url", {"url": "https://a.example"}, "c1")],
+                "tool_calls": [
+                    tool_call("fetch_url", {"url": "https://a.example"}, "c1")
+                ],
             },
             {"role": "assistant", "content": "done"},
         ]
     )
     out = asyncio.run(
-        chat_with_tools(llm, "planner", [{"role": "user", "content": "q"}], build_chat_registry(cfg))
+        chat_with_tools(
+            llm, "planner", [{"role": "user", "content": "q"}], build_chat_registry(cfg)
+        )
     )
     assert out == "done"
 
@@ -363,7 +393,9 @@ def test_ac5_answer_history_branch_returns_tools_used(cfg, store, monkeypatch):
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [tool_call("fetch_url", {"url": "https://docs.example.com/a"})],
+                "tool_calls": [
+                    tool_call("fetch_url", {"url": "https://docs.example.com/a"})
+                ],
             },
             {"role": "assistant", "content": "Docs content"},
         ]
@@ -393,7 +425,9 @@ def test_ac5_answer_conversation_branch_returns_tools_used(cfg, store, monkeypat
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [tool_call("fetch_url", {"url": "https://docs.example.com/a"})],
+                "tool_calls": [
+                    tool_call("fetch_url", {"url": "https://docs.example.com/a"})
+                ],
             },
             {"role": "assistant", "content": "Docs content"},
         ]
@@ -418,6 +452,152 @@ def test_ac5_answer_tools_used_empty_when_no_tools_called(cfg, store):
     )
     res = ask(cfg, store, "How many runs?", transport=fake.transport)
     assert res["tools_used"] == []
+
+
+# ============================== F2: load-time caption + persisted expander
+
+
+def _write_cfg_raw(tmp_path, monkeypatch, raw):
+    """Like test_dashboard._write_cfg but with a custom raw config dict."""
+    import streamlit as st
+
+    st.cache_resource.clear()
+    p = tmp_path / "swarmforge.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    monkeypatch.setenv("FAKE_KEY", "test-key")
+    monkeypatch.setenv("SWARMFORGE_CONFIG", str(p))
+    monkeypatch.setenv("SWARMFORGE_DASH_AUTOREFRESH", "0")
+    monkeypatch.setenv("SWARMFORGE_DASH_UPDATE_CHECK", "0")
+    monkeypatch.delenv("SWARMFORGE_DB", raising=False)
+    return parse_config(raw)
+
+
+def test_f2_quick_actions_caption_on_load(tmp_path, monkeypatch):
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _go(at, "Chat")
+    assert not at.exception, [e.value for e in at.exception]
+    # the affordance is visible immediately, before any interaction
+    caps = [c.value for c in at.caption]
+    assert any(
+        "fetch_url" in c and "/repo" in c and "/code" in c and "/issues" in c
+        for c in caps
+    )
+
+
+def test_f2_caption_omits_fetch_url_when_tools_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_KEY", "k")
+    raw = base_raw(tmp_path / "work")
+    raw["chatbot"] = {"tools": []}
+    cfg = _write_cfg_raw(tmp_path, monkeypatch, raw)
+    _seed(cfg)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _go(at, "Chat")
+    assert not at.exception, [e.value for e in at.exception]
+    caps = [c.value for c in at.caption]
+    quick = [c for c in caps if "Quick actions" in c]
+    assert quick, caps
+    assert "fetch_url" not in quick[0]  # disabled tool is not advertised
+    assert "/repo" in quick[0]  # slash-command affordance still appears
+
+
+def test_f2_tools_used_expander_persists_across_reruns(tmp_path, monkeypatch):
+    trace = [
+        {
+            "name": "fetch_url",
+            "args": {"url": "https://x.example/a"},
+            "ok": True,
+            "preview": "# Doc",
+        }
+    ]
+    results = iter(
+        [
+            {"answer": "traced answer", "tools_used": trace},
+            {"answer": "plain answer"},  # second send: no tools_used
+        ]
+    )
+
+    def fake_ask(c, s, question, history=None, **kw):
+        return {
+            "role": "planner",
+            "model": "qwen-fake",
+            "question": question,
+            **next(results),
+        }
+
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    from swarmforge import chatbot
+
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _go(at, "Chat")
+    assert not at.exception, [e.value for e in at.exception]
+    at.chat_input[0].set_value("first question").run()
+    assert not at.exception, [e.value for e in at.exception]
+    expanders = [e for e in at.expander if "Tools used" in e.label]
+    assert len(expanders) == 1
+    assert "(1)" in expanders[0].label
+
+    # a second, untraced exchange must keep the earlier expander (exactly once)
+    at.chat_input[0].set_value("second question").run()
+    assert not at.exception, [e.value for e in at.exception]
+    expanders = [e for e in at.expander if "Tools used" in e.label]
+    assert len(expanders) == 1
+    assert "(1)" in expanders[0].label
+    assert any("traced answer" in m.value for m in at.markdown)
+    assert any("plain answer" in m.value for m in at.markdown)
+
+    # a plain rerun (page-reload style) must not duplicate the expander
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    expanders = [e for e in at.expander if "Tools used" in e.label]
+    assert len(expanders) == 1
+    assert "(1)" in expanders[0].label
+
+
+def test_f2_clear_removes_persisted_tools_expander(tmp_path, monkeypatch):
+    trace = [
+        {
+            "name": "fetch_url",
+            "args": {"url": "https://x.example/a"},
+            "ok": True,
+            "preview": "# Doc",
+        }
+    ]
+
+    def fake_ask(c, s, question, history=None, **kw):
+        return {
+            "answer": "traced answer",
+            "role": "planner",
+            "model": "qwen-fake",
+            "question": question,
+            "tools_used": trace,
+        }
+
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    _seed(cfg)
+    from swarmforge import chatbot
+
+    monkeypatch.setattr(chatbot, "ask", fake_ask)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _go(at, "Chat")
+    assert not at.exception, [e.value for e in at.exception]
+    at.chat_input[0].set_value("question with tools").run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert len([e for e in at.expander if "Tools used" in e.label]) == 1
+
+    reset = next((b for b in at.button if b.key == "chat_reset"), None)
+    assert reset is not None
+    reset.click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert not [e for e in at.expander if "Tools used" in e.label]
+    assert not any("traced answer" in m.value for m in at.markdown)
 
 
 # --------------------------------------------------------- AppTest plumbing
