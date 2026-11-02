@@ -14,12 +14,46 @@ import asyncio
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 EXCLUDES = ["__pycache__/", "*.pyc", ".pytest_cache/", ".swarmforge/", ".mypy_cache/",
             ".ruff_cache/"]
 CONFLICT_MARKER_RE = re.compile(r"^(<{7}|>{7})( |$)", re.M)
+# Transient subprocess/resource failures (sandbox thread/memory limits under parallel test runs)
+_TRANSIENT_GIT_RE = re.compile(
+    "unable to create thread|Resource temporarily unavailable|fork failed|cannot fork|"
+    "Cannot allocate memory|git-pack-objects died|bad pack header|upload-pack: aborting")
+_MERGE_CONFLICT_RE = re.compile(r"CONFLICT \([^)]*\): Merge conflict in (.+)")
+
+
+def _run_git(cwd: Path, args: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run a git subprocess, retrying a bounded number of times on transient
+    resource-exhaustion failures (sandbox thread/memory limits)."""
+    last: subprocess.CompletedProcess | None = None
+    for attempt in range(5):
+        p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env)
+        if p.returncode == 0 or not _TRANSIENT_GIT_RE.search(p.stdout + p.stderr):
+            return p
+        last = p
+        if attempt < 4:
+            time.sleep(0.1 * (2 ** attempt))
+    assert last is not None
+    return last
+
+
+def git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> str:
+    p = _run_git(cwd, list(args), env=env)
+    if check and p.returncode != 0:
+        raise GitError(f"git {' '.join(args)} failed ({p.returncode}): {p.stderr.strip() or p.stdout.strip()}")
+    return p.stdout
+
+
+def git_rc(cwd: Path, *args: str) -> tuple[int, str]:
+    p = _run_git(cwd, list(args))
+    return p.returncode, (p.stdout + p.stderr)
 
 
 class GitError(RuntimeError):
@@ -37,20 +71,6 @@ class StaleSeed(GitError):
     def __init__(self, message: str, conflicts: list[str] | None = None):
         super().__init__(message)
         self.conflicts = conflicts or []
-
-
-def git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> str:
-    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", env=env)
-    if check and p.returncode != 0:
-        raise GitError(f"git {' '.join(args)} failed ({p.returncode}): {p.stderr.strip() or p.stdout.strip()}")
-    return p.stdout
-
-
-def git_rc(cwd: Path, *args: str) -> tuple[int, str]:
-    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    return p.returncode, (p.stdout + p.stderr)
 
 
 @dataclass
@@ -136,6 +156,9 @@ class GitWorkspace:
             if rc != 0:
                 conflicts = [c for c in git(self.repo, "diff", "--name-only", "--diff-filter=U",
                                              check=False).splitlines() if c]
+                if not conflicts:
+                    # the index query itself can fail transiently; fall back to the merge output
+                    conflicts = _MERGE_CONFLICT_RE.findall(out)
                 git_rc(self.repo, "merge", "--abort")
                 git(self.repo, "reset", "--quiet", "--hard", self.base_sha)
                 raise StaleSeed(
