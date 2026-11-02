@@ -128,18 +128,25 @@ def test_real_browser_sidebar_switches_the_whole_page(tmp_path, monkeypatch):
                     break
                 except Exception:  # noqa: BLE001 - not up yet
                     time.sleep(0.5)
-            bg = lambda: pg.evaluate("getComputedStyle(document.querySelector('.stApp')).backgroundColor")  # noqa: E731
+            def _bg_is(color):
+                return ("(() => { const el = document.querySelector('.stApp'); "
+                        "return !!el && getComputedStyle(el).backgroundColor === '" + color + "'; })()")
+
+            def bg():
+                return pg.evaluate("(() => { const el = document.querySelector('.stApp'); "
+                                   "return el ? getComputedStyle(el).backgroundColor : ''; })()")
+
+            pg.wait_for_selector('.stApp', timeout=10000)
             pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
             pg.wait_for_timeout(2500)
             dark, light = "rgb(14, 17, 23)", "rgb(255, 255, 255)"
             assert bg() == dark, "--theme dark should be the first-visit theme"
             pg.locator(".st-key-theme_pick button", has_text="Light").click()
-            pg.wait_for_function(f"getComputedStyle(document.querySelector('.stApp')).backgroundColor === '{light}'",
-                                 timeout=10000)
+            pg.wait_for_function(_bg_is(light), timeout=10000)
             pg.locator(".st-key-theme_pick button", has_text="Dark").click()
-            pg.wait_for_function(f"getComputedStyle(document.querySelector('.stApp')).backgroundColor === '{dark}'",
-                                 timeout=10000)
+            pg.wait_for_function(_bg_is(dark), timeout=10000)
             pg.goto(f"http://localhost:{port}/?page=speed")         # remembered on the next page load
+            pg.wait_for_selector('.stApp', timeout=10000)
             pg.wait_for_selector(".st-key-theme_pick", timeout=30000)
             pg.wait_for_timeout(1500)
             assert bg() == dark
