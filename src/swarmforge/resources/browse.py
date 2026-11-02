@@ -8,7 +8,7 @@ import time
 MARK = "__SF_BROWSE__"
 args = json.loads(os.environ.get("SF_BROWSE_ARGS") or "{}")
 result = {"url": args.get("url"), "console": [], "page_errors": [], "failed_requests": [],
-          "action_errors": [], "app_errors": [], "controls": []}
+          "action_errors": [], "app_errors": [], "exceptions": [], "controls": []}
 
 
 def emit():
@@ -24,6 +24,8 @@ except Exception as e:  # noqa: BLE001
 
 ERROR_SELECTORS = ['[data-testid="stException"]', '[data-testid="stAlertContentError"]',
                    '[role="alert"]', '.traceback', '#traceback']
+# crashes (an exception/traceback rendered on the page), as opposed to error messages the app shows on purpose
+EXCEPTION_SELECTORS = ['[data-testid="stException"]', '.traceback', '#traceback']
 CONTROL_JS = """() => {
   const out = [];
   const els = document.querySelectorAll('button, a[href], input, select, textarea, [role=button], [role=tab], [role=checkbox], [role=link]');
@@ -89,7 +91,9 @@ with sync_playwright() as p:
     browser = None
     try:
         browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        vp = args.get("viewport") or {}
+        page = browser.new_page(viewport={"width": int(vp.get("width") or 1280), "height": int(vp.get("height") or 900)},
+                                color_scheme=args.get("color_scheme") or "light")
         page.on("console", lambda m: result["console"].append(f"{m.type}: {m.text[:300]}")
                 if m.type in ("error", "warning") and len(result["console"]) < 30 else None)
         page.on("pageerror", lambda e: result["page_errors"].append(str(e)[:500])
@@ -119,12 +123,20 @@ with sync_playwright() as p:
                     continue
                 if t and t[:800] not in result["app_errors"]:
                     result["app_errors"].append(t[:800])
+        for sel in EXCEPTION_SELECTORS:
+            for el in page.locator(sel).all()[:5]:
+                try:
+                    t = el.inner_text(timeout=2000).strip()
+                except Exception:  # noqa: BLE001
+                    continue
+                if t and t[:800] not in result["exceptions"]:
+                    result["exceptions"].append(t[:800])
         result["controls"] = page.evaluate(CONTROL_JS)
         shot = args.get("screenshot")
         if shot:
             try:
                 os.makedirs(os.path.dirname(shot), exist_ok=True)
-                page.screenshot(path=shot, full_page=True)
+                page.screenshot(path=shot, full_page=bool(args.get("full_page", True)))
                 result["screenshot"] = shot
             except Exception as e:  # noqa: BLE001
                 result["screenshot"] = None

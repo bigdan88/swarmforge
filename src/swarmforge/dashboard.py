@@ -816,6 +816,50 @@ def _explain_card(run: dict, events: list[dict], run_id: str) -> None:
             st.rerun()
 
 
+def render_screenshots(run: dict, findings: list[dict], events: list[dict]) -> None:
+    """The app as SwarmForge saw it after each test run (light + dark), with the vision model's notes."""
+    from swarmforge.report import visual_shots
+    shots = visual_shots(run)
+    if not shots:
+        st.caption("No screenshots for this run. SwarmForge takes them when the repository's "
+                   "swarmforge.project.yml has a `preview:` section (how to start the app and which pages "
+                   "to open) and the change touches the files it watches.")
+        return
+    summaries = {}
+    for e in events:
+        if e["kind"] == "visual" and e.get("data"):
+            try:
+                d = json.loads(e["data"]) if isinstance(e["data"], str) else e["data"]
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(d, dict) and d.get("summary"):
+                summaries[d.get("cycle")] = d["summary"]
+    by_cycle: dict[int, dict[str, dict[str, Path]]] = {}
+    for p in shots:
+        m = re.fullmatch(r"c(\d+)-(.+)-(light|dark)\.png", p.name)
+        if m:
+            by_cycle.setdefault(int(m.group(1)), {}).setdefault(m.group(2), {})[m.group(3)] = p
+    cycles = sorted(by_cycle, reverse=True)
+    pick = st.selectbox("Test run", cycles, format_func=lambda c: f"cycle {c}" + (" (latest)" if c == cycles[0] else ""),
+                        key=f"shots_cycle_{run['id']}") if len(cycles) > 1 else cycles[0]
+    if summaries.get(pick):
+        st.info(f"👁 Vision review: {summaries[pick]}")
+    vf = [f for f in findings if f["source"] == "visual" and f["cycle"] == pick]
+    if vf:
+        order = {"critical": 0, "major": 1, "minor": 2, "info": 3}
+        for f in sorted(vf, key=lambda f: order.get(f["severity"], 9)):
+            icon = {"critical": "🔴", "major": "🟠", "minor": "🟡"}.get(f["severity"], "⚪")
+            st.markdown(f"{icon} **{f['title']}** · `{f['file']}`  \n{f['description'] or ''}"
+                        + (f"  \n*Fix:* {f['recommendation']}" if f["recommendation"] else ""))
+    elif summaries.get(pick):
+        st.caption("No visual problems reported.")
+    for page, themes in sorted(by_cycle[pick].items()):
+        st.markdown(f"**{page}**")
+        cols = st.columns(len(themes))
+        for col, theme in zip(cols, [t for t in ("light", "dark") if t in themes]):
+            col.image(str(themes[theme]), caption=f"{page} · {theme}", width="stretch")
+
+
 def run_detail(run_id, header=True):
     run = store.get_run(run_id)
     tasks = store.tasks(run_id)
@@ -893,7 +937,7 @@ def run_detail(run_id, header=True):
     fixes = visited.count("FIX_REQUIRED")
     st.markdown(" → ".join(chips) + (f"  ·  FIX_REQUIRED ×{fixes}" if fixes else ""))
 
-    tabs = st.tabs(["🧭 Delegation", "🤖 Agents & timeline", "💬 Transcripts", "🧪 Tests", "🔍 Review",
+    tabs = st.tabs(["🧭 Delegation", "🤖 Agents & timeline", "💬 Transcripts", "🧪 Tests", "🔍 Review", "🖼 Screenshots",
                     "📚 Knowledge", "💰 Tokens & cost", "🖥 Console", "📜 Events"])
 
     with tabs[0]:
@@ -1003,6 +1047,9 @@ def run_detail(run_id, header=True):
             st.caption("None.")
 
     with tabs[5]:
+        render_screenshots(run, findings, events)
+
+    with tabs[6]:
         kev = [e for e in events if e["kind"] == "knowledge"]
         if not kev:
             st.caption("No knowledge activity yet (notes are retrieved before planning and written after the run).")
@@ -1016,7 +1063,7 @@ def run_detail(run_id, header=True):
                         with st.expander(f"[{n.type}] {n.title}"):
                             st.markdown(wikilinks_to_md(n.body))
 
-    with tabs[6]:
+    with tabs[7]:
         st.markdown(f"Provider-reported: **${cost['measured']:.4f}** · estimated: **${cost['estimated']:.4f}** · "
                     f"calls without cost info: **{cost['unavailable_calls'] or 0}**")
         br = pd.DataFrame(store.cost_by_role(run_id))
@@ -1032,14 +1079,14 @@ def run_detail(run_id, header=True):
             st.altair_chart(alt.Chart(cdf).mark_line(point=True).encode(
                 x=alt.X("t:T", title=None), y=alt.Y("cumulative_cost:Q", title="cumulative USD")), width="stretch")
 
-    with tabs[7]:
+    with tabs[8]:
         log = cfg.workdir / "logs" / f"{run_id}.log" if cfg else None
         if log and log.is_file():
             st.code(log.read_text(encoding="utf-8", errors="replace")[-20000:], language=None)
         else:
             st.caption("No console log (this run was started from the command line).")
 
-    with tabs[8]:
+    with tabs[9]:
         kinds = sorted({e["kind"] for e in events})
         pick = st.multiselect("Kinds", kinds, default=kinds)
         rows = [{"time": fmt_ts(e["ts"]), "level": e["level"], "kind": e["kind"], "task": e["task_key"] or "",

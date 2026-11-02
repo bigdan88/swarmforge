@@ -231,6 +231,45 @@ For any UI change the developer must open the pages it changed with `sf browse` 
 run's artifacts) before finishing; the tester must do the same for UI acceptance criteria. Tool use is
 counted on the **Speed** page (`sf_calls`, `browse_calls`).
 
+## Screenshots and visual review
+
+Tests and code review can't tell whether a page *looks* right. So when a change touches the UI,
+SwarmForge itself takes screenshots after every test run and a vision model looks at them:
+
+1. It starts the app the way the repository's `swarmforge.project.yml` says (`preview:`), inside the
+   sandbox, and opens each listed page in headless Chromium, once with a light and once with a dark
+   browser preference.
+2. Pages that show an exception or traceback, fail to load, or throw a JavaScript error are a
+   **critical** finding straight away (no model needed): the run goes back for a repair.
+3. The screenshots go to the `designer` role (a vision-capable model, `Qwen/Qwen3-VL-235B-A22B-Instruct`
+   on DeepInfra, a fraction of a cent per run) together with the task. It reports what a user would
+   see wrong: cut-off labels, overlapping or cramped controls, unreadable contrast, parts of a page
+   left in the other theme. Only **critical** visual findings (an error, a blank or broken page,
+   unreadable text) block; the rest are listed in the PR under *Known limitations*.
+4. The run's **Screenshots** tab in the dashboard shows every page, light next to dark, with the
+   model's notes.
+
+```yaml
+# swarmforge.project.yml (in the repository)
+preview:
+  command: streamlit run app.py --server.headless true --server.port 8501
+  port: 8501
+  pages: ["/", "/?page=settings"]          # or {path, name, actions: [{click: "text=Advanced"}]}
+  when_changed: ["app.py", "pages/*"]      # only screenshot when these change (default: always)
+  viewport: {width: 1400, height: 1400}
+```
+
+```yaml
+# swarmforge.yaml (yours)
+roles:
+  designer: {provider: deepinfra, model: Qwen/Qwen3-VL-235B-A22B-Instruct}
+vision_models: [Qwen/Qwen3-VL]
+```
+
+SwarmForge's own project file screenshots the dashboard on demo data (`swarmforge seed-demo`), so the
+pages are filled with runs, queues and failures rather than empty. Without a `designer` role you still
+get the screenshots and the automatic error check.
+
 ## Several queues (one per project)
 
 Every queued task belongs to a **queue** ("pile"); pick it when you add the task (dashboard: *Queue

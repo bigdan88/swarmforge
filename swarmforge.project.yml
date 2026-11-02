@@ -1,5 +1,5 @@
 # Settings SwarmForge uses when it works on THIS repository (self-improvement runs).
-# Only these two keys are read from a repository; all safety settings stay in swarmforge.yaml.
+# Only these keys are read from a repository; all safety settings stay in swarmforge.yaml.
 description: SwarmForge itself
 # Runs SwarmForge's own suite inside the dev sandbox (build it with `swarmforge sandbox build --dev`).
 test_command: PYTHONPATH=/workspace/src python -m pytest -q -p no:cacheprovider -n 6 tests
@@ -11,3 +11,22 @@ agent_test_command: PYTHONPATH=/workspace/src python -m pytest -q -p no:cachepro
 # still run the full suite. The full suite takes ~5 min in Docker on Windows.
 agent_env:
   PYTEST_ADDOPTS: "-m 'not slow' -n 4"
+
+# Screenshots after each test run when the dashboard changes: the dashboard is started on demo data
+# (`seed-demo`), each page is opened in the light and the dark theme, and a vision model reviews them.
+preview:
+  command: >-
+    PYTHONPATH=src python -m swarmforge.cli seed-demo /tmp/sf-preview/swarmforge.db &&
+    SWARMFORGE_CONFIG=/tmp/sf-preview/swarmforge.yaml SWARMFORGE_DB=/tmp/sf-preview/swarmforge.db
+    SWARMFORGE_DASH_UPDATE_CHECK=0 SWARMFORGE_DASH_AUTOREFRESH=0 PYTHONPATH=src
+    python -m streamlit run src/swarmforge/dashboard.py --server.headless true --server.port 8599
+    --server.address 127.0.0.1 --client.toolbarMode viewer --server.fileWatcherType none
+    --browser.gatherUsageStats false
+  port: 8599
+  # (no Pull requests page: it needs GitHub, which the sandbox can't reach)
+  pages: ["/?page=work", "/?page=new-task", "/?page=failures", "/?page=speed", "/?page=chat",
+          "/?page=settings"]
+  when_changed: ["src/swarmforge/dashboard.py", "src/swarmforge/settings.py", "src/swarmforge/explain.py",
+                 "src/swarmforge/welcome.py", "src/swarmforge/resources/*.css"]
+  viewport: {width: 1400, height: 1400}
+  max_shots: 12

@@ -626,6 +626,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_metrics)
     s = sub.add_parser("update", help="pull the latest SwarmForge code (merged PRs) and restart the queue worker")
     s.set_defaults(fn=cmd_update)
+    s = sub.add_parser("seed-demo", help=argparse.SUPPRESS)          # demo data for UI screenshots
+    s.add_argument("db")
+    s.set_defaults(fn=cmd_seed_demo, no_config=True)
     s = sub.add_parser("restart-dashboard", help=argparse.SUPPRESS)
     s.add_argument("--pid", type=int, required=True)
     s.add_argument("--args", default="{}")
@@ -854,6 +857,12 @@ def cmd_metrics(args, cfg) -> int:
     return 0
 
 
+def cmd_seed_demo(args, cfg) -> int:
+    from .demo import seed
+    print(f"demo data written to {seed(args.db)}")
+    return 0
+
+
 def cmd_update(args, cfg) -> int:
     from . import selfupdate as su
     try:
@@ -882,6 +891,8 @@ def cmd_restart_dashboard(args, cfg) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "no_config", False):           # works without a swarmforge.yaml (e.g. in the sandbox)
+        return args.fn(args, None) or 0
     try:
         cfg = load_config(args.config)
     except ConfigError as e:
