@@ -94,12 +94,18 @@ async def chat_with_tools(
     *,
     max_rounds: int = 4,
     task_key: str = "chatbot",
+    trace: list | None = None,
 ) -> str:
     """Run a tool-calling conversation loop and return the final text answer.
 
     The caller's `messages` list is never mutated. If the model is still calling
     tools after `max_rounds` rounds, one final call without tools asks it to
     answer with what it has.
+
+    `trace` is an optional list the caller supplies; when given, one entry
+    `{"name", "args", "ok", "preview"}` is appended after each executed tool
+    call (ok=False when the tool returned an ERROR string). Behavior is
+    unchanged when trace is None.
     """
     if max_rounds < 1:
         raise ValueError("max_rounds must be >= 1")
@@ -126,6 +132,15 @@ async def chat_with_tools(
             except (json.JSONDecodeError, TypeError):
                 args = {}
             out = await registry.execute(name, args)
+            if trace is not None:
+                trace.append(
+                    {
+                        "name": name,
+                        "args": args,
+                        "ok": not out.startswith("ERROR:"),
+                        "preview": out[:160],
+                    }
+                )
             work.append(
                 {
                     "role": "tool",
