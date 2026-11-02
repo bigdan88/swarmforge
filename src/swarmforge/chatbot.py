@@ -19,6 +19,7 @@ import asyncio
 import time
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 
@@ -184,10 +185,43 @@ def status_snapshot(store: Store, max_runs: int = 12) -> str:
     return _cap("\n".join(L))
 
 
+def build_user_content(question: str, attachments: list[Path] | None) -> str | list[dict]:
+    """Build the user message content: the plain question when there are no
+    attachments, otherwise an OpenAI-style block list (text block with the
+    question plus an 'Attached files:' listing, then one image_url data-URL
+    block per image attachment). Unreadable files are skipped, never raised."""
+    from . import attachments as att
+
+    if not attachments:
+        return question
+    lines = [question, "", "Attached files:"]
+    image_blocks: list[dict] = []
+    for path in attachments:
+        try:
+            kind = att.classify(path)
+            text = att.inline_text(path)
+            if text is not None:
+                lines.append(f"**{path.name}**")
+                lines.append("```")
+                lines.append(text)
+                lines.append("```")
+            else:
+                lines.append(f"- {path.name} ({kind})")
+            if kind == "image":
+                image_blocks.append({"type": "image_url",
+                                     "image_url": {"url": att.image_data_url(path)}})
+        except OSError:
+            continue
+    blocks: list[dict] = [{"type": "text", "text": "\n".join(lines)}]
+    blocks.extend(image_blocks)
+    return blocks
+
+
 async def answer(cfg: Config, store: Store, question: str,
                  history: list[dict] | None = None, *, conversation: str | None = None,
                  transport: httpx.AsyncBaseTransport | None = None,
-                 max_runs: int = 12, budget=None) -> dict:
+                 max_runs: int = 12, budget=None,
+                 attachments: list[Path] | None = None) -> dict:
     """Ask the status chatbot a question; returns {answer, role, model, question}.
 
     With `conversation` set, the question and reply are persisted to that
@@ -198,7 +232,7 @@ async def answer(cfg: Config, store: Store, question: str,
     from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 
     role = resolve_role(cfg)
-    messages = [{"role": "system",
+    messages: list[dict] = [{"role": "system",
                  "content": SYSTEM_PROMPT + "\n" + IMPROVE_PROMPT + "\n\n<status>\n" + status_snapshot(store, max_runs)
                  + "\n</status>\n\n<improvement_context>\n" + improvement_context(cfg, store)
                  + "\n</improvement_context>"}]
@@ -210,6 +244,8 @@ async def answer(cfg: Config, store: Store, question: str,
                                    cfg.chat.context_max_tokens, reserved_tokens=reserved)
         for m in context:
             messages.append({"role": m["role"], "content": m["content"]})
+        if attachments:
+            messages[-1] = {"role": "user", "content": build_user_content(question, attachments)}
         run_id = CHAT_RUN_PREFIX + conversation
         llm_budget = budget if budget is not None else Budget(
             max(2.0, cfg.limits.budget_usd), store.cost_summary(run_id)["total"])
@@ -227,7 +263,7 @@ async def answer(cfg: Config, store: Store, question: str,
     for m in (history or []):
         if m.get("role") in ("user", "assistant") and m.get("content"):
             messages.append({"role": m["role"], "content": str(m["content"])})
-    messages.append({"role": "user", "content": question})
+    messages.append({"role": "user", "content": build_user_content(question, attachments)})
     try:
         llm = LLMClient(cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport)
         res = await llm.chat(role, messages, task_key="chatbot")
@@ -240,10 +276,11 @@ async def answer(cfg: Config, store: Store, question: str,
 
 def ask(cfg: Config, store: Store, question: str, history: list[dict] | None = None, *,
         conversation: str | None = None, transport: httpx.AsyncBaseTransport | None = None,
-        max_runs: int = 12) -> dict:
+        max_runs: int = 12, attachments: list[Path] | None = None) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
     return asyncio.run(answer(cfg, store, question, history, conversation=conversation,
-                               transport=transport, max_runs=max_runs))
+                               transport=transport, max_runs=max_runs,
+                               attachments=attachments))
 
 
 # ======================================================== conversation persistence
