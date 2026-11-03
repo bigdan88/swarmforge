@@ -425,3 +425,26 @@ def test_run_page_shows_screenshots_and_visual_findings(tmp_path, monkeypatch):
     md = " ".join(m.value for m in at.markdown)
     assert "Label cut off" in md and "Looks tidy." in " ".join(i.value for i in at.info)
     assert len(at.get("image")) >= 2  # light + dark side by side
+
+
+def test_quick_action_caption_is_visible_in_rendered_chat_page(tmp_path, monkeypatch):
+    """AC5: on a fresh Chat-page load (no interaction beyond navigation) the
+    'Quick actions' caption mentioning fetch_url and the slash-commands is visible."""
+    from streamlit.testing.v1 import AppTest
+
+    from .test_dashboard import APP, _go, _write_cfg
+
+    _write_cfg(tmp_path, monkeypatch)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    _go(at, "Chat")
+    assert not at.exception, [e.value for e in at.exception]
+    assert any(
+        "Quick actions" in c.value
+        and "/repo" in c.value
+        and "/code" in c.value
+        and "/issues" in c.value
+        and "fetch_url" in c.value
+        for c in at.caption
+    ), [c.value for c in at.caption]
