@@ -62,7 +62,7 @@ swarmforge run https://github.com/<you>/swarmforge-sample/issues/1
 ```
 
 SwarmForge fetches the issue, clones the repo, plans, runs the agents, tests and reviews. When the
-gate approves it asks:
+gate approves it asks the following when `github.require_push_approval: true` (the example default):
 
 ```
 >>> Push branch 'swarmforge/issue-1-…' to <you>/swarmforge-sample and open a DRAFT pull request against 'main'? [y/N]
@@ -72,6 +72,11 @@ Answer `y` to get a draft PR whose description includes the test evidence, accep
 status, review summary, cost and intervention count. `--yes` pre-approves (still recorded as an
 intervention). If the token was missing during the run, the run ends `COMPLETED` with
 "PR not created" and you can publish later with `swarmforge publish <run_id>`.
+
+Publishing approval and merging are separate. `auto_merge.enabled` defaults to false, leaving
+the PR for you to merge. This checkout's local configuration disables push approval and enables
+auto-merge for `bigdan88/swarmforge`; it therefore behaves differently from a fresh example-based
+installation. See [README delivery](../README.md#when-a-run-finishes) and [SECURITY.md](SECURITY.md).
 
 ## 5. Your own repositories
 

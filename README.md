@@ -6,7 +6,7 @@ GLM, MiniMax) served by DeepInfra.
 **You give it a GitHub issue URL → a planner breaks it into a task graph → two coding agents
 work in parallel in isolated git worktrees → their work is merged → a test engineer writes
 acceptance tests → the orchestrator runs the tests itself → an independent reviewer reviews the
-diff → blocking problems go back to the planner as corrective tasks (up to 3 cycles) → you get a
+diff → blocking problems trigger corrective tasks (bounded by `limits.max_repair_cycles`) → you get a
 tested draft pull request and an execution report** that records what each agent did, the tokens
 and cost, and every human intervention.
 
@@ -14,28 +14,37 @@ and cost, and every human intervention.
 swarmforge run https://github.com/you/repo/issues/42
 ```
 
-| Role | Default model (DeepInfra) | Tools |
-|---|---|---|
-| Planner / Eng. manager | `Qwen/Qwen3.5-397B-A17B` | read-only, `submit_plan` |
-| Backend developer | `deepseek-ai/DeepSeek-V4-Pro` | read/write files, sandboxed commands, dev tools (processes, browser, `check_code`), `finish` |
-| Frontend developer | `moonshotai/Kimi-K2.6` | same, runs concurrently |
-| Reviewer | `zai-org/GLM-5.3` | read-only, `submit_review` |
-| Test engineer | `MiniMaxAI/MiniMax-M3` | test files only, sandboxed commands, dev tools, `submit_test_report` |
-| Librarian | `deepseek-ai/DeepSeek-V4-Flash` | read-only, `submit_notes` (Zettelkasten) |
+Current local team (`swarmforge.yaml`, 2026-11-02):
 
-All of these are set in `swarmforge.yaml`; any role can use any model.
+| Role | Model (DeepInfra) | Runtime / tools |
+|---|---|---|
+| Planner / Eng. manager | `Qwen/Qwen3.8-Flash` | built-in; read-only, `submit_plan` |
+| Backend developer | `zai-org/GLM-5.3` | Pi; read/write/edit/bash and SwarmForge developer tools via `sf` |
+| Frontend developer | `zai-org/GLM-5.3` | Pi; same tools, runs concurrently |
+| Reviewer | `moonshotai/Kimi-K2.6` | built-in; read-only, `submit_review` |
+| Test engineer | `Qwen/Qwen3.8-Flash` | built-in; test files only, sandboxed commands, dev tools, `submit_test_report` |
+| Librarian | `deepseek-ai/DeepSeek-V4-Flash` | built-in; read-only, `submit_notes` (Zettelkasten) |
+| Designer | `Qwen/Qwen3-VL-235B-A22B-Instruct` | screenshot review for configured UI previews |
+
+This is a dated snapshot of the local, git-ignored configuration, not the installation defaults.
+`swarmforge.example.yaml` retains a built-in-runtime team using Qwen3.5, DeepSeek, Kimi, GLM and
+MiniMax. Copying that example does not select the local team above. Any role can use any model;
+the reviewer must differ from developer models unless explicitly overridden.
 
 ## Principles
 
 * **Agents propose, code decides.** State transitions, the approval gate, test verdicts, merges
   and GitHub publishing are deterministic code. A model can't declare tests passed: the
   orchestrator runs them and reads JUnit.
-* **Sandboxed by default.** Each agent command runs in a throwaway Docker container with no
-  network, no capabilities and a read-only root filesystem; only that task's worktree is mounted.
-  Keys never enter a container. See [docs/SECURITY.md](docs/SECURITY.md) for what this doesn't
-  protect against.
-* **Nothing is merged automatically.** It produces draft PRs only, on `swarmforge/*` branches,
-  never force-pushed, after you approve the push.
+* **Sandboxed by default.** Docker containers use a read-only root filesystem, dropped capabilities
+  and scoped writable mounts. Built-in commands default to no network; Pi sessions use
+  `pi.network` (normally `bridge`) to reach the host model relay. Bridge networking is not a
+  relay-only firewall. Provider keys stay on the host; Pi receives a per-agent relay token.
+  See [docs/SECURITY.md](docs/SECURITY.md) for the boundaries and exceptions.
+* **Publishing and merging are configurable.** Branches use `swarmforge/*` and are never
+  force-pushed. The example requires push approval and disables automatic merging. The local
+  configuration skips push approval and enables auto-merge for `bigdan88/swarmforge`; eligible
+  draft PRs can therefore be merged automatically. See [delivery](#when-a-run-finishes).
 * **Measured, not guessed.** Each model call records tokens and DeepInfra's reported cost.
   Estimates and missing data are labelled as such.
 
@@ -130,18 +139,27 @@ The reviewer and the planner additionally get the read-only subset `outline`, `f
 `git_changes` and `git_history` (no execution, HTTP or formatting tools).
 
 They run where `run_command` runs, with the same isolation: in Docker, one long-lived session
-container per agent (no network, read-only root, dropped capabilities), which is killed with every
+container per agent (read-only root, dropped capabilities), which is killed with every
 process in it when the agent finishes. The tools need the rebuilt sandbox image
 (`swarmforge sandbox build`, plus `--dev` for SwarmForge's own runs); the browser adds roughly
 500 MB to the image. In `sandbox.mode: local`, install them with `pip install -e ".[tools]"` and
 `python -m playwright install chromium`. Turn them off with `sandbox.dev_tools: false`.
+Built-in sessions use `sandbox.network` (default `none`); tools sharing a Pi session inherit
+`pi.network`, normally `bridge`. Orchestrator test containers use `sandbox.network`.
 
 ## When a run finishes
 
 * **GitHub repository:** after the gates pass, SwarmForge asks for approval (the *Approval needed* box in
   the dashboard; it auto-declines after `approval.timeout_s`), pushes a `swarmforge/*` branch and opens
-  a **draft** pull request. It never merges: you review and merge the PR on GitHub. Queue items set to
-  approve automatically skip the question.
+  a **draft** pull request. Push approval applies when `github.require_push_approval` is enabled;
+  pre-approved runs skip the question. With `auto_merge.enabled: false` (the default), you merge
+  the PR yourself, on GitHub or through the dashboard. Auto-merge is a separate setting: it checks
+  run/test evidence and PR status, merges small clean changes, and asks a judge model about larger
+  changes. `auto_merge.protected` and `major_findings` select judge or hold behavior. Oversized
+  changes are held; `auto_fix` can launch a bounded follow-up run for a held PR.
+  The local configuration enables this only for `bigdan88/swarmforge`: 400-line clean-change
+  threshold, 3,000-line judge limit, and judge review of protected files and major findings.
+  Updating the running checkout still requires **Update & restart**.
 * **Local repository:** the result is delivered as a new branch in your repository; merge it yourself.
 * Every run gets a **summary** (dashboard: *Task & summary*; file: `<run dir>/summary.md`): the request
   as you wrote it, what was done (approach, work items, files changed, tests, acceptance criteria,
@@ -209,8 +227,10 @@ reviewer and librarian keep the built-in loop because they return structured rep
   the relay writes the transcript the dashboard shows.
 * Pi starts with project-local extensions, skills, MCP, prompt templates and sessions disabled, so a
   repository can't load code into the harness.
-* **Trade-off:** Pi's container uses the `bridge` network (`pi.network`) so it can reach the relay;
-  built-in agents keep `--network none`. If Pi can't reach the relay on Docker Desktop, set
+* **Trade-off:** Pi's container uses the `bridge` network (`pi.network`) so it can reach the relay.
+  Its shell and `sf` session tools share that network, which can also permit outbound access;
+  SwarmForge does not restrict it to the relay. Built-in sessions and orchestrator tests use
+  `sandbox.network` (default `none`). If Pi can't reach the relay on Docker Desktop, set
   `pi: {relay_host: 0.0.0.0}`.
 * In `sandbox.mode: local`, install Pi on the host: `npm install -g @earendil-works/pi-coding-agent`.
 
@@ -377,16 +397,17 @@ These settings (all on by default) keep that down:
   still runs the full `test_command` as the evidence. A repository can name a quicker suite for agents
   with `agent_test_command` in `swarmforge.project.yml` (SwarmForge's own skips the `slow`-marked
   end-to-end tests: `pytest -m "not slow"`).
-* **One active run per repository** (`limits.one_run_per_repo`). A run started while another run on
+* **Repository scheduling.** `limits.same_repo: serial` makes a run started while another run on
   the same repository is active waits for it ("waiting: run(s) ... are already working on this
   repository") instead of competing for the model rate limit and editing the same files. Its time
-  limit starts when it actually starts.
+  limit starts when it actually starts. `coordinate` checks for overlap; `parallel` skips those
+  coordination checks. The example uses `coordinate`; the current local configuration uses `parallel`.
 * **One container per agent** (`sandbox.reuse_container`). `run_command` executes inside the agent's
   long-lived sandbox container instead of starting a new one per command; the timeout is enforced
   inside the container.
-* **Fewer, larger tasks.** The planner aims for 2-4 tasks (`limits.max_tasks: 5`).
-* **Faster developer models.** `swarmforge.yaml` uses Flash models for the developers, with the
-  previous models as fallbacks. Compare with `swarmforge bench` and switch back if quality drops.
+* **Fewer, larger tasks.** The local configuration caps plans at 5 tasks; the example caps them at 8.
+* **Measure model choices.** The local developers use GLM through Pi; planning and testing use
+  Qwen Flash. Compare configurations with `swarmforge bench` before assuming a speed improvement.
 
 * **Tester agent once per run** (`limits.tester_every_cycle: false`). It writes the acceptance tests in
   the first cycle; repair cycles just re-run the suite with them (about 10 minutes saved per cycle).
@@ -451,14 +472,16 @@ the clone.
 
 Project dependencies are installed automatically. Packages from `requirements*.txt` or
 `pyproject.toml` (or an `install_command` in `swarmforge.project.yml`) go into the worktree's
-git-ignored `.swarmforge/pydeps`. This is the only step that gets network access, and it uses a
-shared pip cache. Agents can call `install_dependencies` after adding a package. Tests and agent
-commands stay offline.
+git-ignored `.swarmforge/pydeps`. Installation uses a network-enabled container and a shared pip
+cache. Agents can call `install_dependencies` after adding a package. Built-in commands and
+orchestrator tests default to offline execution; Pi session commands use `pi.network` instead.
 
 ## Per-project settings
 
-A repository can include `swarmforge.project.yml` with `test_command`, `sandbox_image` and
-`install_command`. These are the only settings a repository can set. The dashboard's **Advanced** section and the CLI
+A repository can include `swarmforge.project.yml` with `test_command`, `agent_test_command`,
+`agent_env`, `sandbox_image`, `install_command`, `description`, `preview` and `protected_paths`.
+Repository settings do not set provider credentials, run budgets or global approval/merge policy;
+`protected_paths` is interpreted by the configured auto-merge policy. The dashboard's **Advanced** section and the CLI
 flags `--test-command` / `--sandbox-image` override them for a single run. SwarmForge's own
 repository uses this to test itself in `swarmforge-dev-sandbox` (`swarmforge sandbox build --dev`).
 
@@ -486,7 +509,8 @@ Benchmarks turn the knowledge base off so every mode starts with the same inform
 
 * [docs/FIRST_RUN.md](docs/FIRST_RUN.md): step-by-step first real GitHub issue
 * [docs/SELF_IMPROVEMENT.md](docs/SELF_IMPROVEMENT.md): point SwarmForge at its own code
-* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, state machine, why it has its own agent runtime instead of OpenCode
+* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, state machine, built-in and Pi runtimes
+* [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md): proposed swarm-quality experiments and maintainability work
 * [docs/PROVIDERS.md](docs/PROVIDERS.md): DeepInfra setup, choosing models, other providers
 * [docs/SECURITY.md](docs/SECURITY.md): sandbox strategy and remaining limitations
 * [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)

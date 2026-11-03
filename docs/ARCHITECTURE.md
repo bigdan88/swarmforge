@@ -5,13 +5,13 @@ issue URL ─▶ CLI ─▶ Orchestrator (state machine, gates) ──▶ SQLite
                      │
                      ├─ GitHub client ........ fetch issue, push branch, draft PR
                      ├─ GitWorkspace ......... disposable clone, integration branch, task worktrees
-                     ├─ Planner agent (Qwen) . read-only tools → submit_plan (schema-validated)
+                     ├─ Planner agent ....... read-only tools → submit_plan (schema-validated)
                      ├─ Scheduler ............ dependency DAG, max N concurrent coding agents
-                     │    ├─ Developer agent (DeepSeek)  ┐ each in its own worktree,
-                     │    └─ Developer agent (Kimi)      ┘ commands via Docker sandbox
-                     ├─ Tester agent (MiniMax) acceptance tests → criteria↔test mapping, defects
+                     │    ├─ Backend developer  ┐ each in its own worktree,
+                     │    └─ Frontend developer ┘ built-in or Pi runtime in Docker sandbox
+                     ├─ Tester agent ........ acceptance tests → criteria↔test mapping, defects
                      ├─ Test runner .......... runs the real test command, parses JUnit (deterministic)
-                     ├─ Reviewer agent (GLM) . read-only → submit_review (structured findings)
+                     ├─ Reviewer agent ...... read-only → submit_review (structured findings)
                      └─ Report ............... Markdown report + PR body from recorded telemetry
 ```
 
@@ -24,12 +24,14 @@ issue URL ─▶ CLI ─▶ Orchestrator (state machine, gates) ──▶ SQLite
 | `plan.py` | JSON schemas for plans, reviews and test reports; deterministic validators (unique ids, known dependencies, no cycles, allowed roles, safe paths); topological "waves". |
 | `scheduler.py` | Async DAG executor: dispatches ready tasks up to `max_concurrent_agents`, marks dependents of failed tasks `BLOCKED`. |
 | `agent/runtime.py` | The coding-agent runtime: OpenAI-style tool-calling loop with step/time limits, transcript capture, context compaction, cancellation and budget checks. |
+| `agent/pi_runtime.py` | Optional Pi developer harness inside the sandbox, using a host model relay for metering, fallbacks and role limits; `sf` exposes SwarmForge tools. |
 | `agent/tools.py` | Agent tools. File tools are confined to the worktree (no absolute paths, no `..`, no `.git`). `run_command` goes through the sandbox. Each role gets a subset. |
 | `sandbox.py` | `DockerSandbox` (default) and `LocalSandbox` (explicit opt-in). |
 | `workspace.py` | Git: clone, integration branch, per-task worktrees + leases, commits, serialized merges, conflict detection and the conflict-resolution worktree flow. |
 | `testing.py` | Runs the configured test command, adds `--junitxml`, parses per-test outcomes, evaluates acceptance criteria from executed tests only. |
 | `llm.py` | OpenAI-compatible HTTP client (DeepInfra by default), retries/backoff, per-call usage and cost with source labels, shared run budget. |
 | `github.py` | Issue fetch (REST), push-permission check, safe branch push (prefix-only, no force, refuses existing remote branch), draft PR creation. |
+| `automerge.py` / `prs.py` | Optional rule/judge-based auto-merge and bounded fix-up tasks; dashboard PR status and manual merge operations. |
 | `db.py` | SQLite (WAL) store: runs, tasks, events, llm_calls, test_runs, findings, acceptance, interventions, benchmarks. |
 | `report.py` | Execution report and PR body, generated only from recorded data. |
 | `benchmark.py` | Single-agent vs swarm on identical start states with hidden acceptance tests. |
@@ -66,21 +68,27 @@ any non-terminal state → FAILED | BLOCKED | CANCELLED | BUDGET_EXCEEDED
   JUnit. A criterion is `satisfied` only when its mapped tests were executed and passed.
 * **CODE_REVIEW**: the reviewer (different model; enforced by config validation) reads the diff
   and the integrated tree and submits structured findings.
-* **Gate** (code, not LLM): approve only if the executed test suite passed with ≥1 test, no
+* **Gate** (code, not LLM): approve only if the configured test command passed, no
   acceptance criterion failed, no review finding / defect at a blocking severity, and no task
   failed. Otherwise `FIX_REQUIRED`: the planner turns the problems into corrective tasks and the
   cycle repeats, up to `max_repair_cycles` (default 3), after which the run stops as `FAILED` with a
-  report listing the unresolved problems.
+  report listing the unresolved problems. When JUnit is present, passing requires at least one
+  passed test and no failures/errors. Without JUnit, exit zero is accepted. Criteria explicitly
+  marked failed block delivery; missing/unexecuted mappings are not equivalent to passed evidence.
+  Review blocking severities are configurable, and reviewer findings are filtered to repair scope.
 * **PULL_REQUEST_CREATION**: only after approval, only for GitHub issues, only with push access,
-  and (by default) only after a human answers "yes". The PR is a draft; SwarmForge never merges.
+  and (by default) only after a human answers "yes". Delivery creates a draft PR. Optional
+  `auto_merge` policy can then merge eligible PRs or start a bounded fix-up run; the dashboard
+  also supports manual merges. The example disables auto-merge; this checkout's local
+  configuration enables it for SwarmForge itself. Updating the running checkout is separate.
 
 ## Agent runtime: why not OpenCode
 
 OpenCode was evaluated as the runtime. SwarmForge uses its own small tool-calling loop because:
 
-1. **Sandboxing.** OpenCode executes shell commands on the host. SwarmForge must route *every*
-   agent command through a disposable `--network none` container; owning the tool layer makes this
-   a code guarantee rather than a configuration hope.
+1. **Sandboxing.** SwarmForge routes commands through its sandbox abstraction. Docker is the
+   default; local execution is explicit opt-in. Built-in sessions and orchestrator tests use
+   `sandbox.network` (default `none`); Pi sessions use `pi.network` (normally `bridge`).
 2. **Metering.** Every model call must be counted against the run budget *before* it is made and
    recorded with provider-reported cost. With an external CLI agent, per-call usage is opaque.
 3. **Role-scoped tools and structured outputs.** Planner/reviewer are read-only; the tester can
@@ -89,7 +97,14 @@ OpenCode was evaluated as the runtime. SwarmForge uses its own small tool-callin
 4. **Model portability.** Any OpenAI-compatible endpoint with tool calling works; `swarmforge check
    --live` verifies each configured model actually emits tool calls.
 
-The runtime is ~250 lines (`agent/runtime.py`) and is the place to plug in another runtime later.
+The built-in loop lives in `agent/runtime.py`. Developers can instead select `runtime: pi`;
+`agent/pi_runtime.py` launches Pi inside a session container and forwards model calls through a
+host relay into the same LLM client. Pi receives a per-agent relay token, not the provider key.
+Its own shell and the `sf` tools share that session's network. Bridge networking permits relay
+access but does not enforce relay-only egress. See [SECURITY.md](SECURITY.md).
+
+The README records the local team as of 2026-11-02. The committed example configuration has a
+different team and uses the built-in runtime; model names are configuration, not fixed architecture.
 
 ## Data & observability
 
