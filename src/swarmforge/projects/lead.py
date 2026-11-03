@@ -54,9 +54,15 @@ async def interview(cfg, store, pid, question, transport=None):
         raise ValueError("Kickoff is only available before launch")
     store.conversation_append(p["conversation_id"], "user", question)
     messages = store.conversation_messages(p["conversation_id"])[-30:]
-    result = await call(cfg, store, p, KICKOFF, {"messages": messages, "draft": p["definition"]}, transport)
+    context = {"messages": messages, "draft": p["definition"]}
+    if p["repo"]:
+        context["repository_choice"] = {"repo": p["repo"], "repository_kind": p["definition"].get("repository_kind", "existing")}
+    result = await call(cfg, store, p, KICKOFF, context, transport)
     if result.get("definition"):
-        projects.draft(pid, result["definition"])
+        definition = result["definition"]
+        if p["repo"] and not p["definition"]:
+            definition = {**definition, **context["repository_choice"]}
+        projects.draft(pid, definition)
     reply = str(result.get("reply") or "Review the proposed spec, then approve when ready.")
     store.conversation_append(p["conversation_id"], "assistant", reply)
     return reply

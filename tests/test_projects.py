@@ -87,6 +87,20 @@ async def test_no_repository_touched_before_approval(state, cfg):
     assert ps.items(pid)[-1] not in s.queue_items(include_finished=False)
 
 
+async def test_project_waits_for_an_in_flight_task_on_its_repository(state, cfg):
+    s, ps, pid = state
+    service.approve(s, pid)
+    task_id = s.queue_add("Existing work", "body", "https://github.com/owner/inventory.git")
+    s.queue_update(task_id, status="running")
+    repo = Repo()
+    await service.advance(cfg, s, pid, repository=repo, ask=ask)
+    assert not repo.touched
+    assert f"#{task_id}" in s.kv_get(f"project_activity:{pid}")
+    s.queue_update(task_id, status="done")
+    await service.advance(cfg, s, pid, repository=repo, ask=ask)
+    assert ps.items(pid)
+
+
 async def test_unmerged_pr_blocks_only_its_project(state, cfg):
     s, ps, pid = state
     service.approve(s, pid)
@@ -233,6 +247,15 @@ async def test_budget_guard_and_lane_isolation(state, cfg):
     assert service.can_start(s, s.queue_item(other))
 
 
+def test_plan_accepts_a_leading_living_heading(state, cfg):
+    _, projects, pid = state
+    project = projects.get(pid)
+    result = proposal()
+    expected = service.validate_plan(project, result, cfg.projects.horizon)
+    result["living"] = "## Living\n\n" + result["living"]
+    assert service.validate_plan(project, result, cfg.projects.horizon).strip() == expected.strip()
+
+
 def test_bad_configuration_and_horizon_rejected(cfg):
     from swarmforge.config import ConfigError, ProjectsConfig
     with pytest.raises(ConfigError):
@@ -309,7 +332,9 @@ async def test_fixed_spec_edit_is_blocked_before_publication(state, cfg, tmp_pat
     s.queue_update(q, run_id="r")
     repo = tmp_path / "repo"
     (repo / "docs").mkdir(parents=True)
-    (repo / "docs/project-spec.md").write_text(ps.get(pid)["spec"].replace("Track inventory", "Change the scope"))
+    (repo / "docs/project-spec.md").write_bytes(
+        ps.get(pid)["spec"].replace("Track inventory", "Change the scope").encode("utf-8")
+    )
     obj = SimpleNamespace(store=s, run_id="r", issue=Issue("Build", "body"), ws=SimpleNamespace(repo=repo))
     with pytest.raises(GitError, match="fixed spec"):
         await PublicationService.publish(obj, None, "owner", "inventory")
@@ -374,19 +399,34 @@ def test_latest_failed_check_cannot_be_reported_as_passed(state):
 
 
 def test_new_dashboard_pages_and_spec_preview(tmp_path, monkeypatch):
+    import sqlite3
     from streamlit.testing.v1 import AppTest
     from .test_dashboard import APP, _write_cfg, _go
     cfg = _write_cfg(tmp_path, monkeypatch)
-    s = Store(cfg.db_path)
-    ps = Projects(s)
-    p = ps.create()
-    ps.draft(p["id"], definition())
-    s.close()
+    cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(cfg.db_path) as conn:
+        conn.execute("""CREATE TABLE conversations (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at REAL NOT NULL,
+            updated_at REAL NOT NULL, last_run_id TEXT
+        )""")
     at = AppTest.from_file(str(APP), default_timeout=30).run()
     _go(at, "Projects")
+    next(b for b in at.button if b.label == "Start a project").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    s = Store(cfg.db_path)
+    ps = Projects(s)
+    p, = ps.list()
+    assert s.conversation_messages(p["conversation_id"])[0]["content"].startswith("Who is this app for")
+    ps.draft(p["id"], definition())
+    s.close()
+    at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert any(b.label == "Approve and launch" for b in at.button)
     assert any("Track inventory" in m.value for m in at.markdown)
+    next(r for r in at.radio if r.label == "Where should the app live?").set_value("new")
+    next(b for b in at.button if b.label == "Save repository choice").click().run()
+    assert not at.exception
+    assert any("Create private repository · owner/inventory" in c.value for c in at.caption)
     at.button(key="nav_whats-new").click().run()
     assert not at.exception
     assert any("Keep track of new features" in m.value for m in at.markdown)
@@ -455,6 +495,35 @@ def test_spec_boundary_uses_headings_not_inline_text():
     d["goal"] = "Explain ## Living\nwithout treating inline text as a heading"
     text = render(d)
     assert "without treating" in fixed(text)
+
+
+def test_repository_initializes_empty_existing_repo_once():
+    import httpx
+    from types import SimpleNamespace
+    from swarmforge.projects.repository import Repository
+
+    writes = []
+
+    def request(req):
+        if req.method == "GET" and req.url.path == "/repos/owner/inventory":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if req.method == "GET" and req.url.path.endswith("/commits/main"):
+            if writes:
+                return httpx.Response(200, json={"sha": "initial"})
+            return httpx.Response(409, json={"message": "Git Repository is empty."})
+        assert req.method == "PUT" and req.url.path.endswith("/contents/README.md")
+        writes.append(json.loads(req.content))
+        return httpx.Response(201, json={"commit": {"sha": "initial"}})
+
+    repo = Repository.__new__(Repository)
+    repo.repo = "owner/inventory"
+    repo.root = "/repos/" + repo.repo
+    with httpx.Client(base_url="https://fake.test", transport=httpx.MockTransport(request)) as client:
+        repo.gh = SimpleNamespace(_client=client)
+        repo.ensure("existing", "project-id")
+        repo.ensure("existing", "project-id")
+    assert len(writes) == 1
+    assert "branch" not in writes[0] and "sha" not in writes[0]
 
 
 def test_repository_spec_write_uses_approved_fixed_bytes(cfg):

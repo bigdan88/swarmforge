@@ -22,13 +22,13 @@ class Projects:
     def list(self):
         return [self.get(p["id"]) for p in self.store._all("SELECT id FROM projects ORDER BY created_at DESC")]
 
-    def create(self, name="New project"):
+    def create(self, name="New project", *, repo="", greeting=None):
         pid = uuid.uuid4().hex[:12]
         cid = "project-" + pid
         self.store.conversation_create(cid, name)
         self.store._exec("INSERT INTO projects (id,name,repo,conversation_id,budget_usd,created_at,spec,definition) VALUES (?,?,?,?,?,?,?,?)",
-                         (pid, name, "", cid, 0, time.time(), "", "{}"))
-        self.store.conversation_append(cid, "assistant", "Who is this app for, and what are the 3–5 things they must be able to do? We will turn those into milestones, then agree on scope, constraints, budget and done-when checks before launch.")
+                         (pid, name, repo, cid, 0, time.time(), "", "{}"))
+        self.store.conversation_append(cid, "assistant", greeting or "Who is this app for, and what are the 3–5 things they must be able to do? We will turn those into milestones, then agree on scope, constraints, budget and done-when checks before launch.")
         return self.get(pid)
 
     def draft(self, pid, definition):
