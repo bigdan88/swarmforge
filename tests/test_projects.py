@@ -309,7 +309,9 @@ async def test_fixed_spec_edit_is_blocked_before_publication(state, cfg, tmp_pat
     s.queue_update(q, run_id="r")
     repo = tmp_path / "repo"
     (repo / "docs").mkdir(parents=True)
-    (repo / "docs/project-spec.md").write_text(ps.get(pid)["spec"].replace("Track inventory", "Change the scope"))
+    (repo / "docs/project-spec.md").write_bytes(
+        ps.get(pid)["spec"].replace("Track inventory", "Change the scope").encode("utf-8")
+    )
     obj = SimpleNamespace(store=s, run_id="r", issue=Issue("Build", "body"), ws=SimpleNamespace(repo=repo))
     with pytest.raises(GitError, match="fixed spec"):
         await PublicationService.publish(obj, None, "owner", "inventory")
@@ -374,16 +376,27 @@ def test_latest_failed_check_cannot_be_reported_as_passed(state):
 
 
 def test_new_dashboard_pages_and_spec_preview(tmp_path, monkeypatch):
+    import sqlite3
     from streamlit.testing.v1 import AppTest
     from .test_dashboard import APP, _write_cfg, _go
     cfg = _write_cfg(tmp_path, monkeypatch)
-    s = Store(cfg.db_path)
-    ps = Projects(s)
-    p = ps.create()
-    ps.draft(p["id"], definition())
-    s.close()
+    cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(cfg.db_path) as conn:
+        conn.execute("""CREATE TABLE conversations (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at REAL NOT NULL,
+            updated_at REAL NOT NULL, last_run_id TEXT
+        )""")
     at = AppTest.from_file(str(APP), default_timeout=30).run()
     _go(at, "Projects")
+    next(b for b in at.button if b.label == "Start a project").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    s = Store(cfg.db_path)
+    ps = Projects(s)
+    p, = ps.list()
+    assert s.conversation_messages(p["conversation_id"])[0]["content"].startswith("Who is this app for")
+    ps.draft(p["id"], definition())
+    s.close()
+    at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert any(b.label == "Approve and launch" for b in at.button)
     assert any("Track inventory" in m.value for m in at.markdown)

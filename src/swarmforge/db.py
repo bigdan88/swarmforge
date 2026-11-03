@@ -628,10 +628,15 @@ class Store:
 
     # ------------------------------------------------- chat conversations
     def conversation_create(self, conv_id: str, title: str | None = None) -> dict:
-        self._exec("INSERT OR IGNORE INTO conversations (id, title, created_at) VALUES (?, ?, ?)",
-                   (conv_id, title, time.time()))
+        now = time.time()
+        self._exec(
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(id) DO NOTHING",
+            (conv_id, title if title is not None else "New chat", now, now),
+        )
         conv = self.conversation_get(conv_id)
-        assert conv is not None
+        if conv is None:
+            raise RuntimeError("Conversation was removed during creation")
         return conv
 
     def conversation_get(self, conv_id: str) -> dict | None:
@@ -646,8 +651,7 @@ class Store:
         self._exec("DELETE FROM conversations WHERE id = ?", (conv_id,))
 
     def conversation_append(self, conv_id: str, role: str, content: str) -> int:
-        self._exec("INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)",
-                   (conv_id, time.time()))
+        self.conversation_create(conv_id)
         cur = self._exec(
             "INSERT INTO chat_messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
             (conv_id, role, content, time.time()))
