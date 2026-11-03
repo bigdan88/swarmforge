@@ -1,5 +1,7 @@
 # SwarmForge
 
+![SwarmForge — Autonomous software teams](src/swarmforge/resources/brand/banner.png)
+
 An autonomous multi-agent software team built from Chinese open models (Qwen, DeepSeek, Kimi,
 GLM, MiniMax) served by DeepInfra.
 

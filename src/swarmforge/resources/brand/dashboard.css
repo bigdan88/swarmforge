@@ -1,0 +1,47 @@
+/* Keep native Streamlit light/dark surfaces and text; use the supplied art for brand surfaces. */
+[data-testid="stMainBlockContainer"] { max-width: 1500px; padding-top: 2.5rem; padding-bottom: 3rem; }
+[data-testid="stMain"] h1, [data-testid="stMain"] h2 { letter-spacing: -.035em; font-weight: 650; }
+[data-testid="stMain"] h3 { letter-spacing: -.02em; }
+[data-testid="stSidebarContent"] { padding-top: 1.2rem; }
+[data-testid="stAppDeployButton"] { display: none; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .65rem; }
+.sf-sidebar-brand { overflow: hidden; border-radius: 14px; background: #13181d; margin: 0 0 1rem; border: 1px solid rgba(128,128,128,.18); }
+.sf-sidebar-brand img { display: block; width: 100%; height: 94px; object-fit: cover; object-position: center; }
+.sf-brand-tagline { color: #ced0d2; text-align: center; font-size: 8px; font-weight: 600; letter-spacing: .15em; padding: 0 6px 15px; }
+.sf-nav-label { opacity: .7; font-size: .65rem; font-weight: 650; letter-spacing: .12em; padding: .25rem .7rem .15rem; }
+.sf-login-brand { background: #faf9f6; max-width: 380px; border-radius: 14px; overflow: hidden; margin-bottom: 1rem; }
+.sf-login-brand img { display: block; width: 100%; height: 140px; object-fit: cover; }
+.sf-welcome-banner { border-radius: 18px; overflow: hidden; margin: .2rem 0 1.5rem; }
+.sf-welcome-banner img { display: block; width: 100%; height: auto; }
+.sf-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: .35rem 0 1.5rem; }
+.sf-stat { display: flex; flex-direction: column; border: 1px solid rgba(128,128,128,.2); border-radius: 14px; padding: 18px 20px; background: rgba(128,128,128,.035); }
+.sf-stat-label { font-size: .8rem; font-weight: 550; opacity: .72; }
+.sf-stat strong { font-size: 2rem; font-weight: 650; line-height: 1.45; letter-spacing: -.05em; font-variant-numeric: tabular-nums; }
+.sf-stat-caption { font-size: .72rem; opacity: .72; }
+.sf-stat-active { border-top: 3px solid #ee6b30; padding-top: 16px; }
+.sf-stat-waiting { border-top: 3px solid #d8a65e; padding-top: 16px; }
+.sf-stat-done { border-top: 3px solid #59977b; padding-top: 16px; }
+.sf-stat-failed { border-top: 3px solid #bc6a64; padding-top: 16px; }
+button[data-testid="stBaseButton-primary"] { background: #c94c1a; border-color: #c94c1a; color: white; border-radius: 10px; font-weight: 600; box-shadow: 0 2px 5px rgba(0,0,0,.07); }
+button[data-testid="stBaseButton-primary"]:hover { background: #b84012; border-color: #b84012; color: white; }
+button[data-testid="stBaseButton-secondary"] { border-radius: 9px; }
+[data-testid="stApp"] button[data-variant="segmented_control"][aria-checked="true"][data-selected]:not([data-disabled]) { background: rgba(238,107,48,.13); color: inherit; border-color: #da6939; }
+button:focus-visible, a:focus-visible { outline: 2px solid #dc622d; outline-offset: 3px; }
+[data-testid="stExpander"] { border-radius: 12px; }
+[data-testid="stMetric"] { border: 1px solid rgba(128,128,128,.18); border-radius: 12px; padding: 1rem; }
+[data-testid="stMetricValue"] { letter-spacing: -.04em; }
+.st-key-qbar { border-radius: 14px; background: rgba(128,128,128,.025); margin-bottom: .35rem; }
+.st-key-whead { padding-top: .4rem; padding-bottom: .4rem; border-bottom: 1px solid rgba(128,128,128,.2); }
+[class*="st-key-wr_"] { border-bottom: 1px solid rgba(128,128,128,.1); border-radius: 8px; transition: background .15s ease; }
+.st-key-chat_main [data-testid="stChatMessageContent"] h1,
+.st-key-chat_main [data-testid="stChatMessageContent"] h2,
+.st-key-chat_main [data-testid="stChatMessageContent"] h3,
+.st-key-chat_main .st-key-chat_topbar p, .st-key-chat_empty h3 { font-family: inherit; letter-spacing: -.025em; }
+.st-key-chat_rail { border: 1px solid rgba(128,128,128,.14); }
+@media (max-width: 900px) {
+  .sf-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .sf-stat { padding: 14px; }
+  .sf-stat-caption { display: none; }
+  [data-testid="stMainBlockContainer"] { padding-top: 1.5rem; }
+}
+@media (prefers-reduced-motion: reduce) { [class*="st-key-wr_"] { transition: none; } }

@@ -23,6 +23,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from swarmforge import branding
 from swarmforge.config import ConfigError, load_config
 from swarmforge.db import Store
 from swarmforge.knowledge import NOTE_TYPES, Vault, WIKILINK_RE
@@ -212,7 +213,7 @@ TYPE_COLORS = {"decision": "#4c78a8", "pitfall": "#e45756", "pattern": "#54a24b"
                "hub": "#333333", "user-note": "#eeca3b", "failure": "#d62728"}
 ROLE_ICON = {"planner": "🧭", "reviewer": "🔍", "tester": "🧪", "librarian": "📚"}
 
-st.set_page_config(page_title="SwarmForge", page_icon="🐝", layout="wide")
+st.set_page_config(page_title="SwarmForge", page_icon=branding.asset_uri("emblem.png"), layout="wide")
 
 
 def _password_gate() -> None:
@@ -222,7 +223,8 @@ def _password_gate() -> None:
     pw = os.environ.get("SWARMFORGE_DASH_PASSWORD")
     if not pw or st.session_state.get("_authed"):
         return
-    st.title("🐝 SwarmForge")
+    st.markdown(branding.login_logo(), unsafe_allow_html=True)
+    st.title("Sign in to SwarmForge")
     given = st.text_input("Password", type="password", key="_pw")
     if given:
         if hmac.compare_digest(given.encode(), pw.encode()):
@@ -232,6 +234,7 @@ def _password_gate() -> None:
     st.stop()
 
 
+st.markdown(branding.styles(), unsafe_allow_html=True)
 _password_gate()
 
 
@@ -440,13 +443,15 @@ section[data-testid="stSidebar"] [class*="st-key-nav_"] button > div {{ justify-
 section[data-testid="stSidebar"] [class*="st-key-nav_"] button p {{ text-align: left; }}
 section[data-testid="stSidebar"] [class*="st-key-nav_"] button:hover {{ background: rgba(128,128,128,0.12); }}
 section[data-testid="stSidebar"] .st-key-nav_{SLUG[page]} button {{
-    background: rgba(255, 75, 75, 0.12); color: #ff4b4b; font-weight: 600; }}
+    background: rgba(238, 107, 48, 0.13); color: inherit; font-weight: 650;
+    box-shadow: inset 3px 0 0 #ee6b30; }}
 section[data-testid="stSidebar"] [class*="st-key-nav_"] {{ margin-bottom: -0.6rem; }}
 .sf-badge {{ font-size: 0.75rem; opacity: 0.7; }}
 </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("### 🐝 SwarmForge")
+    st.markdown(branding.sidebar_logo(), unsafe_allow_html=True)
+    st.markdown('<div class="sf-nav-label">WORKSPACE</div>', unsafe_allow_html=True)
     badges = _nav_badges()
     for p in PAGES:
         label = p + (f"  ·  {badges[p]}" if badges.get(p) else "")
@@ -1284,7 +1289,7 @@ WORK_CSS = """<style>
 [class*="st-key-op_"] { height: 0 !important; margin-top: -1rem; overflow: visible; }
 [class*="st-key-op_"] button { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0;
                                z-index: 1; cursor: pointer; }
-[class*="st-key-wr_"]:has([class*="st-key-ck_"] input:checked) { background: rgba(255, 75, 75, 0.08); }
+[class*="st-key-wr_"]:has([class*="st-key-ck_"] input:checked) { background: rgba(238, 107, 48, 0.10); }
 [class*="st-key-ck_"], [class*="st-key-ckall"] { position: relative !important; z-index: 2; }
 [class*="st-key-wr_"] p { margin: 0; font-size: 0.9rem; white-space: nowrap; overflow: hidden;
                           text-overflow: ellipsis; }
@@ -1297,8 +1302,8 @@ WORK_CSS = """<style>
            margin: 1.1rem 0 0.1rem 0.25rem; }
 [class*="st-key-wr_"] [data-testid="stMarkdownContainer"] p { line-height: 1.6; }
 [class*="st-key-wr_"] [data-testid="stCheckbox"] label { min-height: 0; }
-[class*="st-key-wopen_"] { border-left: 3px solid #ff4b4b; padding-left: 0.9rem; margin: 0.2rem 0 1rem 0.4rem; }
-[class*="st-key-wsel_"] { background: rgba(255, 75, 75, 0.08) !important; }
+[class*="st-key-wopen_"] { border-left: 3px solid #ee6b30; padding-left: 0.9rem; margin: 0.2rem 0 1rem 0.4rem; }
+[class*="st-key-wsel_"] { background: rgba(238, 107, 48, 0.10) !important; }
 </style>"""
 
 
@@ -1830,6 +1835,7 @@ def welcome_panel(cfg, empty: bool = False) -> None:
     not be patched from outside)."""
     from swarmforge import welcome
 
+    st.markdown(branding.welcome_banner(), unsafe_allow_html=True)
     st.header("Welcome to SwarmForge")
     st.caption("SwarmForge turns an issue into a reviewed branch: plan it, build it in parallel, "
                "test it, review it, repair it, then prepare a draft pull request.")
@@ -1891,7 +1897,7 @@ def _workdir_bytes(path: str) -> int:
 
 def page_work():
     from swarmforge.dashboard_pages.work import render
-    return render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work_list)
+    return render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work_list, collapse_attempts)
 
 
 # ============================================================= FAILURES page
