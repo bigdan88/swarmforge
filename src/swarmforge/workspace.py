@@ -302,8 +302,15 @@ class GitWorkspace:
         if rc == 0:
             raise GitError(f"branch {branch} already exists in {source}; refusing to overwrite it")
         with self._lock:
-            git(self.repo, "push", "--quiet", str(source), f"refs/heads/{branch}:refs/heads/{branch}")
-        return branch
+            last_out = ""
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(0.5 * attempt)
+                rc, last_out = git_rc(self.repo, "push", "--quiet", str(source),
+                                      f"refs/heads/{branch}:refs/heads/{branch}")
+                if rc == 0:
+                    return branch
+        raise GitError(f"push to {source} failed after 3 attempts: {last_out}")
 
     def file_tree(self, path: Path | None = None, limit: int = 400) -> list[str]:
         files = git(path or self.repo, "ls-files").splitlines()
