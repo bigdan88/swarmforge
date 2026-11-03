@@ -1335,7 +1335,7 @@ def _short_result(text: str) -> str:
     return t[:120]
 
 
-def _cells(w: dict) -> dict:
+def _cells(w: dict, costs: dict[str, float]) -> dict:
     r, i = w["run"], w["item"]
     now = ""
     pr = re.search(r"/pull/(\d+)", (r.get("pr_url") or r.get("state_reason") or "")) if r else None
@@ -1349,7 +1349,7 @@ def _cells(w: dict) -> dict:
         now = _short_result(r["state_reason"])
     elif i and i["note"]:
         now = _short_result(i["note"])
-    cost = store.cost_summary(r["id"])["total"] if r else None
+    cost = costs.get(r["id"], 0.0) if r else None
     return {"now": now, "cost": f"${cost:.2f}" if cost is not None else "",
             "time": fmt_dur((r["finished_at"] or time.time()) - r["created_at"]) if r else "",
             "when": fmt_ts(r["created_at"], True)[5:] if r else ""}
@@ -1483,10 +1483,10 @@ def _row_cols(show_repo: bool) -> list[float]:
     return ROW_COLS if show_repo else ROW_COLS[:5] + ROW_COLS[6:]
 
 
-def work_row(w: dict, show_repo: bool = True) -> None:
+def work_row(w: dict, show_repo: bool, costs: dict[str, float]) -> None:
     k = _wkey(w["key"])
     is_open = st.session_state.get("sel_item") == w["key"]
-    cells = _cells(w)
+    cells = _cells(w, costs)
     tries = len(w.get("attempts") or [])
     with st.container(key=f"wr_{k}"):
         c = st.columns(_row_cols(show_repo), vertical_alignment="center", gap="small")
@@ -1590,6 +1590,7 @@ def work_list(items: list[dict], every) -> None:
     project_names = {p["id"]: p["name"] for p in Projects(store).list()}
     if any(w.get("item") and w["item"].get("project_id") for w in shown):
         shown.sort(key=lambda w: ((w.get("item") or {}).get("project_id") or "~", w["order"]))
+    costs = store.run_cost_totals([w["run"]["id"] for w in shown if w["run"]])
     previous_project = None
     for w in shown:
         project_id = (w.get("item") or {}).get("project_id")
@@ -1603,9 +1604,9 @@ def work_list(items: list[dict], every) -> None:
         section = sec
         if (w.get("item") or {}).get("status") == "tentative":
             with st.container(key=f"tentative_{_wkey(w['key'])}"):
-                work_row(w, show_repo)
+                work_row(w, show_repo, costs)
         else:
-            work_row(w, show_repo)
+            work_row(w, show_repo, costs)
         if sel == w["key"]:
             with st.container(key=f"wopen_{_wkey(w['key'])}"):
                 if w.get("attempts"):

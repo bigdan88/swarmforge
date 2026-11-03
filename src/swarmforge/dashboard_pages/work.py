@@ -15,10 +15,11 @@ def render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work
         st.rerun()
     ps = Projects(store)
     items = work_items()
+    has_active_project = store._one("SELECT id FROM projects WHERE status = 'running' LIMIT 1")
 
-    @st.fragment(run_every=3 if auto else None)
+    @st.fragment(run_every=3 if auto and has_active_project else None)
     def project_progress():
-        if not items and work_items():
+        if not items and has_active_project and store._one("SELECT id FROM queue_items LIMIT 1"):
             st.rerun()
         for project in ps.list():
             if project["status"] not in ("running", "waiting_for_you"):
@@ -47,10 +48,11 @@ def render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work
 
     @st.fragment(run_every=every)
     def listing():
-        current = work_items()
+        current = initial_items.pop() if initial_items else work_items()
         visible = [w for w in current if not w["hidden"] and not w["archived"]]
         st.markdown(branding.work_summary(collapse_attempts(visible)), unsafe_allow_html=True)
         work_list(current, every)
+    initial_items = [items]
     listing()
     if cfg is not None:
         st.caption(f"Workspace storage: {_workdir_bytes(str(cfg.workdir)) / 1e6:.1f} MB")

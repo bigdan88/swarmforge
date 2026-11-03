@@ -407,6 +407,18 @@ class Store:
         row["total"] = (row.get("measured") or 0) + (row.get("estimated") or 0)
         return row
 
+    def run_cost_totals(self, run_ids: list[str]) -> dict[str, float]:
+        if not run_ids:
+            return {}
+        placeholders = ",".join("?" for _ in run_ids)
+        rows = self._all(
+            f"SELECT run_id, SUM(cost_usd) AS total FROM llm_calls "
+            f"WHERE run_id IN ({placeholders}) AND cost_source IN ('provider_reported', 'estimated') "
+            "GROUP BY run_id",
+            tuple(run_ids),
+        )
+        return {row["run_id"]: row["total"] or 0.0 for row in rows}
+
     def cost_by_role(self, run_id: str) -> list[dict]:
         return self._all(
             """SELECT role, model, COUNT(*) AS calls,
