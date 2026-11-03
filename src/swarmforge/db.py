@@ -257,6 +257,7 @@ class Store:
         ("queue_items", "queue", "TEXT"),
         ("queue_items", "heal_attempts", "INTEGER"),
         ("runs", "archived", "INTEGER NOT NULL DEFAULT 0"),
+        ("chat_messages", "tool_calls", "TEXT"),
     ]
 
     def _migrate(self) -> None:

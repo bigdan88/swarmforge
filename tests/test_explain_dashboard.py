@@ -203,7 +203,8 @@ def test_run_again_button_on_blocked_and_cancelled(tmp_path, monkeypatch):
     cfg = _write_cfg(tmp_path, monkeypatch)
     store = Store(cfg.db_path)
     _seed(store, "20990101-050000-ffffff", state="BLOCKED", state_reason=BLOCKED_REASON)
-    _seed(store, "20990101-060000-999999", state="CANCELLED", state_reason="interrupted by user")
+    _seed(store, "20990101-060000-999999", state="CANCELLED", state_reason="interrupted by user",
+          issue_title="Add import")  # a different task (same-title attempts fold into one row)
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
     _open(at, "20990101-060000-999999")

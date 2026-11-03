@@ -283,9 +283,33 @@ def validate_notes(data: dict, max_notes: int) -> tuple[list[dict] | None, str |
 def write_distilled(vault: Vault, items: list[dict], *, repo: str, run: str, source: str,
                     existing: list[Note]) -> list[Note]:
     """Write librarian notes, turning link titles into [[stem|title]] wikilinks."""
+    # Exact semantic-text duplicates only. Similar notes remain separate for human review.
+    def fingerprint(body):
+        return " ".join(body.lower().split())
+
+    unique, aliases, pending = [], {}, set()
+    seen = {(n.type, fingerprint(n.body.split("\n\n## Related")[0].split("\n\n## Supporting runs")[0])): n
+            for n in existing if n.repo == repo}
+    for item in items:
+        duplicate = seen.get((item["type"], fingerprint(item["body"])))
+        if duplicate:
+            aliases[item["title"].lower()] = duplicate.stem
+            evidence = f"- Run `{run}` ({source})"
+            if evidence not in duplicate.body:
+                if "\n\n## Supporting runs\n" not in duplicate.body:
+                    duplicate.body += "\n\n## Supporting runs\n"
+                duplicate.body += "\n" + evidence
+                vault.save(duplicate)
+        else:
+            key = (item["type"], fingerprint(item["body"]))
+            if key not in pending:
+                unique.append(item)
+                pending.add(key)
+    items = unique
     vault.root.mkdir(parents=True, exist_ok=True)
     titles = {n.stem: n.title for n in existing}
     lookup = {n.title.lower(): n.stem for n in existing} | {n.stem.lower(): n.stem for n in existing}
+    lookup |= aliases
     stems: dict[str, str] = {}
     for it in items:  # reserve stems first so new notes can link to each other
         stem = vault._new_stem(it["title"])

@@ -6,7 +6,6 @@ transition, runs the tests itself, applies the approval gate and controls GitHub
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import re
 import sys
@@ -30,16 +29,15 @@ from .db import Store
 from .github import GitHubClient, GitHubError, Issue, get_token, load_issue_file, parse_issue_url, push_branch
 from .deps import ensure_deps, plan_install
 from .preflight import environment_problems, sandbox_tool_warnings
-from .visual import is_blocking as is_visual_blocking
 from .repos import RepoError, _redact, auth_args, normalize_repo, preflight
 from .knowledge import NOTES_JSON_SCHEMA, Vault, render_for_prompt, validate_notes, write_distilled
 from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 from .plan import (PLAN_JSON_SCHEMA, REVIEW_JSON_SCHEMA, TEST_REPORT_JSON_SCHEMA, Criterion, Plan,
                    PlanValidationError, Task, validate_plan, validate_review, validate_test_report)
-from .report import build_pr_body, build_summary, write_report, write_summary
+from .report import build_summary, write_report, write_summary
 from .sandbox import Sandbox, make_sandbox
 from .scheduler import Scheduler
-from .state import (RunAborted, RunState, StateMachine, TaskState, finding_in_scope,
+from .state import (RunAborted, RunState, StateMachine, TaskState,
                     normalize_scope_path, out_of_scope_findings, repair_tasks_from_findings)
 from .testing import TestEvidence, evaluate_criteria, run_tests
 from .repolock import blocking_runs, repo_key as lock_key
@@ -71,18 +69,10 @@ class Orchestrator:
                  seed_run_id: str | None = None,
                  heal_of: str | None = None, heal_attempt: int | None = None,
                  heal_context: str | None = None):
-        assert mode in ("swarm", "single")
-        self.cfg = copy.deepcopy(config)  # per-run copy: project profiles may adjust it
+        assert mode in ("swarm", "single", "reviewed")
+        from .effective_config import resolve_variant
+        self.cfg, self._variant_note = resolve_variant(config, store)
         self.store = store
-        self._variant_note = None
-        if self.cfg.active_variant and not self.cfg.variant_applied:
-            from .variants import apply_overlay
-            v = store.variant(self.cfg.active_variant)
-            if v:
-                self.cfg = apply_overlay(self.cfg, v["overlay"], v["id"])
-            else:
-                self._variant_note = f"active_variant {self.cfg.active_variant!r} not found; using the base config"
-                self.cfg.active_variant = None
         self._override_test_command = test_command
         self._override_image = sandbox_image
         self._repo_poll_s = 15.0   # how often a waiting run re-checks whether its repository is free
@@ -138,6 +128,9 @@ class Orchestrator:
             self.log("variant", self._variant_note, level="warn")
         elif self.cfg.active_variant:
             self.log("variant", f"using agent variant {self.cfg.active_variant}")
+        from .effective_config import effective_config, policy_summary
+        (self.run_dir / "effective-config.json").write_text(json.dumps(effective_config(self.cfg), indent=2), encoding="utf-8")
+        self.log("policy", policy_summary(self.cfg))
         self.log("run", f"run {self.run_id} started (mode={self.mode}, budget ${self.cfg.limits.budget_usd:.2f}, "
                         f"sandbox: {self.sandbox.describe()})")
         self._started = time.monotonic()
@@ -355,6 +348,8 @@ class Orchestrator:
                 self.log("repo", f"starting from the previous attempt's result {seed['integration_branch']} "
                                  f"({sha[:8]}); reviews and PRs still compare against {self.ws.base_branch}")
         self._apply_project_profile()
+        from .effective_config import effective_config
+        (self.run_dir / "effective-config.json").write_text(json.dumps(effective_config(self.cfg), indent=2), encoding="utf-8")
         if getattr(self.ws, "source_dirty", False):
             self.log("repo", "source checkout has uncommitted changes; they are NOT included (only "
                              "committed history is cloned)", level="warn")
@@ -417,7 +412,7 @@ class Orchestrator:
             self.sm.transition(RunState.FIX_REQUIRED, f"{len(problems)} blocking problem(s)")
             for p in problems:
                 self.log("gate", p["summary"], level="warn")
-            max_cycles = self.cfg.limits.max_repair_cycles if self.mode == "swarm" else 0
+            max_cycles = self.cfg.limits.max_repair_cycles if self.mode != "single" else 0
             if cycle >= max_cycles:
                 raise RunAborted(RunState.FAILED,
                                  f"repair limit reached ({max_cycles} cycle(s)); "
@@ -525,15 +520,16 @@ class Orchestrator:
                             PLAN_JSON_SCHEMA, v)
 
     async def _make_plan(self, repo_summary: str) -> Plan:
-        if self.mode == "single":
+        if self.mode in ("single", "reviewed"):
             role = self.single_role
-            self.log("plan", f"single-agent mode: one task for role {role}, no planner")
-            return Plan(summary="Single-agent baseline: one developer implements the whole issue.",
+            self.log("plan", f"{self.mode} mode: one task for role {role}, no initial planner")
+            return Plan(summary=f"{self.mode} workflow: one developer implements the whole issue.",
                         tasks=[Task(id="T1", title=self.issue.title, role=role,
                                     description="Implement the entire issue end to end, including tests "
                                                 "and documentation.",
                                     acceptance_criteria=["Everything requested in the issue"])],
-                        acceptance_criteria=[])
+                        acceptance_criteria=([Criterion(id="AC1", text="Everything requested in the issue")]
+                                             if self.mode == "reviewed" else []))
         user = "\n\n".join([
             prompts.render_issue(self.issue.title, self.issue.body),
             prompts.render_repo_summary(repo_summary),
@@ -743,7 +739,7 @@ class Orchestrator:
 
     async def _testing(self, cycle: int) -> tuple[TestEvidence, dict | None]:
         tester_report = None
-        if self.mode == "swarm":
+        if self.mode != "single":
             if cycle == 0 or getattr(self.cfg.limits, "tester_every_cycle", False) \
                     or getattr(self, "_first_tester_report", None) is None:
                 tester_report = await self._run_tester(cycle)
@@ -835,7 +831,7 @@ class Orchestrator:
         by itself: a preview that won't start or a model error is logged and skipped."""
         from . import visual
         pv = getattr(self, "preview", None)
-        if self.mode != "swarm" or pv is None:
+        if self.mode == "single" or pv is None:
             return []
         changed = await asyncio.to_thread(self.ws.changed_files)
         if not visual.should_capture(pv, changed):
@@ -855,7 +851,14 @@ class Orchestrator:
         self.log("visual", f"{sum(1 for s in shots if s['file'])} screenshot(s) taken (cycle {cycle})",
                  data={"cycle": cycle, "shots": [{k: s[k] for k in ("page", "path", "theme", "file", "problems")}
                                                  for s in shots]})
-        findings = visual.page_error_findings(shots)
+        golden_findings: list[dict] = []
+        try:
+            golden_findings = await asyncio.to_thread(visual.golden_gate, shots, self.ws.repo,
+                                                       threshold=visual.DIFF_THRESHOLD)
+        except (OSError, RuntimeError, visual.PreviewError) as e:
+            self.log("visual", f"golden comparison skipped: {e}"[:800], level="warn")
+        self.log("visual", f"golden diff: {len(shots)} tab(s) checked, {len(golden_findings)} regression(s)")
+        findings = golden_findings + visual.page_error_findings(shots)
         role = self.cfg.visual_role
         if role and role in self.cfg.roles and any(s["file"] for s in shots):
             from .llm import model_supports_vision
@@ -881,7 +884,7 @@ class Orchestrator:
                                       line=None, title=f["title"], description=f["description"],
                                       recommendation=f["recommendation"])
         counts = {sv: sum(1 for f in findings if f["severity"] == sv) for sv in visual.SEVERITIES}
-        self.log("visual", f"visual findings: {counts} (only critical blocks)",
+        self.log("visual", f"visual findings: {counts} (critical and golden regressions block)",
                  level="warn" if counts["critical"] else "info")
         return findings
 
@@ -898,6 +901,10 @@ class Orchestrator:
             f"Deterministic test result (executed by the orchestrator): {ev.short()}",
             f"<diff base='{self.ws.base_branch}'>\n{diff}\n</diff>",
             self.knowledge_review_block,
+            ("Repair review: prioritize the corrective diff and unresolved prior findings. Verify each fix, "
+             "check adjacent regressions, and do not repeat resolved findings without new evidence.\n"
+             + json.dumps(self.store.findings(self.run_id)[-30:], default=str)
+             if cycle else "Review changed interfaces and acceptance coverage before style concerns."),
             "The repository you can read with the tools is the integrated result. Review it and call submit_review.",
         ])
         term = TerminalTool("submit_review", "Submit the structured code review.", REVIEW_JSON_SCHEMA,
@@ -929,37 +936,11 @@ class Orchestrator:
                 if normalize_scope_path(f)}
 
     def _gate(self, cycle, ev: TestEvidence, tester_report, review, failed_tasks) -> list[dict]:
-        """Deterministic approval gate. Returns blocking problems (empty == approved)."""
-        problems = []
-        if not ev.ok:
-            problems.append({"kind": "tests", "summary": f"test suite not passing: {ev.short()}",
-                             "detail": ev.failure_report()})
-        for r in getattr(self, "_criteria_results", []):
-            if r["status"] == "failed":
-                problems.append({"kind": "acceptance", "summary": f"acceptance criterion {r['criterion_id']} failing",
-                                 "detail": f"{r['criterion_id']}: {r['text']}\nEvidence: {r['evidence']}"})
-        blocking = set(self.cfg.review.blocking_severities)
-        if review:
-            scope = self._repair_scope()
-            for f in review["findings"]:
-                if f["severity"] in blocking and finding_in_scope(f, scope):
-                    problems.append({"kind": "review", "summary": f"[{f['severity']}] {f['title']} ({f.get('file')})",
-                                     "detail": json.dumps(f, indent=1)})
-        if tester_report:
-            for d in tester_report["defects"]:
-                if d["severity"] in blocking:
-                    problems.append({"kind": "defect", "summary": f"[defect/{d['severity']}] {d['title']}",
-                                     "detail": json.dumps(d, indent=1)})
-        for f in getattr(self, "_visual_findings", None) or []:
-            if is_visual_blocking(f["severity"]):
-                problems.append({"kind": "visual", "summary": f"[visual/{f['severity']}] {f['title']}",
-                                 "detail": json.dumps(f, indent=1)})
-        for tid in failed_tasks:
-            row = next((t for t in self.store.tasks(self.run_id) if t["task_key"] == tid), {})
-            problems.append({"kind": "task", "summary": f"task {tid} did not complete",
-                             "detail": f"Task {tid} ({row.get('title')}) failed: {row.get('error')}\n"
-                                       f"{row.get('description')}"})
-        return problems
+        from .services.assessment import assess_gate
+        return assess_gate(ev, criteria=getattr(self, "_criteria_results", []),
+                           tester_report=tester_report, review=review, failed_tasks=failed_tasks,
+                           task_rows=self.store.tasks(self.run_id), scope=self._repair_scope(),
+                           visual_findings=getattr(self, "_visual_findings", []), policy=self.cfg.review)
 
     # ================================================================ delivery
     async def _deliver(self) -> None:
@@ -970,18 +951,10 @@ class Orchestrator:
         owner = issue.owner or (self.ref.owner if getattr(self, "ref", None) else None)
         name = issue.repo or (self.ref.name if getattr(self, "ref", None) else None)
         if not owner:
-            src = Path(self.source)
-            if src.is_dir() and (src / ".git").exists():
-                try:
-                    branch = await asyncio.to_thread(self.ws.deliver_to_local, src)
-                    self.log("pr", f"result delivered as new branch '{branch}' in {src}. Review with "
-                                   f"`git diff {self.ws.base_branch}...{branch}` and merge it yourself.")
-                    self.sm.transition(RunState.COMPLETED, f"approved; delivered to branch {branch} in {src}")
-                    return
-                except GitError as e:
-                    self.log("pr", f"could not deliver branch to {src}: {e}", level="warn")
-            self.log("pr", f"local issue: no PR. Result is on branch {self.ws.integration_branch} in {self.ws.repo}")
-            self.sm.transition(RunState.COMPLETED, f"approved; local run, branch {self.ws.integration_branch}")
+            from .services.delivery import deliver_local
+            outcome = await deliver_local(self.ws, self.source)
+            self.log("pr", outcome.warning or outcome.reason, level="warn" if outcome.warning else "info")
+            self.sm.transition(RunState.COMPLETED, outcome.reason)
             return
         if not self.cfg.github.create_pr:
             self.sm.transition(RunState.COMPLETED, "approved; PR creation disabled in config")
@@ -1002,71 +975,19 @@ class Orchestrator:
         else:
             self.sm.transition(RunState.COMPLETED, "approved; push declined by user, PR not created")
 
+    def _publication_service(self):
+        from .services.publication import PublicationService
+        return PublicationService(cfg=self.cfg, store=self.store, run_id=self.run_id,
+                                  issue=self.issue, ws=self.ws, llm=self.llm, log=self.log,
+                                  update_base=self._update_with_base, push=push_branch,
+                                  protected_paths=getattr(self, "protected_paths", []),
+                                  approve=getattr(self, "approve", None))
+
     async def _auto_merge(self, gh: GitHubClient, repo: str, url: str) -> None:
-        """Merge the PR now if the auto_merge rules (or, for larger changes, the judge model) allow it.
-        Never changes the run's outcome; every decision is recorded for the Pull requests page."""
-        from . import automerge as am
-        amc = self.cfg.auto_merge
-        if not am.repo_enabled(self.cfg, repo):
-            return
-        info: dict = {"repo": repo, "url": url, "title": self.issue.title}
-        try:
-            info["number"] = number = int(url.rstrip("/").split("/")[-1])
-            pr = await asyncio.to_thread(am.get_pr, gh, repo, number)
-            files = await asyncio.to_thread(am.pr_files, gh, repo, number)
-            info["node_id"] = pr.node_id
-            lines = pr.additions + pr.deletions
-            run = self.store.get_run(self.run_id)
-            open_findings = [f for f in self.store.findings(self.run_id) if f["cycle"] == run["repair_cycle"]]
-            tests = [t for t in self.store.test_runs(self.run_id) if t["label"] != "baseline"]
-            tests_ok = bool(tests) and tests[-1]["exit_code"] == 0
-            d = am.rule_decision(run, tests_ok, open_findings, files, lines, getattr(self, "protected_paths", []),
-                                 amc.max_lines, amc.judge_max_lines)
-            if d is None:
-                role = amc.judge_role if amc.judge_role in self.cfg.roles else "planner"
-                t = tests[-1]
-                diff = await asyncio.to_thread(self.ws.diff)
-                msgs = am.judge_messages(prompts.MERGE_JUDGE_SYSTEM, self.issue.title, self.issue.body, files, lines,
-                                         diff, open_findings,
-                                         f"exit {t['exit_code']}: {t['passed']} passed, {t['failed']} failed")
-                res = await self.llm.chat(role, msgs, task_key="merge-judge")
-                ok, risk, why = am.parse_judgement(res.content)
-                d = am.Decision(ok, f"{lines}-line change; {self.cfg.roles[role].model.split('/')[-1]} judged "
-                                    f"risk {risk}: {why}", lines, judged=True, risk=risk)
-            info.update(lines=d.lines, reason=d.reason, judged=d.judged, risk=d.risk)
-            if d.merge:
-                info["sha"] = await asyncio.to_thread(am.apply, gh, pr, amc.method)
-                self.store.record_intervention(self.run_id, am.MERGED, json.dumps(info))
-                self.store.update_run(self.run_id, state_reason=f"draft PR created: {url} · auto-merged")
-                self.log("merge", f"auto-merged {url}: {d.reason}")
-                return
-        except (GitHubError, LLMError, ValueError, KeyError, OSError) as e:
-            info["reason"] = f"could not auto-merge: {e}"[:600]
-        self.store.record_intervention(self.run_id, am.HELD, json.dumps(info))
-        self.log("merge", f"waiting for you to merge {url}: {info.get('reason')}", level="warn")
+        await self._publication_service()._auto_merge(gh, repo, url)
 
     async def publish(self, gh: GitHubClient, owner: str, name: str) -> str | None:
-        issue, ws = self.issue, self.ws
-        full = f"{owner}/{name}"
-        if self.cfg.github.require_push_approval:
-            q = (f"Push branch '{ws.integration_branch}' to {full} and open a DRAFT pull request "
-                 f"against '{ws.base_branch}'?")
-            self.log("pr", f"waiting for human approval: {q}")
-            approved = bool(self.approve and await asyncio.to_thread(self.approve, q))
-            self.store.record_intervention(self.run_id, "push_approval",
-                                           f"{'approved' if approved else 'declined'}: {q}")
-            if not approved:
-                return None
-        await asyncio.to_thread(push_branch, ws.repo, owner, name, ws.integration_branch,
-                                gh.token, ws.base_branch, self.cfg.github.branch_prefix)
-        self.log("pr", f"pushed {ws.integration_branch} to {full}")
-        body = build_pr_body(self.store, self.run_id)
-        title = f"[SwarmForge] {issue.title}" + (f" (#{issue.number})" if issue.number else "")
-        url = await asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
-                                      ws.base_branch, title, body)
-        self.store.update_run(self.run_id, pr_url=url)
-        self.log("pr", f"draft pull request: {url}")
-        return url
+        return await self._publication_service().publish(gh, owner, name)
 
     # =============================================================== knowledge
     def _apply_project_profile(self) -> None:
@@ -1607,7 +1528,10 @@ class Orchestrator:
             on_event=lambda kind, msg, data: self.log("agent", msg, task_key=key, role=role, data=data))
         self.log("agent", f"start ({rc.model}{', Pi harness' if use_pi else ''})", task_key=key, role=role)
         try:
-            res = await (self._run_pi(spec, rc) if use_pi else run_agent(self.llm, spec))
+            from .agent.harness import FunctionHarness
+            harness = FunctionHarness((lambda spec: self._run_pi(spec, rc)) if use_pi
+                                      else (lambda spec: run_agent(self.llm, spec)))
+            res = await harness.run(spec)
         finally:
             await ctx.aclose()   # stop processes/browser session the agent left running
         self.log("agent", f"end: {res.status} after {res.steps} step(s), {res.tool_calls} tool call(s), "
@@ -1684,13 +1608,6 @@ def _revert_non_test_changes(path: Path) -> list[str]:
 
 
 def _config_snapshot(cfg: Config) -> dict:
-    return {
-        "roles": {k: {"provider": v.provider, "model": v.model, "temperature": v.temperature,
-                      "max_steps": v.max_steps,
-                      "reasoning_effort": v.reasoning_effort or cfg.reasoning_effort} for k, v in cfg.roles.items()},
-        "developer_roles": cfg.developer_roles,
-        "limits": asdict(cfg.limits),
-        "sandbox": {"mode": cfg.sandbox.mode, "image": cfg.sandbox.image, "network": cfg.sandbox.network},
-        "test_command": cfg.project.test_command,
-        "review": {"blocking_severities": list(cfg.review.blocking_severities)},
-    }
+    from .effective_config import effective_config
+    # Keep the historical test-command field for existing metrics/report readers.
+    return {**effective_config(cfg), "test_command": cfg.project.test_command}

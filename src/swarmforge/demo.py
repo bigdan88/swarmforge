@@ -105,9 +105,27 @@ def seed(path: str | Path) -> Path:
         st.queue_update(qid, status=status,
                         run_id="20261101-143000-3c4d5e" if status == "running" else None)
     st.remember_repo(REPO)
+    _seed_chat(st)
     st.close()
     write_config(path.parent / "swarmforge.yaml", path.parent)
     return path
+
+
+def _seed_chat(st: Store) -> None:
+    """One demo chat conversation with a persisted tool call, so the Chat page
+    shows a real caption. Guarded so seeding never breaks the demo CLI."""
+    try:
+        from . import chatbot
+        conv = chatbot.ensure_default_conversation(st)
+        chatbot.add_message(st, conv["id"], "user", "What files are in the repo?")
+        chatbot.add_message(
+            st, conv["id"], "assistant",
+            "The repository contains the README and the `src/` source tree.",
+            tool_calls=[{"name": "list_files", "args": {"path": "."},
+                        "output": "README.md\nsrc/"}],
+        )
+    except Exception:  # noqa: BLE001 - demo seeding must never fail the CLI
+        pass
 
 
 def write_config(dest: Path, workdir: Path) -> Path:

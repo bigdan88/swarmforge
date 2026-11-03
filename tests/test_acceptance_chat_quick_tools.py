@@ -267,8 +267,8 @@ def test_ac3_apptest_no_expander_when_tools_used_empty(tmp_path, monkeypatch):
 
 
 def test_ac4_default_config_registers_fetch_url(cfg):
-    assert cfg.chatbot.tools == ["fetch_url"]
-    assert build_chat_registry(cfg).names() == ["fetch_url"]
+    assert cfg.chatbot.tools is None
+    assert set(build_chat_registry(cfg).names()) == {"fetch_url", "list_files", "repo_tree", "repo_file", "repo_search", "repo_issues"}
 
 
 def test_ac4_empty_tools_list_yields_empty_registry(tmp_path, monkeypatch):
@@ -290,10 +290,10 @@ def test_ac4_only_listed_tools_are_registered(tmp_path, monkeypatch):
 
 def test_ac4_example_yaml_has_chatbot_tools_section():
     raw = yaml.safe_load((ROOT / "swarmforge.example.yaml").read_text(encoding="utf-8"))
-    assert raw["chatbot"]["tools"] == ["fetch_url"]
+    assert raw["chatbot"]["tools"] is None
     cfg = parse_config(raw)
-    assert cfg.chatbot.tools == ["fetch_url"]
-    assert build_chat_registry(cfg).names() == ["fetch_url"]
+    assert cfg.chatbot.tools is None
+    assert set(build_chat_registry(cfg).names()) == {"fetch_url", "list_files", "repo_tree", "repo_file", "repo_search", "repo_issues"}
 
 
 # ================================================= AC5: trace + tools_used

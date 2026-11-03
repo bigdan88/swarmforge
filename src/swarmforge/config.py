@@ -136,22 +136,29 @@ class GitHubConfig:
 class AutoMergeConfig:
     """Merge the swarm's pull requests without waiting for you (off by default).
 
-    Small changes that passed everything merge straight away; larger ones are judged by a model
-    (`judge_role`). Never auto-merged: unresolved [major] findings, conflicts, failing checks, and any
-    file the repository lists under `protected_paths` in swarmforge.project.yml. Nothing restarts:
-    you still pick when to Update & restart."""
+    Small, clean changes merge straight away. Larger ones, ones with unresolved [major] findings and
+    ones touching the repository's protected_paths go to a judge model (protected files need a LOW risk
+    verdict). A conflict is resolved by merging the latest base in and re-testing. A PR that is still
+    held gets one automatic fix-up task that continues its code and replaces it; only then does it
+    wait for you. Nothing restarts: you still pick when to Update & restart."""
     enabled: bool = False
     repos: list[str] = field(default_factory=list)   # owner/name; empty = every repository
     max_lines: int = 400          # added + deleted lines that merge without asking the judge
     judge_role: str = "reviewer"  # model that decides on larger changes
     judge_max_lines: int = 3000   # bigger than this always waits for you
     method: str = "squash"        # squash | merge | rebase
+    protected: str = "judge"      # PRs touching protected_paths: "judge" (needs a LOW-risk verdict) | "hold"
+    major_findings: str = "judge" # PRs with unresolved [major] findings: "judge" (judge sees them) | "hold"
+    auto_fix: bool = True         # a held PR gets one automatic fix-up task that replaces it
+    fix_attempts: int = 1         # fix-up rounds before a PR really waits for you
 
 
 @dataclass
 class ReviewConfig:
     blocking_severities: list[str] = field(default_factory=lambda: ["critical", "major"])
     allow_same_model_review: bool = False
+    require_junit: bool = False  # compatibility opt-out for non-JUnit projects
+    require_verified_criteria: bool = False
 
 
 @dataclass
@@ -189,12 +196,22 @@ class ChatConfig:
     """Chatbot per-conversation context window."""
     context_max_messages: int = 12
     context_max_tokens: int = 4000
+    tools_enabled: bool = True
+    max_tool_rounds: int = 5
 
 
 @dataclass
 class ChatbotConfig:
-    """Chatbot feature flags: which tools the chat may register."""
-    tools: list[str] = field(default_factory=lambda: ["fetch_url"])
+    """Optional tool allowlist plus a separate opt-in for local shell/file tools."""
+    enable_shell: bool = False
+    tools: list[str] | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.enable_shell, bool):
+            raise ConfigError("chatbot.enable_shell must be a boolean")
+        if self.tools is not None and (not isinstance(self.tools, list) or
+                                       not all(isinstance(name, str) for name in self.tools)):
+            raise ConfigError("chatbot.tools must be a list of names or null")
 
 
 @dataclass
@@ -261,6 +278,9 @@ def _build(dc, data: dict | None, ctx: str):
 def parse_config(raw: dict, source_path: Path | None = None) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
+    if raw.get("team_profile"):
+        from .team_profile import apply_team_profile
+        raw = apply_team_profile(raw, source_path)
     providers = {}
     for name, p in (raw.get("providers") or {}).items():
         providers[name] = _build(ProviderConfig, {"name": name, **(p or {})}, f"providers.{name}")
@@ -320,6 +340,9 @@ EFFORTS = ("none", "low", "medium", "high")
 
 
 def validate_config(cfg: Config) -> None:
+    for name in ("require_junit", "require_verified_criteria"):
+        if not isinstance(getattr(cfg.review, name), bool):
+            raise ConfigError(f"review.{name} must be true or false")
     for where, eff in [("reasoning_effort", cfg.reasoning_effort),
                        *[(f"roles.{n}.reasoning_effort", r.reasoning_effort) for n, r in cfg.roles.items()]]:
         if eff is not None and eff not in EFFORTS:
@@ -342,6 +365,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("chat.context_max_messages must be between 1 and 200")
     if not 256 <= cfg.chat.context_max_tokens <= 200000:
         raise ConfigError("chat.context_max_tokens must be between 256 and 200000")
+    if cfg.chat.max_tool_rounds < 1:
+        raise ConfigError("chat.max_tool_rounds must be at least 1")
     sh = cfg.self_heal
     if not 0 <= sh.max_attempts <= 5:
         raise ConfigError("self_heal.max_attempts must be between 0 and 5")

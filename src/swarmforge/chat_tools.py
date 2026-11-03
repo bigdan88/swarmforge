@@ -52,6 +52,12 @@ class ToolRegistry:
         """Registered tool names, in registration order."""
         return list(self._tools)
 
+    def restrict(self, names: list[str] | None) -> None:
+        """An absent allowlist preserves registered tools; [] disables all of them."""
+        if names is not None:
+            allowed = set(names)
+            self._tools = {name: spec for name, spec in self._tools.items() if name in allowed}
+
     def schemas(self) -> list[dict]:
         """OpenAI function schemas for all registered tools."""
         return [
@@ -94,6 +100,7 @@ async def chat_with_tools(
     *,
     max_rounds: int = 4,
     task_key: str = "chatbot",
+    on_tool: Callable[[str, dict, str], Any] | None = None,
     trace: list | None = None,
 ) -> str:
     """Run a tool-calling conversation loop and return the final text answer.
@@ -101,11 +108,6 @@ async def chat_with_tools(
     The caller's `messages` list is never mutated. If the model is still calling
     tools after `max_rounds` rounds, one final call without tools asks it to
     answer with what it has.
-
-    `trace` is an optional list the caller supplies; when given, one entry
-    `{"name", "args", "ok", "preview"}` is appended after each executed tool
-    call (ok=False when the tool returned an ERROR string). Behavior is
-    unchanged when trace is None.
     """
     if max_rounds < 1:
         raise ValueError("max_rounds must be >= 1")
@@ -133,14 +135,12 @@ async def chat_with_tools(
                 args = {}
             out = await registry.execute(name, args)
             if trace is not None:
-                trace.append(
-                    {
-                        "name": name,
-                        "args": args,
-                        "ok": not out.startswith("ERROR:"),
-                        "preview": out[:160],
-                    }
-                )
+                trace.append({"name": name, "args": args, "ok": not out.startswith("ERROR:"), "preview": out[:160]})
+            if on_tool is not None:
+                try:
+                    on_tool(name, args, out)
+                except Exception:  # noqa: BLE001, S110 - a broken UI callback must not break the loop
+                    pass
             work.append(
                 {
                     "role": "tool",

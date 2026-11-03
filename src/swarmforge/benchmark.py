@@ -8,6 +8,7 @@ Fairness rules:
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import shutil
@@ -18,9 +19,24 @@ from .config import Config
 from .db import Store
 from .sandbox import make_sandbox
 from .testing import run_tests
-from .workspace import git
+from .workspace import GitWorkspace, git
 
 HIDDEN_DIR = "swarmforge_hidden_acceptance"
+
+
+async def freeze_source(cfg: Config, source: str, destination: Path, *, base_ref: str | None = None) -> GitWorkspace:
+    """Resolve/authenticate once, then keep an immutable checkout for every comparison mode."""
+    from .github import get_token
+    from .repos import auth_args, normalize_repo, preflight
+    token = get_token(cfg.github)
+    ref = normalize_repo(source)
+    if base_ref:
+        ref.branch = base_ref
+    ref = await asyncio.to_thread(preflight, ref, token)
+    frozen = GitWorkspace(destination, "benchmark-source", cfg.github.branch_prefix)
+    auth = ["-c", "credential.helper=", *(auth_args(ref.source, token) if ref.use_auth else [])]
+    await asyncio.to_thread(frozen.prepare, ref.source, None, ref.branch, auth)
+    return frozen
 
 
 async def evaluate_hidden(cfg: Config, run: dict, acceptance: Path, label: str) -> dict:
@@ -78,9 +94,14 @@ async def run_benchmark(cfg: Config, store: Store, *, issue: str, repo: str, acc
     if acc_dir and not acc_dir.is_dir():
         print(f"acceptance directory not found: {acc_dir}")
         return 2
+    frozen = None
+    if modes:
+        frozen = await freeze_source(cfg, repo, cfg.workdir / "benchmarks" / f"source-{datetime.now():%Y%m%d-%H%M%S-%f}")
+        repo = str(frozen.repo)
     for mode in modes:
         c = copy.deepcopy(cfg)
         c.github.create_pr = False
+        c.auto_merge.enabled = False
         c.knowledge.enabled = False  # identical starting knowledge for every mode; no notes written
         print(f"\n===== benchmark: {mode} =====")
         orch = Orchestrator(c, store, mode=mode, single_role=single_role, approve=lambda q: False)
@@ -88,6 +109,7 @@ async def run_benchmark(cfg: Config, store: Store, *, issue: str, repo: str, acc
         run_id = await orch.execute(issue_url=issue if is_url else None, issue_file=None if is_url else issue,
                                     repo=repo)
         m = metrics(store, run_id)
+        m["base_commit"] = frozen.base_sha
         if acc_dir:
             m["hidden_acceptance"] = await evaluate_hidden(c, store.get_run(run_id), acc_dir, mode)
         results.append(m)
