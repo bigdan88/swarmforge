@@ -34,6 +34,7 @@ def effective_config(cfg: Config) -> dict:
                   for name, role in cfg.roles.items()},
         "developer_roles": list(cfg.developer_roles),
         "limits": asdict(cfg.limits),
+        "projects": asdict(cfg.projects),
         "sandbox": {"mode": cfg.sandbox.mode, "image": cfg.sandbox.image,
                     "network": cfg.sandbox.network},
         "pi": {"network": cfg.pi.network, "relay_host": cfg.pi.relay_host},

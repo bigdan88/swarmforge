@@ -22,6 +22,11 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
         st.header("Chat: improve SwarmForge and fix failed tasks")
         st.caption("Ask about runs, failures and what to improve. Suggestions come with buttons to launch tasks "
                    "or pick how a failed task should be fixed. CLI: `swarmforge ask \"…\"`.")
+        if st.button("Start a project", icon=":material/flag:"):
+            from swarmforge.projects.store import Projects
+            st.session_state.project_id = Projects(store).create()["id"]
+            st.session_state.goto = "Projects"
+            st.rerun()
         active_id = _chat_conv_id()
         rail, main = page.columns([1, 3.2], gap="large")
 

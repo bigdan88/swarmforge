@@ -113,6 +113,18 @@ class WatchConfig:
 
 
 @dataclass
+class ProjectsConfig:
+    horizon: int = 3
+    max_task_failures: int = 2
+    escalate_budget_factor: float = 2.0
+    escalate_failures: int = 3
+
+    def __post_init__(self):
+        if not 1 <= self.horizon <= 3 or self.max_task_failures < 1 or self.escalate_failures < 2 or self.escalate_budget_factor < 1:
+            raise ConfigError("projects: invalid horizon, failure thresholds or budget factor")
+
+
+@dataclass
 class ProjectConfig:
     test_command: str = "python -m pytest -q"
     agent_test_command: str | None = None  # quicker suite agents run while working (optional)
@@ -224,6 +236,7 @@ class Config:
     chatbot: ChatbotConfig = field(default_factory=ChatbotConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
+    projects: ProjectsConfig = field(default_factory=ProjectsConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
@@ -313,6 +326,7 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         chatbot=_build(ChatbotConfig, raw.get("chatbot"), "chatbot"),
         sandbox=_build(SandboxConfig, raw.get("sandbox"), "sandbox"),
         project=_build(ProjectConfig, raw.get("project"), "project"),
+        projects=_build(ProjectsConfig, raw.get("projects"), "projects"),
         github=_build(GitHubConfig, raw.get("github"), "github"),
         review=_build(ReviewConfig, raw.get("review"), "review"),
         knowledge=_build(KnowledgeConfig, raw.get("knowledge"), "knowledge"),
