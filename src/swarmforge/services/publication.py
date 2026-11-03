@@ -148,6 +148,14 @@ class PublicationService:
 
     async def publish(self, gh: GitHubClient, owner: str, name: str) -> str | None:
         issue, ws = self.issue, self.ws
+        project_item = self.store._one("SELECT project_id FROM queue_items WHERE run_id=? AND project_id IS NOT NULL", (self.run_id,))
+        if project_item:
+            from ..projects.spec import fixed
+            from ..projects.store import Projects
+            p = Projects(self.store).get(project_item["project_id"])
+            spec = ws.repo / p["spec_path"]
+            if not spec.exists() or fixed(spec.read_bytes().decode("utf-8")) != fixed(p["spec"]):
+                raise GitError("Project task changed or removed the approved fixed spec; publication refused")
         if not ws.integration_branch or not ws.base_branch:
             raise GitError("cannot publish a workspace without integration and base branches")
         full = f"{owner}/{name}"

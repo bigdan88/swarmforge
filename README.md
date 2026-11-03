@@ -5,6 +5,10 @@
 An autonomous multi-agent software team built from Chinese open models (Qwen, DeepSeek, Kimi,
 GLM, MiniMax) served by DeepInfra.
 
+Use **Projects** to turn an approved app spec into a rolling milestone plan. Open **What's new**
+for searchable, plain-language feature highlights and links to each change. See the
+[Projects and feature history guide](docs/PROJECTS.md) for the workflow, CLI and current boundaries.
+
 **You give it a GitHub issue URL → a planner breaks it into a task graph → two coding agents
 work in parallel in isolated git worktrees → their work is merged → a test engineer writes
 acceptance tests → the orchestrator runs the tests itself → an independent reviewer reviews the

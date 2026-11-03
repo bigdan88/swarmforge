@@ -38,6 +38,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid #dc622d; outline-offs
 .st-key-chat_main [data-testid="stChatMessageContent"] h3,
 .st-key-chat_main .st-key-chat_topbar p, .st-key-chat_empty h3 { font-family: inherit; letter-spacing: -.025em; }
 .st-key-chat_rail { border: 1px solid rgba(128,128,128,.14); }
+[class*="st-key-tentative_"] { opacity: .6; }
 @media (max-width: 900px) {
   .sf-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .sf-stat { padding: 14px; }

@@ -12,6 +12,13 @@ providers:
 # Any role can use any model; one model may serve several roles.
 # Model ids must exactly match DeepInfra's catalogue (run `swarmforge check` to verify).
 roles:
+  lead:                 # short rolling-wave project planning calls; planner is used when absent
+    provider: deepinfra
+    model: Qwen/Qwen3.5-397B-A17B
+    fallback_models: [Qwen/Qwen3.8-Max]
+    temperature: 0.2
+    timeout_s: 900
+    max_output_tokens: 16384
   planner:              # Engineering Manager: analysis, task graph, corrective planning
     provider: deepinfra
     model: Qwen/Qwen3.5-397B-A17B
@@ -74,6 +81,12 @@ roles:
     max_output_tokens: 4096
 
 developer_roles: [developer_backend, developer_frontend]
+
+projects:
+  horizon: 3
+  max_task_failures: 2
+  escalate_budget_factor: 2.0
+  escalate_failures: 3
 
 # Models allowed to receive image blocks (list-content chat messages). Matched case-
 # insensitively as exact ids or substrings. Models not listed are vision-capable only if
