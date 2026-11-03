@@ -107,9 +107,17 @@ class TestExpandUrls:
         assert "https://example.com/3" not in hint
         assert "https://example.com/4" not in hint
 
+    def test_mentioning_fetch_url_still_gets_hint(self):
+        text = (
+            "Does fetch_url support POST? Here is the endpoint: https://example.com/api"
+        )
+        out = expand_prompt(text)
+        assert out.startswith(text)
+        assert "[chat quick-action] Detected link(s): https://example.com/api." in out
+
     def test_no_double_hint(self):
-        text = "use fetch_url on https://example.com/a"
-        assert expand_prompt(text) == text
+        once = expand_prompt("read https://example.com/a please")
+        assert expand_prompt(once) == once
 
     def test_idempotent(self):
         once = expand_prompt("read https://example.com/a please")
