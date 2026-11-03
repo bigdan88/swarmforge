@@ -61,8 +61,8 @@ def test_file_mutex_stale_lock_is_broken(tmp_path: Path, monkeypatch):
 
 
 def test_browser_slot_returns_usable_context_manager(request):
-    cm = request.getfixturevalue("browser_slot")
-    with cm:
+    slot = request.getfixturevalue("browser_slot")  # factory
+    with slot():
         pass  # acquiring and releasing must not raise on any platform
 
 
