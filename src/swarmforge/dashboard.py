@@ -213,7 +213,7 @@ TYPE_COLORS = {"decision": "#4c78a8", "pitfall": "#e45756", "pattern": "#54a24b"
                "hub": "#333333", "user-note": "#eeca3b", "failure": "#d62728"}
 ROLE_ICON = {"planner": "🧭", "reviewer": "🔍", "tester": "🧪", "librarian": "📚"}
 
-st.set_page_config(page_title="SwarmForge", page_icon=branding.asset_uri("emblem.png"), layout="wide")
+st.set_page_config(page_title="SwarmForge", page_icon=branding.asset_bytes("emblem.png"), layout="wide")
 
 
 def _password_gate() -> None:
@@ -223,7 +223,8 @@ def _password_gate() -> None:
     pw = os.environ.get("SWARMFORGE_DASH_PASSWORD")
     if not pw or st.session_state.get("_authed"):
         return
-    st.markdown(branding.login_logo(), unsafe_allow_html=True)
+    with st.container(key="sf-login-brand"):
+        st.image(branding.asset_bytes("wordmark.png"), width="stretch")
     st.title("Sign in to SwarmForge")
     given = st.text_input("Password", type="password", key="_pw")
     if given:
@@ -456,7 +457,9 @@ section[data-testid="stSidebar"] [class*="st-key-nav_"] {{ margin-bottom: -0.6re
 </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown(branding.sidebar_logo(), unsafe_allow_html=True)
+    with st.container(key="sf-sidebar-brand"):
+        st.image(branding.asset_bytes("lockup-dark.png"), width="stretch")
+        st.markdown('<div class="sf-brand-tagline">AUTONOMOUS SOFTWARE TEAMS</div>', unsafe_allow_html=True)
     st.markdown('<div class="sf-nav-label">WORKSPACE</div>', unsafe_allow_html=True)
     badges = _nav_badges()
     for p in PAGES:
@@ -1134,6 +1137,7 @@ def work_items() -> list[dict]:
     from swarmforge.runqueue import lane as _lane
     waiting_pos: dict[int, int] = {}
     per_lane: dict[str, int] = {}
+    running_by_lane = {_lane(q): q for q in queue if q["status"] == "running"}
     for q in queue:
         if q["status"] == "queued":
             per_lane[_lane(q)] = per_lane.get(_lane(q), 0) + 1
@@ -1160,6 +1164,7 @@ def work_items() -> list[dict]:
             grp, icon, label = "failed", QSTATUS.get(i["status"], "❌"), i["status"].title()
         out.append({"key": f"q:{i['id']}", "group": grp, "icon": icon, "status": label, "title": i["title"],
                     "repo": i["repo"], "item": i, "run": r, "merge": merges.get(r["id"]) if r else None,
+                    "waiting_on": running_by_lane.get(_lane(i)) if i["status"] == "queued" else None,
                     "when": (r["created_at"] if r else i.get("created_at")) or 0,
                     "order": waiting_pos.get(i["id"], 0), "hidden": False,
                     "archived": bool(r.get("archived")) if r else False})
@@ -1333,7 +1338,7 @@ def _short_result(text: str) -> str:
     return t[:120]
 
 
-def _cells(w: dict) -> dict:
+def _cells(w: dict, costs: dict[str, float]) -> dict:
     r, i = w["run"], w["item"]
     now = ""
     pr = re.search(r"/pull/(\d+)", (r.get("pr_url") or r.get("state_reason") or "")) if r else None
@@ -1347,7 +1352,7 @@ def _cells(w: dict) -> dict:
         now = _short_result(r["state_reason"])
     elif i and i["note"]:
         now = _short_result(i["note"])
-    cost = store.cost_summary(r["id"])["total"] if r else None
+    cost = costs.get(r["id"], 0.0) if r else None
     return {"now": now, "cost": f"${cost:.2f}" if cost is not None else "",
             "time": fmt_dur((r["finished_at"] or time.time()) - r["created_at"]) if r else "",
             "when": fmt_ts(r["created_at"], True)[5:] if r else ""}
@@ -1481,10 +1486,10 @@ def _row_cols(show_repo: bool) -> list[float]:
     return ROW_COLS if show_repo else ROW_COLS[:5] + ROW_COLS[6:]
 
 
-def work_row(w: dict, show_repo: bool = True) -> None:
+def work_row(w: dict, show_repo: bool, costs: dict[str, float]) -> None:
     k = _wkey(w["key"])
     is_open = st.session_state.get("sel_item") == w["key"]
-    cells = _cells(w)
+    cells = _cells(w, costs)
     tries = len(w.get("attempts") or [])
     with st.container(key=f"wr_{k}"):
         c = st.columns(_row_cols(show_repo), vertical_alignment="center", gap="small")
@@ -1494,7 +1499,11 @@ def work_row(w: dict, show_repo: bool = True) -> None:
                       f"**{w['title'] or '(untitled)'}**"
                       + (f" <span class='sf-tries' title='earlier attempts of this task are folded into this row'>"
                          f"×{tries + 1}</span>" if tries else ""), unsafe_allow_html=True)
-        c[3].markdown(w["status"])
+        blocker = w.get("waiting_on")
+        if blocker:
+            c[3].markdown(f"Waiting on #{blocker['id']}", help=blocker["title"])
+        else:
+            c[3].markdown(w["status"])
         c[4].markdown(cells["now"] or " ")
         rest = c[5:]
         if show_repo:
@@ -1560,6 +1569,14 @@ def work_list(items: list[dict], every) -> None:
     if not shown:
         st.caption("No tasks match.")
         return
+    history_limit = st.session_state.get("work_history_limit", 25)
+    history = [w for w in shown if w["group"] in ("done", "failed")]
+    if len(history) > history_limit:
+        visible_history = {w["key"] for w in history[:history_limit]}
+        shown = [w for w in shown if w["group"] not in ("done", "failed") or w["key"] in visible_history]
+        if st.button(f"Show more finished tasks ({history_limit} of {len(history)} shown)", key="work_more_history"):
+            st.session_state.work_history_limit = history_limit + 25
+            st.rerun(scope="app")
     bulk_bar(shown)
     show_repo = len({_short_repo(w["repo"]).lower() for w in shown}) > 1
     keys = [_wkey(w["key"]) for w in shown]
@@ -1584,6 +1601,7 @@ def work_list(items: list[dict], every) -> None:
     project_names = {p["id"]: p["name"] for p in Projects(store).list()}
     if any(w.get("item") and w["item"].get("project_id") for w in shown):
         shown.sort(key=lambda w: ((w.get("item") or {}).get("project_id") or "~", w["order"]))
+    costs = store.run_cost_totals([w["run"]["id"] for w in shown if w["run"]])
     previous_project = None
     for w in shown:
         project_id = (w.get("item") or {}).get("project_id")
@@ -1597,9 +1615,9 @@ def work_list(items: list[dict], every) -> None:
         section = sec
         if (w.get("item") or {}).get("status") == "tentative":
             with st.container(key=f"tentative_{_wkey(w['key'])}"):
-                work_row(w, show_repo)
+                work_row(w, show_repo, costs)
         else:
-            work_row(w, show_repo)
+            work_row(w, show_repo, costs)
         if sel == w["key"]:
             with st.container(key=f"wopen_{_wkey(w['key'])}"):
                 if w.get("attempts"):
@@ -1782,6 +1800,8 @@ def item_detail(w: dict, every) -> None:
         bits.append(f"run `{r['id']}`")
     bits.append(f"repo `{w['repo']}`")
     st.caption(" · ".join(bits))
+    if blocker := w.get("waiting_on"):
+        st.info(f"Waiting for task #{blocker['id']} to leave this queue slot. {blocker['title']}")
     if i and i["status"] != "queued":
         extra = []
         if i["base_branch"]:
@@ -1863,7 +1883,8 @@ def welcome_panel(cfg, empty: bool = False) -> None:
     not be patched from outside)."""
     from swarmforge import welcome
 
-    st.markdown(branding.welcome_banner(), unsafe_allow_html=True)
+    with st.container(key="sf-welcome-banner"):
+        st.image(branding.asset_bytes("banner.png"), width="stretch")
     st.header("Welcome to SwarmForge")
     st.caption("SwarmForge turns an issue into a reviewed branch: plan it, build it in parallel, "
                "test it, review it, repair it, then prepare a draft pull request.")

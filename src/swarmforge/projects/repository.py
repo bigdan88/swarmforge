@@ -29,13 +29,25 @@ class Repository:
             owner, name = self.repo.split("/")
             me = self.request("GET", "/user")["login"]
             endpoint = "/user/repos" if me.lower() == owner.lower() else f"/orgs/{owner}/repos"
-            self.request("POST", endpoint, json={"name": name, "private": True, "auto_init": True, "description": "SwarmForge project " + pid})
+            info = self.request("POST", endpoint, json={"name": name, "private": True, "auto_init": True, "description": "SwarmForge project " + pid})
         elif r.status_code >= 400:
             raise ProjectError(f"Repository unavailable: HTTP {r.status_code}")
-        elif kind == "new":
+        else:
+            info = r.json()
             # Retry after a crash is safe, but do not adopt an unrelated existing repository.
-            if r.json().get("description") != "SwarmForge project " + pid:
+            if kind == "new" and info.get("description") != "SwarmForge project " + pid:
                 raise ProjectError("The requested new repository already exists; choose existing or a different name")
+
+        head = self.root + "/commits/" + quote(info["default_branch"], safe="")
+        response = self.gh._client.get(head)
+        if response.status_code == 409 and response.json().get("message") == "Git Repository is empty.":
+            # Omitting the branch lets GitHub create the default branch on the first commit.
+            self.request("PUT", self.root + "/contents/README.md", json={
+                "message": "Initialize project repository",
+                "content": base64.b64encode(f"# {self.repo.split('/')[-1]}\n".encode("utf-8")).decode("ascii"),
+            })
+        elif response.status_code >= 400:
+            raise ProjectError(f"GitHub GET {head}: HTTP {response.status_code}")
 
     def snapshot(self):
         info = self.request("GET", self.root)
