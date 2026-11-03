@@ -12,6 +12,13 @@ providers:
 # Any role can use any model; one model may serve several roles.
 # Model ids must exactly match DeepInfra's catalogue (run `swarmforge check` to verify).
 roles:
+  lead:                 # short rolling-wave project planning calls; planner is used when absent
+    provider: deepinfra
+    model: Qwen/Qwen3.5-397B-A17B
+    fallback_models: [Qwen/Qwen3.8-Max]
+    temperature: 0.2
+    timeout_s: 900
+    max_output_tokens: 16384
   planner:              # Engineering Manager: analysis, task graph, corrective planning
     provider: deepinfra
     model: Qwen/Qwen3.5-397B-A17B
@@ -75,6 +82,12 @@ roles:
 
 developer_roles: [developer_backend, developer_frontend]
 
+projects:
+  horizon: 3
+  max_task_failures: 2
+  escalate_budget_factor: 2.0
+  escalate_failures: 3
+
 # Models allowed to receive image blocks (list-content chat messages). Matched case-
 # insensitively as exact ids or substrings. Models not listed are vision-capable only if
 # their name hints at it (vision, -vl, vl-, omni, 4o, 4v, image, multimodal); images sent to
@@ -123,6 +136,8 @@ github:
 
 review:
   blocking_severities: [critical, major]
+  require_junit: true
+  require_verified_criteria: true
   allow_same_model_review: false
 
 knowledge:                    # Zettelkasten shared by all runs (Obsidian-compatible Markdown)
@@ -149,9 +164,12 @@ approval:
 chat:                   # chatbot per-conversation context window (top-level; not the roles.chat role)
   context_max_messages: 12   # newest N messages of a conversation kept in the prompt
   context_max_tokens: 4000  # estimated-token budget for the conversation history
+  tools_enabled: true   # give the chat model web + filesystem tools (fetch_url, list_files)
+  max_tool_rounds: 5       # tool-call rounds per answer; must be >= 1
 
-chatbot:                  # chatbot feature switches (top-level; not the roles.chat role)
-  tools: [fetch_url]      # tools the Chat page may call; empty list = no tools
+chatbot:
+  enable_shell: false   # local file and command access requires explicit opt-in
+  tools: null           # null preserves available tools; [] disables all; [fetch_url] allows only URL fetches
 
 # `swarmforge watch`: label a GitHub issue to hand it to the swarm. It is queued, labelled
 # swarmforge:queued -> working -> done/failed, and gets a comment with the summary and the draft PR.
@@ -176,10 +194,10 @@ pi:
 # Where clones, worktrees, transcripts, logs and the SQLite DB live.
 workdir: ~/.swarmforge
 
-# Merge the swarm's pull requests without waiting for you (off by default). Small changes that passed
-# everything merge at once; larger ones only if the judge model approves. Never merged automatically:
-# unresolved [major] findings, conflicts, failing checks, and the repository's protected_paths
-# (swarmforge.project.yml). SwarmForge doesn't restart afterwards. Decisions + Revert: Pull requests page.
+# Merge the swarm's pull requests without waiting for you (off by default). Small clean changes merge
+# at once; larger ones, open [major] findings and core files (protected_paths in swarmforge.project.yml)
+# go to the judge model. Conflicts are resolved against the latest base and re-tested. A held PR gets
+# one fix-up task that replaces it. No restart. Decisions + Merge/Fix/Close/Revert: Pull requests page.
 auto_merge:
   enabled: false
   repos: []              # owner/name; empty = every repository
@@ -187,3 +205,7 @@ auto_merge:
   judge_role: reviewer   # decides on larger changes
   judge_max_lines: 3000  # bigger than this always waits for you
   method: squash
+  protected: judge       # PRs touching protected_paths: judge (needs a LOW-risk verdict) | hold
+  major_findings: judge  # PRs with open [major] findings: judge (sees them) | hold
+  auto_fix: true         # a held PR gets one fix-up task that continues its code and replaces it
+  fix_attempts: 1

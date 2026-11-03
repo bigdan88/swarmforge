@@ -7,7 +7,7 @@ from tests.conftest import base_raw
 
 def test_default_tools(tmp_path):
     cfg = parse_config(base_raw(tmp_path / "work"))
-    assert cfg.chatbot.tools == ["fetch_url"]
+    assert cfg.chatbot.tools is None
 
 
 def test_empty_tools(tmp_path):

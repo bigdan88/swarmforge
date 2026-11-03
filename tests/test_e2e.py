@@ -17,6 +17,26 @@ from .conftest import ISSUE, FakeProvider
 pytestmark = pytest.mark.slow
 
 
+@pytest.fixture(autouse=True)
+def _serialize_full_swarm_runs(request):
+    """Serialize real full-swarm runs across pytest-xdist workers.
+
+    A swarm run spawns git worktrees, nested pytest runs and many short-lived
+    subprocesses; several xdist workers doing that at once exhausts OS threads
+    ('unable to create thread: Resource temporarily unavailable'), which is the
+    flake the old xdist_group workaround only papered over. Heavy runs (the
+    ones that operate on a real repo) share the same cross-process lock the
+    browser tests use, so they take turns while the other workers keep chewing
+    through the fast unit tests.
+    """
+    if "sample_repo" not in request.fixturenames:
+        yield
+        return
+    browser_slot = request.getfixturevalue("browser_slot")
+    with browser_slot():
+        yield
+
+
 def _provider():
     return FakeProvider({
         "qwen-fake": fake_team.planner,
@@ -317,6 +337,9 @@ async def test_environment_problems_block_before_any_work(cfg, sample_repo, monk
 
 
 async def test_continue_from_stopped_run(cfg, sample_repo):
+    # this test runs TWO full swarms back-to-back; give each attempt a realistic
+    # wall-clock budget so shared CI runners cannot trip the 300 s watchdog
+    cfg.limits.max_runtime_s = 1200
     cfg.limits.max_repair_cycles = 0          # first attempt stops at the review's major finding
     store, first, _ = await _run(cfg, sample_repo)
     r1 = store.get_run(first)
@@ -377,6 +400,9 @@ async def test_live_settings_and_runtime_watchdog(cfg):
 async def test_failed_run_gets_postmortem_and_heals_itself(cfg, sample_repo):
     from swarmforge.knowledge import Vault
     from swarmforge.postmortem import heal
+    # a failed run plus its self-heal attempt is TWO full swarms; double the
+    # watchdog budget so contention cannot flip this test to a timeout failure
+    cfg.limits.max_runtime_s = 1200
     cfg.limits.max_repair_cycles = 0  # the first attempt fails on the README review finding
     cfg.self_heal.max_attempts = 2
     store = Store(cfg.db_path)

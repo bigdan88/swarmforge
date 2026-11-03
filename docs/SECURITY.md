@@ -8,14 +8,14 @@ they do not eliminate it.
 
 | Risk | Safeguard |
 |---|---|
-| Agent commands touching the host | Every `run_command` (and every orchestrator test run) executes in a fresh Docker container: only the task worktree is bind-mounted, `--network none`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--read-only` root filesystem with a size-limited `/tmp` tmpfs, `--pids-limit`, `--memory`, `--cpus`, non-root `--user`, no Docker socket, no host environment variables. Containers are killed on timeout and on run cancel/timeout (label `swarmforge.run=<id>`). |
+| Agent commands touching the host | In Docker mode, commands execute in disposable containers, with long-lived per-agent sessions when enabled. Containers use `--cap-drop ALL`, `--security-opt no-new-privileges`, a read-only root filesystem, a size-limited `/tmp`, process/memory/CPU limits and a non-root user; no Docker socket or host environment is passed through. Worktrees and explicit artifact/cache mounts provide writable storage. Built-in sessions and orchestrator tests use `sandbox.network` (default `none`); Pi sessions use `pi.network` (default `bridge`). Cleanup handles session completion, timeout and cancellation. Local mode has no container isolation. |
 | Agents editing files outside their workspace | File tools resolve paths and reject absolute paths, `..` escapes, symlink escapes and anything under `.git`. Each worktree is leased to one task. |
 | Overwriting the user's work | The source repository is never modified: SwarmForge clones it into `<workdir>/runs/<id>/repo` (uncommitted local changes are not even copied, and a warning is logged). |
 | Credential leakage | API keys live only in the orchestrator process (`.env` / environment). They are never written into workspaces, never passed to containers, and `LocalSandbox` strips every env var whose name contains KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH. The GitHub token is passed to `git push` as a one-off `http.extraheader` (never stored in `.git/config`) and is redacted from error messages. |
 | Protected branches / destructive pushes | Branches must start with `github.branch_prefix` (`swarmforge/`); names like `main`, `master`, `develop`, `release` are refused; pushes are never forced and SwarmForge refuses to push if the remote branch already exists. |
-| Unreviewed changes reaching the repo | Only draft PRs are created, only after the deterministic gate approves, and by default only after a human types `y` (recorded as an intervention). SwarmForge has no merge code path. |
+| Unreviewed changes reaching the repo | Delivery creates draft PRs after the configured gate passes. Push approval is enabled in the example but can be disabled or pre-approved. Auto-merge is off by default; when enabled for a repository, `automerge.py` can merge eligible PRs after rule checks and, where required, model judgment. The dashboard also supports manual merges. Protected files and major findings can be configured to hold or go to the judge; they are not unconditional vetoes. |
 | LLMs faking success | Test results come from the orchestrator executing the test command and parsing JUnit; a run with 0 executed tests is not a pass. State transitions are code-owned and allow-listed. Reviewer and implementer models must differ unless explicitly overridden. |
-| Prompt injection via issue/repo text | System prompts label all issue/repo/tool content as untrusted data. More importantly, the enforcement above does not depend on the model obeying: an injected instruction cannot grant network access, widen file access, push, or change the gate. |
+| Prompt injection via issue/repo text | Prompts label issue/repo/tool content as untrusted. Container restrictions and code-owned gates apply independently of model instructions. However, Pi bridge sessions already have network connectivity, and model judgments can affect review and auto-merge decisions. File-tool path checks apply to SwarmForge's file tools; shell execution is bounded by the container and its mounts. |
 | Runaway cost or time | Shared run budget checked before every model call (provider-reported cost, else estimated); per-agent step and wall-clock limits; whole-run `max_runtime_s`; `max_repair_cycles`; `max_concurrent_agents`. |
 | Tester weakening the implementation | Changes the tester makes outside test files are reverted before its work is merged. |
 
@@ -29,13 +29,29 @@ they do not eliminate it.
   git hooks are not used by SwarmForge but a script you run might be). Review the diff before
   running the result outside the sandbox.
 * **`sandbox.mode: local` provides no isolation.** It exists only for machines without Docker.
-* **The dependency install step has network access.** `pip install` runs packages' build code,
+* **Network access depends on the execution path.** Built-in sessions and orchestrator test
+  containers use `sandbox.network`, default `none`. Pi uses `pi.network`, default `bridge`, to
+  reach the host model relay; shell commands and `sf` tools in that session share its network.
+  Bridge mode is not restricted to the relay and can permit internet and reachable host/LAN
+  access. `PI_OFFLINE=1` is a harness setting, not a network firewall. For offline agent execution,
+  select `runtime: builtin` and `sandbox.network: none`. Restricting Pi to only the relay requires
+  additional network controls outside the current implementation.
+* **The dependency install step also has network access.** `pip install` runs packages' build code,
   and agents choose what goes into requirements.txt, so a prompt-injected agent could pull a
   malicious package. That code runs in the same locked-down container (no credentials,
   non-root, read-only root fs, only the worktree mounted) but can reach the internet during the
   install. Set `sandbox.dependency_install: false` (and use a custom image with dependencies
-  preinstalled) if that's unacceptable. Regular agent commands and tests always run with
-  `--network none`.
+  preinstalled) to disable this path. This does not disable Pi session networking.
+* **The Pi relay is a host service.** Pi receives a per-agent relay token, not the provider key.
+  If `pi.relay_host: 0.0.0.0` is needed for Docker Desktop, the relay listens on all interfaces;
+  use host firewall rules to limit who can reach it. A relay token is still a credential and should
+  not be shared or published in artifacts.
+* **Local policy can allow autonomous delivery.** As of 2026-11-02, this checkout's git-ignored
+  `swarmforge.yaml` disables push approval and enables auto-merge for `bigdan88/swarmforge`,
+  but now holds protected files and major findings for human review. It blocks critical and major
+  findings and requires JUnit plus verified acceptance criteria.
+  This differs from the example configuration. Review the effective configuration before relying
+  on human approval or a particular finding severity as a gate.
 * **Model providers see your code.** Issue text and repository content are sent to DeepInfra (or
   whichever provider you configure). Don't use SwarmForge on code you can't share with them.
 * **The knowledge base is a persistence channel.** Notes written by the librarian are derived
