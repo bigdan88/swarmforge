@@ -213,7 +213,7 @@ TYPE_COLORS = {"decision": "#4c78a8", "pitfall": "#e45756", "pattern": "#54a24b"
                "hub": "#333333", "user-note": "#eeca3b", "failure": "#d62728"}
 ROLE_ICON = {"planner": "🧭", "reviewer": "🔍", "tester": "🧪", "librarian": "📚"}
 
-st.set_page_config(page_title="SwarmForge", page_icon=branding.asset_uri("emblem.png"), layout="wide")
+st.set_page_config(page_title="SwarmForge", page_icon=branding.asset_bytes("emblem.png"), layout="wide")
 
 
 def _password_gate() -> None:
@@ -223,7 +223,8 @@ def _password_gate() -> None:
     pw = os.environ.get("SWARMFORGE_DASH_PASSWORD")
     if not pw or st.session_state.get("_authed"):
         return
-    st.markdown(branding.login_logo(), unsafe_allow_html=True)
+    with st.container(key="sf-login-brand"):
+        st.image(branding.asset_bytes("wordmark.png"), width="stretch")
     st.title("Sign in to SwarmForge")
     given = st.text_input("Password", type="password", key="_pw")
     if given:
@@ -456,7 +457,9 @@ section[data-testid="stSidebar"] [class*="st-key-nav_"] {{ margin-bottom: -0.6re
 </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown(branding.sidebar_logo(), unsafe_allow_html=True)
+    with st.container(key="sf-sidebar-brand"):
+        st.image(branding.asset_bytes("lockup-dark.png"), width="stretch")
+        st.markdown('<div class="sf-brand-tagline">AUTONOMOUS SOFTWARE TEAMS</div>', unsafe_allow_html=True)
     st.markdown('<div class="sf-nav-label">WORKSPACE</div>', unsafe_allow_html=True)
     badges = _nav_badges()
     for p in PAGES:
@@ -1566,6 +1569,14 @@ def work_list(items: list[dict], every) -> None:
     if not shown:
         st.caption("No tasks match.")
         return
+    history_limit = st.session_state.get("work_history_limit", 25)
+    history = [w for w in shown if w["group"] in ("done", "failed")]
+    if len(history) > history_limit:
+        visible_history = {w["key"] for w in history[:history_limit]}
+        shown = [w for w in shown if w["group"] not in ("done", "failed") or w["key"] in visible_history]
+        if st.button(f"Show more finished tasks ({history_limit} of {len(history)} shown)", key="work_more_history"):
+            st.session_state.work_history_limit = history_limit + 25
+            st.rerun(scope="app")
     bulk_bar(shown)
     show_repo = len({_short_repo(w["repo"]).lower() for w in shown}) > 1
     keys = [_wkey(w["key"]) for w in shown]
@@ -1872,7 +1883,8 @@ def welcome_panel(cfg, empty: bool = False) -> None:
     not be patched from outside)."""
     from swarmforge import welcome
 
-    st.markdown(branding.welcome_banner(), unsafe_allow_html=True)
+    with st.container(key="sf-welcome-banner"):
+        st.image(branding.asset_bytes("banner.png"), width="stretch")
     st.header("Welcome to SwarmForge")
     st.caption("SwarmForge turns an issue into a reviewed branch: plan it, build it in parallel, "
                "test it, review it, repair it, then prepare a draft pull request.")
