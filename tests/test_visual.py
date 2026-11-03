@@ -319,6 +319,49 @@ def test_seed_demo_fills_every_page_and_needs_no_config(tmp_path):
 
     c = load_config(str(tmp_path / "d" / "swarmforge.yaml"))
     assert c.db_path == tmp_path / "d" / "swarmforge.db" and "designer" in c.roles
+    msgs = st._all("SELECT * FROM chat_messages")
+    seeded = [
+        m for m in msgs
+        if m["role"] == "assistant" and m["tool_calls"] and "fetch_url" in m["tool_calls"]
+    ]
+    assert seeded, "demo seeding must persist an assistant message with fetch_url tool_calls"
+
+
+def test_demo_seeded_chat_page_shows_tools_used_widget(tmp_path, monkeypatch):
+    """The screenshot state: fresh load of the Chat page against the demo DB
+    shows the assistant bubble and the collapsible 'Tools used' expander."""
+    import streamlit as st_
+    from streamlit.testing.v1 import AppTest
+
+    from swarmforge.demo import seed
+
+    st_.cache_resource.clear()
+    db = tmp_path / "swarmforge.db"
+    seed(db)
+    for k, v in {
+        "SWARMFORGE_CONFIG": str(tmp_path / "swarmforge.yaml"),
+        "SWARMFORGE_DB": str(db),
+        "SWARMFORGE_DASH_AUTOREFRESH": "0",
+    }.items():
+        monkeypatch.setenv(k, v)
+    at = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "src" / "swarmforge" / "dashboard.py"),
+        default_timeout=60,
+    )
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    nav = next(b for b in at.button if b.key == "nav_chat")
+    nav.click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    md = " ".join(m.value for m in at.markdown)
+    assert "quickstart guide" in md  # the seeded assistant answer renders
+    expanders = [e for e in at.expander if "Tools used" in e.label]
+    assert len(expanders) == 1, [e.label for e in at.expander]
+    assert "1" in expanders[0].label
+    body = " ".join(
+        m.value for m in expanders[0].markdown
+    ) + " " + " ".join(c.value for c in expanders[0].caption)
+    assert "fetch_url" in body
 
 
 def test_run_page_shows_screenshots_and_visual_findings(tmp_path, monkeypatch):
@@ -382,3 +425,26 @@ def test_run_page_shows_screenshots_and_visual_findings(tmp_path, monkeypatch):
     md = " ".join(m.value for m in at.markdown)
     assert "Label cut off" in md and "Looks tidy." in " ".join(i.value for i in at.info)
     assert len(at.get("image")) >= 2  # light + dark side by side
+
+
+def test_quick_action_caption_is_visible_in_rendered_chat_page(tmp_path, monkeypatch):
+    """AC5: on a fresh Chat-page load (no interaction beyond navigation) the
+    'Quick actions' caption mentioning fetch_url and the slash-commands is visible."""
+    from streamlit.testing.v1 import AppTest
+
+    from .test_dashboard import APP, _go, _write_cfg
+
+    _write_cfg(tmp_path, monkeypatch)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    _go(at, "Chat")
+    assert not at.exception, [e.value for e in at.exception]
+    assert any(
+        "Quick actions" in c.value
+        and "/repo" in c.value
+        and "/code" in c.value
+        and "/issues" in c.value
+        and "fetch_url" in c.value
+        for c in at.caption
+    ), [c.value for c in at.caption]
