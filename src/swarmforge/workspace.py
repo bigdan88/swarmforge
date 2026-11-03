@@ -14,6 +14,7 @@ import asyncio
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,18 +40,40 @@ class StaleSeed(GitError):
         self.conflicts = conflicts or []
 
 
+# Transient resource errors worth retrying (e.g. under heavy parallel load).
+_TRANSIENT_GIT_ERRORS = ("unable to create thread", "Resource temporarily unavailable",
+                         "fork failed", "cannot fork", "Cannot allocate memory",
+                         "git-pack-objects died", "bad pack header")
+_GIT_MAX_ATTEMPTS = 5
+
+
+def _run_git_subprocess(cwd: Path, args: tuple[str, ...], env: dict | None,
+                        check: bool) -> tuple[int, str, str]:
+    """Run git, retrying transient resource errors with 0.1s -> 1.6s backoff."""
+    for attempt in range(1, _GIT_MAX_ATTEMPTS + 1):
+        p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env)
+        if p.returncode == 0:
+            return p.returncode, p.stdout, p.stderr
+        combined = p.stdout + p.stderr
+        if attempt < _GIT_MAX_ATTEMPTS and any(t in combined for t in _TRANSIENT_GIT_ERRORS):
+            time.sleep(min(0.1 * 2 ** (attempt - 1), 1.6))
+            continue
+        break
+    if check:
+        raise GitError(f"git {' '.join(args)} failed ({p.returncode}): "
+                       f"{p.stderr.strip() or p.stdout.strip()}")
+    return p.returncode, p.stdout, p.stderr
+
+
 def git(cwd: Path, *args: str, check: bool = True, env: dict | None = None) -> str:
-    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", env=env)
-    if check and p.returncode != 0:
-        raise GitError(f"git {' '.join(args)} failed ({p.returncode}): {p.stderr.strip() or p.stdout.strip()}")
-    return p.stdout
+    _, out, _ = _run_git_subprocess(cwd, args, env, check)
+    return out
 
 
 def git_rc(cwd: Path, *args: str) -> tuple[int, str]:
-    p = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    return p.returncode, (p.stdout + p.stderr)
+    rc, out, err = _run_git_subprocess(cwd, args, None, False)
+    return rc, out + err
 
 
 @dataclass
@@ -279,8 +302,15 @@ class GitWorkspace:
         if rc == 0:
             raise GitError(f"branch {branch} already exists in {source}; refusing to overwrite it")
         with self._lock:
-            git(self.repo, "push", "--quiet", str(source), f"refs/heads/{branch}:refs/heads/{branch}")
-        return branch
+            last_out = ""
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(0.5 * attempt)
+                rc, last_out = git_rc(self.repo, "push", "--quiet", str(source),
+                                      f"refs/heads/{branch}:refs/heads/{branch}")
+                if rc == 0:
+                    return branch
+        raise GitError(f"push to {source} failed after 3 attempts: {last_out}")
 
     def file_tree(self, path: Path | None = None, limit: int = 400) -> list[str]:
         files = git(path or self.repo, "ls-files").splitlines()

@@ -4,6 +4,12 @@ SwarmForge can take an issue about its own code, run the whole team on it, and h
 back to your NiBot folder as a git branch. You review it and merge it yourself; nothing changes in
 your working copy until you do.
 
+That workflow describes a local-folder target. When targeting `bigdan88/swarmforge` through
+GitHub, this checkout's local configuration can push and auto-merge without a human prompt.
+Protected files and major findings are now held for human review under the local policy. The running checkout
+changes only when you update it; see [delivery](../README.md#when-a-run-finishes).
+For proposed quality experiments and refactoring work, see [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md).
+
 ```
 dashboard "New run" (repo = NiBot) → disposable clone of NiBot → planner / developers / tester / reviewer
    → SwarmForge's own test suite runs in the dev sandbox → gate approves
@@ -34,9 +40,10 @@ test_command: PYTHONPATH=/workspace/src python -m pytest -q -p no:cacheprovider 
 sandbox_image: swarmforge-dev-sandbox:latest
 ```
 
-Only those two keys are ever read from a repository. Network, budget, limits and every other
-safety setting come only from your own `swarmforge.yaml`, and a repository can't make
-SwarmForge pull an image it hasn't been told to build.
+The repository profile also supports `agent_test_command`, `agent_env`, `install_command`,
+`description`, `preview` and `protected_paths`. Global network, budget, limits and approval/merge
+policy come from your own `swarmforge.yaml`. Protected paths are interpreted by that merge policy;
+the local `protected: hold` setting prevents automatic merging of core changes.
 
 ## Each improvement
 
@@ -96,8 +103,8 @@ deliver and the reviewer will keep finding problems.
 
 ## Safety notes specific to self-modification
 
-* The running SwarmForge never edits itself: agents work on a disposable clone, and the result
-  only reaches your code when you merge a branch.
+* Agents work on a disposable clone. Local-folder results arrive as branches for you to merge;
+  GitHub results can be auto-merged when enabled. Updating the running checkout is a separate step.
 * Review diffs to `orchestrator.py`, `sandbox.py`, `github.py`, `workspace.py` and
   `agent/tools.py` with particular care: those files enforce the safety gates. A green test
   suite is evidence, not proof.

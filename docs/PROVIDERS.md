@@ -32,10 +32,11 @@ Model ids must match DeepInfra's catalogue exactly. List what is available today
 python -c "import httpx;[print(m['id'], (m.get('metadata') or {}).get('pricing')) for m in httpx.get('https://api.deepinfra.com/v1/openai/models').json()['data'] if any(k in m['id'] for k in ('Qwen','deepseek','moonshot','zai-org','MiniMax'))]"
 ```
 
-Defaults (verified with `check --live` on 2026-10-30; prices are USD per 1M input/output tokens
-at that date):
+Historical example-team measurements (verified with `check --live` on 2026-10-30; prices are USD
+per 1M input/output tokens at that date, not current price guarantees). These models remain in
+`swarmforge.example.yaml`; the dated local team is listed in the [README](../README.md):
 
-| Role | Default model | Price in/out | Cheaper alternative | Stronger alternative |
+| Role | Example model | Historical price in/out | Alternative | Alternative |
 |---|---|---|---|---|
 | planner | `Qwen/Qwen3.5-397B-A17B` | 0.45 / 3.00 | `Qwen/Qwen3.8-Flash` | `Qwen/Qwen3.8-Max` |
 | developer_backend | `deepseek-ai/DeepSeek-V4-Pro` | 1.30 / 2.60 | `deepseek-ai/DeepSeek-V4-Flash` | — |

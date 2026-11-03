@@ -123,6 +123,8 @@ github:
 
 review:
   blocking_severities: [critical, major]
+  require_junit: true
+  require_verified_criteria: true
   allow_same_model_review: false
 
 knowledge:                    # Zettelkasten shared by all runs (Obsidian-compatible Markdown)
@@ -149,6 +151,8 @@ approval:
 chat:                   # chatbot per-conversation context window (top-level; not the roles.chat role)
   context_max_messages: 12   # newest N messages of a conversation kept in the prompt
   context_max_tokens: 4000  # estimated-token budget for the conversation history
+  tools_enabled: true   # give the chat model web + filesystem tools (fetch_url, list_files)
+  max_tool_rounds: 5       # tool-call rounds per answer; must be >= 1
 
 chatbot:                  # chatbot tool gating
   enable_shell: false     # register run_command / read_file / grep (local files, sandboxed shell) in the chat
@@ -176,10 +180,10 @@ pi:
 # Where clones, worktrees, transcripts, logs and the SQLite DB live.
 workdir: ~/.swarmforge
 
-# Merge the swarm's pull requests without waiting for you (off by default). Small changes that passed
-# everything merge at once; larger ones only if the judge model approves. Never merged automatically:
-# unresolved [major] findings, conflicts, failing checks, and the repository's protected_paths
-# (swarmforge.project.yml). SwarmForge doesn't restart afterwards. Decisions + Revert: Pull requests page.
+# Merge the swarm's pull requests without waiting for you (off by default). Small clean changes merge
+# at once; larger ones, open [major] findings and core files (protected_paths in swarmforge.project.yml)
+# go to the judge model. Conflicts are resolved against the latest base and re-tested. A held PR gets
+# one fix-up task that replaces it. No restart. Decisions + Merge/Fix/Close/Revert: Pull requests page.
 auto_merge:
   enabled: false
   repos: []              # owner/name; empty = every repository
@@ -187,3 +191,7 @@ auto_merge:
   judge_role: reviewer   # decides on larger changes
   judge_max_lines: 3000  # bigger than this always waits for you
   method: squash
+  protected: judge       # PRs touching protected_paths: judge (needs a LOW-risk verdict) | hold
+  major_findings: judge  # PRs with open [major] findings: judge (sees them) | hold
+  auto_fix: true         # a held PR gets one fix-up task that continues its code and replaces it
+  fix_attempts: 1

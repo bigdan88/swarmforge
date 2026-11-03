@@ -163,6 +163,8 @@ class DockerSandbox(Sandbox):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             Path(td, "Dockerfile").write_text(text)
+            constraints = resources.files("swarmforge").joinpath("resources/constraints-linux.txt").read_text(encoding="utf-8-sig")
+            Path(td, "constraints-linux.txt").write_text(constraints, encoding="utf-8")
             args = [self.cfg.docker_binary, "build", "--progress=plain"]
             for k, v in build_args.items():
                 args += ["--build-arg", f"{k}={v}"]

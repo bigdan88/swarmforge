@@ -1,0 +1,36 @@
+description: Local team snapshot, 2026-11-02; model availability must be checked live.
+roles:
+  planner:
+    model: Qwen/Qwen3.8-Flash
+    fallback_models: [Qwen/Qwen3.8-Max]
+    runtime: builtin
+    max_steps: 30
+    timeout_s: 900
+  developer_backend:
+    model: zai-org/GLM-5.3
+    fallback_models: [zai-org/GLM-5.2]
+    runtime: pi
+    max_steps: 45
+    timeout_s: 600
+  developer_frontend:
+    model: zai-org/GLM-5.3
+    fallback_models: [XiaomiMiMo/MiMo-V2.6-Flash]
+    runtime: pi
+    max_steps: 45
+    timeout_s: 600
+  reviewer:
+    model: moonshotai/Kimi-K2.6
+    fallback_models: [deepseek-ai/DeepSeek-V4-Pro]
+    runtime: builtin
+    max_steps: 15
+  tester:
+    model: Qwen/Qwen3.8-Flash
+    fallback_models: [MiniMaxAI/MiniMax-M3]
+    runtime: builtin
+  librarian:
+    model: deepseek-ai/DeepSeek-V4-Flash
+    fallback_models: [Qwen/Qwen3.8-Flash]
+    runtime: builtin
+  designer:
+    model: Qwen/Qwen3-VL-235B-A22B-Instruct
+    runtime: builtin

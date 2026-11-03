@@ -24,7 +24,7 @@ def test_enable_shell_defaults_to_false(tmp_path, monkeypatch):
 
 def test_default_registry_has_only_fetch_url(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path, monkeypatch, enable_shell=False)
-    assert build_chat_registry(cfg).names() == ["fetch_url"]
+    assert set(build_chat_registry(cfg).names()) == {"fetch_url", "list_files", "repo_tree", "repo_file", "repo_search", "repo_issues"}
 
 
 def test_enable_shell_registers_sandbox_tools(tmp_path, monkeypatch):

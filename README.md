@@ -6,7 +6,7 @@ GLM, MiniMax) served by DeepInfra.
 **You give it a GitHub issue URL → a planner breaks it into a task graph → two coding agents
 work in parallel in isolated git worktrees → their work is merged → a test engineer writes
 acceptance tests → the orchestrator runs the tests itself → an independent reviewer reviews the
-diff → blocking problems go back to the planner as corrective tasks (up to 3 cycles) → you get a
+diff → blocking problems trigger corrective tasks (bounded by `limits.max_repair_cycles`) → you get a
 tested draft pull request and an execution report** that records what each agent did, the tokens
 and cost, and every human intervention.
 
@@ -14,28 +14,39 @@ and cost, and every human intervention.
 swarmforge run https://github.com/you/repo/issues/42
 ```
 
-| Role | Default model (DeepInfra) | Tools |
-|---|---|---|
-| Planner / Eng. manager | `Qwen/Qwen3.5-397B-A17B` | read-only, `submit_plan` |
-| Backend developer | `deepseek-ai/DeepSeek-V4-Pro` | read/write files, sandboxed commands, dev tools (processes, browser, `check_code`), `finish` |
-| Frontend developer | `moonshotai/Kimi-K2.6` | same, runs concurrently |
-| Reviewer | `zai-org/GLM-5.3` | read-only, `submit_review` |
-| Test engineer | `MiniMaxAI/MiniMax-M3` | test files only, sandboxed commands, dev tools, `submit_test_report` |
-| Librarian | `deepseek-ai/DeepSeek-V4-Flash` | read-only, `submit_notes` (Zettelkasten) |
+Current local team (`swarmforge.yaml`, 2026-11-02):
 
-All of these are set in `swarmforge.yaml`; any role can use any model.
+| Role | Model (DeepInfra) | Runtime / tools |
+|---|---|---|
+| Planner / Eng. manager | `Qwen/Qwen3.8-Flash` | built-in; read-only, `submit_plan` |
+| Backend developer | `zai-org/GLM-5.3` | Pi; read/write/edit/bash and SwarmForge developer tools via `sf` |
+| Frontend developer | `zai-org/GLM-5.3` | Pi; same tools, runs concurrently |
+| Reviewer | `moonshotai/Kimi-K2.6` | built-in; read-only, `submit_review` |
+| Test engineer | `Qwen/Qwen3.8-Flash` | built-in; test files only, sandboxed commands, dev tools, `submit_test_report` |
+| Librarian | `deepseek-ai/DeepSeek-V4-Flash` | built-in; read-only, `submit_notes` (Zettelkasten) |
+| Designer | `Qwen/Qwen3-VL-235B-A22B-Instruct` | screenshot review for configured UI previews |
+
+This is a dated snapshot of the local team, also committed in `profiles/team-current.yaml`, not
+the installation defaults. Add `team_profile: profiles/team-current.yaml` to select it; paths resolve
+relative to the configuration file. Profiles override model/runtime settings only, never permissions.
+`swarmforge.example.yaml` retains a built-in-runtime team using Qwen3.5, DeepSeek, Kimi, GLM and
+MiniMax. Copying that example does not select the local team above. Any role can use any model;
+the reviewer must differ from developer models unless explicitly overridden.
 
 ## Principles
 
 * **Agents propose, code decides.** State transitions, the approval gate, test verdicts, merges
   and GitHub publishing are deterministic code. A model can't declare tests passed: the
   orchestrator runs them and reads JUnit.
-* **Sandboxed by default.** Each agent command runs in a throwaway Docker container with no
-  network, no capabilities and a read-only root filesystem; only that task's worktree is mounted.
-  Keys never enter a container. See [docs/SECURITY.md](docs/SECURITY.md) for what this doesn't
-  protect against.
-* **Nothing is merged automatically.** It produces draft PRs only, on `swarmforge/*` branches,
-  never force-pushed, after you approve the push.
+* **Sandboxed by default.** Docker containers use a read-only root filesystem, dropped capabilities
+  and scoped writable mounts. Built-in commands default to no network; Pi sessions use
+  `pi.network` (normally `bridge`) to reach the host model relay. Bridge networking is not a
+  relay-only firewall. Provider keys stay on the host; Pi receives a per-agent relay token.
+  See [docs/SECURITY.md](docs/SECURITY.md) for the boundaries and exceptions.
+* **Publishing and merging are configurable.** Branches use `swarmforge/*` and are never
+  force-pushed. The example requires push approval and disables automatic merging. The local
+  configuration skips push approval and enables auto-merge for `bigdan88/swarmforge`; eligible
+  draft PRs can therefore be merged automatically. See [delivery](#when-a-run-finishes).
 * **Measured, not guessed.** Each model call records tokens and DeepInfra's reported cost.
   Estimates and missing data are labelled as such.
 
@@ -130,18 +141,28 @@ The reviewer and the planner additionally get the read-only subset `outline`, `f
 `git_changes` and `git_history` (no execution, HTTP or formatting tools).
 
 They run where `run_command` runs, with the same isolation: in Docker, one long-lived session
-container per agent (no network, read-only root, dropped capabilities), which is killed with every
+container per agent (read-only root, dropped capabilities), which is killed with every
 process in it when the agent finishes. The tools need the rebuilt sandbox image
 (`swarmforge sandbox build`, plus `--dev` for SwarmForge's own runs); the browser adds roughly
 500 MB to the image. In `sandbox.mode: local`, install them with `pip install -e ".[tools]"` and
 `python -m playwright install chromium`. Turn them off with `sandbox.dev_tools: false`.
+Built-in sessions use `sandbox.network` (default `none`); tools sharing a Pi session inherit
+`pi.network`, normally `bridge`. Orchestrator test containers use `sandbox.network`.
 
 ## When a run finishes
 
 * **GitHub repository:** after the gates pass, SwarmForge asks for approval (the *Approval needed* box in
   the dashboard; it auto-declines after `approval.timeout_s`), pushes a `swarmforge/*` branch and opens
-  a **draft** pull request. It never merges: you review and merge the PR on GitHub. Queue items set to
-  approve automatically skip the question.
+  a **draft** pull request. Push approval applies when `github.require_push_approval` is enabled;
+  pre-approved runs skip the question. With `auto_merge.enabled: false` (the default), you merge
+  the PR yourself, on GitHub or through the dashboard. Auto-merge is a separate setting: it checks
+  run/test evidence and PR status, merges small clean changes, and asks a judge model about larger
+  changes. `auto_merge.protected` and `major_findings` select judge or hold behavior. Oversized
+  changes are held; `auto_fix` can launch a bounded follow-up run for a held PR.
+  The local configuration enables this only for `bigdan88/swarmforge`: 400-line clean-change
+  threshold and 3,000-line judge limit. Protected files and major findings are now held for human
+  review. The local gate blocks critical and major findings and requires JUnit plus verified criteria.
+  Updating the running checkout still requires **Update & restart**.
 * **Local repository:** the result is delivered as a new branch in your repository; merge it yourself.
 * Every run gets a **summary** (dashboard: *Task & summary*; file: `<run dir>/summary.md`): the request
   as you wrote it, what was done (approach, work items, files changed, tests, acceptance criteria,
@@ -209,8 +230,10 @@ reviewer and librarian keep the built-in loop because they return structured rep
   the relay writes the transcript the dashboard shows.
 * Pi starts with project-local extensions, skills, MCP, prompt templates and sessions disabled, so a
   repository can't load code into the harness.
-* **Trade-off:** Pi's container uses the `bridge` network (`pi.network`) so it can reach the relay;
-  built-in agents keep `--network none`. If Pi can't reach the relay on Docker Desktop, set
+* **Trade-off:** Pi's container uses the `bridge` network (`pi.network`) so it can reach the relay.
+  Its shell and `sf` session tools share that network, which can also permit outbound access;
+  SwarmForge does not restrict it to the relay. Built-in sessions and orchestrator tests use
+  `sandbox.network` (default `none`). If Pi can't reach the relay on Docker Desktop, set
   `pi: {relay_host: 0.0.0.0}`.
 * In `sandbox.mode: local`, install Pi on the host: `npm install -g @earendil-works/pi-coding-agent`.
 
@@ -281,22 +304,26 @@ get the screenshots and the automatic error check.
 
 ## Auto-merge
 
-Turn on `auto_merge` in swarmforge.yaml and the swarm's pull requests merge themselves when it is safe:
+Turn on `auto_merge` in swarmforge.yaml and the swarm's pull requests merge themselves:
 
-* **Small changes** (up to `max_lines`, default 400 lines added + deleted) merge as soon as the run
-  completes with passing tests and no unresolved [major] findings (code review, tester, screenshots).
-* **Larger changes** go to a judge model (`judge_role`, default the reviewer). It reads the task, the
-  diff, the test result and the remaining findings, and answers merge or hold with a risk level; only
-  "merge" at low or medium risk is merged. Above `judge_max_lines` (3000) a change always waits for you.
-* **Never automatic:** conflicts, failing checks or branch protection, and any file the repository lists
-  under `protected_paths` in its swarmforge.project.yml. SwarmForge protects its own core this way
-  (orchestrator, queue, preflight, config, sandbox, agent harness, Dockerfiles...): one bad merge
-  there stops every task, so those PRs wait for you whatever their size.
-* **No surprise restarts:** merged code reaches the running SwarmForge only with your next Update &
-  restart.
+* **Small, clean changes** (up to `max_lines`, default 400 lines added + deleted, no open [major]
+  findings, no core files) merge as soon as the run completes with passing tests.
+* **Everything else goes to a judge model** (`judge_role`, default the reviewer): larger changes, PRs
+  with open [major] findings (the judge sees them), and PRs touching the repository's `protected_paths`
+  (SwarmForge's own core: orchestrator, queue, config, sandbox, agent harness...). It reads the task,
+  the diff, the tests and the findings and answers merge or hold with a risk level. Core files need a
+  **low** risk verdict, everything else low or medium. Set `protected: hold` or `major_findings: hold`
+  to keep those for you instead. Above `judge_max_lines` (3000) a change always waits for you.
+* **Conflicts are resolved, not skipped:** if main moved on and the PR conflicts, SwarmForge merges the
+  latest main into the branch (an agent resolves the conflicts), re-runs the tests, pushes and merges.
+* **A held PR fixes itself once** (`auto_fix`): a fix-up task goes to the front of the same queue,
+  continues the held PR's code (with the latest main merged in), addresses exactly why it was held, and
+  its PR replaces the old one, which is closed. Only if that is held too does it wait for you.
+* **No surprise restarts:** merged code reaches the running SwarmForge with your next Update & restart.
 
-The **Pull requests** page lists every decision (merged / waiting for you, with the reason and whether
-the judge decided) and has a **Revert** button: GitHub creates a revert PR and it is merged at once.
+The **Pull requests** page lists every decision with its reason. Anything waiting for you has **Merge
+now**, **Fix with the swarm** and **Close**; merged PRs have **Revert** (GitHub creates a revert PR and
+it is merged at once). PRs you already merged or closed on GitHub show as no longer open.
 
 ## Several queues (one per project)
 
@@ -373,16 +400,17 @@ These settings (all on by default) keep that down:
   still runs the full `test_command` as the evidence. A repository can name a quicker suite for agents
   with `agent_test_command` in `swarmforge.project.yml` (SwarmForge's own skips the `slow`-marked
   end-to-end tests: `pytest -m "not slow"`).
-* **One active run per repository** (`limits.one_run_per_repo`). A run started while another run on
+* **Repository scheduling.** `limits.same_repo: serial` makes a run started while another run on
   the same repository is active waits for it ("waiting: run(s) ... are already working on this
   repository") instead of competing for the model rate limit and editing the same files. Its time
-  limit starts when it actually starts.
+  limit starts when it actually starts. `coordinate` checks for overlap; `parallel` skips those
+  coordination checks. The example and current local configuration use `coordinate`.
 * **One container per agent** (`sandbox.reuse_container`). `run_command` executes inside the agent's
   long-lived sandbox container instead of starting a new one per command; the timeout is enforced
   inside the container.
-* **Fewer, larger tasks.** The planner aims for 2-4 tasks (`limits.max_tasks: 5`).
-* **Faster developer models.** `swarmforge.yaml` uses Flash models for the developers, with the
-  previous models as fallbacks. Compare with `swarmforge bench` and switch back if quality drops.
+* **Fewer, larger tasks.** The local configuration caps plans at 5 tasks; the example caps them at 8.
+* **Measure model choices.** The local developers use GLM through Pi; planning and testing use
+  Qwen Flash. Compare configurations with `swarmforge bench` before assuming a speed improvement.
 
 * **Tester agent once per run** (`limits.tester_every_cycle: false`). It writes the acceptance tests in
   the first cycle; repair cycles just re-run the suite with them (about 10 minutes saved per cycle).
@@ -447,14 +475,16 @@ the clone.
 
 Project dependencies are installed automatically. Packages from `requirements*.txt` or
 `pyproject.toml` (or an `install_command` in `swarmforge.project.yml`) go into the worktree's
-git-ignored `.swarmforge/pydeps`. This is the only step that gets network access, and it uses a
-shared pip cache. Agents can call `install_dependencies` after adding a package. Tests and agent
-commands stay offline.
+git-ignored `.swarmforge/pydeps`. Installation uses a network-enabled container and a shared pip
+cache. Agents can call `install_dependencies` after adding a package. Built-in commands and
+orchestrator tests default to offline execution; Pi session commands use `pi.network` instead.
 
 ## Per-project settings
 
-A repository can include `swarmforge.project.yml` with `test_command`, `sandbox_image` and
-`install_command`. These are the only settings a repository can set. The dashboard's **Advanced** section and the CLI
+A repository can include `swarmforge.project.yml` with `test_command`, `agent_test_command`,
+`agent_env`, `sandbox_image`, `install_command`, `description`, `preview` and `protected_paths`.
+Repository settings do not set provider credentials, run budgets or global approval/merge policy;
+`protected_paths` is interpreted by the configured auto-merge policy. The dashboard's **Advanced** section and the CLI
 flags `--test-command` / `--sandbox-image` override them for a single run. SwarmForge's own
 repository uses this to test itself in `swarmforge-dev-sandbox` (`swarmforge sandbox build --dev`).
 
@@ -478,11 +508,31 @@ notes with `[[wikilinks]]`:
 
 Benchmarks turn the knowledge base off so every mode starts with the same information.
 
+## Repeated comparisons and effective policy
+
+```sh
+swarmforge run --mode reviewed --issue-file TASK.md --repo PATH
+swarmforge config --json
+swarmforge bench-suite bench/suite.yaml --runs 3 --modes single reviewed swarm --budget 20
+```
+
+`reviewed` uses one developer plus independent testing/review and the final gate. `bench-suite`
+pins starting commits, alternates mode order and persists progress and success/time/cost summaries
+under `<workdir>/evaluations/`. Each invocation has its own total budget; existing before-call checks
+can overshoot by an in-flight call. Unknown-cost calls hold further evaluation. The suite now has
+11 cases; `--limit` selects a smaller trial. `--knowledge` compares with frozen per-run vaults.
+
+The New task page shows effective run policy. Every run stores a credential-excluding
+`effective-config.json`. `config --json` exports the same operational fields without provider
+keys, custom headers, agent environment variables or command strings.
+
 ## Documentation
 
 * [docs/FIRST_RUN.md](docs/FIRST_RUN.md): step-by-step first real GitHub issue
 * [docs/SELF_IMPROVEMENT.md](docs/SELF_IMPROVEMENT.md): point SwarmForge at its own code
-* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, state machine, why it has its own agent runtime instead of OpenCode
+* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, state machine, built-in and Pi runtimes
+* [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md): implementation status and swarm-quality experiments
+* [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): repeatable development and CI checks
 * [docs/PROVIDERS.md](docs/PROVIDERS.md): DeepInfra setup, choosing models, other providers
 * [docs/SECURITY.md](docs/SECURITY.md): sandbox strategy and remaining limitations
 * [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)

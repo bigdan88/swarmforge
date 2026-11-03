@@ -205,7 +205,7 @@ def test_ac4_default_registry_contains_only_fetch_url(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_KEY", "k")
     cfg = parse_config(base_raw(tmp_path / "work"))
     assert cfg.chatbot.enable_shell is False
-    assert build_chat_registry(cfg).names() == ["fetch_url"]
+    assert set(build_chat_registry(cfg).names()) == {"fetch_url", "list_files", "repo_tree", "repo_file", "repo_search", "repo_issues"}
 
 
 # --------------------------------------------------------------------------- AC6
