@@ -427,7 +427,7 @@ def cmd_sandbox(args, cfg) -> int:
 
 def cmd_visual(args, cfg) -> int:
     from . import visual
-    tabs = [t for t in (args.tabs.split(",") if args.tabs else []) if t] or None
+    tabs = [t.strip() for t in (args.tabs.split(",") if args.tabs else []) if t.strip()] or None
     try:
         if args.visual_cmd == "regress":
             result = visual.regress(args.branch, args.base, repo=args.repo,

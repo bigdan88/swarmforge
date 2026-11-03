@@ -110,6 +110,28 @@ def test_cmd_visual_regress_exit_codes(monkeypatch, capsys):
     assert cli.cmd_visual(args, None) == 0
 
 
+def test_cmd_visual_regress_tabs_whitespace(monkeypatch):
+    calls = {}
+
+    def fake_regress(pr_branch, base_branch, **kw):
+        calls.update(branch=pr_branch, base=base_branch, **kw)
+        return _ok_result(ok=True)
+
+    monkeypatch.setattr(visual, "regress", fake_regress)
+    args = cli.build_parser().parse_args(
+        ["visual", "regress", "-b", "feat", "--tabs", "work, chat"]
+    )
+    assert cli.cmd_visual(args, None) == 0
+    assert calls["tabs"] == ["work", "chat"]
+
+    calls.clear()
+    args = cli.build_parser().parse_args(
+        ["visual", "regress", "-b", "feat", "--tabs", " , , "]
+    )
+    assert cli.cmd_visual(args, None) == 0
+    assert calls["tabs"] is None
+
+
 def test_cmd_visual_regress_json(monkeypatch, capsys):
     monkeypatch.setattr(visual, "regress", lambda *a, **kw: _ok_result(ok=False))
     args = cli.build_parser().parse_args(["visual", "regress", "-b", "feat", "--json"])
