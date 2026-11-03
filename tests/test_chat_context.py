@@ -146,7 +146,7 @@ def test_failed_call_keeps_user_message_without_assistant(cfg, st_):
 def test_ask_without_conversation_keeps_old_contract(cfg, st_):
     fake = _fake()
     res = chatbot.ask(cfg, st_, "plain question", transport=fake.transport)
-    assert set(res) == {"answer", "role", "model", "question", "actions"}
+    assert set(res) == {"answer", "role", "model", "question", "actions", "tools_used"}
     assert res["answer"] == "ok"
     # no persistence happened
     assert st_.conversations_list() == []

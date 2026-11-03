@@ -388,6 +388,17 @@ The **Chat** page answers questions about runs and is the place to drive self-im
   **Dismiss** it.
 * **⚡ Why are runs slow or expensive?** plus any free-form question.
 
+Paste a URL to add a fetch hint, or use `/repo owner/name`, `/issues owner/name`, and
+`/code topic` for structured prompts. Assistant replies show a collapsible **Tools used**
+transcript, retained with the conversation alongside live tool-call captions. The **Tools**
+toggle still disables tool execution for a turn.
+
+`chatbot.tools: null` (or an omitted allowlist) preserves available tools; `[]` disables all,
+and a list such as `[fetch_url, repo_tree]` permits only those names. Local `run_command`,
+`read_file` and `grep` additionally require `chatbot.enable_shell: true`. In Docker mode chat
+commands have a read-only project mount, no network and a maximum 30-second timeout;
+explicit local sandbox mode runs on the host and provides no container isolation.
+
 The conversation and its buttons survive dashboard restarts. `swarmforge ask "..."` prints the same
 suggestions in a terminal.
 

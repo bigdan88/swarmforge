@@ -4,7 +4,19 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
     if cfg is None:
         st.error("Configuration not loaded; the chatbot needs a configured model role.")
         return
-    from swarmforge import chatbot
+    from swarmforge import chatbot, chat_quick
+
+    def render_tools_used(used):
+        if not used:
+            return
+        with st.expander(f"🔧 Tools used ({len(used)})", expanded=False):
+            for tool in used:
+                output = str(tool.get("output") or "")
+                ok = tool.get("ok", not output.startswith("ERROR:"))
+                st.markdown(f"**{tool.get('name', '?')}** — " + ("✅ ok" if ok else "⚠️ error"))
+                st.code(json.dumps(tool.get("args") or {}, default=str), language="json")
+                if tool.get("preview") or output:
+                    st.caption(tool.get("preview") or output[:160])
     page = st.container(key="chat_page")
     with page:
         st.header("Chat: improve SwarmForge and fix failed tasks")
@@ -96,6 +108,7 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
                             arg = next((str(v) for v in a.values() if v not in (None, "")), "")[:80]
                             st.caption(f"🔧 {tc.get('name')} · {arg}" if arg else f"🔧 {tc.get('name')}")
                         st.markdown(_chat_md(m["content"]))
+                        render_tools_used(calls or [])
                         render_message_actions(n, actions.get(n))
                     else:
                         st.write(m["content"])
@@ -108,6 +121,12 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
                 lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
                 if st.button(lab, key="chat_q_" + key):
                     pending = prompt_text
+        enabled = cfg.chatbot.tools
+        parts = []
+        if tools_on and (enabled is None or "fetch_url" in enabled):
+            parts.append("paste a URL and the assistant fetches it with the fetch_url tool")
+        parts.append("use /repo <owner/name>, /code <topic>, /issues <owner/name>")
+        st.caption("💡 Quick actions: " + " — or ".join(parts) + ".")
         try:
             from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
             uploaded = st.file_uploader(
@@ -125,15 +144,19 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
     prompt = typed or pending
     if not prompt:
         return
+    question = chat_quick.expand_prompt(prompt)
+    hint = chat_quick.hint_for(prompt)
     att_meta, att_paths = _chat_save_attachments(uploaded)
-    msg = {"role": "user", "content": prompt}
+    msg = {"role": "user", "content": question}
     if att_meta:
         msg["attachments"] = att_meta
     history.append(msg)
-    chatbot.add_message(store, active_id, "user", prompt)
+    chatbot.add_message(store, active_id, "user", question)
     with live:
         with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
             st.write(prompt)
+            if hint:
+                st.caption(hint)
             _render_chat_attachments(att_meta)
         conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
         kwargs = {"history": history[:-1], "conversation": conv}
@@ -155,11 +178,13 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
                 with st.spinner("Thinking…"):
                     ask_cfg = dataclasses.replace(
                         cfg, chat=dataclasses.replace(cfg.chat, tools_enabled=tools_on))
-                    res = chatbot.ask(ask_cfg, store, prompt, on_tool=_on_tool, **kwargs)
+                    res = chatbot.ask(ask_cfg, store, question, on_tool=_on_tool, **kwargs)
             except chatbot.ChatError as e:
                 answer_slot.error(f"Chatbot: {e}")
                 _chat_save(actions, active_id)
                 return
+            if not calls:
+                calls.extend(res.get("tools_used") or [])
             entry = {"role": "assistant", "content": res["answer"]}
             if calls:
                 entry["tool_calls"] = calls
@@ -170,6 +195,7 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
                 actions[len(history) - 1] = res["actions"]
             _chat_save(actions, active_id)
             answer_slot.markdown(_chat_md(res["answer"]))
+            render_tools_used(calls)
             st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
                        f"conversation {res.get('conversation', conv)} · "
                        f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")

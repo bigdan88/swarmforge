@@ -202,13 +202,16 @@ class ChatConfig:
 
 @dataclass
 class ChatbotConfig:
-    """Chatbot tool gating: shell/file-inspection tools (run_command/read_file/grep)."""
-
-    enable_shell: bool = False  # off by default: gives the chatbot local file & command access
+    """Optional tool allowlist plus a separate opt-in for local shell/file tools."""
+    enable_shell: bool = False
+    tools: list[str] | None = None
 
     def __post_init__(self):
         if not isinstance(self.enable_shell, bool):
             raise ConfigError("chatbot.enable_shell must be a boolean")
+        if self.tools is not None and (not isinstance(self.tools, list) or
+                                       not all(isinstance(name, str) for name in self.tools)):
+            raise ConfigError("chatbot.tools must be a list of names or null")
 
 
 @dataclass

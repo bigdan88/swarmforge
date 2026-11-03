@@ -299,7 +299,7 @@ def test_ac5_example_yaml_documents_the_chat_section():
 def test_ac6_ask_without_conversation_is_unchanged(cfg, store):
     fake = _fake()
     res = chatbot.ask(cfg, store, "plain", transport=fake.transport)
-    assert set(res) == {"answer", "role", "model", "question", "actions"}
+    assert set(res) == {"answer", "role", "model", "question", "actions", "tools_used"}
     assert res["answer"] == "ok" and res["question"] == "plain"
     assert res["role"] == "planner" and res["model"] == "qwen-fake"
     # history param honored, question appended last

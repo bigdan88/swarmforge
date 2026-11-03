@@ -366,6 +366,7 @@ def build_chat_registry(cfg: Config) -> ToolRegistry:
             GREP_SCHEMA,
             tools.grep,
         )
+    registry.restrict(cfg.chatbot.tools)
     return registry
 
 
@@ -646,6 +647,13 @@ async def answer(
     dict attachments are saved to disk under <workdir>/chat/attachments/."""
     from .llm import Budget, BudgetExceeded, LLMClient, LLMError
 
+    trace: list = []
+
+    def capture_tool(name, args, output):
+        trace.append({"name": name, "args": args, "ok": not output.startswith("ERROR:"), "preview": output[:160]})
+        if on_tool is not None:
+            on_tool(name, args, output)
+
     role = resolve_role(cfg)
     messages: list[dict] = [
         {
@@ -699,7 +707,7 @@ async def answer(
                 transport=transport,
                 record_errors=False,
             )
-            text = await _run_chat(cfg, llm, role, messages, on_tool)
+            text = await _run_chat(cfg, llm, role, messages, capture_tool)
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e
         text, actions = parse_actions(text, store)
@@ -710,6 +718,7 @@ async def answer(
             "model": cfg.roles[role].model,
             "question": question,
             "actions": actions,
+            "tools_used": trace,
             "conversation": conversation,
             "usage": store.cost_summary(run_id),
         }
@@ -729,7 +738,7 @@ async def answer(
         llm = LLMClient(
             cfg, store=None, run_id=None, budget=Budget(2.0), transport=transport
         )
-        text = await _run_chat(cfg, llm, role, messages, on_tool)
+        text = await _run_chat(cfg, llm, role, messages, capture_tool)
     except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
         raise ChatError(str(e)) from e
     text, actions = parse_actions(text, store)
@@ -739,6 +748,7 @@ async def answer(
         "model": cfg.roles[role].model,
         "question": question,
         "actions": actions,
+        "tools_used": trace,
     }
 
 
