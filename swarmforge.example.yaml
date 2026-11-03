@@ -123,6 +123,8 @@ github:
 
 review:
   blocking_severities: [critical, major]
+  require_junit: true
+  require_verified_criteria: true
   allow_same_model_review: false
 
 knowledge:                    # Zettelkasten shared by all runs (Obsidian-compatible Markdown)

@@ -1,7 +1,42 @@
 # Swarm quality and maintainability improvement plan
 
 Proposals based on the repository and local configuration inspected on 2026-11-02.
-These are experiments and planned changes, not implemented features or measured improvements.
+The rationale below records the starting point. The status distinguishes implemented mechanisms
+from experiments whose results still need evaluation.
+
+## Implementation status
+
+- Expanded `bench/suite.yaml` from one case to eleven behavioral tasks spanning several kinds of
+  work in the same inventory app. Broader real-project coverage remains useful.
+- Added `bench-suite`: pinned commits, alternating mode order, three-repeat default, persisted
+  progress, success/time/cost summaries, knowledge on/off and scheduling selection. Budget checks
+  use existing before-call enforcement; an in-flight call may exceed the remaining allowance.
+  Unpriced calls hold further evaluation.
+- Added `reviewed` mode: one developer plus independent testing/review and the normal final gate.
+  Routing remains an explicit choice until measurements support an automatic rule.
+- Enabled coordinated scheduling, major-finding blocking, strict JUnit/acceptance evidence and
+  holds for protected auto-merge paths locally. Example installs also enable strict evidence.
+- Improved planner interface briefs, tester coverage reuse, corrective-review prompts and
+  category-specific retry guidance. Provider outages no longer inflate coding steps/budget.
+- Deduplicated exact librarian note content while retaining supporting-run provenance. Knowledge
+  comparisons use frozen per-run vaults so one attempt cannot teach later attempts.
+- Extracted all dashboard page entrypoints, pure gate assessment, local delivery, GitHub publication,
+  auto-fix operations and shared cancellation actions. Added a common runtime contract. Continue decomposing the larger modules incrementally.
+- Added a committed team profile, credential-excluding `config --json`, run policy display and
+  stored effective configuration. Added self-healing recovery/cost summaries to metrics JSON and Speed.
+- Added Linux dependency constraints, constrained sandbox builds, separate fast/Docker CI jobs,
+  incremental lint/type checks and documentation/roster checks.
+
+```sh
+swarmforge bench-suite bench/suite.yaml --runs 3 --modes single reviewed swarm --budget 20
+swarmforge config --json
+swarmforge metrics --json
+```
+
+Use `--knowledge` for a knowledge-enabled comparison. Each invocation has its own budget.
+The suite runs cases sequentially, so `--same-repo` alone does not measure simultaneous-run
+contention: use separate coordinated/parallel workload trials for that. The original
+[benchmark](example-benchmark.md) remains historical evidence.
 
 ## Improve the swarm
 
@@ -32,7 +67,7 @@ modes manually before building an automatic router.
 
 The planner should split along interfaces and ownership, with explicit inputs, outputs, files,
 and acceptance criteria. Avoid two agents editing the same module simultaneously. The local
-configuration uses `same_repo: parallel`; evaluate `coordinate` against it, measuring merge
+configuration initially used `same_repo: parallel`; evaluate `coordinate` against it, measuring merge
 conflicts, blocked time and successful deliveries rather than maximizing agent count.
 
 ### 3. Reduce redundant testing and review
@@ -48,12 +83,12 @@ review solely because it is expensive: compare escaped defects as well as minute
 ### 4. Make delivery policy match confidence
 
 For a conservative trial, block both critical and major findings, hold protected paths, and
-disable auto-merge for core changes. The current local policy instead blocks only critical
-findings and allows a judge to accept protected changes and major findings. Compare policies
+disable auto-merge for core changes. The original local policy instead blocked only critical
+findings and allowed a judge to accept protected changes and major findings. Compare policies
 on the evaluation set before expanding autonomous delivery.
 
 Add explicit checks for unmapped/unexecuted acceptance criteria and missing test evidence.
-`TestEvidence.ok` currently accepts exit zero when no JUnit report is available; `_gate` blocks
+`TestEvidence.ok` accepts exit zero when no JUnit report is available; the original `_gate` blocked
 criteria marked failed. Decide and document whether missing evidence should hold delivery,
 with an explicit adapter policy for projects that do not use pytest.
 
@@ -72,7 +107,7 @@ retrieval with knowledge enabled versus disabled. A growing note count is not pr
 
 ### 1. Extract dashboard pages and application services first
 
-`dashboard.py` is roughly 3,000 lines. Move pages into a `dashboard/pages/` package and shared
+`dashboard.py` is roughly 3,000 lines. Move pages into a `dashboard_pages/` package and shared
 rendering into small components. Put start/retry/cancel/approve/merge operations in application
 services that the dashboard and CLI both call. Keep Streamlit session state and widgets in the
 UI layer. Extract one page at a time and preserve page URLs and user behavior.

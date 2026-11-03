@@ -157,6 +157,8 @@ class AutoMergeConfig:
 class ReviewConfig:
     blocking_severities: list[str] = field(default_factory=lambda: ["critical", "major"])
     allow_same_model_review: bool = False
+    require_junit: bool = False  # compatibility opt-out for non-JUnit projects
+    require_verified_criteria: bool = False
 
 
 @dataclass
@@ -261,6 +263,9 @@ def _build(dc, data: dict | None, ctx: str):
 def parse_config(raw: dict, source_path: Path | None = None) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
+    if raw.get("team_profile"):
+        from .team_profile import apply_team_profile
+        raw = apply_team_profile(raw, source_path)
     providers = {}
     for name, p in (raw.get("providers") or {}).items():
         providers[name] = _build(ProviderConfig, {"name": name, **(p or {})}, f"providers.{name}")
@@ -319,6 +324,9 @@ EFFORTS = ("none", "low", "medium", "high")
 
 
 def validate_config(cfg: Config) -> None:
+    for name in ("require_junit", "require_verified_criteria"):
+        if not isinstance(getattr(cfg.review, name), bool):
+            raise ConfigError(f"review.{name} must be true or false")
     for where, eff in [("reasoning_effort", cfg.reasoning_effort),
                        *[(f"roles.{n}.reasoning_effort", r.reasoning_effort) for n, r in cfg.roles.items()]]:
         if eff is not None and eff not in EFFORTS:

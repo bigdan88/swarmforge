@@ -109,7 +109,7 @@ def test_launcher_starts_background_run(tmp_path, monkeypatch, sample_repo):
             break
         time.sleep(0.5)
     # the fake provider host doesn't exist, so the real background process must fail cleanly at planning
-    assert run is not None and run["state"] == "FAILED", run
+    assert run is not None and run["state"] == "FAILED", (run, log.read_text(encoding="utf-8"))
     assert "planner" in (run["state_reason"] or "")
     assert log.is_file() and run_id in log.read_text()
     for _ in range(120):  # the process exits after writing its report / knowledge notes

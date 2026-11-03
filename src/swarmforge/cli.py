@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .config import ConfigError, load_config
 from .db import Store
+from .services.runs import request_cancel
 
 DEV_IMAGE = "swarmforge-dev-sandbox:latest"
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
@@ -47,7 +48,7 @@ def cmd_run(args, cfg) -> int:
     holder = {}
 
     def make(c, seed=None, heal_context=None, heal_of=None, attempt=None):
-        o = Orchestrator(c, store, mode="single" if args.single else "swarm", single_role=args.role,
+        o = Orchestrator(c, store, mode="single" if args.single else getattr(args, "mode", "swarm"), single_role=args.role,
                          test_command=args.test_command, sandbox_image=args.sandbox_image,
                          seed_run_id=seed, heal_of=heal_of, heal_attempt=attempt, heal_context=heal_context)
         holder["orch"] = o
@@ -298,7 +299,7 @@ def cmd_cancel(args, cfg) -> int:
     if run["state"] in TERMINAL:
         print(f"run already finished ({run['state']})")
         return 0
-    store.request_cancel(run["id"])
+    request_cancel(store, run["id"])
     store.event(run["id"], "cancel", "cancel requested from CLI", level="warn")
     print(f"cancel requested for {run['id']}; the orchestrator stops at the next agent step")
     return 0
@@ -586,6 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--continue-from", metavar="RUN",
                    help="start from a stopped run's result and its unresolved problems")
     r.add_argument("--sandbox-image", help="override the sandbox image for this run (must already be built)")
+    r.add_argument("--mode", choices=["swarm", "reviewed", "single"], default="swarm")
     r.add_argument("--single", action="store_true", help="single-agent baseline mode")
     r.add_argument("--role", help="developer role for --single (default: first developer role)")
     r.add_argument("--max-cycles", type=int, help="override limits.max_repair_cycles")
@@ -660,6 +662,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--args", default="{}")
     s.set_defaults(fn=cmd_restart_dashboard)
 
+    s = sub.add_parser("config", help="export operational settings without credentials")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_config)
+    s = sub.add_parser("bench-suite", help="repeat pinned suite cases within a total API budget")
+    s.add_argument("suite", nargs="?", default="bench/suite.yaml")
+    s.add_argument("--runs", type=int, default=3)
+    s.add_argument("--modes", nargs="+", choices=["single", "reviewed", "swarm"], default=["single", "swarm"])
+    s.add_argument("--budget", type=float, required=True, help="total API budget in USD")
+    s.add_argument("--label", default="comparison")
+    s.add_argument("--knowledge", action="store_true", help="use a frozen copy of the knowledge vault")
+    s.add_argument("--same-repo", choices=["serial", "coordinate", "parallel"], default="coordinate")
+    s.add_argument("--limit", type=int)
+    s.set_defaults(fn=cmd_bench_suite)
+
     s = sub.add_parser("check", help="validate config, tools and provider connectivity")
     s.add_argument("--live", action="store_true", help="also send a tiny tool-calling request to each role's model")
     s.add_argument("--roles", nargs="*", help="limit --live to these roles")
@@ -699,7 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("issue", help="GitHub issue URL or local issue .md file")
     s.add_argument("--repo", required=True, help="repository (URL or local path) - same start state for all modes")
     s.add_argument("--acceptance", help="directory of hidden acceptance tests copied in only for evaluation")
-    s.add_argument("--modes", nargs="*", default=["single", "swarm"], choices=["single", "swarm"])
+    s.add_argument("--modes", nargs="*", default=["single", "swarm"], choices=["single", "reviewed", "swarm"])
     s.add_argument("--include-run", action="append", default=[],
                    help="add an already finished run of the same issue to the comparison")
     s.add_argument("--role", help="developer role for the single-agent mode")
@@ -718,7 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             x.add_argument("file", help="e.g. docs/SELF_IMPROVEMENT_BACKLOG.md")
         x.add_argument("--repo", required=True, help="local folder, owner/repo or GitHub URL")
-        x.add_argument("--mode", choices=["swarm", "single"], default="swarm")
+        x.add_argument("--mode", choices=["swarm", "reviewed", "single"], default="swarm")
         x.add_argument("--budget", type=float, default=None)
         x.add_argument("--max-cycles", type=int, default=None)
         x.add_argument("--max-runtime-hours", type=float, default=None)
@@ -886,7 +902,8 @@ def cmd_metrics(args, cfg) -> int:
         return 0
     summ = mx.summarize(rows)
     if args.json:
-        print(json.dumps({"runs": rows, "summary": summ}, indent=2, default=str))
+        from .services.healing import healing_summary
+        print(json.dumps({"runs": rows, "summary": summ, "healing": healing_summary(store)}, indent=2, default=str))
         return 0
     if not rows:
         print("no finished runs yet")
@@ -943,6 +960,22 @@ def cmd_restart_dashboard(args, cfg) -> int:
     from . import selfupdate as su
     return 0 if su.run_restart(str(cfg.source_path) if cfg.source_path else None, args.pid,
                                json.loads(args.args or "{}")) else 1
+
+
+def cmd_config(args, cfg) -> int:
+    from .effective_config import effective_config, policy_summary, resolve_variant
+    cfg, _ = resolve_variant(cfg, _store(cfg))
+    print(json.dumps(effective_config(cfg), indent=2) if args.json else policy_summary(cfg))
+    return 0
+
+
+def cmd_bench_suite(args, cfg) -> int:
+    from .evaluation import run_suite
+    result = asyncio.run(run_suite(cfg, _store(cfg), args.suite, runs=args.runs, modes=args.modes,
+                                  budget=args.budget, label=args.label, knowledge=args.knowledge,
+                                  same_repo=args.same_repo, limit=args.limit))
+    print(json.dumps(result["summary"], indent=2))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

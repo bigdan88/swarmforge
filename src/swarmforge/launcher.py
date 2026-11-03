@@ -50,6 +50,10 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args.append("--single")
         if single_role:
             args += ["--role", single_role]
+    elif mode == "reviewed":
+        args += ["--mode", "reviewed"]
+    elif mode != "swarm":
+        raise ValueError(f"unknown run mode: {mode}")
     if budget is not None:
         args += ["--budget", str(budget)]
     if max_cycles is not None:

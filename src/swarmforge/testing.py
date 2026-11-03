@@ -132,27 +132,34 @@ def evaluate_criteria(mapping: dict[str, list[str]], criteria: list[tuple[str, s
                       ev: TestEvidence) -> list[dict]:
     """Decide per acceptance criterion from executed-test evidence only.
 
-    satisfied  - >=1 mapped test executed and every mapped test that executed passed
+    satisfied  - every mapping matched executed tests and all matched tests passed
     failed     - some mapped test executed and failed/errored
-    unverified - no mapped test was found among executed tests
+    unverified - at least one mapping has no executed test (missing or skipped)
     """
     out = []
     for cid, text in criteria:
         tests = mapping.get(cid, [])
         matched: dict[str, str] = {}
+        missing = []
         for t in tests:
             nt = normalize_test_id(t)
+            found = False
             for case_id, status in ev.cases.items():
                 if case_id == nt or case_id.startswith(nt + ".") or case_id.startswith(nt + "["):
                     matched[case_id] = status
+                    found = found or status != "skipped"
+            if not found:
+                missing.append(t)
         executed = {k: v for k, v in matched.items() if v != "skipped"}
         if not executed:
             status, evidence = "unverified", (
                 "no mapped tests were executed" if tests else "no tests mapped to this criterion")
-        elif all(v == "passed" for v in executed.values()):
-            status, evidence = "satisfied", f"{len(executed)} test(s) passed: " + ", ".join(sorted(executed)[:8])
-        else:
+        elif any(v != "passed" for v in executed.values()):
             bad = [k for k, v in executed.items() if v != "passed"]
             status, evidence = "failed", "failing: " + ", ".join(sorted(bad)[:8])
+        elif missing:
+            status, evidence = "unverified", "mapped tests not executed: " + ", ".join(missing[:8])
+        else:
+            status, evidence = "satisfied", f"{len(executed)} test(s) passed: " + ", ".join(sorted(executed)[:8])
         out.append({"criterion_id": cid, "text": text, "status": status, "evidence": evidence})
     return out

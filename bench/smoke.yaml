@@ -1,0 +1,7 @@
+# Small scripted-test fixture. Use suite.yaml for live comparisons.
+name: samples
+cases:
+  - name: export-csv-json
+    issue: ../samples/issues/export-csv-json.md
+    repo_template: ../samples/inventory-app
+    acceptance: ../samples/acceptance/export

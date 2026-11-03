@@ -357,12 +357,12 @@ def test_ac5_ask_and_answer_gained_exactly_one_optional_keyword_only_param():
         "attachments", "on_tool"}
 
 
-def test_ac5_only_one_new_module_and_no_attachments_outside_the_three_files():
+def test_ac5_single_attachment_module_with_explicit_chat_page_consumer():
     pkg = Path(chatbot.__file__).parent
     assert (pkg / "attachments.py").is_file()
-    touched = {"attachments.py", "chatbot.py", "dashboard.py"}
+    touched = {"attachments.py", "chatbot.py", "dashboard.py", "dashboard_pages/chat.py"}
     for f in sorted(pkg.rglob("*.py")):
-        if f.name == "__init__.py" or f.name in touched:
+        if f.name == "__init__.py" or f.relative_to(pkg).as_posix() in touched:
             continue
         assert "attachments" not in f.read_text(encoding="utf-8"), (
             f"{f}: attachment pipeline must stay out of {f.name}")
@@ -370,6 +370,8 @@ def test_ac5_only_one_new_module_and_no_attachments_outside_the_three_files():
     assert "from . import attachments" in (pkg / "chatbot.py").read_text(encoding="utf-8")
     dash = (pkg / "dashboard.py").read_text(encoding="utf-8")
     assert "from swarmforge.attachments import" in dash
+    page = (pkg / "dashboard_pages" / "chat.py").read_text(encoding="utf-8")
+    assert "from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS" in page
 
 
 def test_ac5_dashboard_attachment_code_is_chat_page_only():
