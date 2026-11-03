@@ -470,6 +470,35 @@ def test_spec_boundary_uses_headings_not_inline_text():
     assert "without treating" in fixed(text)
 
 
+def test_repository_initializes_empty_existing_repo_once():
+    import httpx
+    from types import SimpleNamespace
+    from swarmforge.projects.repository import Repository
+
+    writes = []
+
+    def request(req):
+        if req.method == "GET" and req.url.path == "/repos/owner/inventory":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if req.method == "GET" and req.url.path.endswith("/commits/main"):
+            if writes:
+                return httpx.Response(200, json={"sha": "initial"})
+            return httpx.Response(409, json={"message": "Git Repository is empty."})
+        assert req.method == "PUT" and req.url.path.endswith("/contents/README.md")
+        writes.append(json.loads(req.content))
+        return httpx.Response(201, json={"commit": {"sha": "initial"}})
+
+    repo = Repository.__new__(Repository)
+    repo.repo = "owner/inventory"
+    repo.root = "/repos/" + repo.repo
+    with httpx.Client(base_url="https://fake.test", transport=httpx.MockTransport(request)) as client:
+        repo.gh = SimpleNamespace(_client=client)
+        repo.ensure("existing", "project-id")
+        repo.ensure("existing", "project-id")
+    assert len(writes) == 1
+    assert "branch" not in writes[0] and "sha" not in writes[0]
+
+
 def test_repository_spec_write_uses_approved_fixed_bytes(cfg):
     import base64
     import httpx
