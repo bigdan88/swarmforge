@@ -329,18 +329,23 @@ def capture_tabs(repo_dir: str | Path, out_dir: str | Path, *, tabs=None, themes
     import signal
     import subprocess
     import sys
+    import tempfile
 
     repo_dir = Path(repo_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tabs = [slugify(t) for t in (tabs if tabs is not None else DEFAULT_TABS)]
     themes = tuple(themes) or ("light", "dark")
-    db = repo_dir / ".swarmforge" / "visual-demo.sqlite"
-    db.parent.mkdir(parents=True, exist_ok=True)
-    if db.exists():
-        db.unlink()
+    tmp_db_dir = Path(tempfile.mkdtemp(prefix="sf-visual-demo-"))
+    db = tmp_db_dir / "visual-demo.sqlite"
     env = _streamlit_env(repo_dir, db)
-    _run([sys.executable, "-m", "swarmforge.cli", "seed-demo", str(db)], cwd=repo_dir, env=env)
+    try:
+        _run([sys.executable, "-m", "swarmforge.cli", "seed-demo", str(db)], cwd=repo_dir, env=env)
+    except BaseException:
+        import shutil
+
+        shutil.rmtree(tmp_db_dir, ignore_errors=True)
+        raise
     cmd = [sys.executable, "-m", "streamlit", "run", "src/swarmforge/dashboard.py",
            "--server.headless", "true", "--server.port", str(port), "--server.address", "127.0.0.1",
            "--client.toolbarMode", "viewer", "--server.fileWatcherType", "none",
@@ -378,6 +383,9 @@ def capture_tabs(repo_dir: str | Path, out_dir: str | Path, *, tabs=None, themes
         except OSError:
             proc.kill()
         proc.wait()
+        import shutil
+
+        shutil.rmtree(tmp_db_dir, ignore_errors=True)
     return shots
 
 
@@ -475,6 +483,7 @@ def regress(pr_branch: str, base_branch: str, *, repo: str | Path = ".", golden_
                       "shots": shots_out}
         finally:
             if not keep_dirs:
+                shutil.rmtree(pr_dir, ignore_errors=True)
                 shutil.rmtree(base_dir, ignore_errors=True)
         return result
     finally:

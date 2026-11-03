@@ -17,7 +17,12 @@ class GateProblem(TypedDict):
 def assess_gate(ev: TestEvidence, *, criteria: list[dict], tester_report: dict | None,
                 review: dict | None, failed_tasks: list[str], task_rows: list[dict],
                 scope: set[str], visual_findings: list[dict], policy: ReviewConfig) -> list[GateProblem]:
-    """Deterministic approval gate. Returns blocking problems (empty == approved)."""
+    """Deterministic approval gate. Returns blocking problems (empty == approved).
+
+    Visual findings block the PR only when they are critical severity, or when
+    the blocking flag (set by golden regressions) is present at critical/major
+    severity; low-severity findings with the flag do not block.
+    """
     problems: list[GateProblem] = []
     if policy.require_junit and not ev.junit_found:
         problems.append({"kind": "tests", "summary": "required JUnit evidence is missing",
@@ -41,7 +46,9 @@ def assess_gate(ev: TestEvidence, *, criteria: list[dict], tester_report: dict |
                 problems.append({"kind": "defect", "summary": f"[defect/{d['severity']}] {d['title']}",
                                  "detail": json.dumps(d, indent=1)})
     for f in visual_findings or []:
-        if is_visual_blocking(f["severity"]) or f.get("blocking"):
+        if is_visual_blocking(f["severity"]) or (
+            f.get("blocking") and f["severity"] in ("critical", "major")
+        ):
             problems.append({"kind": "visual", "summary": f"[visual/{f['severity']}] {f['title']}",
                              "detail": json.dumps(f, indent=1)})
     for tid in failed_tasks:

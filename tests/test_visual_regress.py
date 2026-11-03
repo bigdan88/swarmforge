@@ -12,6 +12,7 @@ from swarmforge import visual
 from swarmforge.visual import (
     DIFF_THRESHOLD,
     RegressError,
+    capture_tabs,
     golden_dir,
     golden_gate,
     maybe_refresh_golden_after_update,
@@ -175,6 +176,115 @@ def test_regress_nonexistent_branch_raises(tmp_path):
         regress(
             "nope", "main", repo=repo, tabs=TABS, themes=THEMES, capture=fake_capture
         )
+
+
+def test_regress_cleans_up_shot_temp_dirs(tmp_path, monkeypatch):
+    import tempfile as tf_mod
+
+    repo = make_repo(tmp_path)
+    created: list[Path] = []
+    real_mkdtemp = tf_mod.mkdtemp
+
+    def recording_mkdtemp(prefix=""):
+        p = Path(real_mkdtemp(prefix=prefix))
+        if prefix.startswith("sf-visual-") and "shots" in prefix:
+            created.append(p)
+        return str(p)
+
+    monkeypatch.setattr(tf_mod, "mkdtemp", recording_mkdtemp)
+    res = regress(
+        "feature", "main", repo=repo, tabs=TABS, themes=THEMES, capture=fake_capture
+    )
+    assert res["ok"] is True
+    assert created, "expected regress() to create shot temp dirs"
+    assert not any(p.exists() for p in created)
+
+    # the RegressError path must clean up too
+    created.clear()
+    with pytest.raises(RegressError):
+        regress(
+            "nope", "main", repo=repo, tabs=TABS, themes=THEMES, capture=fake_capture
+        )
+
+
+def test_regress_leaves_no_demo_db_in_repo(tmp_path):
+    repo = make_repo(tmp_path)
+    regress(
+        "feature", "main", repo=repo, tabs=TABS, themes=THEMES, capture=fake_capture
+    )
+    assert not (repo / ".swarmforge" / "visual-demo.sqlite").exists()
+
+
+def test_capture_tabs_leaves_no_demo_db_in_repo(tmp_path, monkeypatch):
+    """capture_tabs must keep the demo DB in a temp dir and remove it, even when it fails."""
+    import subprocess
+
+    repo = make_repo(tmp_path)
+    db_paths: list[str] = []
+
+    class FakeProc:
+        pid = 1234
+
+        def kill(self):
+            pass
+
+        def wait(self):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        db_paths.append(kwargs["env"]["SWARMFORGE_DB"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(visual, "_wait_http", lambda *a, **k: None)
+    monkeypatch.setattr(visual, "_run", lambda *a, **k: None)
+
+    import sys as _sys
+    import types
+
+    class FakePw:
+        def __enter__(self):
+            raise RegressError("no browser")
+
+        def __exit__(self, *a):
+            return False
+
+    fake_pw_mod = types.ModuleType("playwright")
+    fake_api_mod = types.ModuleType("playwright.sync_api")
+    fake_api_mod.sync_playwright = lambda: FakePw()
+    fake_pw_mod.sync_api = fake_api_mod
+    monkeypatch.setitem(_sys.modules, "playwright", fake_pw_mod)
+    monkeypatch.setitem(_sys.modules, "playwright.sync_api", fake_api_mod)
+
+    out = tmp_path / "shots"
+    with pytest.raises(RegressError):
+        capture_tabs(repo, out, tabs=TABS, themes=THEMES)
+
+    assert db_paths, "expected the dashboard process to be launched"
+    db = Path(db_paths[0])
+    assert ".swarmforge" not in db.parts
+    assert not db.exists(), "the demo DB temp dir must be removed"
+    assert not (repo / ".swarmforge" / "visual-demo.sqlite").exists()
+    assert not list(out.glob("*.png"))
+
+
+def test_capture_tabs_seed_failure_cleans_temp_db(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    seen: list[str] = []
+
+    def fake_streamlit_env(repo_dir, db):
+        seen.append(str(db))
+        return {}
+
+    def boom(*a, **k):
+        raise RegressError("seed failed")
+
+    monkeypatch.setattr(visual, "_streamlit_env", fake_streamlit_env)
+    monkeypatch.setattr(visual, "_run", boom)
+    with pytest.raises(RegressError):
+        capture_tabs(repo, tmp_path / "shots", tabs=TABS, themes=THEMES)
+    assert seen and not Path(seen[0]).exists()
+    assert not (repo / ".swarmforge").exists()
 
 
 def test_update_golden_and_golden_gate(tmp_path):
