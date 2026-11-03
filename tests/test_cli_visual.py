@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from swarmforge import cli, visual
 from swarmforge.visual import DIFF_THRESHOLD, RegressError
 from tests.test_visual_regress import (
@@ -312,3 +314,126 @@ def test_cmd_update_no_refresh_when_already_up_to_date(cfg, monkeypatch, capsys)
     assert cli.cmd_update(None, cfg) == 0
     assert called == []
     assert "golden" not in capsys.readouterr().out
+
+
+# ------------------------------------------------------------- check-layout
+def _layout_report(ok=True):
+    return {
+        "ok": ok,
+        "tab": "chat",
+        "widths": [375, 768, 1280],
+        "results": [
+            {"width": w, "screenshot": None, "overflow": [], "clipped": []}
+            for w in (375, 768, 1280)
+        ],
+        "findings": []
+        if ok
+        else [
+            {
+                "severity": "major",
+                "page": "chat",
+                "theme": "light",
+                "blocking": True,
+                "title": "overflow at 375px: element wider than viewport",
+                "description": "d",
+                "recommendation": "r",
+            }
+        ],
+        "error": None,
+    }
+
+
+def test_parser_visual_check_layout():
+    args = cli.build_parser().parse_args(
+        ["visual", "check-layout", "--tab", "chat", "--widths", "375,768,1280"]
+    )
+    assert args.fn is cli.cmd_visual
+    assert args.visual_cmd == "check-layout"
+    assert args.tab == "chat"
+    assert args.widths == "375,768,1280"
+    assert args.repo == "."
+    assert args.url is None
+    assert args.out is None
+    assert args.port is None
+
+    args = cli.build_parser().parse_args(["visual", "check-layout", "--tab", "chat"])
+    assert args.widths == "375,768,1280"
+
+
+def test_cmd_visual_check_layout_dispatch(monkeypatch, capsys):
+    calls = {}
+
+    def fake_render(tab, widths=None, **kw):
+        calls.update(tab=tab, widths=widths, **kw)
+        return _layout_report(ok=True)
+
+    monkeypatch.setattr(visual, "render_breakpoints", fake_render)
+    args = cli.build_parser().parse_args(
+        ["visual", "check-layout", "--tab", "chat", "--widths", "375,768,1280"]
+    )
+    assert cli.cmd_visual(args, None) == 0
+    assert calls == {
+        "tab": "chat",
+        "widths": [375, 768, 1280],
+        "repo": ".",
+        "url": None,
+        "out_dir": None,
+        "port": None,
+    }
+    out = capsys.readouterr().out
+    assert json.loads(out) == _layout_report(ok=True)
+
+    # failing report -> exit 1
+    monkeypatch.setattr(
+        visual, "render_breakpoints", lambda *a, **kw: _layout_report(ok=False)
+    )
+    assert cli.cmd_visual(args, None) == 1
+    out = capsys.readouterr().out
+    assert json.loads(out)["ok"] is False
+    assert json.loads(out)["findings"][0]["severity"] == "major"
+
+
+def test_cmd_visual_check_layout_issue_invocation(monkeypatch, capsys):
+    """The exact shape from the issue: swarmforge visual check-layout --tab chat
+    --widths 375,768,1280 prints a JSON report with the documented keys."""
+    monkeypatch.setattr(
+        visual, "render_breakpoints", lambda *a, **kw: _layout_report(ok=True)
+    )
+    args = cli.build_parser().parse_args(
+        ["visual", "check-layout", "--tab", "chat", "--widths", "375,768,1280"]
+    )
+    assert cli.cmd_visual(args, None) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert set(report) >= {"ok", "tab", "widths", "results", "findings"}
+
+
+@pytest.mark.parametrize("bad", ["375,abc", "", "100", "375,,768,x"])
+def test_cmd_visual_check_layout_bad_widths(bad, monkeypatch, capsys):
+    called = []
+    monkeypatch.setattr(
+        visual,
+        "render_breakpoints",
+        lambda *a, **kw: called.append((a, kw)) or _layout_report(),
+    )
+    args = cli.build_parser().parse_args(
+        ["visual", "check-layout", "--tab", "chat", "--widths", bad]
+    )
+    assert cli.cmd_visual(args, None) == 2
+    assert called == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip()
+
+
+def test_cmd_visual_check_layout_regress_error(monkeypatch, capsys):
+    def boom(*a, **kw):
+        raise RegressError("no browser found")
+
+    monkeypatch.setattr(visual, "render_breakpoints", boom)
+    args = cli.build_parser().parse_args(
+        ["visual", "check-layout", "--tab", "chat", "--widths", "375,768,1280"]
+    )
+    assert cli.cmd_visual(args, None) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "visual check-layout: no browser found" in captured.err

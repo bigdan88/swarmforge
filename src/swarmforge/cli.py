@@ -427,8 +427,28 @@ def cmd_sandbox(args, cfg) -> int:
 
 def cmd_visual(args, cfg) -> int:
     from . import visual
-    tabs = [t.strip() for t in (args.tabs.split(",") if args.tabs else []) if t.strip()] or None
+    tabs = [t.strip() for t in (getattr(args, "tabs", "") and args.tabs.split(",") or []) if t.strip()] or None
     try:
+        if args.visual_cmd == "check-layout":
+            try:
+                widths = [int(w.strip()) for w in args.widths.split(",") if w.strip()]
+            except ValueError:
+                print(f"visual check-layout: invalid --widths {args.widths!r} "
+                      "(expected comma-separated integers)", file=sys.stderr)
+                return 2
+            if not widths or any(not 240 <= w <= 3000 for w in widths):
+                print("visual check-layout: widths must be integers between 240 and 3000",
+                      file=sys.stderr)
+                return 2
+            try:
+                report = visual.render_breakpoints(tab=args.tab, widths=widths, repo=args.repo,
+                                                    url=args.url, out_dir=args.out,
+                                                    port=args.port)
+            except (visual.RegressError, OSError) as e:
+                print(f"visual check-layout: {e}", file=sys.stderr)
+                return 2
+            print(json.dumps(report, indent=2))
+            return 0 if report["ok"] else 1
         if args.visual_cmd == "regress":
             result = visual.regress(args.branch, args.base, repo=args.repo,
                                     threshold=args.threshold, tabs=tabs, port=args.port)
@@ -699,6 +719,16 @@ def build_parser() -> argparse.ArgumentParser:
     vr.add_argument("--tabs", help="comma-separated tab list (default: all dashboard tabs)")
     vr.add_argument("--port", type=int, default=None, help="port for the dashboard server")
     vr.add_argument("--json", action="store_true", help="output the full result as JSON")
+    vc = vsub.add_parser("check-layout",
+                         help="screenshot a dashboard tab at responsive breakpoints and check for overflow/clipping")
+    vc.add_argument("--tab", required=True, help="dashboard tab to screenshot (e.g. chat)")
+    vc.add_argument("--widths", default="375,768,1280",
+                    help="comma-separated viewport widths in px (default: 375,768,1280)")
+    vc.add_argument("--repo", default=".", help="repository path (default: current directory)")
+    vc.add_argument("--url", default=None,
+                    help="check an already-served page instead of launching the local dashboard")
+    vc.add_argument("--out", default=None, help="directory for screenshots (default: temporary)")
+    vc.add_argument("--port", type=int, default=None, help="port for the dashboard server")
     vu = vsub.add_parser("update-golden", help="refresh the golden PNGs under tests/golden")
     vu.add_argument("--branch", default=None, help="branch to capture from (default: current checkout)")
     vu.add_argument("--repo", default=".", help="repository path (default: current directory)")
