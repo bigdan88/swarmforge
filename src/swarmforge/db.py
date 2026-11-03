@@ -17,6 +17,20 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL, spec_path TEXT NOT NULL DEFAULT 'docs/project-spec.md',
+    conversation_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'drafting', current_milestone INTEGER NOT NULL DEFAULT 0,
+    budget_usd REAL NOT NULL, created_at REAL NOT NULL, spec TEXT NOT NULL, definition TEXT NOT NULL,
+    observed_sha TEXT, last_error TEXT, approved_at REAL
+);
+CREATE TABLE IF NOT EXISTS milestones (
+    project_id TEXT NOT NULL, idx INTEGER NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ahead',
+    estimate_usd REAL NOT NULL, estimate_hours REAL NOT NULL, spent_usd REAL NOT NULL DEFAULT 0,
+    started_at REAL, finished_at REAL, report TEXT, PRIMARY KEY(project_id, idx)
+);
+CREATE TABLE IF NOT EXISTS project_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, ts REAL NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
     created_at REAL NOT NULL,
@@ -244,6 +258,12 @@ class Store:
 
     # columns added after the first release; existing databases get them on open
     MIGRATIONS = [
+        ("queue_items", "project_id", "TEXT"),
+        ("queue_items", "milestone", "INTEGER"),
+        ("queue_items", "project_key", "TEXT"),
+        ("queue_items", "merged_sha", "TEXT"),
+        ("queue_items", "project_processed", "INTEGER NOT NULL DEFAULT 0"),
+        ("projects", "previous_spec", "TEXT"),
         ("queue_items", "max_runtime_s", "INTEGER"),
         ("queue_items", "seed_run_id", "TEXT"),
         ("runs", "seed_run_id", "TEXT"),
@@ -257,6 +277,7 @@ class Store:
         ("queue_items", "queue", "TEXT"),
         ("queue_items", "heal_attempts", "INTEGER"),
         ("runs", "archived", "INTEGER NOT NULL DEFAULT 0"),
+        ("chat_messages", "tool_calls", "TEXT"),
     ]
 
     def _migrate(self) -> None:
@@ -486,7 +507,7 @@ class Store:
     QUEUE_FIELDS = ("title", "body", "repo", "mode", "budget", "max_cycles", "chain", "approval",
                     "status", "run_id", "base_branch", "result_branch", "note", "started_at",
                     "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts", "issue_url",
-                    "queue")
+                    "queue", "project_id", "milestone", "project_key", "merged_sha", "project_processed")
 
     def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
         row = self._one("SELECT MAX(position) AS m FROM queue_items")
@@ -525,6 +546,8 @@ class Store:
 
     def delete_run(self, run_id: str) -> None:
         """Remove a run and everything recorded about it (its failure post-mortem is kept for learning)."""
+        if self._one("SELECT id FROM queue_items WHERE run_id=? AND project_id IS NOT NULL", (run_id,)):
+            raise ValueError("Project runs retain their evidence and budget history; archive instead")
         with self._lock:
             for t in self.RUN_TABLES:
                 self.conn.execute(f"DELETE FROM {t} WHERE run_id = ?", (run_id,))
@@ -560,6 +583,8 @@ class Store:
         self.kv_set(self.RECENT_REPOS_KEY, _json.dumps([r for r in self.recent_repos(100) if r != repo] or [""]))
 
     def queue_remove(self, item_id: int) -> None:
+        if (self.queue_item(item_id) or {}).get("project_id"):
+            raise ValueError("Project tasks retain their planning and budget history; cancel the project instead")
         self._exec("DELETE FROM queue_items WHERE id = ? AND status != 'running'", (item_id,))
 
     def queue_move(self, item_id: int, direction: int) -> None:
@@ -579,7 +604,7 @@ class Store:
                 self.conn.commit()
 
     def queue_clear_finished(self) -> int:
-        return self._exec("DELETE FROM queue_items WHERE status IN ('done','failed','cancelled','skipped')").rowcount
+        return self._exec("DELETE FROM queue_items WHERE project_id IS NULL AND status IN ('done','failed','cancelled','skipped')").rowcount
 
     # ------------------------------------------------------------- variants
     def variant_add(self, vid: str, overlay: dict, parent: str | None = None, rationale: str = "") -> None:

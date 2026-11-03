@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 
 from ..config import SandboxConfig
-from ..sandbox import SandboxError, make_sandbox
+from ..sandbox import DockerSandbox, SandboxError, make_sandbox
 
 DEFAULT_TIMEOUT_S = 30
 GREP_MAX_LINES = 200
@@ -37,6 +37,17 @@ _MAX_GREP_FILE_BYTES = 1024 * 1024  # 1 MiB
 
 class SandboxToolError(Exception):
     """Raised for invalid paths, bad patterns or sandbox failures."""
+
+
+class ReadOnlyChatSandbox(DockerSandbox):
+    """Chat commands may inspect the project, but cannot change its bind mount."""
+
+    def build_args(self, *args, **kwargs):
+        argv = super().build_args(*args, **kwargs)
+        for index, value in enumerate(argv):
+            if value == "--mount" and "target=/workspace" in argv[index + 1]:
+                argv[index + 1] += ",readonly"
+        return argv
 
 
 def resolve_within(root: Path, user_path: str) -> Path:
@@ -77,9 +88,12 @@ class ChatSandboxTools:
             raise SandboxToolError("command must not be empty")
         try:
             sandbox = make_sandbox(self.sandbox_cfg)
+            if isinstance(sandbox, DockerSandbox):
+                sandbox = ReadOnlyChatSandbox(self.sandbox_cfg)
         except SandboxError as e:
             raise SandboxToolError(str(e)) from e
-        result = await sandbox.run(self.root, command, timeout_s=max(1, int(timeout_s)))
+        timeout_s = max(1, min(DEFAULT_TIMEOUT_S, int(timeout_s)))
+        result = await sandbox.run(self.root, command, timeout_s=timeout_s, network="none")
         status = (
             f"[TIMED OUT after {timeout_s}s]"
             if result.timed_out

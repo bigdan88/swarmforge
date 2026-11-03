@@ -7,6 +7,9 @@ processes; the dashboard only reads the SQLite store / vault and writes explicit
 """
 from __future__ import annotations
 
+from swarmforge.services.runs import request_cancel as request_run_cancel
+
+import dataclasses
 import json
 import os
 import re
@@ -20,6 +23,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from swarmforge import branding
 from swarmforge.config import ConfigError, load_config
 from swarmforge.db import Store
 from swarmforge.knowledge import NOTE_TYPES, Vault, WIKILINK_RE
@@ -114,6 +118,19 @@ CHAT_CSS = """<style>
 .st-key-chat_chips button:hover { background: rgba(128, 128, 128, 0.1); }
 .st-key-chat_chips button p { font-size: 0.88rem; }
 
+/* ---- transcript scrolls by itself (fills the window), so the page, the rail and the composer stay put */
+[data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) { padding-top: 2.75rem; padding-bottom: 0.75rem; }
+[data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) [data-testid="stElementContainer"]:has(> iframe.stIFrame) { position: absolute; height: 0; overflow: hidden; margin: 0; }
+/* compact composer: a small "Upload" button instead of a big drop zone */
+.st-key-chat_files [data-testid="stFileUploaderDropzone"] { padding: 0; background: transparent; border: 0; }
+.st-key-chat_files [data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
+.st-key-chat_chips { gap: 0.4rem; }
+.st-key-chat_chips button { min-height: 1.9rem !important; padding: 0.15rem 0.75rem !important; }
+div[data-testid="stLayoutWrapper"]:has(> .st-key-chat_scroll) { flex: 0 0 auto !important; height: auto !important; }
+.st-key-chat_scroll { flex: 0 0 auto !important; height: var(--sf-chat-h, calc(100vh - 25rem)) !important; min-height: 10rem; overflow-y: auto;
+                      border: 0 !important; overscroll-behavior: contain; }
+.st-key-chat_rail { position: sticky; top: 3.75rem; max-height: calc(100vh - 9rem); overflow-y: auto; flex-wrap: nowrap; }
+
 /* ---- conversation rail */
 .st-key-chat_rail { background: rgba(128, 128, 128, 0.06); border-radius: 14px; padding: 0.75rem 0.55rem; gap: 0.15rem; }
 .st-key-chat_rail .st-key-chat_new button { justify-content: flex-start; border-radius: 10px; font-weight: 500; }
@@ -143,6 +160,43 @@ CHAT_CSS = """<style>
 }
 </style>"""
 
+# Keeps the chat transcript scrolled to the newest message (like ChatGPT/Claude): on every render and
+# whenever content grows (the "Thinking…" spinner, a long answer), unless you scrolled up to read.
+CHAT_SCROLL_JS = """<script>
+(function () {
+  // run __N__ (unique per render). One watcher lives on the page itself: it finds the current transcript
+  // box (Streamlit may swap the element on a rerun) and keeps it pinned to the newest message unless the
+  // reader has scrolled up to read older ones.
+  const w = window.parent, d = w.document;
+  const pin = () => { const el = d.querySelector('.st-key-chat_scroll'); if (el && el.scrollTop !== el.scrollHeight) el.scrollTop = el.scrollHeight; };
+  if (w.__sfChatPin) { w.__sfChatPin.stick = true; pin(); setTimeout(pin, 150); setTimeout(pin, 600); return; }
+  const st = w.__sfChatPin = {stick: true, el: null};
+  const onScroll = (e) => { const el = e.target; st.stick = el.scrollHeight - el.scrollTop - el.clientHeight < 80; };
+  w.setInterval(() => {
+    const el = d.querySelector('.st-key-chat_scroll');
+    if (!el) return;
+    if (el !== st.el) { st.el = el; st.stick = true; el.addEventListener('scroll', onScroll, {passive: true}); }
+    // size the transcript so the page itself never scrolls: rail and composer stay in place
+    const main = d.querySelector('[data-testid="stMain"]');
+    const rail = d.querySelector('.st-key-chat_rail');
+    if (rail && main) {  // the conversation list scrolls inside its own panel
+      const h = Math.max(200, Math.floor(main.getBoundingClientRect().bottom - rail.getBoundingClientRect().top - 28));
+      if (Math.abs(h - rail.getBoundingClientRect().height) > 2 || rail.style.maxHeight !== h + 'px') {
+        rail.style.setProperty('max-height', h + 'px', 'important');
+      }
+    }
+    const col = d.querySelector('.st-key-chat_main');
+    if (main && col) {  // fill the window down to the composer; the page itself never scrolls
+      const r = el.getBoundingClientRect(), below = col.getBoundingClientRect().bottom - r.bottom;
+      const want = Math.max(160, Math.floor(main.getBoundingClientRect().bottom - r.top - below - 24));
+      if (Math.abs(want - r.height) > 2) el.style.setProperty('height', want + 'px', 'important');
+    }
+    if (st.stick && el.scrollHeight - el.scrollTop - el.clientHeight > 2) el.scrollTop = el.scrollHeight;
+  }, 200);
+  pin();
+})();
+</script>"""
+
 # Slash-format Material icons for the chat page avatars (colon format raises StreamlitAPIException).
 CHAT_AVATARS = {"user": ":material/person:", "assistant": ":material/auto_awesome:"}
 
@@ -159,7 +213,7 @@ TYPE_COLORS = {"decision": "#4c78a8", "pitfall": "#e45756", "pattern": "#54a24b"
                "hub": "#333333", "user-note": "#eeca3b", "failure": "#d62728"}
 ROLE_ICON = {"planner": "🧭", "reviewer": "🔍", "tester": "🧪", "librarian": "📚"}
 
-st.set_page_config(page_title="SwarmForge", page_icon="🐝", layout="wide")
+st.set_page_config(page_title="SwarmForge", page_icon=branding.asset_uri("emblem.png"), layout="wide")
 
 
 def _password_gate() -> None:
@@ -169,7 +223,8 @@ def _password_gate() -> None:
     pw = os.environ.get("SWARMFORGE_DASH_PASSWORD")
     if not pw or st.session_state.get("_authed"):
         return
-    st.title("🐝 SwarmForge")
+    st.markdown(branding.login_logo(), unsafe_allow_html=True)
+    st.title("Sign in to SwarmForge")
     given = st.text_input("Password", type="password", key="_pw")
     if given:
         if hmac.compare_digest(given.encode(), pw.encode()):
@@ -179,6 +234,7 @@ def _password_gate() -> None:
     st.stop()
 
 
+st.markdown(branding.styles(), unsafe_allow_html=True)
 _password_gate()
 
 
@@ -275,13 +331,15 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "Pull requests", "New task", "Failures", "Speed", "Chat", "Knowledge", "Benchmarks", "Settings"]
+PAGES = ["Work", "Projects", "Pull requests", "New task", "Failures", "Speed", "Chat", "Knowledge", "Benchmarks", "What's new", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
             "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
 NAV_ICON["Settings"] = ":material/settings:"
 NAV_ICON["Pull requests"] = ":material/merge:"
 NAV_ICON["Speed"] = ":material/speed:"
-SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
+NAV_ICON["Projects"] = ":material/flag:"
+NAV_ICON["What's new"] = ":material/auto_awesome:"
+SLUG = {p: p.lower().replace("'", "").replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
 if "goto" in st.session_state:  # navigation requested by a button on the previous script run
@@ -302,6 +360,10 @@ def _nav_badges() -> dict:
         needs = sum(1 for f in store.failures() if (f["outcome"] or "").startswith(("needs you", "still failing",
                                                                                       "not retried")))
         out["Failures"] = f"{needs} need you" if needs else ""
+        from swarmforge.history import entries
+        seen = set((store.kv_get("feature_history_seen") or "").split(","))
+        new = sum(e["id"] not in seen for e in entries())
+        out["What's new"] = f"{new} new" if new else ""
     except Exception:  # noqa: BLE001 - badges are decoration
         pass
     return out
@@ -387,13 +449,15 @@ section[data-testid="stSidebar"] [class*="st-key-nav_"] button > div {{ justify-
 section[data-testid="stSidebar"] [class*="st-key-nav_"] button p {{ text-align: left; }}
 section[data-testid="stSidebar"] [class*="st-key-nav_"] button:hover {{ background: rgba(128,128,128,0.12); }}
 section[data-testid="stSidebar"] .st-key-nav_{SLUG[page]} button {{
-    background: rgba(255, 75, 75, 0.12); color: #ff4b4b; font-weight: 600; }}
+    background: rgba(238, 107, 48, 0.13); color: inherit; font-weight: 650;
+    box-shadow: inset 3px 0 0 #ee6b30; }}
 section[data-testid="stSidebar"] [class*="st-key-nav_"] {{ margin-bottom: -0.6rem; }}
 .sf-badge {{ font-size: 0.75rem; opacity: 0.7; }}
 </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("### 🐝 SwarmForge")
+    st.markdown(branding.sidebar_logo(), unsafe_allow_html=True)
+    st.markdown('<div class="sf-nav-label">WORKSPACE</div>', unsafe_allow_html=True)
     badges = _nav_badges()
     for p in PAGES:
         label = p + (f"  ·  {badges[p]}" if badges.get(p) else "")
@@ -436,120 +500,8 @@ except Exception:  # noqa: BLE001
 
 # ============================================================== NEW RUN page
 def page_new_run():
-    if not cfg:
-        st.error("Configuration not loaded; cannot start runs.")
-        return
-    from swarmforge.launcher import start_run
-    sample_issue = Path(__file__).resolve().parents[2] / "samples" / "issues" / "export-csv-json.md"
-    sample_repo = Path("~/swarmforge-sample").expanduser()
-    with st.expander("🧪 Try the bundled sample (inventory app, CSV/JSON export issue)"):
-        st.write(f"Creates a small git repository at `{sample_repo}` and fills the form below.")
-        if st.button("Prepare sample"):
-            if not sample_repo.exists():
-                import subprocess
-                import sys
-                subprocess.run([sys.executable, str(sample_issue.parents[1] / "make_sample_repo.py"), str(sample_repo)],
-                               check=False, capture_output=True)
-            if sample_issue.is_file():
-                text = sample_issue.read_text(encoding="utf-8")
-                m = re.match(r"#\s+(.+)\n", text)
-                st.session_state.nr_source = "Describe it here"
-                st.session_state.nr_title = m.group(1) if m else "Sample issue"
-                st.session_state.nr_body = text[m.end():].strip() if m else text
-                store.remember_repo(str(sample_repo))
-                st.session_state.nr_repo = str(sample_repo)
-                st.rerun()
-
-    source = st.radio("What should the team work on?", ["Describe it here", "GitHub issue"],
-                      key="nr_source", horizontal=True)
-    url = title = body = None
-    if source == "GitHub issue":
-        url = st.text_input("Issue URL", placeholder="https://github.com/owner/repo/issues/42", key="nr_url")
-        repo = st.text_input("Repository override (optional)", key="nr_repo_gh",
-                             help="Leave empty to clone the issue's repository.")
-    else:
-        title = st.text_input("Title", key="nr_title", placeholder="Add CSV export to the reports page")
-        body = st.text_area("Description, requirements and acceptance criteria", height=260, key="nr_body",
-                            placeholder="Describe what you want built. Be specific about interfaces and "
-                                        "acceptance criteria; the planner turns this into a task graph.")
-        repo = repo_picker("Repository", "nr_repo")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    mode = c1.selectbox("Team", ["swarm", "single"], format_func=lambda m: {
-        "swarm": "Swarm (5 roles)", "single": "Single agent (baseline)"}[m])
-    budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(cfg.limits.budget_usd), 0.5, key="nr_budget")
-    cycles = c3.number_input("Max repair cycles", 0, 10, int(cfg.limits.max_repair_cycles), key="nr_cycles")
-    hours = c4.number_input("Time limit (hours)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s), 0.5,
-                            help="The whole run stops after this long. Default from swarmforge.yaml "
-                                 "(limits.max_runtime_s).")
-    approval = c5.selectbox("Before pushing to GitHub", ["dashboard", "yes"], format_func=lambda a: {
-        "dashboard": "Ask me here", "yes": "Pre-approve"}[a])
-    heal = heal_input(st.columns(5)[0], "nr_heal")
-
-    with st.expander("Advanced: test command and sandbox image"):
-        st.caption("Leave blank to use the repository's `swarmforge.project.yml` (if it has one), "
-                   f"otherwise your defaults: `{cfg.project.test_command}` in `{cfg.sandbox.image}`.")
-        test_cmd = st.text_input("Test command", key="nr_test_cmd")
-        image = st.text_input("Sandbox image (must already be built)", key="nr_image",
-                              placeholder="e.g. swarmforge-dev-sandbox:latest")
-
-    with st.expander("Team roster for this run"):
-        roster = [{"role": r, "model": cfg.roles[r].model} for r in
-                  ["planner", *cfg.developer_roles, "tester", "reviewer", cfg.librarian_role] if r in cfg.roles]
-        st.dataframe(pd.DataFrame(roster).drop_duplicates(), hide_index=True, width="stretch")
-        st.caption("Change models in swarmforge.yaml (then restart the dashboard).")
-
-    if vault and (body or title):
-        found = vault.search(f"{title or ''}\n{body or ''}", k=cfg.knowledge.max_notes_in_prompt)
-        if found:
-            with st.expander(f"📚 {len(found)} knowledge note(s) the team will start from"):
-                for sc, n in found:
-                    st.markdown(f"- **{n.title}** · _{n.type}_ · {n.repo or ''} (score {sc})")
-
-    if st.button("🚀 Start run", type="primary"):
-        from swarmforge.github import get_token, parse_issue_url
-        from swarmforge.repos import RepoError, normalize_repo, preflight
-        try:
-            base = None
-            repo_arg = None
-            if source == "GitHub issue":
-                if not (url or "").strip():
-                    raise ValueError("paste the GitHub issue URL (https://github.com/owner/repo/issues/N)")
-                try:
-                    parse_issue_url(url.strip())
-                except Exception:
-                    raise ValueError(f"'{url.strip()}' is not a GitHub issue URL. To work on a repository "
-                                     "without an issue, choose 'Describe it here' and put the repository URL "
-                                     "in the Repository field.")
-                url = url.strip()
-            elif not (title or "").strip() or not (body or "").strip():
-                raise ValueError("give the run a title and a description")
-            from swarmforge.preflight import environment_problems
-            with st.spinner("Checking Docker, keys and the repository…"):
-                problems = environment_problems(cfg, (image or "").strip() or None)
-            if problems:
-                raise ValueError("\n\n".join(problems))
-            if repo and repo.strip():
-                with st.spinner("Checking the repository…"):
-                    ref = preflight(normalize_repo(repo), get_token(cfg.github))
-                repo_arg, base = ref.source, ref.branch
-                store.remember_repo(repo.strip() if ref.branch else ref.source)
-                if ref.source != repo.strip():
-                    st.info(f"Using {ref.source}" + (f" (branch {ref.branch})" if ref.branch else ""))
-            elif source != "GitHub issue":
-                raise ValueError("give a repository: a local folder, owner/repo, or a GitHub URL")
-            run_id, log = start_run(cfg, repo=repo_arg, issue_url=url, issue_title=title, issue_body=body,
-                                    mode=mode, budget=budget, max_cycles=int(cycles), approval=approval,
-                                    test_command=(test_cmd or "").strip() or None,
-                                    sandbox_image=(image or "").strip() or None, base=base,
-                                    max_runtime_s=int(hours * 3600), heal_attempts=heal)
-        except (ValueError, RepoError) as e:
-            st.error(str(e))
-            return
-        select_item(f"r:{run_id}")
-        st.session_state.goto = "Work"
-        time.sleep(1.5)  # give the process a moment to register the run
-        st.rerun()
+    from swarmforge.dashboard_pages.new_run import render
+    return render(Path, _hrs, cfg, dataclasses, heal_input, pd, re, repo_picker, select_item, st, store, time, vault)
 
 
 # ============================================================ run details
@@ -1099,93 +1051,8 @@ def run_detail(run_id, header=True):
 
 # ============================================================ KNOWLEDGE page
 def page_knowledge():
-    st.header("📚 Knowledge base (Zettelkasten)")
-    if not vault:
-        st.error("Configuration not loaded.")
-        return
-    st.caption(f"Vault: `{vault.root}` — plain Markdown with [[wikilinks]]; open the same folder in Obsidian if you like. "
-               "Agents read relevant notes before planning/coding/reviewing and a librarian writes new ones after each run.")
-    notes = vault.notes()
-    repos = sorted({n.repo for n in notes if n.repo})
-    c1, c2, c3 = st.columns([2, 2, 3])
-    repo = c1.selectbox("Repository", ["(all)"] + repos)
-    types = c2.multiselect("Types", list(NOTE_TYPES), default=[t for t in NOTE_TYPES if t != "run-log"])
-    q = c3.text_input("Search", placeholder="keywords…")
-    sel = [n for n in notes if (repo == "(all)" or n.repo == repo) and n.type in types]
-    if q:
-        ranked = vault.search(q, repo=None if repo == "(all)" else repo, k=200, exclude_types=())
-        keep = {n.stem for _, n in ranked}
-        sel = [n for _, n in ranked if n.stem in {x.stem for x in sel}] if keep else []
-    tl, tg, tn = st.tabs(["Notes", "Graph", "➕ New note"])
-    with tl:
-        if not sel:
-            st.info("No notes match. After your first run the librarian will add some, or write one yourself.")
-        else:
-            left, right = st.columns([1, 2])
-            with left:
-                labels = {n.stem: f"[{n.type}] {n.title}" for n in sel}
-                stem = st.radio("Notes", list(labels), format_func=labels.get, label_visibility="collapsed",
-                                key="kn_sel")
-            with right:
-                n = next(x for x in sel if x.stem == stem)
-                st.markdown(f"### {n.title}")
-                st.caption(f"{n.type} · repo {n.repo or '-'} · source {n.source} · created {n.created} · "
-                           f"tags {', '.join(n.tags) or '-'} · file `{n.stem}.md`")
-                st.markdown(wikilinks_to_md(n.body))
-                back = vault.backlinks(n.stem, notes)
-                if back:
-                    st.markdown("**Linked from:** " + ", ".join(f"_{b.title}_" for b in back))
-                with st.expander("✏️ Edit"):
-                    with st.form(f"edit_{n.stem}"):
-                        title = st.text_input("Title", n.title)
-                        typ = st.selectbox("Type", list(NOTE_TYPES), index=list(NOTE_TYPES).index(n.type) if n.type in NOTE_TYPES else 0)
-                        tags = st.text_input("Tags (comma separated)", ", ".join(n.tags))
-                        body = st.text_area("Body (Markdown, [[wikilinks]] allowed)", n.body, height=300)
-                        if st.form_submit_button("Save"):
-                            n.title, n.type, n.body = title, typ, body
-                            n.tags = [t.strip() for t in tags.split(",") if t.strip()]
-                            n.source = n.source if n.source.startswith("user") else f"{n.source} (edited by user)"
-                            vault.save(n)
-                            st.success("Saved")
-                            st.rerun()
-                    if st.checkbox("I want to delete this note", key=f"delc_{n.stem}"):
-                        if st.button("🗑 Delete note", key=f"del_{n.stem}"):
-                            vault.delete(n.stem)
-                            st.rerun()
-    with tg:
-        shown, edges = vault.graph(sel)
-        if len(shown) > 150:
-            st.caption(f"Showing the 150 most recent of {len(shown)} notes.")
-            shown = sorted(shown, key=lambda n: n.stem)[-150:]
-        stems = {n.stem for n in shown}
-        dot = ['graph K { layout=neato; overlap=false; splines=true; node [shape=box style="rounded,filled" '
-               'fontname=Helvetica fontsize=9 fontcolor=white];']
-        for n in shown:
-            dot.append(f'"{_esc(n.stem)}" [label="{_esc(n.title[:40])}" fillcolor="{TYPE_COLORS.get(n.type, "#777")}"];')
-        for a, b in edges:
-            if a in stems and b in stems:
-                dot.append(f'"{_esc(a)}" -- "{_esc(b)}";')
-        dot.append("}")
-        if shown:
-            st.graphviz_chart("\n".join(dot), width="stretch")
-            st.caption(" · ".join(f"{t}" for t in TYPE_COLORS))
-        else:
-            st.caption("Nothing to draw yet.")
-    with tn:
-        with st.form("new_note", clear_on_submit=True):
-            title = st.text_input("Title (state the single idea as a claim)")
-            c1, c2 = st.columns(2)
-            typ = c1.selectbox("Type", ["user-note", "decision", "pitfall", "pattern", "repo-fact", "review-lesson"])
-            nrepo = c2.text_input("Repository (e.g. owner/repo or folder name; blank = applies everywhere)")
-            tags = st.text_input("Tags (comma separated)")
-            body = st.text_area("Body (Markdown; link with [[note title or file name]])", height=220)
-            if st.form_submit_button("Create note"):
-                if not title.strip() or not body.strip():
-                    st.error("Title and body are required.")
-                else:
-                    vault.write(title, body, type=typ, repo=nrepo.strip() or None,
-                                tags=[t.strip() for t in tags.split(",") if t.strip()], source="user")
-                    st.success("Note created")
+    from swarmforge.dashboard_pages.knowledge import render
+    return render(st, vault, wikilinks_to_md, _esc, TYPE_COLORS)
 
 
 # ================================================================= WORK page
@@ -1196,7 +1063,10 @@ FILTERS = {"All": None, "Active": {"active"}, "Waiting": {"waiting"}, "Finished"
 
 
 def _short_repo(repo: str) -> str:
-    repo = (repo or "").rstrip("/\\")
+    repo = (repo or "").strip().rstrip("/\\")
+    m = re.match(r"(?:https?://|git@)github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$", repo)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
     parts = re.split(r"[/\\]", repo)
     return "/".join(parts[-2:]) if len(parts) > 2 else repo
 
@@ -1214,10 +1084,42 @@ def _run_status(r: dict, approvals: set) -> tuple[str, str, str]:
             return "active", "🩹", f"Self-healing (attempt {r['heal_attempt']})"
         return "active", "🟢", "Running"
     if r["state"] == "COMPLETED" and r.get("heal_attempt"):
-        return "done", "✅", f"Done (fixed itself, attempt {r['heal_attempt']})"
+        return "done", "✅", "Done · self-healed"
     if r["state"] == "COMPLETED":
         return "done", "✅", "Done"
     return "failed", STATE_ICON.get(r["state"], "❌"), r["state"].replace("_", " ").title()
+
+
+def _merge_states() -> dict[str, str]:
+    """Latest auto-merge outcome per run id (merged / waiting for you / being fixed / ...)."""
+    try:
+        from swarmforge import automerge as am
+        kinds = {am.MERGED: "merged", am.MANUAL: "merged", am.HELD: "waiting for you",
+                 am.FIXING: "being fixed", am.CLOSED: "replaced by a fix-up", "auto_merge_reverted": "reverted"}
+        rows = store._all(f"SELECT run_id, kind FROM interventions WHERE kind IN ({','.join('?' * len(kinds))}) "
+                          "ORDER BY id", tuple(kinds))
+    except Exception:
+        return {}
+    return {r["run_id"]: kinds[r["kind"]] for r in rows}
+
+
+def _task_key(w: dict) -> str:
+    return re.sub(r"\s+", " ", (w["title"] or "").strip().lower()) + "|" + _short_repo(w["repo"]).lower()
+
+
+def collapse_attempts(items: list[dict]) -> list[dict]:
+    """One row per task: repeated attempts of the same task (same title and repo) fold into the most
+    relevant one (running, else waiting, else the newest). `items` must already be in display order."""
+    out, by_key = [], {}
+    for w in items:
+        k = _task_key(w)
+        if k in by_key:
+            by_key[k]["attempts"].append(w)
+            continue
+        w = {**w, "attempts": []}
+        by_key[k] = w
+        out.append(w)
+    return out
 
 
 def work_items() -> list[dict]:
@@ -1226,6 +1128,7 @@ def work_items() -> list[dict]:
     by_id = {r["id"]: r for r in runs}
     healed = {r["heal_of"] for r in runs if r.get("heal_of")}  # earlier attempts: shown under Failures
     approvals = {a["run_id"] for a in store.pending_approvals()}
+    merges = _merge_states()
     out, used = [], set()
     queue = store.queue_items()
     from swarmforge.runqueue import lane as _lane
@@ -1243,6 +1146,8 @@ def work_items() -> list[dict]:
         if i["status"] == "queued":
             grp, icon, label = "waiting", "⏳", (f"Waiting (#{waiting_pos[i['id']]} in {_lane(i)})" if multi
                                                  else f"Waiting (#{waiting_pos[i['id']]} in line)")
+        elif i["status"] == "tentative":
+            grp, icon, label = "waiting", "○", "Tentative · not ready"
         elif _restarted_as(i):
             grp, icon, label = "failed", "↻", f"Restarted as #{_restarted_as(i)}"
         elif r:
@@ -1254,7 +1159,7 @@ def work_items() -> list[dict]:
         else:
             grp, icon, label = "failed", QSTATUS.get(i["status"], "❌"), i["status"].title()
         out.append({"key": f"q:{i['id']}", "group": grp, "icon": icon, "status": label, "title": i["title"],
-                    "repo": i["repo"], "item": i, "run": r,
+                    "repo": i["repo"], "item": i, "run": r, "merge": merges.get(r["id"]) if r else None,
                     "when": (r["created_at"] if r else i.get("created_at")) or 0,
                     "order": waiting_pos.get(i["id"], 0), "hidden": False,
                     "archived": bool(r.get("archived")) if r else False})
@@ -1264,6 +1169,7 @@ def work_items() -> list[dict]:
         grp, icon, label = _run_status(r, approvals)
         out.append({"key": f"r:{r['id']}", "group": grp, "icon": icon, "status": label,
                     "title": r["issue_title"] or r["issue_url"] or r["id"], "repo": r["repo"] or "",
+                    "merge": merges.get(r["id"]),
                     "item": None, "run": r, "when": r["created_at"] or 0, "order": 0,
                     "hidden": r["id"] in healed, "archived": bool(r.get("archived"))})
     rank = {"active": 0, "waiting": 1}
@@ -1294,13 +1200,14 @@ def queue_bar() -> None:
     running = [i for i in items if i["status"] == "running"]
     if not items:
         return
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 2])
+    with st.container(border=True, key="qbar"):
+        c1, c2, c3, c4 = st.columns([2.6, 1.3, 1.3, 2], vertical_alignment="center")
+        counts = f"{len(running)} running · {len(queued)} waiting"
         if pid:
-            c1.markdown(f"**Queue:** 🟢 working (pid {pid})" + (" — pauses after the current task" if paused else ""))
+            c1.markdown(f"**Queue** 🟢 working · {counts}" + (" · pauses after the current task" if paused else ""),
+                        help=f"Queue worker process {pid}")
         else:
-            c1.markdown("**Queue:** ⚪ stopped" + (" (paused)" if paused and queued else "")
-                        + (f" · {len(queued)} waiting" if queued else ""))
+            c1.markdown("**Queue** ⚪ stopped" + (" (paused)" if paused and queued else "") + f" · {counts}")
         if not pid:
             if c2.button("▶ Start queue", type="primary", disabled=not queued or not cfg, key="qb_start"):
                 rq.resume_all(store)
@@ -1338,22 +1245,21 @@ def queue_bar() -> None:
                                   label_visibility="collapsed")
         if new_policy != policy:
             store.kv_set(rq.POLICY_KEY, new_policy)
-        done = sum(1 for i in items if i["status"] == "done")
-        st.progress(done / len(items), text=f"{done} of {len(items)} queue tasks done · {len(running)} running "
-                                             f"· {len(queued)} waiting")
-        lanes = [n for n in store.queue_names() if any(rq.lane(i) == n for i in items)]
+        lanes = [n for n in store.queue_names()
+                 if any(rq.lane(i) == n and i["status"] in ("queued", "running") for i in items)
+                 or rq.lane_paused(store, n)]
         if len(lanes) > 1 or any(rq.lane_paused(store, n) for n in lanes):
             limit = cfg.limits.max_parallel_queues if cfg else 3
-            st.caption(f"Queues run side by side (up to {limit} at once); each runs its own tasks in order.")
             for n in lanes:
                 mine = [i for i in items if rq.lane(i) == n]
                 run_ = [i for i in mine if i["status"] == "running"]
                 wait_ = [i for i in mine if i["status"] == "queued"]
                 lp = rq.lane_paused(store, n)
-                q1, q2 = st.columns([5, 1.3])
+                q1, q2 = st.columns([5, 1.3], vertical_alignment="center")
                 q1.markdown(f"🗂 **{n}** — " + ("⏸ paused · " if lp else "")
-                            + (f"running: {run_[0]['title'][:60]}" if run_ else "idle")
-                            + (f" · {len(wait_)} waiting" if wait_ else ""))
+                            + (f"running: {run_[0]['title'][:70]}" if run_ else "idle")
+                            + (f" · {len(wait_)} waiting" if wait_ else ""),
+                            help=f"Queues run side by side (up to {limit} at once); each runs its own tasks in order.")
                 env = next((i for i in wait_ if (i.get("note") or "").startswith(rq.ENV_PAUSE_NOTE)), None)
                 if lp and env:
                     q1.warning("Paused because of an environment problem; fix it, then Resume. "
@@ -1378,7 +1284,7 @@ def _wkey(key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", key)
 
 
-ROW_COLS = [0.32, 0.32, 4.4, 2.0, 2.8, 2.0, 0.85, 0.95]
+ROW_COLS = [0.3, 0.3, 4.6, 1.9, 2.6, 1.8, 0.7, 0.85]
 WORK_CSS = """<style>
 [class*="st-key-wr_"] { position: relative; border-bottom: 1px solid rgba(128,128,128,0.18);
                         padding: 0.15rem 0.25rem; border-radius: 0.4rem; }
@@ -1391,27 +1297,56 @@ WORK_CSS = """<style>
 [class*="st-key-op_"] { height: 0 !important; margin-top: -1rem; overflow: visible; }
 [class*="st-key-op_"] button { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0;
                                z-index: 1; cursor: pointer; }
-[class*="st-key-wr_"]:has([class*="st-key-ck_"] input:checked) { background: rgba(255, 75, 75, 0.08); }
+[class*="st-key-wr_"]:has([class*="st-key-ck_"] input:checked) { background: rgba(238, 107, 48, 0.10); }
 [class*="st-key-ck_"], [class*="st-key-ckall"] { position: relative !important; z-index: 2; }
 [class*="st-key-wr_"] p { margin: 0; font-size: 0.9rem; white-space: nowrap; overflow: hidden;
                           text-overflow: ellipsis; }
-.st-key-whead p { font-size: 0.78rem; opacity: 0.65; margin: 0; }
-[class*="st-key-wopen_"] { border-left: 3px solid #ff4b4b; padding-left: 0.9rem; margin: 0.2rem 0 1rem 0.4rem; }
-[class*="st-key-wsel_"] { background: rgba(255, 75, 75, 0.08) !important; }
+.st-key-qbar { gap: 0.4rem; padding-top: 0.6rem; padding-bottom: 0.6rem; }
+.st-key-qbar p { margin: 0; }
+.st-key-whead p { font-size: 0.75rem; opacity: 0.6; margin: 0; letter-spacing: 0.04em; }
+[class*="st-key-wr_"] .sf-tries { font-size: 0.72rem; font-weight: 600; opacity: 0.75; padding: 0.05rem 0.4rem;
+                                  border-radius: 999px; background: rgba(128,128,128,0.18); margin-left: 0.35rem; }
+.sf-wsec { font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.6;
+           margin: 1.1rem 0 0.1rem 0.25rem; }
+[class*="st-key-wr_"] [data-testid="stMarkdownContainer"] p { line-height: 1.6; }
+[class*="st-key-wr_"] [data-testid="stCheckbox"] label { min-height: 0; }
+[class*="st-key-wopen_"] { border-left: 3px solid #ee6b30; padding-left: 0.9rem; margin: 0.2rem 0 1rem 0.4rem; }
+[class*="st-key-wsel_"] { background: rgba(238, 107, 48, 0.10) !important; }
 </style>"""
+
+
+def _short_result(text: str) -> str:
+    """The run's last word, shortened to what matters in a list."""
+    t = (text or "").strip()
+    low = t.lower()
+    if "queue worker stopped" in low:
+        return "Interrupted (the worker restarted)"
+    if low.startswith("the sandbox image") and "missing" in low:
+        return "Sandbox image is missing a tool"
+    if low.startswith("maximum runtime"):
+        return "Hit the time limit"
+    m = re.match(r"repair limit reached.*?(\d+) unresolved problem", low)
+    if m:
+        return f"Still {m.group(1)} problem(s) after repairs"
+    if low.startswith("unexpected error: giterror"):
+        return "Git error: " + t.split(":", 2)[-1].strip()[:60]
+    return t[:120]
 
 
 def _cells(w: dict) -> dict:
     r, i = w["run"], w["item"]
     now = ""
-    if w["group"] == "active" and r and (r["state_reason"] or "").startswith("waiting for the repository"):
+    pr = re.search(r"/pull/(\d+)", (r.get("pr_url") or r.get("state_reason") or "")) if r else None
+    if pr and w["group"] == "done":
+        now = f"PR #{pr.group(1)}" + (f" · {w['merge']}" if w.get("merge") else "")
+    elif w["group"] == "active" and r and (r["state_reason"] or "").startswith("waiting for the repository"):
         now = r["state_reason"][:120]
     elif w["group"] == "active" and r:
         now = r["state"].replace("_", " ").title() + (f" · repair cycle {r['repair_cycle']}" if r["repair_cycle"] else "")
     elif r and r["state_reason"]:
-        now = r["state_reason"][:120]
+        now = _short_result(r["state_reason"])
     elif i and i["note"]:
-        now = i["note"][:120]
+        now = _short_result(i["note"])
     cost = store.cost_summary(r["id"])["total"] if r else None
     return {"now": now, "cost": f"${cost:.2f}" if cost is not None else "",
             "time": fmt_dur((r["finished_at"] or time.time()) - r["created_at"]) if r else "",
@@ -1448,7 +1383,7 @@ def _delete_items(ws: list[dict], files: bool) -> tuple[int, int]:
     done = skipped = 0
     root = cfg.workdir.resolve() if cfg else None
     for w in ws:
-        if w["group"] == "active":
+        if w["group"] == "active" or (w.get("item") or {}).get("project_id"):
             skipped += 1
             continue
         runs = []
@@ -1470,6 +1405,9 @@ def _delete_items(ws: list[dict], files: bool) -> tuple[int, int]:
 
 def bulk_bar(shown: list[dict]) -> None:
     sel = _checked(shown)
+    if any((w.get("item") or {}).get("project_id") for w in sel):
+        st.info("Manage project tasks from Projects so their plan, merge barriers and spend stay together.")
+        sel = [w for w in sel if not (w.get("item") or {}).get("project_id")]
     if not sel:
         return
     with st.container(border=True, key="bulkbar"):
@@ -1483,7 +1421,7 @@ def bulk_bar(shown: list[dict]) -> None:
         if c[2].button("Cancel", icon=":material/stop_circle:", key="bk_cancel", disabled=not running,
                        help="Stop the selected running tasks."):
             for w in running:
-                store.request_cancel(w["run"]["id"])
+                request_run_cancel(store, w["run"]["id"])
                 store.event(w["run"]["id"], "cancel", "cancel requested from dashboard", level="warn")
             st.session_state.flash = f"Cancel requested for {len(running)} task(s)."
             st.rerun(scope="app")
@@ -1515,7 +1453,7 @@ def bulk_bar(shown: list[dict]) -> None:
                                 key="bk_files")
             d1, d2, _ = st.columns([1, 1, 4])
             if d1.button("Yes, delete", type="primary", key="bk_yes"):
-                done, skipped = _delete_items(sel, files)
+                done, skipped = _delete_items(sel + [a for w in sel for a in w.get("attempts") or []], files)
                 st.session_state.confirm_delete = False
                 _clear_checks(shown)
                 if st.session_state.get("sel_item") in {w["key"] for w in sel if w["group"] != "active"}:
@@ -1539,22 +1477,32 @@ def _toggle_all(keys: list[str]) -> None:
         st.session_state[f"ck_{k}"] = v
 
 
-def work_row(w: dict) -> None:
+def _row_cols(show_repo: bool) -> list[float]:
+    return ROW_COLS if show_repo else ROW_COLS[:5] + ROW_COLS[6:]
+
+
+def work_row(w: dict, show_repo: bool = True) -> None:
     k = _wkey(w["key"])
     is_open = st.session_state.get("sel_item") == w["key"]
     cells = _cells(w)
+    tries = len(w.get("attempts") or [])
     with st.container(key=f"wr_{k}"):
-        c = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
+        c = st.columns(_row_cols(show_repo), vertical_alignment="center", gap="small")
         c[0].checkbox("select", key=f"ck_{k}", label_visibility="collapsed")
         c[1].markdown(w["icon"])
         c[2].markdown(f"{'▾' if is_open else '▸'} {'📦 ' if w.get('archived') else ''}"
-                      f"**{w['title'] or '(untitled)'}**")
+                      f"**{w['title'] or '(untitled)'}**"
+                      + (f" <span class='sf-tries' title='earlier attempts of this task are folded into this row'>"
+                         f"×{tries + 1}</span>" if tries else ""), unsafe_allow_html=True)
         c[3].markdown(w["status"])
         c[4].markdown(cells["now"] or " ")
-        c[5].markdown(_short_repo(w["repo"]))
-        c[6].markdown(cells["cost"] or " ")
-        c[7].markdown(cells["time"] or " ")
-        if c[7].button("open", key=f"op_{k}", help="Show / hide details"):
+        rest = c[5:]
+        if show_repo:
+            rest[0].markdown(_short_repo(w["repo"]))
+            rest = rest[1:]
+        rest[0].markdown(cells["cost"] or " ")
+        rest[1].markdown(cells["time"] or " ")
+        if rest[1].button("open", key=f"op_{k}", help="Show / hide details"):
             select_item(None if is_open else w["key"])
             st.rerun(scope="app")
 
@@ -1566,52 +1514,61 @@ def _item_mode(w: dict) -> str | None:
     return w["item"].get("mode") if w["item"] else None
 
 
+SECTIONS = {"active": "Running now", "waiting": "Up next", "finished": "Finished"}
+
+
 def work_list(items: list[dict], every) -> None:
+    st.markdown(WORK_CSS, unsafe_allow_html=True)
     queue_bar()
     visible = [w for w in items if not w["hidden"]]
     if not visible:
         st.info("Nothing here yet. Go to **New task** to start a run or fill the queue.")
         return
-    counts = {g: sum(1 for w in visible if w["group"] == g) for g in ("active", "waiting", "done", "failed")}
-    f1, f2 = st.columns([3, 2])
-    labels = {"All": f"All ({len(visible)})", "Active": f"Active ({counts['active']})",
-              "Waiting": f"Waiting ({counts['waiting']})", "Finished": f"Finished ({counts['done']})",
+    f1, f2, f3 = st.columns([3.2, 2, 1.1], vertical_alignment="center")
+    query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
+                          label_visibility="collapsed").strip().lower()
+    every_try = f3.toggle("Every attempt", key="w_all",
+                          help="Show each attempt of a task as its own row. Off: one row per task, with the "
+                               "number of attempts (×N) next to its title.")
+    with st.expander("More filters"):
+        g1, g2, g3, g4 = st.columns([1.5, 1.5, 1.1, 1.1], vertical_alignment="bottom")
+        states = g1.multiselect("State", sorted({w["run"]["state"] for w in items if w["run"]}),
+                                key="w_state", placeholder="All states")
+        repo_sel = g2.selectbox("Repository", ["All repos"] + sorted({_short_repo(w["repo"]) for w in items
+                                                                     if w["repo"]}), key="w_repo")
+        mode_sel = g3.selectbox("Mode", ["All modes", "swarm", "single"], key="w_mode")
+        show_arch = g4.checkbox("Show archived", key="w_arch",
+                                help="Archived runs stay in the database but are hidden from this list.")
+    base = visible if show_arch else [w for w in visible if not w["archived"]]
+    if states:
+        base = [w for w in base if w["run"] and w["run"]["state"] in states]
+    if repo_sel and repo_sel != "All repos":
+        base = [w for w in base if _short_repo(w["repo"]) == repo_sel]
+    if mode_sel and mode_sel != "All modes":
+        base = [w for w in base if _item_mode(w) == mode_sel]
+    if query:
+        base = [w for w in base if query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower()]
+    if not every_try:
+        base = collapse_attempts(base)
+    counts = {g: sum(1 for w in base if w["group"] == g) for g in ("active", "waiting", "done", "failed")}
+    labels = {"All": f"All ({len(base)})", "Active": f"Running ({counts['active']})",
+              "Waiting": f"Up next ({counts['waiting']})", "Finished": f"Finished ({counts['done']})",
               "Failed": f"Failed ({counts['failed']})"}
     filt = f1.segmented_control("Show", list(FILTERS), key="w_filter", format_func=labels.get,
                                 label_visibility="collapsed", default="All") or "All"
-    query = f2.text_input("Search", key="w_search", placeholder="🔎 Search title, repo or run id",
-                          label_visibility="collapsed").strip().lower()
-    # filters above the table; options come from the full list so they stay stable while narrowing it
-    g1, g2, g3, g4 = st.columns([1.5, 1.5, 1.1, 1.1])
-    states = g1.multiselect("State", sorted({w["run"]["state"] for w in items if w["run"]}),
-                            key="w_state", placeholder="All states")
-    repo_sel = g2.selectbox("Repository", ["All repos"] + sorted({w["repo"] for w in items if w["repo"]}),
-                            key="w_repo")
-    mode_sel = g3.selectbox("Mode", ["All modes", "swarm", "single"], key="w_mode")
-    show_arch = g4.checkbox("Show archived", key="w_arch",
-                            help="Archived runs stay in the database but are hidden from this list.")
-    base = visible if show_arch else [w for w in visible if not w["archived"]]
     shown = [w for w in base if FILTERS[filt] is None or w["group"] in FILTERS[filt]]
-    if states:
-        shown = [w for w in shown if w["run"] and w["run"]["state"] in states]
-    if repo_sel and repo_sel != "All repos":
-        shown = [w for w in shown if w["repo"] == repo_sel]
-    if mode_sel and mode_sel != "All modes":
-        shown = [w for w in shown if _item_mode(w) == mode_sel]
-    if query:
-        shown = [w for w in shown
-                 if query in f"{w['title']} {w['repo']} {w['run']['id'] if w['run'] else ''}".lower()]
     if not shown:
         st.caption("No tasks match.")
         return
     bulk_bar(shown)
-    st.markdown(WORK_CSS, unsafe_allow_html=True)
+    show_repo = len({_short_repo(w["repo"]).lower() for w in shown}) > 1
     keys = [_wkey(w["key"]) for w in shown]
     with st.container(key="whead"):
-        h = st.columns(ROW_COLS, vertical_alignment="center", gap="small")
+        h = st.columns(_row_cols(show_repo), vertical_alignment="center", gap="small")
         h[0].checkbox("all", key="ckall", label_visibility="collapsed", on_change=_toggle_all, args=(keys,),
                       help="Select all shown")
-        for col, name in zip(h[2:], ["TASK", "STATUS", "NOW / RESULT", "REPO", "COST", "TIME"]):
+        names = ["TASK", "STATUS", "RESULT"] + (["REPO"] if show_repo else []) + ["COST", "TIME"]
+        for col, name in zip(h[2:], names):
             col.markdown(name)
     sel = st.session_state.get("sel_item")
     if sel and sel not in {w["key"] for w in shown}:  # opened from elsewhere (e.g. Failures): show on top
@@ -1622,10 +1579,33 @@ def work_list(items: list[dict], every) -> None:
                     select_item(None)
                     st.rerun(scope="app")
                 item_detail(w, every)
+    section = None
+    from swarmforge.projects.store import Projects
+    project_names = {p["id"]: p["name"] for p in Projects(store).list()}
+    if any(w.get("item") and w["item"].get("project_id") for w in shown):
+        shown.sort(key=lambda w: ((w.get("item") or {}).get("project_id") or "~", w["order"]))
+    previous_project = None
     for w in shown:
-        work_row(w)
+        project_id = (w.get("item") or {}).get("project_id")
+        if project_id != previous_project:
+            st.subheader(project_names.get(project_id, "Single tasks"))
+            section = None
+        previous_project = project_id
+        sec = w["group"] if w["group"] in ("active", "waiting") else "finished"
+        if filt == "All" and sec != section:
+            st.markdown(f"<div class='sf-wsec'>{SECTIONS[sec]}</div>", unsafe_allow_html=True)
+        section = sec
+        if (w.get("item") or {}).get("status") == "tentative":
+            with st.container(key=f"tentative_{_wkey(w['key'])}"):
+                work_row(w, show_repo)
+        else:
+            work_row(w, show_repo)
         if sel == w["key"]:
             with st.container(key=f"wopen_{_wkey(w['key'])}"):
+                if w.get("attempts"):
+                    st.caption("Earlier attempts of this task: " + " · ".join(
+                        f"{a['icon']} {a['status']} ({fmt_ts(a['when'], True)[5:]})" for a in w["attempts"][:8])
+                        + (" …" if len(w["attempts"]) > 8 else "") + ". Turn on **Every attempt** to open them.")
                 item_detail(w, every)
     st.caption("Click a task to open it. Tick boxes to act on several tasks at once.")
 
@@ -1658,8 +1638,8 @@ def waiting_editor(i: dict) -> None:
         body = st.text_area("Description and acceptance criteria", i["body"], height=240, key=f"qe_d_{i['id']}")
         repo = repo_picker("Repository", f"qe_r_{i['id']}", value=i["repo"])
         c1, c2, c3, c4, c5 = st.columns(5)
-        mode = c1.selectbox("Team", ["swarm", "single"], index=["swarm", "single"].index(i["mode"] or "swarm"),
-                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "single": "Single agent"}.get)
+        mode = c1.selectbox("Team", ["swarm", "reviewed", "single"], index=["swarm", "reviewed", "single"].index(i["mode"] or "swarm"),
+                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent"}.get)
         budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(i["budget"] or cfg.limits.budget_usd), 0.5,
                                  key=f"qe_b_{i['id']}")
         cycles = c3.number_input("Max repair cycles", 0, 10, int(i["max_cycles"] if i["max_cycles"] is not None
@@ -1717,7 +1697,7 @@ def live_settings(run: dict) -> None:
                 st.rerun()
     if not run["cancel_requested"]:
         if st.button("⏹ Cancel this run", key=f"cancel_{rid}"):
-            store.request_cancel(rid)
+            request_run_cancel(store, rid)
             store.event(rid, "cancel", "cancel requested from dashboard", level="warn")
             st.rerun()
     else:
@@ -1814,6 +1794,9 @@ def item_detail(w: dict, every) -> None:
         diagnosis_box(r, w)
     if not cfg:
         st.warning("Configuration not loaded: settings can't be changed.")
+    elif i and i.get("project_id"):
+        st.info("The project lead owns this plan. Open Projects to review the spec or pause the project.")
+        st.markdown(i["body"].split("Approved project spec", 1)[0])
     elif i and i["status"] == "queued":
         waiting_editor(i)
     elif r and w["group"] == "active":
@@ -1880,6 +1863,7 @@ def welcome_panel(cfg, empty: bool = False) -> None:
     not be patched from outside)."""
     from swarmforge import welcome
 
+    st.markdown(branding.welcome_banner(), unsafe_allow_html=True)
     st.header("Welcome to SwarmForge")
     st.caption("SwarmForge turns an issue into a reviewed branch: plan it, build it in parallel, "
                "test it, review it, repair it, then prepare a draft pull request.")
@@ -1940,112 +1924,14 @@ def _workdir_bytes(path: str) -> int:
 
 
 def page_work():
-    from swarmforge import runqueue as rq
-    if "flash" in st.session_state:
-        st.success(st.session_state.pop("flash"))
-    h1, h2 = st.columns([4, 1], vertical_alignment="bottom")
-    h1.header("Work")
-    if h2.button("New task", icon=":material/add:", type="primary", width="stretch"):
-        st.session_state.goto = "New task"
-        st.rerun()
-    if cfg is not None:
-        st.caption(f"💽 Workdir usage: {_workdir_bytes(str(cfg.workdir)) / 1e6:.1f} MB · `{cfg.workdir}`")
-    items = work_items()
-    show = st.session_state.pop("show_welcome", False)
-    if not items or show:  # first run (or "Getting started" in the sidebar): welcome instead of an empty table
-        welcome_panel(cfg, empty=not items)
-        if items:
-            st.divider()
-    if not items:
-        return
-    busy = any(w["group"] == "active" for w in items) or bool(rq.worker_pid(store))
-    open_w = next((w for w in items if w["key"] == st.session_state.get("sel_item")), None)
-    editing = bool(open_w and (open_w["group"] != "active" or st.session_state.get("confirm_delete")))
-    # refresh live while something runs, but not while you're editing an open waiting/finished task
-    every = 3 if auto and busy and not editing else None
-
-    @st.fragment(run_every=every)
-    def listing():
-        work_list(work_items(), every)
-    listing()
+    from swarmforge.dashboard_pages.work import render
+    return render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work_list, collapse_attempts)
 
 
 # ============================================================= FAILURES page
 def page_failures():
-    from swarmforge.postmortem import CATEGORIES
-    st.header("Failures")
-    st.caption("Every run that failed, why, and what happened next. SwarmForge diagnoses each failure "
-               "automatically and, if a retry can fix it, tries again with more effort. The same post-mortems "
-               "are in your knowledge vault (note **Failures**) so agents learn from them, and in each run's "
-               "`postmortem.md`. CLI: `swarmforge failures`.")
-    fails = store.failures()
-    recorded = {f["run_id"] for f in fails}
-    undiagnosed = [r for r in store.list_runs(300) if r["id"] not in recorded
-                   and r["state"] in ("FAILED", "BLOCKED", "BUDGET_EXCEEDED")]
-    if undiagnosed and cfg:
-        c1, c2 = st.columns([3, 1])
-        c1.info(f"{len(undiagnosed)} failed run(s) from before automatic diagnosis have no post-mortem yet.")
-        if c2.button(f"🩺 Diagnose {len(undiagnosed)} run(s)", key="diag_all"):
-            for r in undiagnosed:
-                diagnose_now(r["id"])
-            st.rerun()
-    if not fails:
-        st.success("No failures recorded.")
-        return
-    fixed = sum(1 for f in fails if (f["outcome"] or "").startswith("fixed itself"))
-    needs = sum(1 for f in fails if (f["outcome"] or "").startswith(("needs you", "still failing", "not retried")))
-    cats = pd.Series([f["category"] for f in fails]).value_counts()
-    m = st.columns(3)
-    m[0].metric("Failures", len(fails))
-    m[1].metric("Fixed themselves", fixed)
-    m[2].metric("Need you", needs)
-    chart = pd.DataFrame({"cause": [CATEGORIES.get(c, c) for c in cats.index], "failures": cats.values})
-    st.altair_chart(alt.Chart(chart).mark_bar(color="#e45756").encode(
-        x=alt.X("failures:Q", title=None, axis=alt.Axis(tickMinStep=1)), y=alt.Y("cause:N", sort="-x", title=None),
-        tooltip=["cause", "failures"]).properties(height=max(60, 28 * len(chart))), width="stretch")
-    pick = st.multiselect("Cause", list(cats.index), format_func=lambda c: CATEGORIES.get(c, c), key="f_cat",
-                          placeholder="All causes")
-    shown = [f for f in fails if not pick or f["category"] in pick]
-    df = pd.DataFrame([{"When": fmt_ts(f["created_at"], True), "Task": (f["title"] or "")[:70],
-                        "Cause": CATEGORIES.get(f["category"], f["category"]),
-                        "Why": (f["root_cause"] or "")[:140], "What happened next": f["outcome"] or "",
-                        "Cost $": round(f["cost_usd"] or 0, 3)} for f in shown])
-    tkey = f"ft_{abs(hash(tuple(f['run_id'] for f in shown))) % 10**8}"
-    ev = st.dataframe(df, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(shown)),
-                      on_select="rerun", selection_mode="single-row", key=tkey,
-                      column_config={"Why": st.column_config.TextColumn(width="large"),
-                                     "Cost $": st.column_config.NumberColumn(format="$%.3f")})
-    rows = list(ev.selection.rows) if ev is not None and hasattr(ev, "selection") else []
-    if rows:
-        st.session_state.sel_failure = shown[rows[0]]["run_id"]
-    sel = st.session_state.get("sel_failure")
-    f = next((x for x in shown if x["run_id"] == sel), shown[0] if shown else None)
-    if not f:
-        return
-    st.divider()
-    st.subheader(f["title"] or f["run_id"])
-    st.caption(f"run `{f['run_id']}` · repo `{f['repo'] or '-'}` · {f['state']}: {(f['reason'] or '')[:200]} · "
-               f"diagnosed by {f['diagnosed_by']}")
-    st.markdown(f"**Cause:** {CATEGORIES.get(f['category'], f['category'])}"
-                + (f"  ·  **What happened next:** {f['outcome']}" if f["outcome"] else ""))
-    st.markdown("#### Why it failed")
-    st.write(f["root_cause"])
-    st.markdown("#### What to do differently")
-    st.write(f["fix"])
-    if f["lesson"]:
-        st.markdown("#### Lesson")
-        st.write(f["lesson"])
-    with st.expander("Evidence the diagnosis was based on"):
-        st.code(f["evidence"] or "", language=None)
-    b = st.columns(3)
-    with b[0]:
-        open_run_button("Open this run", f["run_id"], f"fo_{f['run_id']}")
-    if f["heal_run_id"]:
-        with b[1]:
-            open_run_button("Open the retry", f["heal_run_id"], f"fh_{f['run_id']}")
-    if cfg and b[2].button("↻ Diagnose again", key=f"fd_{f['run_id']}"):
-        diagnose_now(f["run_id"])
-        st.rerun()
+    from swarmforge.dashboard_pages.failures import render
+    return render(alt, cfg, diagnose_now, fmt_ts, open_run_button, pd, st, store)
 
 
 # ================================================================= CHAT page
@@ -2132,8 +2018,13 @@ def _chat_load(conv_id: str) -> tuple[list, dict]:
     from swarmforge import chatbot
     _chat_migrate_legacy()
     if st.session_state.get("chat_loaded_conv") != conv_id:
-        st.session_state.chat_history = [{"role": m["role"], "content": m["content"]}
-                                         for m in chatbot.get_messages(store, conv_id)]
+        def _row(m):
+            d = {"role": m["role"], "content": m["content"]}
+            if m.get("tool_calls"):
+                d["tool_calls"] = m["tool_calls"]
+            return d
+
+        st.session_state.chat_history = [_row(m) for m in chatbot.get_messages(store, conv_id)]
         try:
             d = json.loads(store.kv_get(_chat_actions_key(conv_id)) or "{}")
         except json.JSONDecodeError:
@@ -2313,144 +2204,8 @@ def _chat_rail(active_id: str, chatbot) -> dict:
 
 
 def page_chat():
-    if cfg is None:
-        st.error("Configuration not loaded; the chatbot needs a configured model role.")
-        return
-    from swarmforge import chatbot
-    page = st.container(key="chat_page")
-    with page:
-        st.header("Chat: improve SwarmForge and fix failed tasks")
-        st.caption("Ask about runs, failures and what to improve. Suggestions come with buttons to launch tasks "
-                   "or pick how a failed task should be fixed. CLI: `swarmforge ask \"…\"`.")
-        active_id = _chat_conv_id()
-        rail, main = page.columns([1, 3.2], gap="large")
-
-    # ------------------------------------------------ conversation rail (left)
-    with rail:
-        clicked = _chat_rail(active_id, chatbot)
-
-    # rail clicks are handled before the transcript renders; each one reruns
-    if clicked["new"]:
-        conv = chatbot.create_conversation(store, "New chat")
-        st.session_state.chat_conv_id = conv["id"]
-        st.session_state.pop("chat_done", None)
-        st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
-        st.rerun()
-    if clicked["sel"] and clicked["sel"] != active_id:
-        st.session_state.chat_conv_id = clicked["sel"]
-        st.rerun()
-    if clicked["edit"]:
-        st.session_state.chat_renaming = clicked["edit"]
-        st.rerun()
-    if clicked["cancel"]:
-        st.session_state.pop("chat_renaming", None)
-        st.rerun()
-    if clicked["save"]:
-        convs = {c["id"]: c for c in chatbot.list_conversations(store)}
-        c = convs.get(clicked["save"])
-        if c:
-            txt = st.session_state.get(f"chat_rename_{clicked['save']}") or ""
-            chatbot.rename_conversation(store, clicked["save"], txt.strip() or c["title"])
-        st.session_state.pop("chat_renaming", None)
-        st.rerun()
-    if clicked["del"]:
-        del_id = clicked["del"]
-        chatbot.delete_conversation(store, del_id)
-        if st.session_state.get("chat_renaming") == del_id:
-            st.session_state.pop("chat_renaming", None)
-        if active_id == del_id:
-            rest = chatbot.list_conversations(store)
-            st.session_state.chat_conv_id = (rest[0]["id"] if rest
-                                             else chatbot.ensure_default_conversation(store)["id"])
-        st.rerun()
-
-    # ------------------------------------------------ transcript (right)
-    history, actions = _chat_load(active_id)
-    needs = chatbot.failures_needing_attention(store)
-    active_conv = chatbot.get_conversation(store, active_id) or {}
-    with main, st.container(key="chat_main"):
-        with st.container(key="chat_topbar", horizontal=True, vertical_alignment="center"):
-            st.markdown(active_conv.get("title") or "New chat", width="stretch")
-            reset = st.button("Clear", icon=":material/restart_alt:", key="chat_reset", type="tertiary",
-                              help="Remove every message in this conversation")
-        if reset:
-            chatbot.clear_messages(store, active_id)
-            store.kv_set(_chat_actions_key(active_id), None)
-            history.clear()
-            actions.clear()
-            st.session_state.pop("chat_done", None)
-            st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
-            _chat_save(actions, active_id)
-        if not history:
-            with st.container(key="chat_empty"):
-                st.markdown("### What should we look at?")
-                st.markdown("Runs and their statuses, failed tasks, cost and speed, or what to build next.")
-            if needs:
-                st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
-                        "Press **Review my failed tasks**.")
-        for n, m in enumerate(history):
-            with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
-                if m["role"] == "assistant":
-                    st.markdown(_chat_md(m["content"]))
-                    render_message_actions(n, actions.get(n))
-                else:
-                    st.write(m["content"])
-                _render_chat_attachments(m.get("attachments"))
-        live = st.container()  # the new exchange renders here, above the chips and the input
-        pending = None
-        with st.container(key="chat_chips", horizontal=True, horizontal_alignment="center" if not history
-                          else "left", gap="small"):
-            for key, (label, prompt_text) in zip(("improve", "failures", "slow"), QUICK_PROMPTS.items()):
-                lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
-                if st.button(lab, key="chat_q_" + key):
-                    pending = prompt_text
-        try:
-            from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
-            uploaded = st.file_uploader(
-                "Attach images or files",
-                type=sorted(TEXT_EXTENSIONS | IMAGE_EXTENSIONS),
-                accept_multiple_files=True,
-                key="chat_files",
-                help="Images and text/code files are attached to your next question.",
-            )
-        except Exception:
-            uploaded = None
-        typed = st.chat_input("Ask about runs, failures, or what to improve…")
-    prompt = typed or pending
-    if not prompt:
-        return
-    att_meta, att_paths = _chat_save_attachments(uploaded)
-    msg = {"role": "user", "content": prompt}
-    if att_meta:
-        msg["attachments"] = att_meta
-    history.append(msg)
-    chatbot.add_message(store, active_id, "user", prompt)
-    with live:
-        with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
-            st.write(prompt)
-            _render_chat_attachments(att_meta)
-        conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
-        kwargs = {"history": history[:-1], "conversation": conv}
-        if att_paths:
-            kwargs["attachments"] = att_paths
-        try:
-            with st.spinner("Thinking…"):
-                res = chatbot.ask(cfg, store, prompt, **kwargs)
-        except chatbot.ChatError as e:
-            st.error(f"Chatbot: {e}")
-            _chat_save(actions, active_id)
-            return
-        history.append({"role": "assistant", "content": res["answer"]})
-        chatbot.add_message(store, active_id, "assistant", res["answer"])
-        if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
-            actions[len(history) - 1] = res["actions"]
-        _chat_save(actions, active_id)
-        with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
-            st.markdown(_chat_md(res["answer"]))
-            st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
-                       f"conversation {res.get('conversation', conv)} · "
-                       f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
-            render_message_actions(len(history) - 1, actions.get(len(history) - 1))
+    from swarmforge.dashboard_pages.chat import render
+    return render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat_conv_id, _chat_load, _chat_md, _chat_rail, _chat_save, _chat_save_attachments, _render_chat_attachments, cfg, components, dataclasses, json, render_message_actions, st, store, uuid)
 
 
 # ============================================================ NEW TASK page
@@ -2463,8 +2218,8 @@ def queue_forms() -> None:
 
     def common(prefix):
         c1, c2, c3, c5, c4 = st.columns(5)
-        mode = c1.selectbox("Team", ["swarm", "single"], key=f"{prefix}_mode",
-                            format_func=lambda m: {"swarm": "Swarm", "single": "Single agent"}[m])
+        mode = c1.selectbox("Team", ["swarm", "reviewed", "single"], key=f"{prefix}_mode",
+                            format_func=lambda m: {"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent"}[m])
         budget = c2.number_input("Budget per task (USD)", 0.5, 500.0, 5.0, 0.5, key=f"{prefix}_budget")
         cycles = c3.number_input("Max repair cycles", 0, 10, 2, key=f"{prefix}_cycles")
         hours = c5.number_input("Time limit per task (h)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s),
@@ -2537,147 +2292,132 @@ def queue_forms() -> None:
 
 
 def page_new_task():
-    st.header("New task")
-    if not cfg:
-        st.error("Configuration not loaded; cannot start runs.")
-        return
-    how = st.radio("How should it run?", ["Start now", "Add to the queue"], horizontal=True, key="nt_how",
-                   captions=["Runs right away in the background.",
-                             "Waits its turn in a queue; queues for different projects run side by side."])
-    st.divider()
-    if how == "Start now":
-        page_new_run()
-    else:
-        queue_forms()
+    from swarmforge.dashboard_pages.new_task import render
+    return render(cfg, page_new_run, queue_forms, st)
 
 
 # =========================================================== BENCHMARKS page
 def page_speed():
-    """Where the time goes, per run and per agent; compare settings before/after a change."""
-    from swarmforge import metrics as mx
-    st.header("Speed")
-    st.caption("Where each finished run's time went. Change a setting, let a few runs finish, then compare the "
-               "groups under **By settings**. `swarmforge metrics --csv FILE` exports the same data.")
-    n = st.select_slider("Runs to include", [10, 20, 30, 50, 100, 200], value=30, key="speed_n")
-    try:
-        rows = mx.collect(store, n)
-        agents = mx.agent_rows(store, n)
-    except Exception as e:  # noqa: BLE001 - a bad row must not break the page
-        st.error(f"Could not compute metrics: {e}")
-        return
-    if not rows:
-        st.info("No finished runs yet. Metrics appear here once a run completes or fails.")
-        return
-    summ = mx.summarize(rows)["all"]
-    k = st.columns(4)
-    k[0].metric("Median run", f"{summ['total_min']:.0f} min")
-    k[1].metric("Median working time", f"{summ['work_min']:.0f} min", help="run time minus waiting in line")
-    k[2].metric("Median repair cycles", f"{summ['repair_cycles']:g}")
-    k[3].metric("Median cost", f"${summ['cost_usd']:.2f}")
-
-    st.subheader("Where the time goes")
-    long = pd.DataFrame([{"run": f"{r['title'][:38]} · {r['run_id'][-6:]}", "phase": p, "minutes": r[f"{p}_min"],
-                          "order": mx.PHASES.index(p), "started": r["started"]}
-                         for r in rows for p in mx.PHASES if r[f"{p}_min"] > 0.05])
-    runs_order = [f"{r['title'][:38]} · {r['run_id'][-6:]}" for r in rows]
-    st.altair_chart(alt.Chart(long).mark_bar().encode(
-        x=alt.X("sum(minutes):Q", title="minutes"), y=alt.Y("run:N", sort=runs_order, title=None),
-        color=alt.Color("phase:N", sort=mx.PHASES, scale=alt.Scale(domain=mx.PHASES)),
-        order=alt.Order("order:Q"), tooltip=["run", "phase", alt.Tooltip("minutes:Q", format=".1f")]
-    ).properties(height=max(120, 26 * len(rows))), width="stretch")
-    med = pd.DataFrame([{"phase": p, "median minutes": summ.get(f"{p}_min") or 0, "what it is": mx.PHASE_HELP[p]}
-                        for p in mx.PHASES])
-    st.dataframe(med, hide_index=True, width="stretch",
-                 column_config={"median minutes": st.column_config.NumberColumn(format="%.1f")})
-
-    st.subheader("By settings")
-    st.caption("Medians per settings fingerprint: developer/reviewer/tester model and max steps, repair cycles, "
-               "blocking severities, tester every cycle or once.")
-    bys = mx.summarize(rows)["by_settings"]
-    st.dataframe(pd.DataFrame([{"settings": k2, **v} for k2, v in bys.items()]), hide_index=True, width="stretch",
-                 column_config={c: st.column_config.NumberColumn(format="%.1f")
-                                for c in ["total_min", "work_min", *[f"{p}_min" for p in mx.PHASES], "repair_cycles"]}
-                 | {"cost_usd": st.column_config.NumberColumn(format="$%.2f")})
-
-    st.subheader("Agents by role and model")
-    if agents:
-        adf = pd.DataFrame(agents)
-        g = adf.groupby(["role", "model"]).agg(sessions=("task", "count"), median_min=("minutes", "median"),
-                                               max_min=("minutes", "max"), median_sec_per_call=("sec_per_call", "median"),
-                                               retries=("retries", "sum")).reset_index().sort_values("median_min",
-                                                                                                    ascending=False)
-        st.dataframe(g, hide_index=True, width="stretch",
-                     column_config={c: st.column_config.NumberColumn(format="%.1f")
-                                    for c in ["median_min", "max_min", "median_sec_per_call"]})
-    else:
-        st.caption("No agent sessions recorded.")
-
-    st.subheader("Runs")
-    df = pd.DataFrame(rows).drop(columns=["started"])
-    st.dataframe(df, hide_index=True, width="stretch",
-                 column_config={c: st.column_config.NumberColumn(format="%.1f") for c in df.columns if c.endswith("_min")})
-    c = st.columns(2)
-    c[0].download_button("Download runs (CSV)", mx.to_csv(rows), "swarmforge-runs.csv", "text/csv", key="speed_csv")
-    c[1].download_button("Download agent sessions (CSV)", mx.to_csv(agents), "swarmforge-agents.csv", "text/csv",
-                         key="speed_csv_agents")
-    with st.expander("Counters per run (timeouts, step limits, busy models, tool use)"):
-        st.dataframe(df[["run_id", "title", "agent_timeouts", "step_limit_hits", "model_busy_waits", "sf_calls", "browse_calls", "test_runs",
-                         "test_suite_min", "approval_wait_min"]], hide_index=True, width="stretch")
+    from swarmforge.dashboard_pages.speed import render
+    return render(st, store, pd, alt)
 
 
 def page_benchmarks():
-    st.header("Benchmarks: single agent vs swarm")
-    b = store.benchmarks()
-    if not b:
-        st.info("No benchmarks yet. Run `swarmforge bench ISSUE --repo PATH --acceptance DIR`.")
-    for row in b:
-        st.subheader(f"{row['label']} — {row['issue']}")
-        df = pd.DataFrame(row["results"]).set_index("mode").T
-        st.dataframe(df.astype(str), width="stretch")
+    from swarmforge.dashboard_pages.benchmarks import render
+    return render(st, store, pd)
 
 
 # ======================================================== PULL REQUESTS page
-def auto_merge_panel(gh) -> None:
-    """What auto-merge did (merged / waiting for you, and why), with one-click revert of a merge."""
+def _am_latest(rows: list[dict]) -> dict[str, tuple[dict, dict]]:
+    """Latest auto-merge event per PR url -> (row, detail); rows are newest first."""
+    out: dict[str, tuple[dict, dict]] = {}
+    for r in rows:
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if d.get("url") and d["url"] not in out:
+            out[d["url"]] = (r, d)
+    return out
+
+
+def auto_merge_panel(gh, open_urls: set[str] | None = None) -> None:
+    """What auto-merge did, and buttons for everything that waits for you."""
     from swarmforge import automerge as am
     from swarmforge.github import GitHubError
     amc = cfg.auto_merge
-    rows = store._all("SELECT * FROM interventions WHERE kind IN (?, ?, ?) ORDER BY id DESC LIMIT 25",
-                      (am.MERGED, am.HELD, "auto_merge_reverted"))
-    reverted = {json.loads(r["detail"]).get("url") for r in rows if r["kind"] == "auto_merge_reverted"}
+    kinds = (am.MERGED, am.HELD, am.FIXING, am.CLOSED, am.MANUAL, "auto_merge_reverted")
+    rows = store._all(f"SELECT * FROM interventions WHERE kind IN ({','.join('?' * len(kinds))}) "
+                      "ORDER BY id DESC LIMIT 60", kinds)
+    latest = _am_latest(rows)
+    gone = {u for u, (r, _) in latest.items()
+            if r["kind"] == am.HELD and open_urls is not None and u not in open_urls}
+    waiting = [u for u, (r, _) in latest.items() if r["kind"] == am.HELD and u not in gone]
     where = ", ".join(amc.repos) if amc.repos else "every repository"
-    title = (f"🤖 Auto-merge: **on** for {where} · up to {amc.max_lines} lines merge straight away, larger ones "
-             f"(up to {amc.judge_max_lines}) if the {amc.judge_role} model approves" if amc.enabled
-             else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
-    with st.expander(title, expanded=bool(amc.enabled and rows)):
-        st.caption("Never merged automatically: unresolved [major] findings, conflicts, failing checks, and files "
-                   "the repository protects (`protected_paths` in swarmforge.project.yml). SwarmForge doesn't "
-                   "restart after an auto-merge; the new code arrives with your next Update & restart.")
+    title = (f"🤖 Auto-merge: **on** for {where}" + (f" · **{len(waiting)} waiting for you**" if waiting else "")
+             if amc.enabled else "🤖 Auto-merge: **off** (set `auto_merge: {enabled: true}` in swarmforge.yaml)")
+    with st.expander(title, expanded=bool(waiting)):
+        st.caption(f"Up to {amc.max_lines} clean lines merge at once. Larger changes, open [major] findings and "
+                   f"core files (protected_paths) go to the {amc.judge_role} model; core files need a low-risk "
+                   "verdict. Conflicts are resolved against the latest main and re-tested. A PR that is still held "
+                   + ("gets one automatic fix-up task that replaces it; after that it waits here."
+                      if amc.auto_fix else "waits here.")
+                   + " Nothing restarts by itself.")
         flash = st.session_state.pop("am_flash", None)
         if flash:
             (st.success if flash[0] else st.error)(flash[1])
-        shown = [r for r in rows if r["kind"] != "auto_merge_reverted"]
-        if not shown:
+        if not latest:
             st.caption("No auto-merge decisions yet.")
-        for r in shown:
-            try:
-                d = json.loads(r["detail"] or "{}")
-            except json.JSONDecodeError:
+        label = {am.MERGED: "✅ merged", am.MANUAL: "✅ merged by you", am.HELD: "⏸ waiting for you",
+                 am.FIXING: "🔧 being fixed", am.CLOSED: "🗑 closed", "auto_merge_reverted": "↩️ reverted"}
+        for url, (r, d) in list(latest.items())[:25]:
+            kind = r["kind"]
+            if url in gone:
+                st.markdown(f"**✔ no longer open** (merged or closed on GitHub) · [{d.get('title') or url}]({url})")
                 continue
-            merged = r["kind"] == am.MERGED
-            url = d.get("url", "")
-            icon = ("↩️ reverted" if url in reverted else "✅ merged") if merged else "⏸ waiting for you"
-            c1, c2 = st.columns([6, 1.3])
-            c1.markdown(f"**{icon}** · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
-                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "") + f"  \n{d.get('reason', '')}")
-            if merged and url not in reverted and d.get("number"):
-                key = f"am_rev_{r['id']}"
+            extra = (f" (task #{d['fix_task']})" if kind == am.FIXING and d.get("fix_task") else "") + \
+                    (f" (run `{d['fix_run']}`)" if kind == am.FIXING and d.get("fix_run") else "") + \
+                    (f" → {d['replaced_by']}" if d.get("replaced_by") else "")
+            st.markdown(f"**{label.get(kind, kind)}**{extra} · [{d.get('title') or url}]({url}) · {fmt_ts(r['ts'])}"
+                        + (" · 🧑‍⚖️ judged" if d.get("judged") else "")
+                        + (f"  \n{d['reason']}" if d.get("reason") else ""))
+            key = f"am_{r['id']}"
+            if kind == am.HELD and d.get("number"):
+                c1, c2, c3, _ = st.columns([1.2, 1.6, 1, 3])
+                if c1.button("Merge now", key=key + "_merge", type="primary",
+                             help="Merge it as it is (marks a draft ready first)"):
+                    try:
+                        pr = am.get_pr(gh, d["repo"], int(d["number"]))
+                        sha = am.apply(gh, pr, amc.method)
+                        store.record_intervention(r["run_id"], am.MANUAL, json.dumps({**d, "sha": sha,
+                                                                                     "reason": "merged by you"}))
+                        st.session_state.am_flash = (True, f"Merged {url}. Update & restart to pick it up.")
+                    except (GitHubError, Exception) as e:  # noqa: BLE001
+                        st.session_state.am_flash = (False, f"Could not merge {url}: {e}. "
+                                                            "Use **Fix with the swarm** to have it updated.")
+                    st.session_state.pop("pr_cache", None)
+                    st.rerun()
+                if c2.button("Fix with the swarm", key=key + "_fix",
+                             help="Start a run right now that continues this PR's code, fixes why it was held "
+                                  "(and any conflicts with main), then replaces this PR"):
+                    run = store.get_run(r["run_id"]) or {}
+                    item = store._one("SELECT queue FROM queue_items WHERE run_id = ?", (r["run_id"],)) or {}
+                    findings = [f for f in store.findings(r["run_id"])
+                                if f["cycle"] == run.get("repair_cycle") and f["severity"] != "info"]
+                    body = run.get("issue_body") or d.get("title") or ""
+                    if am.fix_depth(body)[0] and "supersedes=" in body:   # allow one more manual round
+                        body = am.FIX_MARK.sub("", body)
+                    args = dict(title=run.get("issue_title") or d.get("title") or "", body=body, repo=d["repo"],
+                                url=url, reason=d.get("reason", ""), findings=findings)
+                    try:
+                        rid = am.start_fix(cfg, r["run_id"], **args)                 # starts right now
+                        store.record_intervention(r["run_id"], am.FIXING, json.dumps({**d, "fix_run": rid}))
+                        st.session_state.am_flash = (True, f"Started fix-up run {rid} now; its PR will replace {url}.")
+                    except Exception as e:  # noqa: BLE001 - fall back to the queue
+                        qid = am.queue_fix(store, r["run_id"], queue=item.get("queue"), **args)
+                        store.record_intervention(r["run_id"], am.FIXING, json.dumps({**d, "fix_task": qid}))
+                        from swarmforge import runqueue as rq
+                        if not rq.worker_pid(store):
+                            rq.start_worker(cfg, store)
+                        st.session_state.am_flash = (True, f"Couldn't start it right away ({e}); queued fix-up "
+                                                           f"task #{qid} at the front instead.")
+                    st.rerun()
+                if c3.button("Close", key=key + "_close", help="Close the PR without merging"):
+                    try:
+                        am.close_pr(gh, d["repo"], int(d["number"]), "Closed from the SwarmForge dashboard.")
+                        store.record_intervention(r["run_id"], am.CLOSED, json.dumps({**d, "reason": "closed by you"}))
+                        st.session_state.am_flash = (True, f"Closed {url}.")
+                    except (GitHubError, Exception) as e:  # noqa: BLE001
+                        st.session_state.am_flash = (False, f"Could not close {url}: {e}")
+                    st.session_state.pop("pr_cache", None)
+                    st.rerun()
+            elif kind in (am.MERGED, am.MANUAL) and d.get("number"):
                 if st.session_state.get(key + "_ask"):
-                    if c2.button("Confirm revert", key=key + "_yes", type="primary"):
+                    if st.button("Confirm revert", key=key + "_yes", type="primary"):
                         try:
-                            rev = am.revert(gh, d["repo"], int(d["number"]), cfg.auto_merge.method)
+                            rev = am.revert(gh, d["repo"], int(d["number"]), amc.method)
                             store.record_intervention(r["run_id"], "auto_merge_reverted",
-                                                      json.dumps({"url": url, "revert_url": rev}))
+                                                      json.dumps({**d, "revert_url": rev}))
                             st.session_state.am_flash = (True, f"Reverted: {rev} is merged. Update & restart to "
                                                                "pick up the change.")
                         except (GitHubError, Exception) as e:  # noqa: BLE001
@@ -2685,130 +2425,31 @@ def auto_merge_panel(gh) -> None:
                         st.session_state.pop(key + "_ask", None)
                         st.session_state.pop("pr_cache", None)
                         st.rerun()
-                elif c2.button("↩ Revert", key=key, help="GitHub creates a revert PR and it is merged at once"):
+                elif st.button("↩ Revert", key=key + "_rev", help="GitHub creates a revert PR and it is merged at once"):
                     st.session_state[key + "_ask"] = True
                     st.rerun()
 
 
 def page_prs():
-    from swarmforge import prs as P
-    from swarmforge import selfupdate as su
-    from swarmforge.github import GitHubClient, GitHubError
-    st.header("Pull requests")
-    if not cfg:
-        st.error("Configuration not loaded.")
-        return
-    gh = GitHubClient(cfg.github)
-    if not gh.token:
-        st.warning(f"No GitHub token: add `{cfg.github.token_env}=...` to `.env` (or run `gh auth login`) and "
-                   "restart the dashboard. Merging needs Contents + Pull requests: write.")
-    repos = P.known_repos(cfg, store)
-    if not repos:
-        st.info("No GitHub repositories yet: pull requests appear here once a run opens one.")
-        return
-    c1, c2, c3 = st.columns([3, 2, 1])
-    chosen = c1.multiselect("Repositories", repos, default=repos, key="pr_repos")
-    method = c2.selectbox("How to merge", ["squash", "merge", "rebase"], key="pr_method",
-                          format_func={"squash": "Squash (one commit per PR)", "merge": "Merge commit",
-                                       "rebase": "Rebase"}.get)
-    if c3.button("🔄 Refresh", key="pr_refresh"):
-        st.session_state.pop("pr_cache", None)
-    delete = st.checkbox("Delete the swarmforge/* branch after merging", value=True, key="pr_delete")
-    cache = st.session_state.get("pr_cache")
-    if not cache or time.time() - cache["t"] > 60 or cache["repos"] != chosen:
-        data, errors = {}, {}
-        with st.spinner("Loading pull requests from GitHub…"):
-            for repo in chosen:
-                try:
-                    data[repo] = P.list_prs(gh, repo, store)
-                except (GitHubError, Exception) as e:  # noqa: BLE001
-                    errors[repo] = str(e)
-        cache = {"t": time.time(), "repos": chosen, "data": data, "errors": errors}
-        st.session_state.pr_cache = cache
-    for repo, err in cache["errors"].items():
-        st.warning(f"{repo}: {err}")
-    all_prs = [pr for prs in cache["data"].values() for pr in prs]
-    flash = st.session_state.pop("pr_flash", None)
-    if flash:
-        for ok, msg in flash["results"]:
-            (st.success if ok else st.error)(msg)
-        own = su.own_repo()
-        if own and any(ok and own.lower() in msg.lower() for ok, msg in flash["results"]):
-            with st.container(border=True):
-                st.markdown("**You merged changes to SwarmForge itself.** Update now to start using them.")
-                if st.button("⬆️ Update & restart SwarmForge now", type="primary", key="pr_update"):
-                    st.session_state.upd_status = None
-                    do_update_and_restart()
-    auto_merge_panel(gh)
-    if not all_prs:
-        st.success("No open pull requests. 🎉")
-        return
-    ready = [pr for pr in all_prs if pr.ready]
-    with st.container(border=True):
-        a, b = st.columns([3, 2])
-        a.markdown(f"**{len(all_prs)} open** · **{len(ready)} ready to merge** · "
-                   f"{sum(1 for p in all_prs if p.state == 'dirty')} with conflicts")
-        sure = a.checkbox("I've reviewed these changes", key="pr_sure",
-                          help="Merging changes the main branch on GitHub. Draft PRs are marked ready first.")
-        if b.button(f"Merge all ready ({len(ready)})", type="primary", disabled=not ready or not sure,
-                    key="pr_merge_all", width="stretch"):
-            with st.spinner("Merging, oldest first…"):
-                res = P.merge_all(gh, ready, method, delete)
-            st.session_state.pr_flash = {"results": [
-                (ok, f"{pr.repo} #{pr.number} {pr.title}: {msg}") for pr, ok, msg in res]}
-            st.session_state.pop("pr_cache", None)
-            st.session_state.upd_status = None
-            st.rerun()
-    for repo, prs in cache["data"].items():
-        if not prs:
-            continue
-        st.subheader(repo)
-        for pr in prs:
-            icon, text = pr.label
-            with st.container(border=True):
-                h1, h2 = st.columns([5, 2])
-                h1.markdown(f"**[#{pr.number} {pr.title}]({pr.url})**  \n"
-                            f"`{pr.head}` → `{pr.base}` · by {pr.author} · {pr.created_at[:10]} · "
-                            f"+{pr.additions} −{pr.deletions} in {pr.changed_files} file(s)")
-                h2.markdown(f"{icon} {text}")
-                b1, b2, b3 = st.columns([1.2, 1.4, 3])
-                if b1.button("Merge", key=f"pr_m_{repo}_{pr.number}", type="primary", disabled=not pr.ready or not sure,
-                             help="Tick “I've reviewed these changes” above first." if not sure else None):
-                    try:
-                        P.merge(gh, pr, method, delete)
-                        st.session_state.pr_flash = {"results": [(True, f"{repo} #{pr.number} {pr.title}: merged")]}
-                    except GitHubError as e:
-                        st.session_state.pr_flash = {"results": [(False, str(e))]}
-                    st.session_state.pop("pr_cache", None)
-                    st.session_state.upd_status = None
-                    st.rerun()
-                if pr.state == "behind" and b2.button("↻ Update branch", key=f"pr_u_{repo}_{pr.number}",
-                                                      help="Merge the latest main into this PR (no conflicts)."):
-                    try:
-                        P.update_branch(gh, pr)
-                        st.session_state.pr_flash = {"results": [(True, f"#{pr.number}: branch updated")]}
-                    except GitHubError as e:
-                        st.session_state.pr_flash = {"results": [(False, str(e))]}
-                    st.session_state.pop("pr_cache", None)
-                    st.rerun()
-                if pr.state == "dirty":
-                    b2.caption("Resolve on GitHub, or restart its task so it rebuilds on the latest main.")
-                if pr.run_id:
-                    with b3.expander("What the swarm did"):
-                        try:
-                            from swarmforge.report import build_summary
-                            st.markdown(build_summary(store, pr.run_id).split("### What you need to do")[0])
-                        except Exception as e:  # noqa: BLE001
-                            st.caption(f"summary unavailable: {e}")
-                        open_run_button("Open the run", pr.run_id, key=f"pr_o_{repo}_{pr.number}")
+    from swarmforge.dashboard_pages.prs import render
+    return render(auto_merge_panel, cfg, do_update_and_restart, open_run_button, st, store, time)
 
 
 # =========================================================== SETTINGS page
 def page_settings():
-    st.caption("Edit swarmforge.yaml, run health checks and test models.")
-    from swarmforge import settings
-    settings.render(cfg)
+    from swarmforge.dashboard_pages.settings import render
+    return render(cfg, st)
 
 
-{"Work": page_work, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Speed": page_speed, "Chat": page_chat,
+def page_projects():
+    from swarmforge.dashboard_pages.projects import render
+    render(cfg, st, store)
+
+
+def page_history():
+    from swarmforge.dashboard_pages.history import render
+    render(st, store)
+
+
+{"Work": page_work, "Projects": page_projects, "What's new": page_history, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Speed": page_speed, "Chat": page_chat,
  "Knowledge": page_knowledge, "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()

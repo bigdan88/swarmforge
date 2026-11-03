@@ -1,11 +1,57 @@
-# Benchmark suite for `swarmforge variants eval/evolve`.
-# Each case: an issue, a repository (a template folder copied into a fresh git repo per run, or an
-# existing repo path/URL), and HIDDEN acceptance tests the agents never see. Score = share passed.
-# One case is a weak signal: add more cases (different kinds of work) before trusting the ranking,
-# and use `--runs 2+` to average out noise.
-name: samples
+# Each template is committed to one pinned snapshot per comparison. Hidden tests are copied only after agents finish.
+name: inventory-diverse-v1
 cases:
-  - name: export-csv-json
-    issue: ../samples/issues/export-csv-json.md
-    repo_template: ../samples/inventory-app
-    acceptance: ../samples/acceptance/export
+- name: export-csv-json
+  issue: ../samples/issues/export-csv-json.md
+  repo_template: ../samples/inventory-app
+  acceptance: ../samples/acceptance/export
+- name: search
+  category: search
+  issue: issues/search.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/search
+- name: adjust-stock
+  category: domain
+  issue: issues/adjust-stock.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/adjust-stock
+- name: low-stock
+  category: query
+  issue: issues/low-stock.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/low-stock
+- name: statistics
+  category: multi-module
+  issue: issues/statistics.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/statistics
+- name: rename
+  category: validation
+  issue: issues/rename.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/rename
+- name: html-report
+  category: ui
+  issue: issues/html-report.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/html-report
+- name: csv-import
+  category: io
+  issue: issues/csv-import.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/csv-import
+- name: stock-command
+  category: cli
+  issue: issues/stock-command.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/stock-command
+- name: merge-inventory
+  category: integration
+  issue: issues/merge-inventory.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/merge-inventory
+- name: price-validation
+  category: bugfix
+  issue: issues/price-validation.md
+  repo_template: ../samples/inventory-app
+  acceptance: acceptance/price-validation

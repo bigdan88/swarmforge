@@ -24,7 +24,7 @@ def test_enable_shell_defaults_to_false(tmp_path, monkeypatch):
 
 def test_default_registry_has_only_fetch_url(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path, monkeypatch, enable_shell=False)
-    assert build_chat_registry(cfg).names() == ["fetch_url"]
+    assert set(build_chat_registry(cfg).names()) == {"fetch_url", "list_files", "repo_tree", "repo_file", "repo_search", "repo_issues"}
 
 
 def test_enable_shell_registers_sandbox_tools(tmp_path, monkeypatch):
@@ -86,3 +86,13 @@ def test_end_to_end_read_file_tool_loop(tmp_path, monkeypatch):
     tool_msgs = [m for m in fake.requests[1]["messages"] if m.get("role") == "tool"]
     assert len(tool_msgs) == 1
     assert "hello sandbox tools" in tool_msgs[0]["content"]
+
+
+def test_tool_allowlist_cannot_grant_shell_access(tmp_path):
+    raw = base_raw(tmp_path / "work")
+    raw["chatbot"] = {"enable_shell": False, "tools": ["read_file", "run_command"]}
+    assert build_chat_registry(parse_config(raw)).names() == []
+    raw["chatbot"] = {"enable_shell": True, "tools": ["read_file"]}
+    assert build_chat_registry(parse_config(raw)).names() == ["read_file"]
+    raw["chatbot"]["tools"] = []
+    assert build_chat_registry(parse_config(raw)).names() == []

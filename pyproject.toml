@@ -28,7 +28,7 @@ swarmforge = "swarmforge.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-swarmforge = ["resources/*"]
+swarmforge = ["resources/*", "resources/brand/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

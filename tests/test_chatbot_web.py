@@ -152,3 +152,153 @@ def test_conversation_branch_uses_tools(cfg, store, monkeypatch):
     assert res["answer"] == "Docs content, per https://docs.example.com/a"
     assert calls and calls[0]["url"] == "https://docs.example.com/a"
     assert res["conversation"] == conv["id"]
+
+
+# ======================================================== tool gating + trace
+
+
+def test_build_chat_registry_empty_tools_list(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_KEY", "k")
+    raw = base_raw(tmp_path / "work")
+    raw["chatbot"] = {"tools": []}
+    cfg = parse_config(raw)
+    assert build_chat_registry(cfg).names() == []
+
+
+def test_build_chat_registry_unknown_tool_names_ignored(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_KEY", "k")
+    raw = base_raw(tmp_path / "work")
+    raw["chatbot"] = {"tools": ["nope"]}
+    cfg = parse_config(raw)
+    assert build_chat_registry(cfg).names() == []
+
+
+def test_build_chat_registry_explicit_fetch_url(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_KEY", "k")
+    raw = base_raw(tmp_path / "work")
+    raw["chatbot"] = {"tools": ["fetch_url"]}
+    cfg = parse_config(raw)
+    assert build_chat_registry(cfg).names() == ["fetch_url"]
+
+
+def test_build_chat_registry_default_registers_fetch_url(cfg):
+    assert "fetch_url" in build_chat_registry(cfg).names()
+
+
+def test_chat_with_tools_trace_success(cfg, monkeypatch):
+    import asyncio
+
+    from swarmforge.chat_tools import chat_with_tools
+
+    _stub_fetch(monkeypatch, "# Repo\n\nHello from the README")
+    responses = iter(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    tool_call("fetch_url", {"url": "https://github.com/o/r"})
+                ],
+            },
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+    fake = FakeProvider({"qwen-fake": lambda body: next(responses)})
+
+    class _LLM:
+        async def chat(self, role, messages, tools=None, task_key="chatbot"):
+            body = {"messages": messages, "tools": tools}
+            msg = fake.handlers["qwen-fake"](body)
+            return type("R", (), {"message": msg})()
+
+    trace: list = []
+    out = asyncio.run(
+        chat_with_tools(
+            _LLM(),
+            "chat",
+            [{"role": "user", "content": "q"}],
+            build_chat_registry(cfg),
+            trace=trace,
+        )
+    )
+    assert out == "done"
+    assert len(trace) == 1
+    entry = trace[0]
+    assert entry["name"] == "fetch_url"
+    assert entry["args"] == {"url": "https://github.com/o/r"}
+    assert entry["ok"] is True
+    assert "Hello from the README" in entry["preview"]
+
+
+def test_chat_with_tools_trace_error(cfg, store, monkeypatch):
+    _failing_fetch(monkeypatch)
+    responses = iter(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    tool_call("fetch_url", {"url": "https://example.com/x"})
+                ],
+            },
+            {"role": "assistant", "content": "I could not fetch that page."},
+        ]
+    )
+    fake = FakeProvider({"qwen-fake": lambda body: next(responses)})
+    res = ask(cfg, store, "Fetch https://example.com/x", transport=fake.transport)
+    assert res["answer"] == "I could not fetch that page."
+    assert len(res["tools_used"]) == 1
+    entry = res["tools_used"][0]
+    assert entry["name"] == "fetch_url"
+    assert entry["ok"] is False
+    assert entry["preview"].startswith("ERROR:")
+
+
+def test_ask_tools_used_empty_without_tool_calls(cfg, store):
+    fake = FakeProvider(
+        {
+            "qwen-fake": lambda body: {
+                "role": "assistant",
+                "content": "2 runs: 1 completed, 1 failed",
+            }
+        }
+    )
+    res = ask(cfg, store, "How many runs?", transport=fake.transport)
+    assert res["tools_used"] == []
+
+
+def test_ask_tools_used_in_conversation_branch(cfg, store, monkeypatch):
+    from swarmforge.chatbot import create_conversation
+
+    conv = create_conversation(store)
+    _stub_fetch(monkeypatch, "# Doc\n\nDocs content")
+    responses = iter(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    tool_call("fetch_url", {"url": "https://docs.example.com/a"})
+                ],
+            },
+            {"role": "assistant", "content": "Docs content"},
+        ]
+    )
+    fake = FakeProvider({"qwen-fake": lambda body: next(responses)})
+    res = ask(
+        cfg,
+        store,
+        "Summarize https://docs.example.com/a",
+        conversation=conv["id"],
+        transport=fake.transport,
+    )
+    assert res["tools_used"] and res["tools_used"][0]["name"] == "fetch_url"
+    assert res["tools_used"][0]["ok"] is True
+
+
+def test_parse_config_chatbot_tools_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_KEY", "k")
+    raw = base_raw(tmp_path / "work")
+    raw["chatbot"] = {"tools": []}
+    cfg = parse_config(raw)
+    assert cfg.chatbot.tools == []

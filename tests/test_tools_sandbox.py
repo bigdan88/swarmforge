@@ -115,3 +115,36 @@ def test_resolve_within_rejects_missing(tmp_path):
         resolve_within(tmp_path, "nope.txt")
     with pytest.raises(SandboxToolError):
         resolve_within(tmp_path, "  ")
+
+
+def test_chat_docker_mount_is_read_only(tmp_path):
+    from swarmforge.tools.sandbox import ReadOnlyChatSandbox
+    args = ReadOnlyChatSandbox(SandboxConfig()).build_args(tmp_path, "echo ok", "test", network="none")
+    mount = next(args[i + 1] for i, value in enumerate(args) if value == "--mount" and "target=/workspace" in args[i + 1])
+    assert mount.endswith(",readonly")
+    assert args[args.index("--network") + 1] == "none"
+
+
+def test_shell_timeout_is_capped_and_network_disabled(tmp_path, monkeypatch):
+    from swarmforge.tools import sandbox as module
+    from swarmforge.sandbox import CommandResult
+    seen = {}
+    class Stub:
+        async def run(self, root, command, **kwargs):
+            seen.update(kwargs)
+            return CommandResult(command, 0, "ok", .1)
+    monkeypatch.setattr(module, "make_sandbox", lambda _: Stub())
+    asyncio.run(ChatSandboxTools(tmp_path).run_command("echo ok", timeout_s=1000))
+    assert seen == {"timeout_s": 30, "network": "none"}
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is not installed")
+def test_chat_command_cannot_modify_project_in_docker(tmp_path):
+    original = tmp_path / "original.txt"
+    original.write_text("keep me")
+    tools = ChatSandboxTools(tmp_path, SandboxConfig(mode="docker"))
+    output = asyncio.run(tools.run_command(
+        "python -c \"from pathlib import Path; Path('original.txt').write_text('changed')\""))
+    assert "[exit 0" not in output
+    assert original.read_text() == "keep me"
