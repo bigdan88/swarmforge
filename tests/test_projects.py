@@ -233,6 +233,15 @@ async def test_budget_guard_and_lane_isolation(state, cfg):
     assert service.can_start(s, s.queue_item(other))
 
 
+def test_plan_accepts_a_leading_living_heading(state, cfg):
+    _, projects, pid = state
+    project = projects.get(pid)
+    result = proposal()
+    expected = service.validate_plan(project, result, cfg.projects.horizon)
+    result["living"] = "## Living\n\n" + result["living"]
+    assert service.validate_plan(project, result, cfg.projects.horizon).strip() == expected.strip()
+
+
 def test_bad_configuration_and_horizon_rejected(cfg):
     from swarmforge.config import ConfigError, ProjectsConfig
     with pytest.raises(ConfigError):

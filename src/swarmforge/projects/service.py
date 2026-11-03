@@ -138,6 +138,9 @@ def validate_plan(p, result, horizon):
     if action not in ("plan", "checkpoint", "escalate") or not isinstance(result.get("reason"), str) or not result["reason"].strip():
         raise ProjectError("Lead proposal requires a known action and reason")
     living = result.get("living")
+    if isinstance(living, str):
+        # Some models include the section heading even when asked for its body.
+        living = re.sub(r"\A\s*## Living[ \t]*\r?\n(?:[ \t]*\r?\n)*", "", living, count=1)
     if not isinstance(living, str) or any("### " + h not in living for h in ("Current state", "Decisions made", "Plan", "Plan changes", "Open questions")):
         raise ProjectError("Lead must supply all living sections")
     spec = fixed(p["spec"]) + "## Living\n\n" + living
