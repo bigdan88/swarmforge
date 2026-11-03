@@ -79,6 +79,19 @@ def test_run_command_timeout_message_uses_clamped_value(tmp_path):
     assert time.monotonic() - start < 5
 
 
+def test_run_command_timeout_message_uses_clamped_value_for_negative(tmp_path):
+    tools = make_tools(tmp_path)
+    start = time.monotonic()
+    out = asyncio.run(
+        tools.run_command(
+            f'"{sys.executable}" -c "import time;time.sleep(5)"', timeout_s=-3
+        )
+    )
+    assert "[TIMED OUT after 1s]" in out
+    assert "[TIMED OUT after -3s]" not in out
+    assert time.monotonic() - start < 5
+
+
 def test_run_command_blank_rejected(tmp_path):
     tools = make_tools(tmp_path)
     with pytest.raises(SandboxToolError):
