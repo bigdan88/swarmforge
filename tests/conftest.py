@@ -206,7 +206,7 @@ def browser_slot():
     On platforms without fcntl (Windows) this falls back to a stdlib file
     mutex (O_EXCL lock file with polling + timeout).
     """
-    return _slot_lock(_BROWSER_LOCK_PATH, _BROWSER_LOCK_TIMEOUT_S)
+    return lambda: _slot_lock(_BROWSER_LOCK_PATH, _BROWSER_LOCK_TIMEOUT_S)
 
 
 # ------------------------------------------------------------- fake model API

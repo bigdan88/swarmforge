@@ -12,6 +12,23 @@ from .conftest import ISSUE, ROOT, FakeProvider
 pytestmark = pytest.mark.slow
 
 
+@pytest.fixture(autouse=True)
+def _serialize_full_swarm_runs(request):
+    """Serialize real full-swarm queue runs across pytest-xdist workers.
+
+    Same resource-exhaustion flake guard as tests/test_e2e.py: every item that
+    drives an actual orchestrator run holds the cross-process browser slot
+    lock, so heavy swarms take turns instead of collectively exhausting OS
+    threads (which the removed xdist_group workarounds could not prevent).
+    """
+    if "sample_repo" not in request.fixturenames:
+        yield
+        return
+    browser_slot = request.getfixturevalue("browser_slot")
+    with browser_slot():
+        yield
+
+
 def _provider():
     return FakeProvider({
         "qwen-fake": fake_team.planner, "deepseek-fake": fake_team.developer,
@@ -134,6 +151,9 @@ async def test_queue_item_continue_uses_seed_and_runtime(cfg, sample_repo):
 
 
 async def test_queue_item_heals_itself(cfg, sample_repo):
+    # a failed attempt plus its self-heal is TWO full swarms; give the watchdog
+    # a realistic budget so a contended runner cannot time the run out
+    cfg.limits.max_runtime_s = 1200
     store = Store(cfg.db_path)
     body = ISSUE.read_text(encoding="utf-8").split("\n", 2)[2]
     iid = store.queue_add("Export", body, str(sample_repo.resolve()), max_cycles=0, heal_attempts=1)
@@ -141,7 +161,7 @@ async def test_queue_item_heals_itself(cfg, sample_repo):
     item = store.queue_item(iid)
     assert item["status"] == "done", item["note"]
     run = store.get_run(item["run_id"])
-    assert run["heal_attempt"] == 1 and run["state"] == "COMPLETED"
+    assert run["heal_attempt"] == 1 and run["state"] == "COMPLETED", run["state_reason"]
     assert store.failure(run["heal_of"])["outcome"] == "fixed itself on attempt 1"
     assert "after self-healing attempt 1" in item["note"]
 

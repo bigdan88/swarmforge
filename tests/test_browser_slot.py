@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-from conftest import _file_mutex_slot, _slot_lock  # noqa: F401
+from .conftest import _file_mutex_slot, _slot_lock  # noqa: F401
 
 
 def test_file_mutex_released_after_exit(tmp_path: Path):
@@ -67,7 +67,7 @@ def test_browser_slot_returns_usable_context_manager(request):
 
 
 def test_slot_lock_selects_file_mutex_without_fcntl(tmp_path: Path, monkeypatch):
-    import conftest
+    from . import conftest
 
     monkeypatch.setattr(conftest, "fcntl", None)
     cm = conftest._slot_lock(tmp_path / "sel", timeout_s=5)
