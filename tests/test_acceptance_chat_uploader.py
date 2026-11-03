@@ -311,8 +311,8 @@ def test_ac4_no_upload_send_calls_ask_with_exactly_todays_arguments(tmp_path, mo
     assert len(calls) == 1
     kw = calls[0]["kw"]
     assert "attachments" not in kw
-    # exactly today's call shape: history + conversation, nothing else
-    assert set(kw) == {"conversation"}
+    # exactly today's call shape: history + conversation (+ the live on_tool callback), nothing else
+    assert set(kw) == {"conversation", "on_tool"}
     assert calls[0]["history"] == []
     # nothing image-like is rendered, and the answer still comes through
     assert not at.image
@@ -328,7 +328,7 @@ def test_ac4_cli_ask_never_passes_attachments(tmp_path, monkeypatch):
     cfg_path.write_text(yaml.safe_dump(base_raw(tmp_path / "work")))
     recorded = {}
 
-    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12, on_tool=None):
         recorded["ok"] = True
         return {"answer": "All good.", "role": "chat", "model": "m1", "question": question}
 
@@ -350,10 +350,11 @@ def test_ac5_ask_and_answer_gained_exactly_one_optional_keyword_only_param():
         assert params["attachments"].kind is inspect.Parameter.KEYWORD_ONLY
         assert params["attachments"].default is None
     assert set(inspect.signature(chatbot.ask).parameters) == {
-        "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "attachments"}
+        "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "attachments",
+        "on_tool"}
     assert set(inspect.signature(chatbot.answer).parameters) == {
         "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "budget",
-        "attachments"}
+        "attachments", "on_tool"}
 
 
 def test_ac5_only_one_new_module_and_no_attachments_outside_the_three_files():

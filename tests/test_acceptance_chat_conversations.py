@@ -326,7 +326,7 @@ def test_ac6_cli_ask_has_conversation_defaulting_to_cli(tmp_path, monkeypatch, c
     p = _write_yaml(tmp_path, base_raw(tmp_path / "work"))
     seen = {}
 
-    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12, on_tool=None):
         seen["conversation"] = conversation
         seen["question"] = question
         return {"answer": "fine", "role": "planner", "model": "qwen-fake", "question": question}
@@ -359,7 +359,7 @@ def test_ac6_dashboard_chat_session_conversation_and_reset(tmp_path, monkeypatch
 
     calls = []
 
-    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12):
+    def fake_ask(cfg, store, question, history=None, *, conversation=None, transport=None, max_runs=12, on_tool=None):
         calls.append({"question": question, "conversation": conversation})
         return {"answer": "ok", "role": "planner", "model": "qwen-fake", "question": question,
                 "conversation": conversation, "usage": {"cost_usd": 0.02, "total_tokens": 10}}

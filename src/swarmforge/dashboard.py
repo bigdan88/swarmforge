@@ -7,6 +7,7 @@ processes; the dashboard only reads the SQLite store / vault and writes explicit
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -2276,8 +2277,13 @@ def _chat_load(conv_id: str) -> tuple[list, dict]:
     from swarmforge import chatbot
     _chat_migrate_legacy()
     if st.session_state.get("chat_loaded_conv") != conv_id:
-        st.session_state.chat_history = [{"role": m["role"], "content": m["content"]}
-                                         for m in chatbot.get_messages(store, conv_id)]
+        def _row(m):
+            d = {"role": m["role"], "content": m["content"]}
+            if m.get("tool_calls"):
+                d["tool_calls"] = m["tool_calls"]
+            return d
+
+        st.session_state.chat_history = [_row(m) for m in chatbot.get_messages(store, conv_id)]
         try:
             d = json.loads(store.kv_get(_chat_actions_key(conv_id)) or "{}")
         except json.JSONDecodeError:
@@ -2515,6 +2521,8 @@ def page_chat():
     with main, st.container(key="chat_main"):
         with st.container(key="chat_topbar", horizontal=True, vertical_alignment="center"):
             st.markdown(active_conv.get("title") or "New chat", width="stretch")
+            tools_on = st.toggle("Tools", value=cfg.chat.tools_enabled, key="chat_tools_enabled",
+                                 help="Let the assistant call fetch_url / list_files while answering")
             reset = st.button("Clear", icon=":material/restart_alt:", key="chat_reset", type="tertiary",
                               help="Remove every message in this conversation")
         if reset:
@@ -2537,6 +2545,18 @@ def page_chat():
             for n, m in enumerate(history):
                 with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
                     if m["role"] == "assistant":
+                        calls = m.get("tool_calls")
+                        if isinstance(calls, str):
+                            try:
+                                calls = json.loads(calls)
+                            except (TypeError, ValueError):
+                                calls = None
+                        for tc in calls or []:
+                            if not isinstance(tc, dict):
+                                continue
+                            a = tc.get("args") or {}
+                            arg = next((str(v) for v in a.values() if v not in (None, "")), "")[:80]
+                            st.caption(f"🔧 {tc.get('name')} · {arg}" if arg else f"🔧 {tc.get('name')}")
                         st.markdown(_chat_md(m["content"]))
                         render_message_actions(n, actions.get(n))
                     else:
@@ -2581,20 +2601,37 @@ def page_chat():
         kwargs = {"history": history[:-1], "conversation": conv}
         if att_paths:
             kwargs["attachments"] = att_paths
-        try:
-            with st.spinner("Thinking…"):
-                res = chatbot.ask(cfg, store, prompt, **kwargs)
-        except chatbot.ChatError as e:
-            st.error(f"Chatbot: {e}")
-            _chat_save(actions, active_id)
-            return
-        history.append({"role": "assistant", "content": res["answer"]})
-        chatbot.add_message(store, active_id, "assistant", res["answer"])
-        if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
-            actions[len(history) - 1] = res["actions"]
-        _chat_save(actions, active_id)
         with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
-            st.markdown(_chat_md(res["answer"]))
+            tools_box = st.container()
+            answer_slot = st.empty()
+
+            calls: list[dict] = []
+
+            def _on_tool(name, args, output):
+                a = args or {}
+                arg = str(a.get("url") or a.get("path") or next(iter(a.values()), ""))[:80]
+                tools_box.caption(f"🔧 {name} · {arg}" if arg else f"🔧 {name}")
+                calls.append({"name": name, "args": a, "output": output})
+
+            try:
+                with st.spinner("Thinking…"):
+                    ask_cfg = dataclasses.replace(
+                        cfg, chat=dataclasses.replace(cfg.chat, tools_enabled=tools_on))
+                    res = chatbot.ask(ask_cfg, store, prompt, on_tool=_on_tool, **kwargs)
+            except chatbot.ChatError as e:
+                answer_slot.error(f"Chatbot: {e}")
+                _chat_save(actions, active_id)
+                return
+            entry = {"role": "assistant", "content": res["answer"]}
+            if calls:
+                entry["tool_calls"] = calls
+            history.append(entry)
+            chatbot.add_message(store, active_id, "assistant", res["answer"],
+                                tool_calls=calls or None)
+            if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
+                actions[len(history) - 1] = res["actions"]
+            _chat_save(actions, active_id)
+            answer_slot.markdown(_chat_md(res["answer"]))
             st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
                        f"conversation {res.get('conversation', conv)} · "
                        f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")

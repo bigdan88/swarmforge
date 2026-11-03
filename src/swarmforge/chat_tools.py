@@ -94,6 +94,7 @@ async def chat_with_tools(
     *,
     max_rounds: int = 4,
     task_key: str = "chatbot",
+    on_tool: Callable[[str, dict, str], Any] | None = None,
 ) -> str:
     """Run a tool-calling conversation loop and return the final text answer.
 
@@ -126,6 +127,11 @@ async def chat_with_tools(
             except (json.JSONDecodeError, TypeError):
                 args = {}
             out = await registry.execute(name, args)
+            if on_tool is not None:
+                try:
+                    on_tool(name, args, out)
+                except Exception:  # noqa: BLE001, S110 - a broken UI callback must not break the loop
+                    pass
             work.append(
                 {
                     "role": "tool",
