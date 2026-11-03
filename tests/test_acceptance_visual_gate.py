@@ -205,6 +205,46 @@ def test_vision_model_major_without_blocking_flag_stays_non_blocking(tmp_path, c
     assert orch._gate(1, _ev(), None, None, []) == []
 
 
+def test_blocking_flag_on_low_severity_visual_finding_does_not_block(tmp_path, cfg):
+    """info/minor findings with blocking=True must NOT block; critical still does."""
+    orch, _ = _orch(tmp_path, cfg)
+    orch._visual_findings = [
+        {
+            "severity": "info",
+            "blocking": True,
+            "page": "home",
+            "theme": "light",
+            "title": "cosmetic nit",
+            "description": "d",
+            "recommendation": "r",
+        },
+        {
+            "severity": "minor",
+            "blocking": True,
+            "page": "chat",
+            "theme": "dark",
+            "title": "minor nit",
+            "description": "d",
+            "recommendation": "r",
+        },
+    ]
+    assert orch._gate(1, _ev(), None, None, []) == []
+
+    orch._visual_findings = [
+        {
+            "severity": "critical",
+            "page": "home",
+            "theme": "light",
+            "title": "blank dashboard",
+            "description": "d",
+            "recommendation": "r",
+        }
+    ]
+    problems = orch._gate(1, _ev(), None, None, [])
+    assert [p["kind"] for p in problems] == ["visual"]
+    assert "[visual/critical]" in problems[0]["summary"]
+
+
 def test_blocking_flag_alone_triggers_the_gate_problem(tmp_path, cfg):
     """The blocking flag (set by golden regressions) blocks even at 'major' severity."""
     orch, _ = _orch(tmp_path, cfg)
