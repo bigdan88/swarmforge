@@ -57,14 +57,39 @@ def test_run_command_stdout_and_stderr(tmp_path):
 
 def test_run_command_timeout(tmp_path):
     tools = make_tools(tmp_path)
-    start = time.time()
+    start = time.monotonic()
     out = asyncio.run(
         tools.run_command(
             f'"{sys.executable}" -c "import time;time.sleep(10)"', timeout_s=1
         )
     )
     assert "TIMED OUT" in out
-    assert time.time() - start < 8
+    assert time.monotonic() - start < 8
+
+
+def test_run_command_timeout_message_uses_clamped_value(tmp_path):
+    tools = make_tools(tmp_path)
+    start = time.monotonic()
+    out = asyncio.run(
+        tools.run_command(
+            f'"{sys.executable}" -c "import time;time.sleep(5)"', timeout_s=0
+        )
+    )
+    assert "[TIMED OUT after 1s]" in out
+    assert time.monotonic() - start < 5
+
+
+def test_run_command_timeout_message_uses_clamped_value_for_negative(tmp_path):
+    tools = make_tools(tmp_path)
+    start = time.monotonic()
+    out = asyncio.run(
+        tools.run_command(
+            f'"{sys.executable}" -c "import time;time.sleep(5)"', timeout_s=-3
+        )
+    )
+    assert "[TIMED OUT after 1s]" in out
+    assert "[TIMED OUT after -3s]" not in out
+    assert time.monotonic() - start < 5
 
 
 def test_run_command_blank_rejected(tmp_path):
@@ -119,8 +144,15 @@ def test_resolve_within_rejects_missing(tmp_path):
 
 def test_chat_docker_mount_is_read_only(tmp_path):
     from swarmforge.tools.sandbox import ReadOnlyChatSandbox
-    args = ReadOnlyChatSandbox(SandboxConfig()).build_args(tmp_path, "echo ok", "test", network="none")
-    mount = next(args[i + 1] for i, value in enumerate(args) if value == "--mount" and "target=/workspace" in args[i + 1])
+
+    args = ReadOnlyChatSandbox(SandboxConfig()).build_args(
+        tmp_path, "echo ok", "test", network="none"
+    )
+    mount = next(
+        args[i + 1]
+        for i, value in enumerate(args)
+        if value == "--mount" and "target=/workspace" in args[i + 1]
+    )
     assert mount.endswith(",readonly")
     assert args[args.index("--network") + 1] == "none"
 
@@ -128,11 +160,14 @@ def test_chat_docker_mount_is_read_only(tmp_path):
 def test_shell_timeout_is_capped_and_network_disabled(tmp_path, monkeypatch):
     from swarmforge.tools import sandbox as module
     from swarmforge.sandbox import CommandResult
+
     seen = {}
+
     class Stub:
         async def run(self, root, command, **kwargs):
             seen.update(kwargs)
-            return CommandResult(command, 0, "ok", .1)
+            return CommandResult(command, 0, "ok", 0.1)
+
     monkeypatch.setattr(module, "make_sandbox", lambda _: Stub())
     asyncio.run(ChatSandboxTools(tmp_path).run_command("echo ok", timeout_s=1000))
     assert seen == {"timeout_s": 30, "network": "none"}
@@ -144,7 +179,10 @@ def test_chat_command_cannot_modify_project_in_docker(tmp_path):
     original = tmp_path / "original.txt"
     original.write_text("keep me")
     tools = ChatSandboxTools(tmp_path, SandboxConfig(mode="docker"))
-    output = asyncio.run(tools.run_command(
-        "python -c \"from pathlib import Path; Path('original.txt').write_text('changed')\""))
+    output = asyncio.run(
+        tools.run_command(
+            "python -c \"from pathlib import Path; Path('original.txt').write_text('changed')\""
+        )
+    )
     assert "[exit 0" not in output
     assert original.read_text() == "keep me"
