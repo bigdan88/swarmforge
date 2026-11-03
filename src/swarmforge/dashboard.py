@@ -1134,6 +1134,7 @@ def work_items() -> list[dict]:
     from swarmforge.runqueue import lane as _lane
     waiting_pos: dict[int, int] = {}
     per_lane: dict[str, int] = {}
+    running_by_lane = {_lane(q): q for q in queue if q["status"] == "running"}
     for q in queue:
         if q["status"] == "queued":
             per_lane[_lane(q)] = per_lane.get(_lane(q), 0) + 1
@@ -1160,6 +1161,7 @@ def work_items() -> list[dict]:
             grp, icon, label = "failed", QSTATUS.get(i["status"], "❌"), i["status"].title()
         out.append({"key": f"q:{i['id']}", "group": grp, "icon": icon, "status": label, "title": i["title"],
                     "repo": i["repo"], "item": i, "run": r, "merge": merges.get(r["id"]) if r else None,
+                    "waiting_on": running_by_lane.get(_lane(i)) if i["status"] == "queued" else None,
                     "when": (r["created_at"] if r else i.get("created_at")) or 0,
                     "order": waiting_pos.get(i["id"], 0), "hidden": False,
                     "archived": bool(r.get("archived")) if r else False})
@@ -1494,7 +1496,11 @@ def work_row(w: dict, show_repo: bool = True) -> None:
                       f"**{w['title'] or '(untitled)'}**"
                       + (f" <span class='sf-tries' title='earlier attempts of this task are folded into this row'>"
                          f"×{tries + 1}</span>" if tries else ""), unsafe_allow_html=True)
-        c[3].markdown(w["status"])
+        blocker = w.get("waiting_on")
+        if blocker:
+            c[3].markdown(f"Waiting on #{blocker['id']}", help=blocker["title"])
+        else:
+            c[3].markdown(w["status"])
         c[4].markdown(cells["now"] or " ")
         rest = c[5:]
         if show_repo:
@@ -1782,6 +1788,8 @@ def item_detail(w: dict, every) -> None:
         bits.append(f"run `{r['id']}`")
     bits.append(f"repo `{w['repo']}`")
     st.caption(" · ".join(bits))
+    if blocker := w.get("waiting_on"):
+        st.info(f"Waiting for task #{blocker['id']} to leave this queue slot. {blocker['title']}")
     if i and i["status"] != "queued":
         extra = []
         if i["base_branch"]:
