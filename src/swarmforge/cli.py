@@ -804,6 +804,19 @@ def build_parser() -> argparse.ArgumentParser:
     x = vas.add_parser("use", help="make a variant the default for every run (writes active_variant)")
     x.add_argument("id", help="variant id, or 'none' for the base config")
     va.set_defaults(fn=cmd_variants)
+    prj = sub.add_parser("project", help="build apps through approved milestones")
+    ps = prj.add_subparsers(dest="project_cmd", required=True)
+    x = ps.add_parser("new", help="start a kickoff chat or load a JSON project definition")
+    x.add_argument("--name", default="New project")
+    x.add_argument("--definition", help="JSON file with goal, constraints and milestones")
+    for action in ("status", "approve", "pause", "resume", "cancel", "chat"):
+        x = ps.add_parser(action)
+        x.add_argument("id")
+        if action in ("resume", "chat"):
+            x.add_argument("--reply", default="continue" if action == "resume" else None, required=action == "chat")
+        if action == "resume":
+            x.add_argument("--confirm-manual", action="store_true", help="confirm all checks marked needs you")
+    prj.set_defaults(fn=cmd_project)
     return p
 
 
@@ -976,6 +989,39 @@ def cmd_bench_suite(args, cfg) -> int:
                                   same_repo=args.same_repo, limit=args.limit))
     print(json.dumps(result["summary"], indent=2))
     return 0
+
+
+def cmd_project(args, cfg) -> int:
+    from .projects import lead, service
+    from .projects.store import Projects
+    store = _store(cfg)
+    ps = Projects(store)
+    try:
+        action = args.project_cmd
+        if action == "new":
+            p = ps.create(args.name)
+            if args.definition:
+                ps.draft(p["id"], json.loads(Path(args.definition).read_text(encoding="utf-8")))
+            print(json.dumps(ps.get(p["id"]), indent=2))
+        elif action == "status":
+            print(json.dumps({"project": ps.get(args.id), "milestones": ps.milestones(args.id), "tasks": ps.items(args.id), "spent_usd": ps.spent(args.id)}, indent=2))
+        elif action == "chat":
+            print(asyncio.run(lead.interview(cfg, store, args.id, args.reply)))
+        else:
+            if action == "resume":
+                service.resume(store, args.id, args.reply, confirm_manual=args.confirm_manual)
+            else:
+                getattr(service, action)(store, args.id)
+            if action in ("approve", "resume"):
+                from .runqueue import start_worker
+                start_worker(cfg, store)
+            print(f"Project {args.id}: {ps.get(args.id)['status']}")
+        return 0
+    except (ValueError, OSError) as e:
+        print(f"project: {e}", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
 
 
 def main(argv: list[str] | None = None) -> int:

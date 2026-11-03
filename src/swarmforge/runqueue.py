@@ -128,8 +128,29 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     from .orchestrator import Orchestrator, new_run_id
     cfg = fresh_config(cfg, echo)        # settings edited since the worker started apply to this task
     c = copy.deepcopy(cfg)
+    if item.get("project_id"):
+        from .projects.store import Projects
+        ps = Projects(store)
+        p = ps.get(item["project_id"])
+        if p["status"] != "running":
+            return store.queue_item(item["id"])
+        # One approved project owns publication; detached auto-fixes would escape its budget/lane.
+        c.auto_merge.auto_fix = False
+        c.auto_merge.enabled = True
+        c.auto_merge.repos = [p["repo"]]
+        c.self_heal.enabled = False
+        c.github.create_pr = not str(item.get("project_key") or "").startswith("spike:")
+        ms = ps.milestones(p["id"])[p["current_milestone"]]
+        remaining = min(p["budget_usd"] - ps.spent(p["id"]),
+                        ms["estimate_usd"] * cfg.projects.escalate_budget_factor - ps.spent(p["id"], p["current_milestone"]))
+        requested = min(float(item["budget"] or c.limits.budget_usd), c.limits.budget_usd)
+        if remaining <= 0 or requested > remaining:
+            from .projects.service import stop
+            stop(ps, p, "The next run needs a budget review before it starts.", {"requested": requested, "remaining": remaining})
+            return store.queue_item(item["id"])
+        c.limits.budget_usd = min(c.limits.budget_usd, remaining)
     if item["budget"]:
-        c.limits.budget_usd = float(item["budget"])
+        c.limits.budget_usd = min(c.limits.budget_usd, float(item["budget"])) if item.get("project_id") else float(item["budget"])
     if item["max_cycles"] is not None:
         c.limits.max_repair_cycles = int(item["max_cycles"])
     if item.get("max_runtime_s"):
@@ -271,18 +292,29 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
     """Work through every queue ("pile"). Each queue runs its items strictly in order, one at a time;
     different queues run side by side (at most `limits.max_parallel_queues`). Returns items processed.
     The global pause stops new starts everywhere; a failed item (policy "stop") pauses only its queue."""
-    other = worker_pid(store)
-    if other and other != os.getpid():
-        if echo:
-            echo(f"another queue worker is already running (pid {other})")
-        return 0
-    store.kv_set(WORKER_KEY, str(os.getpid()))
+    # Two dashboard launches can race before either child records its PID. Claim the worker
+    # inside a write transaction so a project cannot dispatch duplicate runs in that window.
+    with store._lock, store.conn:
+        store.conn.execute("BEGIN IMMEDIATE")
+        other = worker_pid(store)
+        if other and other != os.getpid():
+            if echo:
+                echo(f"another queue worker is already running (pid {other})")
+            return 0
+        store.conn.execute("INSERT INTO kv(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (WORKER_KEY, str(os.getpid())))
     done = started = 0
     running: dict[str, tuple[dict, asyncio.Task]] = {}
+    project_poll = 0.0
+    project_task = None
     try:
         # recover items left 'running' by a crashed worker
         for i in store.queue_items(include_finished=False):
             if i["status"] == "running":
+                prior = store.get_run(i["run_id"]) if i.get("run_id") else None
+                if i.get("project_id") and prior and prior["state"] in ("COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"):
+                    store.queue_update(i["id"], status="done" if prior["state"] == "COMPLETED" else "failed", finished_at=time.time(), note="Recovered completed project run after worker restart")
+                    continue
                 # put it back in line once (the worker was restarted, e.g. for new code); a second
                 # interruption marks it failed so a task that crashes the worker can't loop forever
                 again = "worker stopped while this item was running" in (i.get("note") or "")
@@ -317,16 +349,24 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                 store.kv_set(WORKER_KEY, None)
                 if echo:
                     echo("queue worker restarting with the updated code")
-                if any(i["status"] == "queued" for i in store.queue_items(include_finished=False)):
+                if any(i["status"] == "queued" for i in store.queue_items(include_finished=False)) or store._one("SELECT id FROM projects WHERE status='running' LIMIT 1"):
                     start_worker(cfg, store, keep_pause=True)
                 break
             can_start = not paused and not restart and (max_items is None or started < max_items)
+            from .projects import service as projects
+            from .projects.store import Projects
+            if project_task is not None and project_task.done():
+                project_task.result()
+                project_task = None
+            if can_start and project_task is None and time.monotonic() >= project_poll:
+                project_task = asyncio.create_task(projects.tick(cfg, store, transport=llm_transport))
+                project_poll = time.monotonic() + 10
             startable = []
             if can_start:
                 seen = set(running)
                 for item in store.queue_items(include_finished=False):
                     name = lane(item)
-                    if item["status"] != "queued" or name in seen or lane_paused(store, name):
+                    if item["status"] != "queued" or name in seen or lane_paused(store, name) or not projects.can_start(store, item):
                         continue
                     seen.add(name)
                     startable.append(item)
@@ -341,15 +381,23 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                     started += 1
             if not running:
                 if restart:
+                    if project_task is not None:
+                        await asyncio.sleep(poll_s)
                     continue
                 if paused and echo:
                     echo("queue paused")
+                if not paused and not restart and (max_items is None or started < max_items) and any(p["status"] == "running" for p in Projects(store).list()):
+                    await asyncio.sleep(poll_s)
+                    continue
                 if paused or not startable or (max_items is not None and started >= max_items):
                     break
                 continue
             await asyncio.wait([t for _, t in running.values()], timeout=poll_s,
                                return_when=asyncio.FIRST_COMPLETED)
     finally:
+        if project_task is not None:
+            project_task.cancel()
+            await asyncio.gather(project_task, return_exceptions=True)
         for _, task in running.values():          # worker cancelled (Ctrl+C): stop the runs it owns
             task.cancel()
         if store.kv_get(WORKER_KEY) == str(os.getpid()):

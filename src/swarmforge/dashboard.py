@@ -331,13 +331,15 @@ def wikilinks_to_md(text: str) -> str:
 
 
 # --------------------------------------------------------------------- sidebar
-PAGES = ["Work", "Pull requests", "New task", "Failures", "Speed", "Chat", "Knowledge", "Benchmarks", "Settings"]
+PAGES = ["Work", "Projects", "Pull requests", "New task", "Failures", "Speed", "Chat", "Knowledge", "Benchmarks", "What's new", "Settings"]
 NAV_ICON = {"Work": ":material/view_list:", "New task": ":material/add_circle:", "Failures": ":material/healing:",
             "Chat": ":material/chat_bubble:", "Knowledge": ":material/hub:", "Benchmarks": ":material/leaderboard:"}
 NAV_ICON["Settings"] = ":material/settings:"
 NAV_ICON["Pull requests"] = ":material/merge:"
 NAV_ICON["Speed"] = ":material/speed:"
-SLUG = {p: p.lower().replace(" ", "-") for p in PAGES}
+NAV_ICON["Projects"] = ":material/flag:"
+NAV_ICON["What's new"] = ":material/auto_awesome:"
+SLUG = {p: p.lower().replace("'", "").replace(" ", "-") for p in PAGES}
 if st.session_state.get("page") not in PAGES:  # first load: honour ?page=... so pages can be bookmarked
     st.session_state.page = {v: k for k, v in SLUG.items()}.get(st.query_params.get("page", ""), "Work")
 if "goto" in st.session_state:  # navigation requested by a button on the previous script run
@@ -358,6 +360,10 @@ def _nav_badges() -> dict:
         needs = sum(1 for f in store.failures() if (f["outcome"] or "").startswith(("needs you", "still failing",
                                                                                       "not retried")))
         out["Failures"] = f"{needs} need you" if needs else ""
+        from swarmforge.history import entries
+        seen = set((store.kv_get("feature_history_seen") or "").split(","))
+        new = sum(e["id"] not in seen for e in entries())
+        out["What's new"] = f"{new} new" if new else ""
     except Exception:  # noqa: BLE001 - badges are decoration
         pass
     return out
@@ -1140,6 +1146,8 @@ def work_items() -> list[dict]:
         if i["status"] == "queued":
             grp, icon, label = "waiting", "⏳", (f"Waiting (#{waiting_pos[i['id']]} in {_lane(i)})" if multi
                                                  else f"Waiting (#{waiting_pos[i['id']]} in line)")
+        elif i["status"] == "tentative":
+            grp, icon, label = "waiting", "○", "Tentative · not ready"
         elif _restarted_as(i):
             grp, icon, label = "failed", "↻", f"Restarted as #{_restarted_as(i)}"
         elif r:
@@ -1375,7 +1383,7 @@ def _delete_items(ws: list[dict], files: bool) -> tuple[int, int]:
     done = skipped = 0
     root = cfg.workdir.resolve() if cfg else None
     for w in ws:
-        if w["group"] == "active":
+        if w["group"] == "active" or (w.get("item") or {}).get("project_id"):
             skipped += 1
             continue
         runs = []
@@ -1397,6 +1405,9 @@ def _delete_items(ws: list[dict], files: bool) -> tuple[int, int]:
 
 def bulk_bar(shown: list[dict]) -> None:
     sel = _checked(shown)
+    if any((w.get("item") or {}).get("project_id") for w in sel):
+        st.info("Manage project tasks from Projects so their plan, merge barriers and spend stay together.")
+        sel = [w for w in sel if not (w.get("item") or {}).get("project_id")]
     if not sel:
         return
     with st.container(border=True, key="bulkbar"):
@@ -1569,12 +1580,26 @@ def work_list(items: list[dict], every) -> None:
                     st.rerun(scope="app")
                 item_detail(w, every)
     section = None
+    from swarmforge.projects.store import Projects
+    project_names = {p["id"]: p["name"] for p in Projects(store).list()}
+    if any(w.get("item") and w["item"].get("project_id") for w in shown):
+        shown.sort(key=lambda w: ((w.get("item") or {}).get("project_id") or "~", w["order"]))
+    previous_project = None
     for w in shown:
+        project_id = (w.get("item") or {}).get("project_id")
+        if project_id != previous_project:
+            st.subheader(project_names.get(project_id, "Single tasks"))
+            section = None
+        previous_project = project_id
         sec = w["group"] if w["group"] in ("active", "waiting") else "finished"
         if filt == "All" and sec != section:
             st.markdown(f"<div class='sf-wsec'>{SECTIONS[sec]}</div>", unsafe_allow_html=True)
         section = sec
-        work_row(w, show_repo)
+        if (w.get("item") or {}).get("status") == "tentative":
+            with st.container(key=f"tentative_{_wkey(w['key'])}"):
+                work_row(w, show_repo)
+        else:
+            work_row(w, show_repo)
         if sel == w["key"]:
             with st.container(key=f"wopen_{_wkey(w['key'])}"):
                 if w.get("attempts"):
@@ -1769,6 +1794,9 @@ def item_detail(w: dict, every) -> None:
         diagnosis_box(r, w)
     if not cfg:
         st.warning("Configuration not loaded: settings can't be changed.")
+    elif i and i.get("project_id"):
+        st.info("The project lead owns this plan. Open Projects to review the spec or pause the project.")
+        st.markdown(i["body"].split("Approved project spec", 1)[0])
     elif i and i["status"] == "queued":
         waiting_editor(i)
     elif r and w["group"] == "active":
@@ -2413,5 +2441,15 @@ def page_settings():
     return render(cfg, st)
 
 
-{"Work": page_work, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Speed": page_speed, "Chat": page_chat,
+def page_projects():
+    from swarmforge.dashboard_pages.projects import render
+    render(cfg, st, store)
+
+
+def page_history():
+    from swarmforge.dashboard_pages.history import render
+    render(st, store)
+
+
+{"Work": page_work, "Projects": page_projects, "What's new": page_history, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Speed": page_speed, "Chat": page_chat,
  "Knowledge": page_knowledge, "Benchmarks": page_benchmarks, "Settings": page_settings}[page]()
