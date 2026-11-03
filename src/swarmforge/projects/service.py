@@ -114,15 +114,19 @@ def resume(store, pid, reply="continue", *, confirm_manual=False):
     set_lane_paused(store, lane(pid), False)
 
 
+def github_repo_name(repo):
+    from ..repos import normalize_repo
+    try:
+        return (normalize_repo(repo).full_name or "").lower()
+    except ValueError:
+        return ""
+
+
 def can_start(store, item):
     if not item.get("project_id"):
         # Single tasks in a project's repository wait; other repositories are unaffected.
-        from ..repos import normalize_repo
-        try:
-            name = normalize_repo(item["repo"]).full_name
-        except ValueError:
-            name = None
-        return not name or not any(p["repo"].lower() == name.lower() and p["status"] not in ("drafting", "done", "cancelled") for p in Projects(store).list())
+        name = github_repo_name(item["repo"])
+        return not name or not any(p["repo"].lower() == name and p["status"] not in ("drafting", "done", "cancelled") for p in Projects(store).list())
     ps = Projects(store)
     p = ps.get(item["project_id"])
     if p["status"] != "running" or not p["observed_sha"] or item["milestone"] != p["current_milestone"]:
@@ -231,10 +235,15 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
     p = ps.get(pid)
     if p["status"] != "running":
         return
+    activity_key = f"project_activity:{pid}"
+    for q in store.queue_items(include_finished=False):
+        if (q["status"] == "running" and not q.get("project_id")
+                and github_repo_name(q["repo"]) == p["repo"].lower()):
+            store.kv_set(activity_key, f"Waiting for task #{q['id']} to finish on this repository")
+            return
     own = repository is None
     repo = repository or Repository(cfg, p["repo"])
     ask = ask or lead.call
-    activity_key = f"project_activity:{pid}"
     try:
         items = ps.items(pid)
         if any(q["status"] == "running" for q in items):

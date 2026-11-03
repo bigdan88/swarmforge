@@ -42,8 +42,21 @@ def render(cfg, st, store):
         st.info("Load a configuration to start a project.")
         return
     ps = Projects(store)
-    if st.button("Start a project", type="primary", icon=":material/add:"):
+    from swarmforge.selfupdate import own_repo
+    repo = own_repo() or "bigdan88/swarmforge"
+    start, improve = st.columns(2)
+    if start.button("Start a project", type="primary", icon=":material/add:"):
         st.session_state.project_id = ps.create()["id"]
+        st.rerun()
+    if improve.button("Improve SwarmForge", icon=":material/build:",
+                               help=f"Plan a multi-milestone improvement for {repo}."):
+        project = ps.create(
+            "Improve SwarmForge", repo=repo,
+            greeting=f"We’ll plan improvements to your existing SwarmForge repository, `{repo}`. "
+                     "What outcome do you want over the next few milestones? Tell me what is frustrating today "
+                     "and what would show that it improved. You’ll review the plan and budget before launch.",
+        )
+        st.session_state.project_id = project["id"]
         st.rerun()
     items = ps.list()
     if not items:

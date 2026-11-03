@@ -87,6 +87,20 @@ async def test_no_repository_touched_before_approval(state, cfg):
     assert ps.items(pid)[-1] not in s.queue_items(include_finished=False)
 
 
+async def test_project_waits_for_an_in_flight_task_on_its_repository(state, cfg):
+    s, ps, pid = state
+    service.approve(s, pid)
+    task_id = s.queue_add("Existing work", "body", "https://github.com/owner/inventory.git")
+    s.queue_update(task_id, status="running")
+    repo = Repo()
+    await service.advance(cfg, s, pid, repository=repo, ask=ask)
+    assert not repo.touched
+    assert f"#{task_id}" in s.kv_get(f"project_activity:{pid}")
+    s.queue_update(task_id, status="done")
+    await service.advance(cfg, s, pid, repository=repo, ask=ask)
+    assert ps.items(pid)
+
+
 async def test_unmerged_pr_blocks_only_its_project(state, cfg):
     s, ps, pid = state
     service.approve(s, pid)
