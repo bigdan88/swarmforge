@@ -11,7 +11,7 @@ from swarmforge.orchestrator import Orchestrator
 from . import fake_team
 from .conftest import ROOT, FakeProvider
 
-SUITE = str(ROOT / "bench" / "suite.yaml")
+SUITE = str(ROOT / "bench" / "smoke.yaml")
 
 
 def test_overlay_validation_blocks_safety_settings_and_bad_values(cfg):

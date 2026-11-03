@@ -338,6 +338,10 @@ def escalate(cfg: Config, attempt: int, *, budget_cap: float | None = None, cate
     c.limits.max_repair_cycles = min(10, cfg.limits.max_repair_cycles + sh.extra_repair_cycles * attempt)
     if category == "model_unavailable":
         c.limits.busy_wait_s = int(cfg.limits.busy_wait_s * 2 ** attempt)
+        # Provider availability is not evidence that the task needs more tokens or repairs.
+        c.limits.budget_usd = round(min(cfg.limits.budget_usd, budget_cap or cfg.limits.budget_usd), 2)
+        c.limits.max_repair_cycles = cfg.limits.max_repair_cycles
+        return c
     for r in c.roles.values():
         r.max_steps = int(min(200, r.max_steps * sh.steps_factor ** attempt))
         r.timeout_s = int(min(6 * 3600, r.timeout_s * sh.time_factor ** attempt))
@@ -350,6 +354,9 @@ def heal_context(fail: dict, attempt: int, max_attempts: int) -> str:
         f"The previous run ({fail['run_id']}) failed: {CATEGORIES.get(fail['category'], fail['category'])}.",
         f"Diagnosis: {fail['root_cause']}",
         f"What to do differently now: {fail['fix']}",
+        "For code/test failures, add a focused regression that reproduces the failure before changing "
+        "the implementation. For provider/environment failures, verify availability first and preserve "
+        "working code rather than rewriting it.\n"
         "Take more care than last time: first reproduce and understand the problem (read the code, run the "
         "failing tests), fix the root cause rather than the symptom, and verify every acceptance criterion "
         "with a test before finishing. You have more time, budget and steps than the previous attempt."])

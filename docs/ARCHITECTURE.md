@@ -24,6 +24,12 @@ issue URL ─▶ CLI ─▶ Orchestrator (state machine, gates) ──▶ SQLite
 | `plan.py` | JSON schemas for plans, reviews and test reports; deterministic validators (unique ids, known dependencies, no cycles, allowed roles, safe paths); topological "waves". |
 | `scheduler.py` | Async DAG executor: dispatches ready tasks up to `max_concurrent_agents`, marks dependents of failed tasks `BLOCKED`. |
 | `agent/runtime.py` | The coding-agent runtime: OpenAI-style tool-calling loop with step/time limits, transcript capture, context compaction, cancellation and budget checks. |
+| `agent/harness.py` | Shared async execution contract and cancellation before launch. |
+| `services/assessment.py` | Pure evidence assessment; lifecycle transitions stay in the orchestrator. |
+| `services/delivery.py` / `services/publication.py` / `services/runs.py` | Local delivery, GitHub publication/auto-fix and shared cancellation; lifecycle transitions remain in the orchestrator. |
+| `dashboard_pages/` | Page renderers with explicit UI/application dependencies. |
+| `effective_config.py` / `team_profile.py` | Allow-listed operational export and validated team profiles. |
+| `evaluation.py` | Repeated pinned comparisons, persisted progress and total spend stop. |
 | `agent/pi_runtime.py` | Optional Pi developer harness inside the sandbox, using a host model relay for metering, fallbacks and role limits; `sf` exposes SwarmForge tools. |
 | `agent/tools.py` | Agent tools. File tools are confined to the worktree (no absolute paths, no `..`, no `.git`). `run_command` goes through the sandbox. Each role gets a subset. |
 | `sandbox.py` | `DockerSandbox` (default) and `LocalSandbox` (explicit opt-in). |
@@ -73,8 +79,10 @@ any non-terminal state → FAILED | BLOCKED | CANCELLED | BUDGET_EXCEEDED
   failed. Otherwise `FIX_REQUIRED`: the planner turns the problems into corrective tasks and the
   cycle repeats, up to `max_repair_cycles` (default 3), after which the run stops as `FAILED` with a
   report listing the unresolved problems. When JUnit is present, passing requires at least one
-  passed test and no failures/errors. Without JUnit, exit zero is accepted. Criteria explicitly
-  marked failed block delivery; missing/unexecuted mappings are not equivalent to passed evidence.
+  passed test and no failures/errors. `review.require_junit` holds delivery without JUnit;
+  `review.require_verified_criteria` also holds unverified criteria. Both are enabled in the example
+  and local configuration; compatibility defaults in the Python config classes are false. Missing
+  or skipped test mappings remain unverified even if other mapped tests pass.
   Review blocking severities are configurable, and reviewer findings are filtered to repair scope.
 * **PULL_REQUEST_CREATION**: only after approval, only for GitHub issues, only with push access,
   and (by default) only after a human answers "yes". Delivery creates a draft PR. Optional
@@ -117,6 +125,8 @@ runs/<run_id>/worktrees/<task>      per-task worktrees (removed after successful
 runs/<run_id>/transcripts/*.jsonl   full agent transcripts: prompts, tool calls, outputs, usage
 runs/<run_id>/artifacts/            test logs and JUnit XML
 runs/<run_id>/report.md             execution report
+runs/<run_id>/effective-config.json operational policy/model snapshot (no credentials)
+evaluations/<label>-<id>/results.json pinned comparison inputs, progress and summaries
 benchmarks/*.md                     benchmark tables
 ```
 

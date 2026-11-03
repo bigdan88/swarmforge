@@ -6,7 +6,7 @@ your working copy until you do.
 
 That workflow describes a local-folder target. When targeting `bigdan88/swarmforge` through
 GitHub, this checkout's local configuration can push and auto-merge without a human prompt.
-Protected files and major findings go to a judge model under that policy. The running checkout
+Protected files and major findings are now held for human review under the local policy. The running checkout
 changes only when you update it; see [delivery](../README.md#when-a-run-finishes).
 For proposed quality experiments and refactoring work, see [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md).
 
@@ -43,7 +43,7 @@ sandbox_image: swarmforge-dev-sandbox:latest
 The repository profile also supports `agent_test_command`, `agent_env`, `install_command`,
 `description`, `preview` and `protected_paths`. Global network, budget, limits and approval/merge
 policy come from your own `swarmforge.yaml`. Protected paths are interpreted by that merge policy;
-the local `protected: judge` setting permits model judgment rather than an unconditional hold.
+the local `protected: hold` setting prevents automatic merging of core changes.
 
 ## Each improvement
 

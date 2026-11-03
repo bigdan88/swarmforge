@@ -47,8 +47,9 @@ they do not eliminate it.
   use host firewall rules to limit who can reach it. A relay token is still a credential and should
   not be shared or published in artifacts.
 * **Local policy can allow autonomous delivery.** As of 2026-11-02, this checkout's git-ignored
-  `swarmforge.yaml` disables push approval, blocks only critical review findings, and enables
-  auto-merge for `bigdan88/swarmforge`, with protected files and major findings sent to a judge.
+  `swarmforge.yaml` disables push approval and enables auto-merge for `bigdan88/swarmforge`,
+  but now holds protected files and major findings for human review. It blocks critical and major
+  findings and requires JUnit plus verified acceptance criteria.
   This differs from the example configuration. Review the effective configuration before relying
   on human approval or a particular finding severity as a gate.
 * **Model providers see your code.** Issue text and repository content are sent to DeepInfra (or

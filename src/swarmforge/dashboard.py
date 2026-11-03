@@ -7,6 +7,8 @@ processes; the dashboard only reads the SQLite store / vault and writes explicit
 """
 from __future__ import annotations
 
+from swarmforge.services.runs import request_cancel as request_run_cancel
+
 import dataclasses
 import json
 import os
@@ -487,120 +489,8 @@ except Exception:  # noqa: BLE001
 
 # ============================================================== NEW RUN page
 def page_new_run():
-    if not cfg:
-        st.error("Configuration not loaded; cannot start runs.")
-        return
-    from swarmforge.launcher import start_run
-    sample_issue = Path(__file__).resolve().parents[2] / "samples" / "issues" / "export-csv-json.md"
-    sample_repo = Path("~/swarmforge-sample").expanduser()
-    with st.expander("🧪 Try the bundled sample (inventory app, CSV/JSON export issue)"):
-        st.write(f"Creates a small git repository at `{sample_repo}` and fills the form below.")
-        if st.button("Prepare sample"):
-            if not sample_repo.exists():
-                import subprocess
-                import sys
-                subprocess.run([sys.executable, str(sample_issue.parents[1] / "make_sample_repo.py"), str(sample_repo)],
-                               check=False, capture_output=True)
-            if sample_issue.is_file():
-                text = sample_issue.read_text(encoding="utf-8")
-                m = re.match(r"#\s+(.+)\n", text)
-                st.session_state.nr_source = "Describe it here"
-                st.session_state.nr_title = m.group(1) if m else "Sample issue"
-                st.session_state.nr_body = text[m.end():].strip() if m else text
-                store.remember_repo(str(sample_repo))
-                st.session_state.nr_repo = str(sample_repo)
-                st.rerun()
-
-    source = st.radio("What should the team work on?", ["Describe it here", "GitHub issue"],
-                      key="nr_source", horizontal=True)
-    url = title = body = None
-    if source == "GitHub issue":
-        url = st.text_input("Issue URL", placeholder="https://github.com/owner/repo/issues/42", key="nr_url")
-        repo = st.text_input("Repository override (optional)", key="nr_repo_gh",
-                             help="Leave empty to clone the issue's repository.")
-    else:
-        title = st.text_input("Title", key="nr_title", placeholder="Add CSV export to the reports page")
-        body = st.text_area("Description, requirements and acceptance criteria", height=260, key="nr_body",
-                            placeholder="Describe what you want built. Be specific about interfaces and "
-                                        "acceptance criteria; the planner turns this into a task graph.")
-        repo = repo_picker("Repository", "nr_repo")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    mode = c1.selectbox("Team", ["swarm", "single"], format_func=lambda m: {
-        "swarm": "Swarm (5 roles)", "single": "Single agent (baseline)"}[m])
-    budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(cfg.limits.budget_usd), 0.5, key="nr_budget")
-    cycles = c3.number_input("Max repair cycles", 0, 10, int(cfg.limits.max_repair_cycles), key="nr_cycles")
-    hours = c4.number_input("Time limit (hours)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s), 0.5,
-                            help="The whole run stops after this long. Default from swarmforge.yaml "
-                                 "(limits.max_runtime_s).")
-    approval = c5.selectbox("Before pushing to GitHub", ["dashboard", "yes"], format_func=lambda a: {
-        "dashboard": "Ask me here", "yes": "Pre-approve"}[a])
-    heal = heal_input(st.columns(5)[0], "nr_heal")
-
-    with st.expander("Advanced: test command and sandbox image"):
-        st.caption("Leave blank to use the repository's `swarmforge.project.yml` (if it has one), "
-                   f"otherwise your defaults: `{cfg.project.test_command}` in `{cfg.sandbox.image}`.")
-        test_cmd = st.text_input("Test command", key="nr_test_cmd")
-        image = st.text_input("Sandbox image (must already be built)", key="nr_image",
-                              placeholder="e.g. swarmforge-dev-sandbox:latest")
-
-    with st.expander("Team roster for this run"):
-        roster = [{"role": r, "model": cfg.roles[r].model} for r in
-                  ["planner", *cfg.developer_roles, "tester", "reviewer", cfg.librarian_role] if r in cfg.roles]
-        st.dataframe(pd.DataFrame(roster).drop_duplicates(), hide_index=True, width="stretch")
-        st.caption("Change models in swarmforge.yaml (then restart the dashboard).")
-
-    if vault and (body or title):
-        found = vault.search(f"{title or ''}\n{body or ''}", k=cfg.knowledge.max_notes_in_prompt)
-        if found:
-            with st.expander(f"📚 {len(found)} knowledge note(s) the team will start from"):
-                for sc, n in found:
-                    st.markdown(f"- **{n.title}** · _{n.type}_ · {n.repo or ''} (score {sc})")
-
-    if st.button("🚀 Start run", type="primary"):
-        from swarmforge.github import get_token, parse_issue_url
-        from swarmforge.repos import RepoError, normalize_repo, preflight
-        try:
-            base = None
-            repo_arg = None
-            if source == "GitHub issue":
-                if not (url or "").strip():
-                    raise ValueError("paste the GitHub issue URL (https://github.com/owner/repo/issues/N)")
-                try:
-                    parse_issue_url(url.strip())
-                except Exception:
-                    raise ValueError(f"'{url.strip()}' is not a GitHub issue URL. To work on a repository "
-                                     "without an issue, choose 'Describe it here' and put the repository URL "
-                                     "in the Repository field.")
-                url = url.strip()
-            elif not (title or "").strip() or not (body or "").strip():
-                raise ValueError("give the run a title and a description")
-            from swarmforge.preflight import environment_problems
-            with st.spinner("Checking Docker, keys and the repository…"):
-                problems = environment_problems(cfg, (image or "").strip() or None)
-            if problems:
-                raise ValueError("\n\n".join(problems))
-            if repo and repo.strip():
-                with st.spinner("Checking the repository…"):
-                    ref = preflight(normalize_repo(repo), get_token(cfg.github))
-                repo_arg, base = ref.source, ref.branch
-                store.remember_repo(repo.strip() if ref.branch else ref.source)
-                if ref.source != repo.strip():
-                    st.info(f"Using {ref.source}" + (f" (branch {ref.branch})" if ref.branch else ""))
-            elif source != "GitHub issue":
-                raise ValueError("give a repository: a local folder, owner/repo, or a GitHub URL")
-            run_id, log = start_run(cfg, repo=repo_arg, issue_url=url, issue_title=title, issue_body=body,
-                                    mode=mode, budget=budget, max_cycles=int(cycles), approval=approval,
-                                    test_command=(test_cmd or "").strip() or None,
-                                    sandbox_image=(image or "").strip() or None, base=base,
-                                    max_runtime_s=int(hours * 3600), heal_attempts=heal)
-        except (ValueError, RepoError) as e:
-            st.error(str(e))
-            return
-        select_item(f"r:{run_id}")
-        st.session_state.goto = "Work"
-        time.sleep(1.5)  # give the process a moment to register the run
-        st.rerun()
+    from swarmforge.dashboard_pages.new_run import render
+    return render(Path, _hrs, cfg, dataclasses, heal_input, pd, re, repo_picker, select_item, st, store, time, vault)
 
 
 # ============================================================ run details
@@ -1150,93 +1040,8 @@ def run_detail(run_id, header=True):
 
 # ============================================================ KNOWLEDGE page
 def page_knowledge():
-    st.header("📚 Knowledge base (Zettelkasten)")
-    if not vault:
-        st.error("Configuration not loaded.")
-        return
-    st.caption(f"Vault: `{vault.root}` — plain Markdown with [[wikilinks]]; open the same folder in Obsidian if you like. "
-               "Agents read relevant notes before planning/coding/reviewing and a librarian writes new ones after each run.")
-    notes = vault.notes()
-    repos = sorted({n.repo for n in notes if n.repo})
-    c1, c2, c3 = st.columns([2, 2, 3])
-    repo = c1.selectbox("Repository", ["(all)"] + repos)
-    types = c2.multiselect("Types", list(NOTE_TYPES), default=[t for t in NOTE_TYPES if t != "run-log"])
-    q = c3.text_input("Search", placeholder="keywords…")
-    sel = [n for n in notes if (repo == "(all)" or n.repo == repo) and n.type in types]
-    if q:
-        ranked = vault.search(q, repo=None if repo == "(all)" else repo, k=200, exclude_types=())
-        keep = {n.stem for _, n in ranked}
-        sel = [n for _, n in ranked if n.stem in {x.stem for x in sel}] if keep else []
-    tl, tg, tn = st.tabs(["Notes", "Graph", "➕ New note"])
-    with tl:
-        if not sel:
-            st.info("No notes match. After your first run the librarian will add some, or write one yourself.")
-        else:
-            left, right = st.columns([1, 2])
-            with left:
-                labels = {n.stem: f"[{n.type}] {n.title}" for n in sel}
-                stem = st.radio("Notes", list(labels), format_func=labels.get, label_visibility="collapsed",
-                                key="kn_sel")
-            with right:
-                n = next(x for x in sel if x.stem == stem)
-                st.markdown(f"### {n.title}")
-                st.caption(f"{n.type} · repo {n.repo or '-'} · source {n.source} · created {n.created} · "
-                           f"tags {', '.join(n.tags) or '-'} · file `{n.stem}.md`")
-                st.markdown(wikilinks_to_md(n.body))
-                back = vault.backlinks(n.stem, notes)
-                if back:
-                    st.markdown("**Linked from:** " + ", ".join(f"_{b.title}_" for b in back))
-                with st.expander("✏️ Edit"):
-                    with st.form(f"edit_{n.stem}"):
-                        title = st.text_input("Title", n.title)
-                        typ = st.selectbox("Type", list(NOTE_TYPES), index=list(NOTE_TYPES).index(n.type) if n.type in NOTE_TYPES else 0)
-                        tags = st.text_input("Tags (comma separated)", ", ".join(n.tags))
-                        body = st.text_area("Body (Markdown, [[wikilinks]] allowed)", n.body, height=300)
-                        if st.form_submit_button("Save"):
-                            n.title, n.type, n.body = title, typ, body
-                            n.tags = [t.strip() for t in tags.split(",") if t.strip()]
-                            n.source = n.source if n.source.startswith("user") else f"{n.source} (edited by user)"
-                            vault.save(n)
-                            st.success("Saved")
-                            st.rerun()
-                    if st.checkbox("I want to delete this note", key=f"delc_{n.stem}"):
-                        if st.button("🗑 Delete note", key=f"del_{n.stem}"):
-                            vault.delete(n.stem)
-                            st.rerun()
-    with tg:
-        shown, edges = vault.graph(sel)
-        if len(shown) > 150:
-            st.caption(f"Showing the 150 most recent of {len(shown)} notes.")
-            shown = sorted(shown, key=lambda n: n.stem)[-150:]
-        stems = {n.stem for n in shown}
-        dot = ['graph K { layout=neato; overlap=false; splines=true; node [shape=box style="rounded,filled" '
-               'fontname=Helvetica fontsize=9 fontcolor=white];']
-        for n in shown:
-            dot.append(f'"{_esc(n.stem)}" [label="{_esc(n.title[:40])}" fillcolor="{TYPE_COLORS.get(n.type, "#777")}"];')
-        for a, b in edges:
-            if a in stems and b in stems:
-                dot.append(f'"{_esc(a)}" -- "{_esc(b)}";')
-        dot.append("}")
-        if shown:
-            st.graphviz_chart("\n".join(dot), width="stretch")
-            st.caption(" · ".join(f"{t}" for t in TYPE_COLORS))
-        else:
-            st.caption("Nothing to draw yet.")
-    with tn:
-        with st.form("new_note", clear_on_submit=True):
-            title = st.text_input("Title (state the single idea as a claim)")
-            c1, c2 = st.columns(2)
-            typ = c1.selectbox("Type", ["user-note", "decision", "pitfall", "pattern", "repo-fact", "review-lesson"])
-            nrepo = c2.text_input("Repository (e.g. owner/repo or folder name; blank = applies everywhere)")
-            tags = st.text_input("Tags (comma separated)")
-            body = st.text_area("Body (Markdown; link with [[note title or file name]])", height=220)
-            if st.form_submit_button("Create note"):
-                if not title.strip() or not body.strip():
-                    st.error("Title and body are required.")
-                else:
-                    vault.write(title, body, type=typ, repo=nrepo.strip() or None,
-                                tags=[t.strip() for t in tags.split(",") if t.strip()], source="user")
-                    st.success("Note created")
+    from swarmforge.dashboard_pages.knowledge import render
+    return render(st, vault, wikilinks_to_md, _esc, TYPE_COLORS)
 
 
 # ================================================================= WORK page
@@ -1600,7 +1405,7 @@ def bulk_bar(shown: list[dict]) -> None:
         if c[2].button("Cancel", icon=":material/stop_circle:", key="bk_cancel", disabled=not running,
                        help="Stop the selected running tasks."):
             for w in running:
-                store.request_cancel(w["run"]["id"])
+                request_run_cancel(store, w["run"]["id"])
                 store.event(w["run"]["id"], "cancel", "cancel requested from dashboard", level="warn")
             st.session_state.flash = f"Cancel requested for {len(running)} task(s)."
             st.rerun(scope="app")
@@ -1803,8 +1608,8 @@ def waiting_editor(i: dict) -> None:
         body = st.text_area("Description and acceptance criteria", i["body"], height=240, key=f"qe_d_{i['id']}")
         repo = repo_picker("Repository", f"qe_r_{i['id']}", value=i["repo"])
         c1, c2, c3, c4, c5 = st.columns(5)
-        mode = c1.selectbox("Team", ["swarm", "single"], index=["swarm", "single"].index(i["mode"] or "swarm"),
-                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "single": "Single agent"}.get)
+        mode = c1.selectbox("Team", ["swarm", "reviewed", "single"], index=["swarm", "reviewed", "single"].index(i["mode"] or "swarm"),
+                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent"}.get)
         budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(i["budget"] or cfg.limits.budget_usd), 0.5,
                                  key=f"qe_b_{i['id']}")
         cycles = c3.number_input("Max repair cycles", 0, 10, int(i["max_cycles"] if i["max_cycles"] is not None
@@ -1862,7 +1667,7 @@ def live_settings(run: dict) -> None:
                 st.rerun()
     if not run["cancel_requested"]:
         if st.button("⏹ Cancel this run", key=f"cancel_{rid}"):
-            store.request_cancel(rid)
+            request_run_cancel(store, rid)
             store.event(rid, "cancel", "cancel requested from dashboard", level="warn")
             st.rerun()
     else:
@@ -2085,112 +1890,14 @@ def _workdir_bytes(path: str) -> int:
 
 
 def page_work():
-    from swarmforge import runqueue as rq
-    if "flash" in st.session_state:
-        st.success(st.session_state.pop("flash"))
-    h1, h2 = st.columns([4, 1], vertical_alignment="bottom")
-    h1.header("Work")
-    if h2.button("New task", icon=":material/add:", type="primary", width="stretch"):
-        st.session_state.goto = "New task"
-        st.rerun()
-    if cfg is not None:
-        st.caption(f"💽 Workdir usage: {_workdir_bytes(str(cfg.workdir)) / 1e6:.1f} MB · `{cfg.workdir}`")
-    items = work_items()
-    show = st.session_state.pop("show_welcome", False)
-    if not items or show:  # first run (or "Getting started" in the sidebar): welcome instead of an empty table
-        welcome_panel(cfg, empty=not items)
-        if items:
-            st.divider()
-    if not items:
-        return
-    busy = any(w["group"] == "active" for w in items) or bool(rq.worker_pid(store))
-    open_w = next((w for w in items if w["key"] == st.session_state.get("sel_item")), None)
-    editing = bool(open_w and (open_w["group"] != "active" or st.session_state.get("confirm_delete")))
-    # refresh live while something runs, but not while you're editing an open waiting/finished task
-    every = 3 if auto and busy and not editing else None
-
-    @st.fragment(run_every=every)
-    def listing():
-        work_list(work_items(), every)
-    listing()
+    from swarmforge.dashboard_pages.work import render
+    return render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work_list)
 
 
 # ============================================================= FAILURES page
 def page_failures():
-    from swarmforge.postmortem import CATEGORIES
-    st.header("Failures")
-    st.caption("Every run that failed, why, and what happened next. SwarmForge diagnoses each failure "
-               "automatically and, if a retry can fix it, tries again with more effort. The same post-mortems "
-               "are in your knowledge vault (note **Failures**) so agents learn from them, and in each run's "
-               "`postmortem.md`. CLI: `swarmforge failures`.")
-    fails = store.failures()
-    recorded = {f["run_id"] for f in fails}
-    undiagnosed = [r for r in store.list_runs(300) if r["id"] not in recorded
-                   and r["state"] in ("FAILED", "BLOCKED", "BUDGET_EXCEEDED")]
-    if undiagnosed and cfg:
-        c1, c2 = st.columns([3, 1])
-        c1.info(f"{len(undiagnosed)} failed run(s) from before automatic diagnosis have no post-mortem yet.")
-        if c2.button(f"🩺 Diagnose {len(undiagnosed)} run(s)", key="diag_all"):
-            for r in undiagnosed:
-                diagnose_now(r["id"])
-            st.rerun()
-    if not fails:
-        st.success("No failures recorded.")
-        return
-    fixed = sum(1 for f in fails if (f["outcome"] or "").startswith("fixed itself"))
-    needs = sum(1 for f in fails if (f["outcome"] or "").startswith(("needs you", "still failing", "not retried")))
-    cats = pd.Series([f["category"] for f in fails]).value_counts()
-    m = st.columns(3)
-    m[0].metric("Failures", len(fails))
-    m[1].metric("Fixed themselves", fixed)
-    m[2].metric("Need you", needs)
-    chart = pd.DataFrame({"cause": [CATEGORIES.get(c, c) for c in cats.index], "failures": cats.values})
-    st.altair_chart(alt.Chart(chart).mark_bar(color="#e45756").encode(
-        x=alt.X("failures:Q", title=None, axis=alt.Axis(tickMinStep=1)), y=alt.Y("cause:N", sort="-x", title=None),
-        tooltip=["cause", "failures"]).properties(height=max(60, 28 * len(chart))), width="stretch")
-    pick = st.multiselect("Cause", list(cats.index), format_func=lambda c: CATEGORIES.get(c, c), key="f_cat",
-                          placeholder="All causes")
-    shown = [f for f in fails if not pick or f["category"] in pick]
-    df = pd.DataFrame([{"When": fmt_ts(f["created_at"], True), "Task": (f["title"] or "")[:70],
-                        "Cause": CATEGORIES.get(f["category"], f["category"]),
-                        "Why": (f["root_cause"] or "")[:140], "What happened next": f["outcome"] or "",
-                        "Cost $": round(f["cost_usd"] or 0, 3)} for f in shown])
-    tkey = f"ft_{abs(hash(tuple(f['run_id'] for f in shown))) % 10**8}"
-    ev = st.dataframe(df, hide_index=True, width="stretch", height=min(420, 38 + 35 * len(shown)),
-                      on_select="rerun", selection_mode="single-row", key=tkey,
-                      column_config={"Why": st.column_config.TextColumn(width="large"),
-                                     "Cost $": st.column_config.NumberColumn(format="$%.3f")})
-    rows = list(ev.selection.rows) if ev is not None and hasattr(ev, "selection") else []
-    if rows:
-        st.session_state.sel_failure = shown[rows[0]]["run_id"]
-    sel = st.session_state.get("sel_failure")
-    f = next((x for x in shown if x["run_id"] == sel), shown[0] if shown else None)
-    if not f:
-        return
-    st.divider()
-    st.subheader(f["title"] or f["run_id"])
-    st.caption(f"run `{f['run_id']}` · repo `{f['repo'] or '-'}` · {f['state']}: {(f['reason'] or '')[:200]} · "
-               f"diagnosed by {f['diagnosed_by']}")
-    st.markdown(f"**Cause:** {CATEGORIES.get(f['category'], f['category'])}"
-                + (f"  ·  **What happened next:** {f['outcome']}" if f["outcome"] else ""))
-    st.markdown("#### Why it failed")
-    st.write(f["root_cause"])
-    st.markdown("#### What to do differently")
-    st.write(f["fix"])
-    if f["lesson"]:
-        st.markdown("#### Lesson")
-        st.write(f["lesson"])
-    with st.expander("Evidence the diagnosis was based on"):
-        st.code(f["evidence"] or "", language=None)
-    b = st.columns(3)
-    with b[0]:
-        open_run_button("Open this run", f["run_id"], f"fo_{f['run_id']}")
-    if f["heal_run_id"]:
-        with b[1]:
-            open_run_button("Open the retry", f["heal_run_id"], f"fh_{f['run_id']}")
-    if cfg and b[2].button("↻ Diagnose again", key=f"fd_{f['run_id']}"):
-        diagnose_now(f["run_id"])
-        st.rerun()
+    from swarmforge.dashboard_pages.failures import render
+    return render(alt, cfg, diagnose_now, fmt_ts, open_run_button, pd, st, store)
 
 
 # ================================================================= CHAT page
@@ -2463,179 +2170,8 @@ def _chat_rail(active_id: str, chatbot) -> dict:
 
 
 def page_chat():
-    if cfg is None:
-        st.error("Configuration not loaded; the chatbot needs a configured model role.")
-        return
-    from swarmforge import chatbot
-    page = st.container(key="chat_page")
-    with page:
-        st.header("Chat: improve SwarmForge and fix failed tasks")
-        st.caption("Ask about runs, failures and what to improve. Suggestions come with buttons to launch tasks "
-                   "or pick how a failed task should be fixed. CLI: `swarmforge ask \"…\"`.")
-        active_id = _chat_conv_id()
-        rail, main = page.columns([1, 3.2], gap="large")
-
-    # ------------------------------------------------ conversation rail (left)
-    with rail:
-        clicked = _chat_rail(active_id, chatbot)
-
-    # rail clicks are handled before the transcript renders; each one reruns
-    if clicked["new"]:
-        conv = chatbot.create_conversation(store, "New chat")
-        st.session_state.chat_conv_id = conv["id"]
-        st.session_state.pop("chat_done", None)
-        st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
-        st.rerun()
-    if clicked["sel"] and clicked["sel"] != active_id:
-        st.session_state.chat_conv_id = clicked["sel"]
-        st.rerun()
-    if clicked["edit"]:
-        st.session_state.chat_renaming = clicked["edit"]
-        st.rerun()
-    if clicked["cancel"]:
-        st.session_state.pop("chat_renaming", None)
-        st.rerun()
-    if clicked["save"]:
-        convs = {c["id"]: c for c in chatbot.list_conversations(store)}
-        c = convs.get(clicked["save"])
-        if c:
-            txt = st.session_state.get(f"chat_rename_{clicked['save']}") or ""
-            chatbot.rename_conversation(store, clicked["save"], txt.strip() or c["title"])
-        st.session_state.pop("chat_renaming", None)
-        st.rerun()
-    if clicked["del"]:
-        del_id = clicked["del"]
-        chatbot.delete_conversation(store, del_id)
-        if st.session_state.get("chat_renaming") == del_id:
-            st.session_state.pop("chat_renaming", None)
-        if active_id == del_id:
-            rest = chatbot.list_conversations(store)
-            st.session_state.chat_conv_id = (rest[0]["id"] if rest
-                                             else chatbot.ensure_default_conversation(store)["id"])
-        st.rerun()
-
-    # ------------------------------------------------ transcript (right)
-    history, actions = _chat_load(active_id)
-    needs = chatbot.failures_needing_attention(store)
-    active_conv = chatbot.get_conversation(store, active_id) or {}
-    with main, st.container(key="chat_main"):
-        with st.container(key="chat_topbar", horizontal=True, vertical_alignment="center"):
-            st.markdown(active_conv.get("title") or "New chat", width="stretch")
-            tools_on = st.toggle("Tools", value=cfg.chat.tools_enabled, key="chat_tools_enabled",
-                                 help="Let the assistant call fetch_url / list_files while answering")
-            reset = st.button("Clear", icon=":material/restart_alt:", key="chat_reset", type="tertiary",
-                              help="Remove every message in this conversation")
-        if reset:
-            chatbot.clear_messages(store, active_id)
-            store.kv_set(_chat_actions_key(active_id), None)
-            history.clear()
-            actions.clear()
-            st.session_state.pop("chat_done", None)
-            st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
-            _chat_save(actions, active_id)
-        scroll = st.container(key="chat_scroll", height=520)   # the transcript scrolls on its own
-        with scroll:
-            if not history:
-                with st.container(key="chat_empty"):
-                    st.markdown("### What should we look at?")
-                    st.markdown("Runs and their statuses, failed tasks, cost and speed, or what to build next.")
-                if needs:
-                    st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
-                            "Press **Review my failed tasks**.")
-            for n, m in enumerate(history):
-                with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
-                    if m["role"] == "assistant":
-                        calls = m.get("tool_calls")
-                        if isinstance(calls, str):
-                            try:
-                                calls = json.loads(calls)
-                            except (TypeError, ValueError):
-                                calls = None
-                        for tc in calls or []:
-                            if not isinstance(tc, dict):
-                                continue
-                            a = tc.get("args") or {}
-                            arg = next((str(v) for v in a.values() if v not in (None, "")), "")[:80]
-                            st.caption(f"🔧 {tc.get('name')} · {arg}" if arg else f"🔧 {tc.get('name')}")
-                        st.markdown(_chat_md(m["content"]))
-                        render_message_actions(n, actions.get(n))
-                    else:
-                        st.write(m["content"])
-                    _render_chat_attachments(m.get("attachments"))
-            live = st.container()  # the new exchange renders here, at the bottom of the transcript
-        pending = None
-        with st.container(key="chat_chips", horizontal=True, horizontal_alignment="center" if not history
-                          else "left", gap="small"):
-            for key, (label, prompt_text) in zip(("improve", "failures", "slow"), QUICK_PROMPTS.items()):
-                lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
-                if st.button(lab, key="chat_q_" + key):
-                    pending = prompt_text
-        try:
-            from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
-            uploaded = st.file_uploader(
-                "Attach images or files",
-                label_visibility="collapsed",
-                type=sorted(TEXT_EXTENSIONS | IMAGE_EXTENSIONS),
-                accept_multiple_files=True,
-                key="chat_files",
-                help="Images and text/code files are attached to your next question.",
-            )
-        except Exception:
-            uploaded = None
-        typed = st.chat_input("Ask about runs, failures, or what to improve…")
-    components.html(CHAT_SCROLL_JS.replace("__N__", str(len(history)) + "-" + uuid.uuid4().hex[:6]), height=0)
-    prompt = typed or pending
-    if not prompt:
-        return
-    att_meta, att_paths = _chat_save_attachments(uploaded)
-    msg = {"role": "user", "content": prompt}
-    if att_meta:
-        msg["attachments"] = att_meta
-    history.append(msg)
-    chatbot.add_message(store, active_id, "user", prompt)
-    with live:
-        with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
-            st.write(prompt)
-            _render_chat_attachments(att_meta)
-        conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
-        kwargs = {"history": history[:-1], "conversation": conv}
-        if att_paths:
-            kwargs["attachments"] = att_paths
-        with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
-            tools_box = st.container()
-            answer_slot = st.empty()
-
-            calls: list[dict] = []
-
-            def _on_tool(name, args, output):
-                a = args or {}
-                arg = str(a.get("url") or a.get("path") or next(iter(a.values()), ""))[:80]
-                tools_box.caption(f"🔧 {name} · {arg}" if arg else f"🔧 {name}")
-                calls.append({"name": name, "args": a, "output": output})
-
-            try:
-                with st.spinner("Thinking…"):
-                    ask_cfg = dataclasses.replace(
-                        cfg, chat=dataclasses.replace(cfg.chat, tools_enabled=tools_on))
-                    res = chatbot.ask(ask_cfg, store, prompt, on_tool=_on_tool, **kwargs)
-            except chatbot.ChatError as e:
-                answer_slot.error(f"Chatbot: {e}")
-                _chat_save(actions, active_id)
-                return
-            entry = {"role": "assistant", "content": res["answer"]}
-            if calls:
-                entry["tool_calls"] = calls
-            history.append(entry)
-            chatbot.add_message(store, active_id, "assistant", res["answer"],
-                                tool_calls=calls or None)
-            if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
-                actions[len(history) - 1] = res["actions"]
-            _chat_save(actions, active_id)
-            answer_slot.markdown(_chat_md(res["answer"]))
-            st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
-                       f"conversation {res.get('conversation', conv)} · "
-                       f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
-            render_message_actions(len(history) - 1, actions.get(len(history) - 1))
+    from swarmforge.dashboard_pages.chat import render
+    return render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat_conv_id, _chat_load, _chat_md, _chat_rail, _chat_save, _chat_save_attachments, _render_chat_attachments, cfg, components, dataclasses, json, render_message_actions, st, store, uuid)
 
 
 # ============================================================ NEW TASK page
@@ -2648,8 +2184,8 @@ def queue_forms() -> None:
 
     def common(prefix):
         c1, c2, c3, c5, c4 = st.columns(5)
-        mode = c1.selectbox("Team", ["swarm", "single"], key=f"{prefix}_mode",
-                            format_func=lambda m: {"swarm": "Swarm", "single": "Single agent"}[m])
+        mode = c1.selectbox("Team", ["swarm", "reviewed", "single"], key=f"{prefix}_mode",
+                            format_func=lambda m: {"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent"}[m])
         budget = c2.number_input("Budget per task (USD)", 0.5, 500.0, 5.0, 0.5, key=f"{prefix}_budget")
         cycles = c3.number_input("Max repair cycles", 0, 10, 2, key=f"{prefix}_cycles")
         hours = c5.number_input("Time limit per task (h)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s),
@@ -2722,103 +2258,19 @@ def queue_forms() -> None:
 
 
 def page_new_task():
-    st.header("New task")
-    if not cfg:
-        st.error("Configuration not loaded; cannot start runs.")
-        return
-    how = st.radio("How should it run?", ["Start now", "Add to the queue"], horizontal=True, key="nt_how",
-                   captions=["Runs right away in the background.",
-                             "Waits its turn in a queue; queues for different projects run side by side."])
-    st.divider()
-    if how == "Start now":
-        page_new_run()
-    else:
-        queue_forms()
+    from swarmforge.dashboard_pages.new_task import render
+    return render(cfg, page_new_run, queue_forms, st)
 
 
 # =========================================================== BENCHMARKS page
 def page_speed():
-    """Where the time goes, per run and per agent; compare settings before/after a change."""
-    from swarmforge import metrics as mx
-    st.header("Speed")
-    st.caption("Where each finished run's time went. Change a setting, let a few runs finish, then compare the "
-               "groups under **By settings**. `swarmforge metrics --csv FILE` exports the same data.")
-    n = st.select_slider("Runs to include", [10, 20, 30, 50, 100, 200], value=30, key="speed_n")
-    try:
-        rows = mx.collect(store, n)
-        agents = mx.agent_rows(store, n)
-    except Exception as e:  # noqa: BLE001 - a bad row must not break the page
-        st.error(f"Could not compute metrics: {e}")
-        return
-    if not rows:
-        st.info("No finished runs yet. Metrics appear here once a run completes or fails.")
-        return
-    summ = mx.summarize(rows)["all"]
-    k = st.columns(4)
-    k[0].metric("Median run", f"{summ['total_min']:.0f} min")
-    k[1].metric("Median working time", f"{summ['work_min']:.0f} min", help="run time minus waiting in line")
-    k[2].metric("Median repair cycles", f"{summ['repair_cycles']:g}")
-    k[3].metric("Median cost", f"${summ['cost_usd']:.2f}")
-
-    st.subheader("Where the time goes")
-    long = pd.DataFrame([{"run": f"{r['title'][:38]} · {r['run_id'][-6:]}", "phase": p, "minutes": r[f"{p}_min"],
-                          "order": mx.PHASES.index(p), "started": r["started"]}
-                         for r in rows for p in mx.PHASES if r[f"{p}_min"] > 0.05])
-    runs_order = [f"{r['title'][:38]} · {r['run_id'][-6:]}" for r in rows]
-    st.altair_chart(alt.Chart(long).mark_bar().encode(
-        x=alt.X("sum(minutes):Q", title="minutes"), y=alt.Y("run:N", sort=runs_order, title=None),
-        color=alt.Color("phase:N", sort=mx.PHASES, scale=alt.Scale(domain=mx.PHASES)),
-        order=alt.Order("order:Q"), tooltip=["run", "phase", alt.Tooltip("minutes:Q", format=".1f")]
-    ).properties(height=max(120, 26 * len(rows))), width="stretch")
-    med = pd.DataFrame([{"phase": p, "median minutes": summ.get(f"{p}_min") or 0, "what it is": mx.PHASE_HELP[p]}
-                        for p in mx.PHASES])
-    st.dataframe(med, hide_index=True, width="stretch",
-                 column_config={"median minutes": st.column_config.NumberColumn(format="%.1f")})
-
-    st.subheader("By settings")
-    st.caption("Medians per settings fingerprint: developer/reviewer/tester model and max steps, repair cycles, "
-               "blocking severities, tester every cycle or once.")
-    bys = mx.summarize(rows)["by_settings"]
-    st.dataframe(pd.DataFrame([{"settings": k2, **v} for k2, v in bys.items()]), hide_index=True, width="stretch",
-                 column_config={c: st.column_config.NumberColumn(format="%.1f")
-                                for c in ["total_min", "work_min", *[f"{p}_min" for p in mx.PHASES], "repair_cycles"]}
-                 | {"cost_usd": st.column_config.NumberColumn(format="$%.2f")})
-
-    st.subheader("Agents by role and model")
-    if agents:
-        adf = pd.DataFrame(agents)
-        g = adf.groupby(["role", "model"]).agg(sessions=("task", "count"), median_min=("minutes", "median"),
-                                               max_min=("minutes", "max"), median_sec_per_call=("sec_per_call", "median"),
-                                               retries=("retries", "sum")).reset_index().sort_values("median_min",
-                                                                                                    ascending=False)
-        st.dataframe(g, hide_index=True, width="stretch",
-                     column_config={c: st.column_config.NumberColumn(format="%.1f")
-                                    for c in ["median_min", "max_min", "median_sec_per_call"]})
-    else:
-        st.caption("No agent sessions recorded.")
-
-    st.subheader("Runs")
-    df = pd.DataFrame(rows).drop(columns=["started"])
-    st.dataframe(df, hide_index=True, width="stretch",
-                 column_config={c: st.column_config.NumberColumn(format="%.1f") for c in df.columns if c.endswith("_min")})
-    c = st.columns(2)
-    c[0].download_button("Download runs (CSV)", mx.to_csv(rows), "swarmforge-runs.csv", "text/csv", key="speed_csv")
-    c[1].download_button("Download agent sessions (CSV)", mx.to_csv(agents), "swarmforge-agents.csv", "text/csv",
-                         key="speed_csv_agents")
-    with st.expander("Counters per run (timeouts, step limits, busy models, tool use)"):
-        st.dataframe(df[["run_id", "title", "agent_timeouts", "step_limit_hits", "model_busy_waits", "sf_calls", "browse_calls", "test_runs",
-                         "test_suite_min", "approval_wait_min"]], hide_index=True, width="stretch")
+    from swarmforge.dashboard_pages.speed import render
+    return render(st, store, pd, alt)
 
 
 def page_benchmarks():
-    st.header("Benchmarks: single agent vs swarm")
-    b = store.benchmarks()
-    if not b:
-        st.info("No benchmarks yet. Run `swarmforge bench ISSUE --repo PATH --acceptance DIR`.")
-    for row in b:
-        st.subheader(f"{row['label']} — {row['issue']}")
-        df = pd.DataFrame(row["results"]).set_index("mode").T
-        st.dataframe(df.astype(str), width="stretch")
+    from swarmforge.dashboard_pages.benchmarks import render
+    return render(st, store, pd)
 
 
 # ======================================================== PULL REQUESTS page
@@ -2945,123 +2397,14 @@ def auto_merge_panel(gh, open_urls: set[str] | None = None) -> None:
 
 
 def page_prs():
-    from swarmforge import prs as P
-    from swarmforge import selfupdate as su
-    from swarmforge.github import GitHubClient, GitHubError
-    st.header("Pull requests")
-    if not cfg:
-        st.error("Configuration not loaded.")
-        return
-    gh = GitHubClient(cfg.github)
-    if not gh.token:
-        st.warning(f"No GitHub token: add `{cfg.github.token_env}=...` to `.env` (or run `gh auth login`) and "
-                   "restart the dashboard. Merging needs Contents + Pull requests: write.")
-    repos = P.known_repos(cfg, store)
-    if not repos:
-        st.info("No GitHub repositories yet: pull requests appear here once a run opens one.")
-        return
-    c1, c2, c3 = st.columns([3, 2, 1])
-    chosen = c1.multiselect("Repositories", repos, default=repos, key="pr_repos")
-    method = c2.selectbox("How to merge", ["squash", "merge", "rebase"], key="pr_method",
-                          format_func={"squash": "Squash (one commit per PR)", "merge": "Merge commit",
-                                       "rebase": "Rebase"}.get)
-    if c3.button("🔄 Refresh", key="pr_refresh"):
-        st.session_state.pop("pr_cache", None)
-    delete = st.checkbox("Delete the swarmforge/* branch after merging", value=True, key="pr_delete")
-    cache = st.session_state.get("pr_cache")
-    if not cache or time.time() - cache["t"] > 60 or cache["repos"] != chosen:
-        data, errors = {}, {}
-        with st.spinner("Loading pull requests from GitHub…"):
-            for repo in chosen:
-                try:
-                    data[repo] = P.list_prs(gh, repo, store)
-                except (GitHubError, Exception) as e:  # noqa: BLE001
-                    errors[repo] = str(e)
-        cache = {"t": time.time(), "repos": chosen, "data": data, "errors": errors}
-        st.session_state.pr_cache = cache
-    for repo, err in cache["errors"].items():
-        st.warning(f"{repo}: {err}")
-    all_prs = [pr for prs in cache["data"].values() for pr in prs]
-    flash = st.session_state.pop("pr_flash", None)
-    if flash:
-        for ok, msg in flash["results"]:
-            (st.success if ok else st.error)(msg)
-        own = su.own_repo()
-        if own and any(ok and own.lower() in msg.lower() for ok, msg in flash["results"]):
-            with st.container(border=True):
-                st.markdown("**You merged changes to SwarmForge itself.** Update now to start using them.")
-                if st.button("⬆️ Update & restart SwarmForge now", type="primary", key="pr_update"):
-                    st.session_state.upd_status = None
-                    do_update_and_restart()
-    auto_merge_panel(gh, {pr.url for pr in all_prs} if not cache["errors"] else None)
-    if not all_prs:
-        st.success("No open pull requests. 🎉")
-        return
-    ready = [pr for pr in all_prs if pr.ready]
-    with st.container(border=True):
-        a, b = st.columns([3, 2])
-        a.markdown(f"**{len(all_prs)} open** · **{len(ready)} ready to merge** · "
-                   f"{sum(1 for p in all_prs if p.state == 'dirty')} with conflicts")
-        sure = a.checkbox("I've reviewed these changes", key="pr_sure",
-                          help="Merging changes the main branch on GitHub. Draft PRs are marked ready first.")
-        if b.button(f"Merge all ready ({len(ready)})", type="primary", disabled=not ready or not sure,
-                    key="pr_merge_all", width="stretch"):
-            with st.spinner("Merging, oldest first…"):
-                res = P.merge_all(gh, ready, method, delete)
-            st.session_state.pr_flash = {"results": [
-                (ok, f"{pr.repo} #{pr.number} {pr.title}: {msg}") for pr, ok, msg in res]}
-            st.session_state.pop("pr_cache", None)
-            st.session_state.upd_status = None
-            st.rerun()
-    for repo, prs in cache["data"].items():
-        if not prs:
-            continue
-        st.subheader(repo)
-        for pr in prs:
-            icon, text = pr.label
-            with st.container(border=True):
-                h1, h2 = st.columns([5, 2])
-                h1.markdown(f"**[#{pr.number} {pr.title}]({pr.url})**  \n"
-                            f"`{pr.head}` → `{pr.base}` · by {pr.author} · {pr.created_at[:10]} · "
-                            f"+{pr.additions} −{pr.deletions} in {pr.changed_files} file(s)")
-                h2.markdown(f"{icon} {text}")
-                b1, b2, b3 = st.columns([1.2, 1.4, 3])
-                if b1.button("Merge", key=f"pr_m_{repo}_{pr.number}", type="primary", disabled=not pr.ready or not sure,
-                             help="Tick “I've reviewed these changes” above first." if not sure else None):
-                    try:
-                        P.merge(gh, pr, method, delete)
-                        st.session_state.pr_flash = {"results": [(True, f"{repo} #{pr.number} {pr.title}: merged")]}
-                    except GitHubError as e:
-                        st.session_state.pr_flash = {"results": [(False, str(e))]}
-                    st.session_state.pop("pr_cache", None)
-                    st.session_state.upd_status = None
-                    st.rerun()
-                if pr.state == "behind" and b2.button("↻ Update branch", key=f"pr_u_{repo}_{pr.number}",
-                                                      help="Merge the latest main into this PR (no conflicts)."):
-                    try:
-                        P.update_branch(gh, pr)
-                        st.session_state.pr_flash = {"results": [(True, f"#{pr.number}: branch updated")]}
-                    except GitHubError as e:
-                        st.session_state.pr_flash = {"results": [(False, str(e))]}
-                    st.session_state.pop("pr_cache", None)
-                    st.rerun()
-                if pr.state == "dirty":
-                    b2.caption("Resolve on GitHub, or restart its task so it rebuilds on the latest main.")
-                if pr.run_id:
-                    with b3.expander("What the swarm did"):
-                        try:
-                            from swarmforge.report import build_summary
-                            st.markdown(build_summary(store, pr.run_id).split("### What you need to do")[0])
-                        except Exception as e:  # noqa: BLE001
-                            st.caption(f"summary unavailable: {e}")
-                        open_run_button("Open the run", pr.run_id, key=f"pr_o_{repo}_{pr.number}")
+    from swarmforge.dashboard_pages.prs import render
+    return render(auto_merge_panel, cfg, do_update_and_restart, open_run_button, st, store, time)
 
 
 # =========================================================== SETTINGS page
 def page_settings():
-    st.caption("Edit swarmforge.yaml, run health checks and test models.")
-    from swarmforge import settings
-    settings.render(cfg)
+    from swarmforge.dashboard_pages.settings import render
+    return render(cfg, st)
 
 
 {"Work": page_work, "Pull requests": page_prs, "New task": page_new_task, "Failures": page_failures, "Speed": page_speed, "Chat": page_chat,

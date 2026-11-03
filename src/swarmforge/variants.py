@@ -28,6 +28,7 @@ import yaml
 
 from .config import Config, ConfigError, validate_config
 from .db import Store
+from .workspace import git
 
 ROLE_KEYS = {"model": str, "fallback_models": list, "temperature": (int, float), "max_steps": int,
              "timeout_s": int, "max_output_tokens": int, "reasoning_effort": str}
@@ -134,9 +135,17 @@ def load_suite(path: str | Path) -> tuple[str, list[dict]]:
     cases = []
     for c in data.get("cases") or []:
         case = {"name": c["name"]}
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", str(case["name"])):
+            raise ValueError("suite case names must be safe directory names")
+        if c.get("base_ref"):
+            case["base_ref"] = str(c["base_ref"])
         for k in ("issue", "repo_template", "repo", "acceptance"):
             if c.get(k):
-                case[k] = str((p.parent / c[k]).resolve()) if not str(c[k]).startswith("http") else c[k]
+                value = str(c[k])
+                remote = value.startswith(("http://", "https://", "git@")) or (
+                    k == "repo" and re.fullmatch(r"[\w.-]+/[\w.-]+", value)
+                    and not (p.parent / value).exists())
+                case[k] = value if remote else str((p.parent / value).resolve())
         if "issue" not in case or "acceptance" not in case or not (case.get("repo") or case.get("repo_template")):
             raise ValueError(f"suite case {c.get('name')!r} needs issue, acceptance and repo or repo_template")
         cases.append(case)
@@ -156,7 +165,7 @@ def _fresh_repo(template: str, dest: Path) -> Path:
 async def evaluate(cfg: Config, store: Store, vid: str, suite_path: str, *, runs_per_case: int = 1,
                    echo: Callable[[str], None] = print, orchestrator_kwargs: dict | None = None) -> dict:
     """Run every case of the suite with the variant and score it by hidden acceptance tests."""
-    from .benchmark import evaluate_hidden
+    from .benchmark import evaluate_hidden, freeze_source
     from .orchestrator import Orchestrator
     v = store.variant(vid)
     if not v:
@@ -168,19 +177,22 @@ async def evaluate(cfg: Config, store: Store, vid: str, suite_path: str, *, runs
     c.limits.one_run_per_repo = False
     per_case, run_ids, cost, elapsed = [], [], 0.0, 0.0
     for case in cases:
+        dest = cfg.workdir / "variants" / "repos" / f"{vid}-{case['name']}-{time.time_ns()}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if case.get("repo_template"):
+            repo = str(_fresh_repo(case["repo_template"], dest))
+        else:
+            repo = str((await freeze_source(c, case["repo"], dest, base_ref=case.get("base_ref"))).repo)
+        base_commit = git(Path(repo), "rev-parse", "HEAD").strip()
         for k in range(runs_per_case):
             echo(f"[{vid}] case {case['name']} ({k + 1}/{runs_per_case})")
-            repo = case.get("repo")
-            if not repo:
-                dest = cfg.workdir / "variants" / "repos" / f"{vid}-{case['name']}-{int(time.time() * 1000)}"
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                repo = str(_fresh_repo(case["repo_template"], dest))
             orch = Orchestrator(c, store, approve=lambda q: False, echo=None, **(orchestrator_kwargs or {}))
             rid = await orch.execute(issue_file=case["issue"], repo=repo)
             run = store.get_run(rid)
             hidden = await evaluate_hidden(c, run, Path(case["acceptance"]), f"variant-{vid}")
             score = (hidden["passed"] / hidden["total"]) if hidden.get("total") else 0.0
             per_case.append({"case": case["name"], "run_id": rid, "state": run["state"], "score": round(score, 3),
+                             "base_commit": base_commit,
                              "hidden": f"{hidden.get('passed', 0)}/{hidden.get('total', 0)}"})
             run_ids.append(rid)
             cs = store.cost_summary(rid)

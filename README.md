@@ -26,7 +26,9 @@ Current local team (`swarmforge.yaml`, 2026-11-02):
 | Librarian | `deepseek-ai/DeepSeek-V4-Flash` | built-in; read-only, `submit_notes` (Zettelkasten) |
 | Designer | `Qwen/Qwen3-VL-235B-A22B-Instruct` | screenshot review for configured UI previews |
 
-This is a dated snapshot of the local, git-ignored configuration, not the installation defaults.
+This is a dated snapshot of the local team, also committed in `profiles/team-current.yaml`, not
+the installation defaults. Add `team_profile: profiles/team-current.yaml` to select it; paths resolve
+relative to the configuration file. Profiles override model/runtime settings only, never permissions.
 `swarmforge.example.yaml` retains a built-in-runtime team using Qwen3.5, DeepSeek, Kimi, GLM and
 MiniMax. Copying that example does not select the local team above. Any role can use any model;
 the reviewer must differ from developer models unless explicitly overridden.
@@ -158,7 +160,8 @@ Built-in sessions use `sandbox.network` (default `none`); tools sharing a Pi ses
   changes. `auto_merge.protected` and `major_findings` select judge or hold behavior. Oversized
   changes are held; `auto_fix` can launch a bounded follow-up run for a held PR.
   The local configuration enables this only for `bigdan88/swarmforge`: 400-line clean-change
-  threshold, 3,000-line judge limit, and judge review of protected files and major findings.
+  threshold and 3,000-line judge limit. Protected files and major findings are now held for human
+  review. The local gate blocks critical and major findings and requires JUnit plus verified criteria.
   Updating the running checkout still requires **Update & restart**.
 * **Local repository:** the result is delivered as a new branch in your repository; merge it yourself.
 * Every run gets a **summary** (dashboard: *Task & summary*; file: `<run dir>/summary.md`): the request
@@ -401,7 +404,7 @@ These settings (all on by default) keep that down:
   the same repository is active waits for it ("waiting: run(s) ... are already working on this
   repository") instead of competing for the model rate limit and editing the same files. Its time
   limit starts when it actually starts. `coordinate` checks for overlap; `parallel` skips those
-  coordination checks. The example uses `coordinate`; the current local configuration uses `parallel`.
+  coordination checks. The example and current local configuration use `coordinate`.
 * **One container per agent** (`sandbox.reuse_container`). `run_command` executes inside the agent's
   long-lived sandbox container instead of starting a new one per command; the timeout is enforced
   inside the container.
@@ -505,12 +508,31 @@ notes with `[[wikilinks]]`:
 
 Benchmarks turn the knowledge base off so every mode starts with the same information.
 
+## Repeated comparisons and effective policy
+
+```sh
+swarmforge run --mode reviewed --issue-file TASK.md --repo PATH
+swarmforge config --json
+swarmforge bench-suite bench/suite.yaml --runs 3 --modes single reviewed swarm --budget 20
+```
+
+`reviewed` uses one developer plus independent testing/review and the final gate. `bench-suite`
+pins starting commits, alternates mode order and persists progress and success/time/cost summaries
+under `<workdir>/evaluations/`. Each invocation has its own total budget; existing before-call checks
+can overshoot by an in-flight call. Unknown-cost calls hold further evaluation. The suite now has
+11 cases; `--limit` selects a smaller trial. `--knowledge` compares with frozen per-run vaults.
+
+The New task page shows effective run policy. Every run stores a credential-excluding
+`effective-config.json`. `config --json` exports the same operational fields without provider
+keys, custom headers, agent environment variables or command strings.
+
 ## Documentation
 
 * [docs/FIRST_RUN.md](docs/FIRST_RUN.md): step-by-step first real GitHub issue
 * [docs/SELF_IMPROVEMENT.md](docs/SELF_IMPROVEMENT.md): point SwarmForge at its own code
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, state machine, built-in and Pi runtimes
-* [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md): proposed swarm-quality experiments and maintainability work
+* [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md): implementation status and swarm-quality experiments
+* [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): repeatable development and CI checks
 * [docs/PROVIDERS.md](docs/PROVIDERS.md): DeepInfra setup, choosing models, other providers
 * [docs/SECURITY.md](docs/SECURITY.md): sandbox strategy and remaining limitations
 * [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)

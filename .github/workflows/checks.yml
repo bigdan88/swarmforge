@@ -1,0 +1,42 @@
+name: Checks
+permissions:
+  contents: read
+on:
+  push:
+  pull_request:
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -c src/swarmforge/resources/constraints-linux.txt -e '.[dashboard,dev,tools]'
+      - run: python -m playwright install --with-deps chromium
+      - run: python scripts/check_docs.py
+      - run: ruff check src/swarmforge scripts/check_docs.py --select E9,F63,F7,F82
+      - run: mypy --follow-imports=silent --ignore-missing-imports src/swarmforge/agent/harness.py src/swarmforge/services
+      - run: python -m pytest -q -m 'not slow' -n 4 --junitxml=fast.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fast-test-evidence
+          path: fast.xml
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -c src/swarmforge/resources/constraints-linux.txt -e '.[dev]'
+      - run: cp swarmforge.example.yaml swarmforge.yaml
+      - run: swarmforge sandbox build --dev
+      - run: python -m pytest -q tests/test_e2e.py --junitxml=docker.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docker-test-evidence
+          path: docker.xml
