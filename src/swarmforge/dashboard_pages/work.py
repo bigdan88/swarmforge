@@ -3,6 +3,8 @@
 def render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work_list, collapse_attempts):
     from swarmforge import branding
     from swarmforge import runqueue as rq
+    from swarmforge.dashboard_pages.project_activity import describe
+    from swarmforge.projects.store import Projects
     if "flash" in st.session_state:
         st.success(st.session_state.pop("flash"))
     h1, h2 = st.columns([4, 1], vertical_alignment="bottom")
@@ -11,7 +13,25 @@ def render(_workdir_bytes, auto, cfg, st, store, welcome_panel, work_items, work
     if h2.button("New task", icon=":material/add:", type="primary", width="stretch"):
         st.session_state.goto = "New task"
         st.rerun()
+    ps = Projects(store)
     items = work_items()
+
+    @st.fragment(run_every=3 if auto else None)
+    def project_progress():
+        if not items and work_items():
+            st.rerun()
+        for project in ps.list():
+            if project["status"] not in ("running", "waiting_for_you"):
+                continue
+            message = describe(store, project, ps.items(project["id"]))
+            if message:
+                st.info(f"{project['name']} · {message}")
+                if st.button("Open project", key=f"work_project_{project['id']}"):
+                    st.session_state.project_id = project["id"]
+                    st.session_state.goto = "Projects"
+                    st.rerun()
+
+    project_progress()
     show = st.session_state.pop("show_welcome", False)
     if not items or show:  # first run (or "Getting started" in the sidebar): welcome instead of an empty table
         welcome_panel(cfg, empty=not items)

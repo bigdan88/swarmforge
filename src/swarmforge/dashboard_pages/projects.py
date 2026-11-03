@@ -7,6 +7,7 @@ import json
 
 from swarmforge.projects import lead, service
 from swarmforge.projects.store import Projects
+from swarmforge.dashboard_pages.project_activity import describe
 
 
 def edit_definition(st, definition, key, *, revision=False):
@@ -76,14 +77,53 @@ def render(cfg, st, store):
         st.progress(sum(m["status"] == "done" for m in milestones) / len(milestones))
         st.caption(" → ".join(("✓ " if m["status"] == "done" else "● " if m["idx"] == p["current_milestone"] else "○ ") + m["name"] for m in milestones))
         st.link_button("Open repository", "https://github.com/" + p["repo"])
-    if p.get("last_error"):
-        st.info(p["last_error"])
+    @st.fragment(run_every=3 if p["status"] == "running" else None)
+    def activity():
+        current = ps.get(pid)
+        tasks = ps.items(pid)
+        message = describe(store, current, tasks)
+        if message:
+            st.info(message)
+        if tasks and st.button("View tasks on Work", key=f"project_work_{pid}"):
+            st.session_state.goto = "Work"
+            st.rerun()
+        if current["status"] == "running":
+            from swarmforge.runqueue import PAUSED_KEY, start_worker, worker_pid
+            if not worker_pid(store) or store.kv_get(PAUSED_KEY) == "1":
+                if st.button("Start queue", key=f"project_start_queue_{pid}"):
+                    store.kv_set(PAUSED_KEY, "0")
+                    start_worker(cfg, store)
+            if st.button("Refresh project", key=f"project_refresh_{pid}"):
+                st.rerun()
+        elif current["status"] != p["status"]:
+            st.rerun()
+
+    activity()
+    if p["status"] == "drafting" and p["definition"]:
+        definition = p["definition"]
+        options = {"new": "Create a private GitHub repository", "existing": "Use an existing GitHub repository"}
+        with st.form(f"project_repository_{pid}"):
+            kind = st.radio("Where should the app live?", list(options),
+                            index=0 if definition["repository_kind"] == "new" else 1,
+                            format_func=options.get)
+            owner, _, name = definition["repo"].partition("/")
+            a, b = st.columns(2)
+            owner = a.text_input("GitHub account or organization", owner)
+            name = b.text_input("Repository name", name)
+            st.caption("SwarmForge creates the private repository when you approve and launch the project.")
+            if st.form_submit_button("Save repository choice"):
+                try:
+                    ps.draft(pid, {**definition, "repository_kind": kind, "repo": f"{owner.strip()}/{name.strip()}"})
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
     chat, spec, plan, reports = st.tabs(["Project chat", "Approved spec", "Plan & decisions", "Milestone reports"])
     with chat:
         for m in store.conversation_messages(p["conversation_id"]):
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
         if p["status"] == "drafting":
+            st.caption("Tell the kickoff chat your GitHub account and the name you want for a new repo. You can change the repository choice before launch.")
             question = st.chat_input("Describe your app or answer the kickoff questions", key="project_kickoff_" + pid)
             if question:
                 try:
@@ -130,7 +170,9 @@ def render(cfg, st, store):
                             st.rerun()
                         except Exception as e:
                             st.error(str(e))
-                st.caption("Launch authorizes repository creation or updates, task runs and PR publication within this spec and budget. Existing auto-merge rules still apply.")
+                action = "Create private repository" if p["definition"]["repository_kind"] == "new" else "Use existing repository"
+                st.caption(f"{action} · {p['repo']}. After launch, the first tasks appear on Work as soon as planning finishes.")
+                st.caption("Launch approves task runs and pull requests within this spec and budget. The existing merge rules apply.")
                 if st.button("Approve and launch", type="primary", key="launch_" + pid):
                     try:
                         service.approve(store, pid)

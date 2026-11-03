@@ -400,6 +400,10 @@ def test_new_dashboard_pages_and_spec_preview(tmp_path, monkeypatch):
     assert not at.exception, [e.value for e in at.exception]
     assert any(b.label == "Approve and launch" for b in at.button)
     assert any("Track inventory" in m.value for m in at.markdown)
+    next(r for r in at.radio if r.label == "Where should the app live?").set_value("new")
+    next(b for b in at.button if b.label == "Save repository choice").click().run()
+    assert not at.exception
+    assert any("Create private repository · owner/inventory" in c.value for c in at.caption)
     at.button(key="nav_whats-new").click().run()
     assert not at.exception
     assert any("Keep track of new features" in m.value for m in at.markdown)

@@ -231,6 +231,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
     own = repository is None
     repo = repository or Repository(cfg, p["repo"])
     ask = ask or lead.call
+    activity_key = f"project_activity:{pid}"
     try:
         items = ps.items(pid)
         if any(q["status"] == "running" for q in items):
@@ -294,6 +295,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
         if spent >= p["budget_usd"] or mspent >= ms["estimate_usd"] * cfg.projects.escalate_budget_factor:
             stop(ps, p, "Budget checkpoint: review spend and choose a revised plan before continuing.", {"spent_usd": spent, "milestone_spent_usd": mspent})
             return
+        store.kv_set(activity_key, "Preparing the GitHub repository")
         await asyncio.to_thread(repo.ensure, p["definition"]["repository_kind"], pid)
         snapshot = await asyncio.to_thread(repo.snapshot)
         if any(q["status"] == "queued" and q.get("seed_run_id") for q in ps.items(pid)):
@@ -322,6 +324,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
                 context["latest_diff"] = await asyncio.to_thread(repo.change, run["pr_url"])
         proposal = None
         for attempt in range(2):
+            store.kv_set(activity_key, "Planning the next tasks" if p["observed_sha"] else "Planning the first tasks")
             result = await ask(cfg, store, p, lead.LEAD, context, transport)
             try:
                 proposal = validate_plan(p, result, cfg.projects.horizon)
@@ -357,6 +360,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
                 ps.event(pid, "plan_churn_failure", {"key": key})
                 return
         # Protect fixed bytes in repository too; persist the living spec before dispatch.
+        store.kv_set(activity_key, "Saving the plan to the repository")
         await asyncio.to_thread(repo.write_spec, p, proposal, snapshot)
         snapshot = await asyncio.to_thread(repo.snapshot)
         if ps.get(pid)["status"] != "running":
@@ -390,6 +394,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
         from ..runqueue import set_lane_paused
         set_lane_paused(store, lane(pid), False)
     finally:
+        store.kv_set(activity_key, None)
         if own:
             repo.close()
 
