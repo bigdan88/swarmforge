@@ -154,6 +154,9 @@ chat:                   # chatbot per-conversation context window (top-level; no
   tools_enabled: true   # give the chat model web + filesystem tools (fetch_url, list_files)
   max_tool_rounds: 5       # tool-call rounds per answer; must be >= 1
 
+chatbot:                  # chatbot tool gating
+  enable_shell: false     # register run_command / read_file / grep (local files, sandboxed shell) in the chat
+
 # `swarmforge watch`: label a GitHub issue to hand it to the swarm. It is queued, labelled
 # swarmforge:queued -> working -> done/failed, and gets a comment with the summary and the draft PR.
 watch:

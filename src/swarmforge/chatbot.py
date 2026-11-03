@@ -107,6 +107,12 @@ private repos); `repo_issues` summarizes open/closed/all issues (pull requests e
 - Use `fetch_url` for READMEs and HTML pages, and the repo_* tools to dig into the repository's code
 and issues. If a tool returns an ERROR string, explain the failure briefly instead of inventing content."""
 
+SYSTEM_PROMPT += """
+Local project inspection (only when enabled by the operator):
+- read_file and grep inspect files under the project root; paths outside it are refused.
+- run_command uses the configured sandbox with a 30 second default timeout.
+"""
+
 WEB_TOOL_SCHEMA = {
     "type": "object",
     "properties": {
@@ -121,6 +127,39 @@ WEB_TOOL_SCHEMA = {
         },
     },
     "required": ["url"],
+}
+
+
+RUN_COMMAND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string",
+                     "description": "Shell command to run in the sandbox (read-only, no network)"},
+        "timeout_s": {"type": "integer", "description": "Timeout in seconds (default 30)"},
+    },
+    "required": ["command"],
+}
+
+
+READ_FILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string",
+                 "description": "File path relative to the project root"},
+        "max_chars": {"type": "integer"},
+    },
+    "required": ["path"],
+}
+
+
+GREP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pattern": {"type": "string", "description": "Regex to search for (ripgrep syntax)"},
+        "path": {"type": "string",
+                 "description": "File or directory to search, relative to the project root; default ."},
+    },
+    "required": ["pattern"],
 }
 
 
@@ -302,6 +341,31 @@ def build_chat_registry(cfg: Config) -> ToolRegistry:
         REPO_ISSUES_SCHEMA,
         _repo_issues,
     )
+    if getattr(cfg.chatbot, "enable_shell", False):
+        from .tools import sandbox as _sandbox
+
+        tools = _sandbox.ChatSandboxTools(Path.cwd(), cfg.sandbox)
+        registry.register(
+            "run_command",
+            "Run a shell command in the sandbox (read-only, no network, 30 s timeout) "
+            "and return stdout+stderr.",
+            RUN_COMMAND_SCHEMA,
+            tools.run_command,
+        )
+        registry.register(
+            "read_file",
+            "Read a text file under the project root (paths relative to the root; "
+            "traversal outside it is refused).",
+            READ_FILE_SCHEMA,
+            tools.read_file,
+        )
+        registry.register(
+            "grep",
+            "Search for a regex pattern under a path in the project (ripgrep syntax), "
+            "results truncated to 200 lines.",
+            GREP_SCHEMA,
+            tools.grep,
+        )
     return registry
 
 
