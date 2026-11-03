@@ -1,6 +1,9 @@
 name: Checks
 permissions:
   contents: read
+concurrency:
+  group: checks-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
 on:
   push:
   pull_request:
