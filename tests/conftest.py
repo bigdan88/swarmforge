@@ -106,6 +106,70 @@ def _noop_slot():
     yield
 
 
+_STALE_LOCK_S = 2 * 60 * 60  # locks older than 2h are considered breakable
+
+
+def _break_stale_lock(lock_path: Path) -> bool:
+    """Best-effort removal of a dead/stale lock file. Race-tolerant."""
+    try:
+        age_s = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False  # gone already
+    if age_s < _STALE_LOCK_S:
+        return False
+    try:
+        lock_path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+@contextmanager
+def _file_mutex_slot(path, timeout_s=_BROWSER_LOCK_TIMEOUT_S):
+    """Cross-platform lockfile mutex (Windows fallback for the flock slot).
+
+    Uses an O_EXCL lock file with polling + timeout. The owning PID is written
+    into the lock file; locks older than 2h are treated as stale and broken.
+    Only guards a test resource, so this is deliberately simple and
+    race-tolerant rather than bulletproof.
+    """
+    lock_path = Path(str(path) + ".mutex")
+    deadline = time.monotonic() + timeout_s
+    fd = None
+    try:
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                break
+            except FileExistsError:
+                if _break_stale_lock(lock_path):
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out waiting for the browser slot lock at {lock_path}"
+                    )
+                time.sleep(0.2)
+        yield
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _slot_lock(path, timeout_s=_BROWSER_LOCK_TIMEOUT_S):
+    """Select the platform lock: flock on POSIX, file mutex otherwise."""
+    if fcntl is None:
+        return _file_mutex_slot(path, timeout_s)
+    return _flock_slot()
+
+
 @contextmanager
 def _flock_slot():
     """Hold an exclusive cross-process advisory lock on a shared lockfile.
@@ -139,11 +203,10 @@ def browser_slot():
 
     Real-browser tests wrap their launch window in `with browser_slot():` so at
     most one Chromium/dashboard runs at any moment, even under pytest-xdist.
-    On platforms without fcntl (Windows) this is a no-op.
+    On platforms without fcntl (Windows) this falls back to a stdlib file
+    mutex (O_EXCL lock file with polling + timeout).
     """
-    if fcntl is None:
-        return _noop_slot
-    return _flock_slot
+    return _slot_lock(_BROWSER_LOCK_PATH, _BROWSER_LOCK_TIMEOUT_S)
 
 
 # ------------------------------------------------------------- fake model API
