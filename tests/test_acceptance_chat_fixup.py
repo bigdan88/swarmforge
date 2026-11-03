@@ -17,8 +17,9 @@ from streamlit.testing.v1 import AppTest
 
 from swarmforge import chatbot
 from swarmforge.chat_quick import URL_HINT_MARKER, _repo_slug, expand_prompt
+from swarmforge.db import Store
 
-from .test_dashboard import APP, _write_cfg
+from .test_dashboard import APP, _go, _write_cfg
 
 MARKER_LITERAL = "[chat quick-action] Detected link(s):"
 
@@ -74,16 +75,21 @@ class TestFreshLoadToolsUsedWidget:
     def test_fresh_page_load_renders_expander_for_output_form_calls(self, tmp_path,
                                                                       monkeypatch):
         cfg = _write_cfg(tmp_path, monkeypatch)
-        store = chatbot.get_store(cfg.db_path)
-        conv = chatbot.ensure_default_conversation(store)
-        chatbot.add_message(store, conv["id"], "user", "search the docs for x")
-        chatbot.add_message(
-            store, conv["id"], "assistant", "Found it: # Doc",
-            tool_calls=[{"name": "search_docs", "args": {"q": "x"}, "output": "# Doc"}],
-        )
+        store = Store(cfg.db_path)
+        try:
+            conv = chatbot.ensure_default_conversation(store)
+            chatbot.add_message(store, conv["id"], "user", "search the docs for x")
+            chatbot.add_message(
+                store, conv["id"], "assistant", "Found it: # Doc",
+                tool_calls=[{"name": "search_docs", "args": {"q": "x"}, "output": "# Doc"}],
+            )
+        finally:
+            store.close()
 
         at = AppTest.from_file(str(APP), default_timeout=120)
         at.run()
+        assert not at.exception, [e.value for e in at.exception]
+        _go(at, "Chat")
         assert not at.exception, [e.value for e in at.exception]
 
         expanders = [e for e in at.expander if "Tools used" in e.label]
