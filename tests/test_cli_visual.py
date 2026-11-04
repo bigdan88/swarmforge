@@ -323,7 +323,14 @@ def _layout_report(ok=True):
         "tab": "chat",
         "widths": [375, 768, 1280],
         "results": [
-            {"width": w, "screenshot": None, "overflow": [], "clipped": []}
+            {
+                "width": w,
+                "shot": f"/tmp/layout/chat-{w}px-light.png",
+                "status": "clean",
+                "doc_scroll_width": 360,
+                "overflowing": [],
+                "clipped": [],
+            }
             for w in (375, 768, 1280)
         ],
         "findings": []
@@ -331,8 +338,11 @@ def _layout_report(ok=True):
         else [
             {
                 "severity": "major",
+                "file": "chat (375px)",
                 "page": "chat",
                 "theme": "light",
+                "width": 375,
+                "layout_overflow": True,
                 "blocking": True,
                 "title": "overflow at 375px: element wider than viewport",
                 "description": "d",
