@@ -21,6 +21,7 @@ from typing import Callable
 import yaml
 
 from . import prompts
+from . import evidence
 from .agent.runtime import AgentResult, AgentSpec, run_agent
 from .agent.navtools import NAV_READONLY, NAV_TOOLS
 from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext, ToolError
@@ -86,6 +87,7 @@ class Orchestrator:
         self._llm_transport = llm_transport
         self._integration_lock = asyncio.Lock()
         self._conflicts_used = 0
+        self._evidence_done = False
         self.run_id: str | None = None
 
     # ================================================================ logging
@@ -178,6 +180,11 @@ class Orchestrator:
                     await asyncio.wait_for(self._capture_knowledge(), timeout=900)
                 except Exception as e:  # knowledge capture must never change the run outcome
                     self.log("knowledge", f"knowledge capture failed: {type(e).__name__}: {e}", level="warn")
+            try:
+                if self.store.get_run(self.run_id)["state"] != "COMPLETED":
+                    await self._collect_evidence()
+            except Exception as e:  # evidence must never change the run outcome
+                self.log("evidence", f"evidence collection failed: {type(e).__name__}: {e}", level="warn")
             try:
                 path = write_report(self.store, self.run_id, self.run_dir)
                 self.log("report", f"execution report written to {path}")
@@ -442,7 +449,62 @@ class Orchestrator:
                      data=fix_plan.to_dict())
             tasks = repair_tasks + fix_plan.tasks
 
+        await self._collect_evidence()
         await self._deliver()
+
+    # ============================================================ visual evidence
+    def _plan_file_set(self) -> list[str]:
+        """Files the plan intends to change, plus what actually changed (deduped)."""
+        files: list[str] = []
+        plan = getattr(self, "plan", None)
+        if plan is not None:
+            for f in evidence.plan_files(plan):
+                if f not in files:
+                    files.append(f)
+        ws = getattr(self, "ws", None)
+        if ws is not None:
+            try:
+                for f in ws.changed_files():
+                    if f not in files:
+                        files.append(f)
+            except Exception:  # a missing git workspace must never block evidence
+                pass
+        return files
+
+    async def _collect_evidence(self) -> None:
+        """Screenshot the dashboard tabs the plan touched, once per run.
+
+        Never changes the run's outcome: capture failures are logged as warnings and skipped.
+        """
+        from . import visual
+        if self._evidence_done:
+            return
+        if self.mode == "single":
+            self.log("evidence", "no evidence screenshots: single-agent mode")
+            self._evidence_done = True
+            return
+        files = self._plan_file_set()
+        if not evidence.touches_ui(files):
+            self.log("evidence", "no evidence screenshots: the plan does not touch dashboard files")
+            self._evidence_done = True
+            return
+        if getattr(self, "ws", None) is None or self.run_dir is None:
+            self.log("evidence", "no evidence screenshots: no workspace to capture from", level="warn")
+            return
+        failed = True
+        try:
+            failed = self.store.get_run(self.run_id)["state"] != "COMPLETED"
+        except Exception:
+            pass
+        try:
+            shots = await asyncio.to_thread(
+                evidence.screenshot_tabs, self.ws.repo, self.run_dir / "screenshots", files,
+                failed=failed)
+        except (OSError, RuntimeError, visual.RegressError, visual.PreviewError) as e:
+            self.log("evidence", f"screenshots skipped: {e}"[:1500], level="warn")
+            return
+        self._evidence_done = True
+        self.log("evidence", f"{len(shots)} evidence screenshot(s) taken", data={"shots": shots})
 
     # ============================================================ issue/repo
     def _load_issue(self, issue_url, issue_file, repo) -> tuple[Issue, str]:
