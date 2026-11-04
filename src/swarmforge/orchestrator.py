@@ -1097,8 +1097,8 @@ class Orchestrator:
                 timeout_s=self.cfg.sandbox.install_timeout_s, cache_dir=self.cfg.workdir / "pipcache",
                 install_command=getattr(self, "install_command", None))
             if status == "none":
-                return ("No dependency files found. Declare packages in requirements.txt (one per line) "
-                        "or in pyproject.toml [project].dependencies, then call this again.")
+                return ("No dependency files found. Declare packages in requirements.txt, "
+                        "pyproject.toml [project].dependencies, or package.json, then call this again.")
             if status == "current":
                 return f"Dependencies from {', '.join(plan.sources)} are already installed and unchanged."
             out = res.summary(4000) if res else ""

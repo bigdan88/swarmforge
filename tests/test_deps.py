@@ -51,6 +51,21 @@ async def test_ensure_deps_uses_network_once_and_caches(tmp_path):
     assert status == "failed" and res.exit_code == 1
 
 
+async def test_npm_setup_detects_manifest_and_lockfile(tmp_path):
+    (tmp_path / "package.json").write_text('{"name": "scaffold", "dependencies": {"react": "^18"}}')
+    sandbox = RecordingSandbox()
+    status, _, plan = await ensure_deps(sandbox, tmp_path, network="bridge")
+    assert status == "installed"
+    assert plan.command.startswith("npm install --no-package-lock")
+    assert sandbox.calls[0]["network"] == "bridge"
+    assert (await ensure_deps(sandbox, tmp_path))[0] == "current"
+    (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+    status, _, locked_plan = await ensure_deps(sandbox, tmp_path)
+    assert status == "installed" and locked_plan.command.startswith("npm ci ")
+    assert locked_plan.fingerprint != plan.fingerprint
+    assert plan_install(tmp_path, "custom install").command == "custom install"
+
+
 def test_docker_args_for_install_and_pythonpath(tmp_path):
     from swarmforge.config import SandboxConfig
     from swarmforge.sandbox import DockerSandbox

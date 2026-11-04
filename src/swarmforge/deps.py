@@ -145,12 +145,19 @@ def plan_install(ws: Path, install_command: str | None = None) -> InstallPlan:
     if pp:
         h.update("\n".join(pp).encode())
         sources.append("pyproject.toml")
-    if install_command:
-        cmd = install_command
-    elif files or pp:
-        cmd = "python .swarmforge/sf_deps.py"
-    else:
-        cmd = None
+    commands = ["python .swarmforge/sf_deps.py"] if files or pp else []
+    manifest = ws / "package.json"
+    lockfile = next((ws / name for name in ("npm-shrinkwrap.json", "package-lock.json")
+                     if (ws / name).is_file()), None)
+    other_manager = any((ws / name).is_file() for name in ("pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"))
+    if manifest.is_file() and (lockfile or not other_manager):
+        for path in (manifest, lockfile, ws / ".npmrc"):
+            if path is not None and path.is_file():
+                h.update(path.name.encode() + path.read_bytes())
+                sources.append(path.name)
+        npm = "npm ci" if lockfile else "npm install --no-package-lock"
+        commands.append(f"{npm} --no-audit --no-fund --cache .swarmforge/npm-cache")
+    cmd = install_command or (" && ".join(commands) if commands else None)
     return InstallPlan(cmd, sources, h.hexdigest()[:16])
 
 
@@ -184,7 +191,7 @@ async def ensure_deps(sandbox: Sandbox, ws: Path, *, network: str = "bridge", ti
     if not force and is_current(ws, plan):
         return "current", None, plan
     (ws / DEPS_DIR).mkdir(parents=True, exist_ok=True)
-    if plan.command.endswith(".swarmforge/sf_deps.py"):
+    if plan.command.split(" && ", 1)[0].endswith(".swarmforge/sf_deps.py"):
         _write_helper(ws)
     res = await sandbox.run(ws, plan.command, timeout_s=timeout_s, network=network, cache_dir=cache_dir)
     if res.exit_code == 0 and not res.timed_out:
