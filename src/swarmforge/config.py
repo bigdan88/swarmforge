@@ -171,6 +171,7 @@ class ReviewConfig:
     allow_same_model_review: bool = False
     require_junit: bool = False  # compatibility opt-out for non-JUnit projects
     require_verified_criteria: bool = False
+    a11y_gate: bool = False  # run the Playwright accessibility audit after dashboard-changing PRs (needs a configured preview)
 
 
 @dataclass
