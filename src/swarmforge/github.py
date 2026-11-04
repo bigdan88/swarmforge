@@ -148,6 +148,28 @@ class GitHubClient:
             raise GitHubError(f"creating draft PR failed: HTTP {r.status_code} {r.text[:500]}")
         return r.json()["html_url"]
 
+    def get_pr_body(self, owner: str, repo: str, number: int) -> str:
+        r = self._client.get(f"/repos/{owner}/{repo}/pulls/{number}")
+        if r.status_code >= 400:
+            raise GitHubError(f"fetching PR failed: HTTP {r.status_code} {r.text[:300]}")
+        return r.json().get("body") or ""
+
+    def update_pr_body(self, owner: str, repo: str, number: int, body: str) -> None:
+        r = self._client.patch(f"/repos/{owner}/{repo}/pulls/{number}", json={"body": body[:60_000]})
+        if r.status_code >= 400:
+            raise GitHubError(f"updating PR body failed: HTTP {r.status_code} {r.text[:300]}")
+
+    def upload_pr_asset(self, owner: str, repo: str, issue_number: int, path: str | Path) -> str:
+        """Upload a file as an issue/PR asset; returns the browser_download_url."""
+        p = Path(path)
+        url = (f"https://uploads.github.com/repos/{owner}/{repo}/issues/{issue_number}"
+               f"/assets?name={p.name}")
+        r = self._client.post(url, content=p.read_bytes(),
+                              headers={"Content-Type": "image/png"})
+        if r.status_code >= 400:
+            raise GitHubError(f"uploading PR asset failed: HTTP {r.status_code} {r.text[:300]}")
+        return r.json().get("browser_download_url") or r.json().get("url", "")
+
 
 def check_branch_safe(branch: str, default_branch: str, prefix: str) -> None:
     if not branch.startswith(prefix):
