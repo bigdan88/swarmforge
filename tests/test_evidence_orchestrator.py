@@ -119,8 +119,8 @@ def test_collect_evidence_warns_and_survives_capture_failures(tmp_path, cfg, mon
     assert "screenshots skipped" in evs[0]["message"]
     assert str(exc) in evs[0]["message"]
     assert store.get_run("r-evidence")["state"] not in ("COMPLETED",)
-    # a retry is still possible (the flag was not set on failure)
-    assert orch._evidence_done is False
+    # no retry is attempted after a capture failure (the flag is set before capture)
+    assert orch._evidence_done is True
 
 
 def test_collect_evidence_is_idempotent(tmp_path, cfg, monkeypatch):

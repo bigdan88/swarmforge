@@ -495,12 +495,14 @@ class Orchestrator:
                 return
             if getattr(self, "ws", None) is None or self.run_dir is None:
                 self.log("evidence", "no evidence screenshots: no workspace to capture from", level="warn")
+                self._evidence_done = True
                 return
             failed = True
             try:
                 failed = self.store.get_run(self.run_id)["state"] != "COMPLETED"
             except Exception:
                 pass
+            self._evidence_done = True  # never retry, even if capture fails
             try:
                 shots = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -515,7 +517,6 @@ class Orchestrator:
             except Exception as e:
                 self.log("evidence", f"screenshots skipped: {type(e).__name__}: {e}"[:1500], level="warn")
                 return
-            self._evidence_done = True
             self.log("evidence", f"{len(shots)} evidence screenshot(s) taken", data={"shots": shots})
         except Exception as e:  # evidence must never change the run outcome
             self.log("evidence", f"evidence collection failed: {type(e).__name__}: {e}", level="warn")
