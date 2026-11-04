@@ -476,7 +476,6 @@ class Orchestrator:
 
         Never changes the run's outcome: capture failures are logged as warnings and skipped.
         """
-        from . import visual
         if self._evidence_done:
             return
         if self.mode == "single":
@@ -496,11 +495,12 @@ class Orchestrator:
             failed = self.store.get_run(self.run_id)["state"] != "COMPLETED"
         except Exception:
             pass
+        self._evidence_done = True  # never retry, even if capture fails
         try:
             shots = await asyncio.to_thread(
                 evidence.screenshot_tabs, self.ws.repo, self.run_dir / "screenshots", files,
                 failed=failed)
-        except (OSError, RuntimeError, visual.RegressError, visual.PreviewError) as e:
+        except Exception as e:  # capture failures must never change the run outcome
             self.log("evidence", f"screenshots skipped: {e}"[:1500], level="warn")
             return
         self._evidence_done = True
