@@ -2,7 +2,6 @@
 and the Chat page's accessible names. Offline except for the optional real-browser probe test."""
 
 import importlib.util
-import inspect
 import json
 import os
 import socket
@@ -309,12 +308,7 @@ def test_nameless_icon_button_is_flagged_major(tmp_path, monkeypatch):
     snapshot = _chat_snapshot_from(at, strip_help_keys={edit_key})
     assert any(c["role"] == "button" and not c["name"] for c in snapshot["children"])
 
-    params = inspect.signature(a11y.label_findings).parameters
-    findings = (
-        a11y.label_findings(snapshot, page="chat")
-        if "page" in params
-        else a11y.label_findings(snapshot)
-    )
+    findings = a11y.label_findings("chat", "light", snapshot)
     majors = [f for f in findings if (f.get("severity") or "").lower() == "major"]
     assert len(majors) == 1, findings
     blob = json.dumps(majors[0]).lower()
@@ -337,12 +331,7 @@ def test_fully_labelled_chat_snapshot_has_no_major_label_findings(
     )
     at = _chat_app(tmp_path, monkeypatch)
     snapshot = _chat_snapshot_from(at, strip_help_keys=set())
-    params = inspect.signature(a11y.label_findings).parameters
-    findings = (
-        a11y.label_findings(snapshot, page="chat")
-        if "page" in params
-        else a11y.label_findings(snapshot)
-    )
+    findings = a11y.label_findings("chat", "light", snapshot)
     assert not [f for f in findings if (f.get("severity") or "").lower() == "major"], (
         findings
     )
