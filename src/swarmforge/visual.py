@@ -919,3 +919,11 @@ def record_breakpoint_findings(
         )
         n += 1
     return n
+
+
+# ------------------------------------------------------------- a11y audit
+def audit(tab_url, **kwargs):
+    """Accessibility audit of a served page (Playwright a11y snapshot + WCAG AA contrast).
+    See swarmforge.a11y.audit for options; returns {ok, url, tab, themes, results, findings, error}."""
+    from . import a11y
+    return a11y.audit(tab_url, **kwargs)
