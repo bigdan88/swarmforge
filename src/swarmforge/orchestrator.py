@@ -46,6 +46,10 @@ from .workspace import EmptyRepository, GitError, GitWorkspace, StaleSeed, git
 
 TEST_PATH_HINTS = ("tests/", "test/", "testing/")
 
+# Hard cap on evidence screenshot capture so a hung Streamlit/Chromium child
+# can never wedge the pipeline (or an xdist worker).
+_EVIDENCE_CAPTURE_TIMEOUT_S = 300
+
 
 def new_run_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
@@ -474,37 +478,47 @@ class Orchestrator:
     async def _collect_evidence(self) -> None:
         """Screenshot the dashboard tabs the plan touched, once per run.
 
-        Never changes the run's outcome: capture failures are logged as warnings and skipped.
+        Never changes the run's outcome: any failure (including capture
+        timeouts) is logged as a warning and skipped.
         """
-        from . import visual
         if self._evidence_done:
             return
-        if self.mode == "single":
-            self.log("evidence", "no evidence screenshots: single-agent mode")
-            self._evidence_done = True
-            return
-        files = self._plan_file_set()
-        if not evidence.touches_ui(files):
-            self.log("evidence", "no evidence screenshots: the plan does not touch dashboard files")
-            self._evidence_done = True
-            return
-        if getattr(self, "ws", None) is None or self.run_dir is None:
-            self.log("evidence", "no evidence screenshots: no workspace to capture from", level="warn")
-            return
-        failed = True
         try:
-            failed = self.store.get_run(self.run_id)["state"] != "COMPLETED"
-        except Exception:
-            pass
-        try:
-            shots = await asyncio.to_thread(
-                evidence.screenshot_tabs, self.ws.repo, self.run_dir / "screenshots", files,
-                failed=failed)
-        except (OSError, RuntimeError, visual.RegressError, visual.PreviewError) as e:
-            self.log("evidence", f"screenshots skipped: {e}"[:1500], level="warn")
-            return
-        self._evidence_done = True
-        self.log("evidence", f"{len(shots)} evidence screenshot(s) taken", data={"shots": shots})
+            if self.mode == "single":
+                self.log("evidence", "no evidence screenshots: single-agent mode")
+                self._evidence_done = True
+                return
+            files = self._plan_file_set()
+            if not evidence.touches_ui(files):
+                self.log("evidence", "no evidence screenshots: the plan does not touch dashboard files")
+                self._evidence_done = True
+                return
+            if getattr(self, "ws", None) is None or self.run_dir is None:
+                self.log("evidence", "no evidence screenshots: no workspace to capture from", level="warn")
+                return
+            failed = True
+            try:
+                failed = self.store.get_run(self.run_id)["state"] != "COMPLETED"
+            except Exception:
+                pass
+            try:
+                shots = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        evidence.screenshot_tabs, self.ws.repo, self.run_dir / "screenshots", files,
+                        failed=failed),
+                    timeout=_EVIDENCE_CAPTURE_TIMEOUT_S)
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                self.log("evidence",
+                         f"screenshots skipped: capture timed out after {_EVIDENCE_CAPTURE_TIMEOUT_S}s: {e}",
+                         level="warn")
+                return
+            except Exception as e:
+                self.log("evidence", f"screenshots skipped: {type(e).__name__}: {e}"[:1500], level="warn")
+                return
+            self._evidence_done = True
+            self.log("evidence", f"{len(shots)} evidence screenshot(s) taken", data={"shots": shots})
+        except Exception as e:  # evidence must never change the run outcome
+            self.log("evidence", f"evidence collection failed: {type(e).__name__}: {e}", level="warn")
 
     # ============================================================ issue/repo
     def _load_issue(self, issue_url, issue_file, repo) -> tuple[Issue, str]:
