@@ -573,3 +573,343 @@ def maybe_refresh_golden_after_update(repo: str | Path = ".", *, capture=None) -
         return {"refreshed": True, "files": [str(f) for f in files]}
     except (RegressError, OSError) as e:
         return {"refreshed": False, "reason": str(e)}
+
+
+# ------------------------------------------------------------- layout checks
+# Responsive-layout checks: screenshot a tab at phone/tablet/desktop widths and
+# look for DOM overflow/clipping, so mobile regressions are caught by tests
+# instead of manual inspection.
+
+BREAKPOINT_WIDTHS = (375, 768, 1280)
+
+OVERFLOW_JS = """
+(width) => {
+    const doc = document.documentElement || null;
+    const overflowing = [];
+    const clipped = [];
+    const selector = (el) => {
+        let s = (el.tagName || "*").toLowerCase();
+        if (el.id) s += "#" + el.id;
+        if (el.classList && el.classList.length) s += "." + el.classList[0];
+        return s.length > 60 ? s.slice(0, 57) + "..." : s;
+    };
+    let els = [];
+    try { els = document.querySelectorAll("body *"); } catch (e) { els = []; }
+    for (const el of els) {
+        try {
+            const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (!rect || !(rect.width > 0) || !(rect.height > 0)) continue;
+            let style = null;
+            try { style = getComputedStyle(el); } catch (e) { style = null; }
+            if (style && (style.display === "none" || style.visibility === "hidden")) continue;
+            if (rect.right > width + 2 || rect.left < -2) {
+                overflowing.push({selector: selector(el), width: rect.width,
+                                   left: rect.left, right: rect.right});
+            }
+            const sw = el.scrollWidth || 0, cw = el.clientWidth || 0;
+            if (sw - cw > 2 && style &&
+                (style.overflowX === "hidden" || style.overflowX === "clip")) {
+                clipped.push({selector: selector(el), scroll_width: sw, client_width: cw});
+            }
+        } catch (e) { /* skip unreadable elements */ }
+    }
+    return {viewport: width, doc_scroll_width: doc ? (doc.scrollWidth || 0) : 0,
+            overflowing: overflowing, clipped: clipped};
+}
+"""
+
+
+def breakpoint_findings(
+    tab: str, width: int, dom: dict, *, theme: str = "light"
+) -> list[dict]:
+    """Convert one OVERFLOW_JS payload into review findings (empty list when clean)."""
+    page = slugify(tab)
+    overflowing = list(dom.get("overflowing") or [])
+    clipped = list(dom.get("clipped") or [])
+    doc_scroll = int(dom.get("doc_scroll_width") or 0)
+    if doc_scroll > width + 2 or overflowing:
+        parts = []
+        if doc_scroll > width + 2:
+            parts.append(f"the document is {doc_scroll}px wide at a {width}px viewport")
+        for o in overflowing[:5]:
+            parts.append(
+                f"{o.get('selector')} (width {o.get('width'):.0f}px, "
+                f"right edge {o.get('right'):.0f}px)"
+            )
+        return [
+            {
+                "severity": "major",
+                "page": page,
+                "theme": theme,
+                "blocking": True,
+                "layout_overflow": True,
+                "width": int(width),
+                "title": f"layout overflow at {width}px viewport",
+                "description": (
+                    f"Tab '{tab}' overflows a {width}px viewport: " + "; ".join(parts)
+                ),
+                "recommendation": (
+                    f"make the {tab} tab responsive at {width}px "
+                    f"(flex-wrap, min-width:0, overflow handling)"
+                ),
+            }
+        ]
+    if clipped:
+        parts = [
+            f"{c.get('selector')} (content {c.get('scroll_width')}px in a "
+            f"{c.get('client_width')}px box)"
+            for c in clipped[:5]
+        ]
+        return [
+            {
+                "severity": "minor",
+                "page": page,
+                "theme": theme,
+                "blocking": False,
+                "layout_overflow": True,
+                "width": int(width),
+                "title": f"content clipped at {width}px viewport",
+                "description": (
+                    f"Tab '{tab}' clips content at a {width}px viewport: "
+                    + "; ".join(parts)
+                ),
+                "recommendation": (
+                    f"let the {tab} tab's clipped content wrap or scroll "
+                    f"at {width}px instead of hiding it"
+                ),
+            }
+        ]
+    return []
+
+
+def _default_open_page():
+    """Real-browser page factory: one headless Chromium page per viewport width."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as e:  # pragma: no cover - depends on the sandbox
+        raise RegressError(
+            "playwright is not installed; run `playwright install chromium`"
+        ) from e
+
+    def open_page(width: int, theme: str):
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch()
+        page = browser.new_page(
+            color_scheme=theme,  # type: ignore[arg-type]
+            viewport={"width": int(width), "height": 900},
+        )
+
+        class _Page:
+            def goto(self, url, **kw):
+                page.goto(url, **kw)
+
+            def wait_for_timeout(self, ms):
+                page.wait_for_timeout(ms)
+
+            def screenshot(self, path, **kw):
+                page.screenshot(path=str(path), **kw)
+
+            def evaluate(self, js, arg=None):
+                return page.evaluate(js, arg)
+
+            def close(self):
+                try:
+                    page.close()
+                finally:
+                    browser.close()
+                    pw.stop()
+
+        return _Page()
+
+    return open_page
+
+
+def render_breakpoints(
+    tab: str,
+    widths=BREAKPOINT_WIDTHS,
+    *,
+    repo: str | Path = ".",
+    url: str | None = None,
+    out_dir: str | Path | None = None,
+    port: int | None = None,
+    theme: str = "light",
+    timeout_s: int = 180,
+    open_page=None,
+) -> dict:
+    """Screenshot `tab` at each viewport width and check the DOM for overflow/clipping.
+
+    Returns a JSON-safe report {ok, tab, widths, results, findings, error}. `url` skips the
+    local dashboard launch (tests inject their own page this way); `open_page(width, theme)`
+    overrides the real browser (offline tests pass a fake).
+    """
+    import os
+    import shutil
+    import signal
+    import socket
+    import subprocess
+    import sys
+    import tempfile
+
+    if not str(tab or "").strip():
+        raise RegressError("tab must not be empty")
+    widths = list(widths)
+    if not widths:
+        raise RegressError("widths must not be empty")
+    for w in widths:
+        if not isinstance(w, int) or isinstance(w, bool) or not 240 <= w <= 3000:
+            raise RegressError(
+                f"invalid viewport width {w!r}: use integers between 240 and 3000"
+            )
+    if theme not in ("light", "dark"):
+        raise RegressError(f"unknown theme {theme!r}: expected 'light' or 'dark'")
+
+    slug = slugify(tab)
+    out_dir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="layout-"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    proc = None
+    tmp_db_dir = None
+    try:
+        if url is None:
+            if port is None:
+                with socket.socket() as s:
+                    s.bind(("127.0.0.1", 0))
+                    port = s.getsockname()[1]
+            repo_dir = Path(repo)
+            tmp_db_dir = Path(tempfile.mkdtemp(prefix="sf-layout-demo-"))
+            db = tmp_db_dir / "layout-demo.sqlite"
+            env = _streamlit_env(repo_dir, db)
+            _run(
+                [sys.executable, "-m", "swarmforge.cli", "seed-demo", str(db)],
+                cwd=repo_dir,
+                env=env,
+            )
+            cmd = [
+                sys.executable,
+                "-m",
+                "streamlit",
+                "run",
+                "src/swarmforge/dashboard.py",
+                "--server.headless",
+                "true",
+                "--server.port",
+                str(port),
+                "--server.address",
+                "127.0.0.1",
+                "--client.toolbarMode",
+                "viewer",
+                "--server.fileWatcherType",
+                "none",
+                "--browser.gatherUsageStats",
+                "false",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo_dir,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            _wait_http(port, timeout_s=min(timeout_s, 60))
+            url = f"http://127.0.0.1:{port}/?page={slug}"
+
+        if open_page is None:
+            open_page = _default_open_page()
+
+        results = []
+        findings: list[dict] = []
+        error: str | None = None
+        for w in widths:
+            shot = out_dir / f"{slug}-{w}px-{theme}.png"
+            try:
+                page = open_page(w, theme)
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=timeout_s * 1000)
+                    page.wait_for_timeout(350)
+                    page.screenshot(shot, full_page=True)
+                    dom = page.evaluate(OVERFLOW_JS, w) or {}
+                finally:
+                    page.close()
+                fs = breakpoint_findings(tab, w, dom, theme=theme)
+                status = "overflow" if any(f["blocking"] for f in fs) else "clean"
+                findings.extend(fs)
+                results.append(
+                    {
+                        "width": w,
+                        "shot": str(shot),
+                        "status": status,
+                        "doc_scroll_width": int(dom.get("doc_scroll_width") or 0),
+                        "overflowing": list(dom.get("overflowing") or []),
+                        "clipped": list(dom.get("clipped") or []),
+                    }
+                )
+            except Exception as e:  # noqa: BLE001 - any browser failure becomes a finding
+                error = str(e)
+                findings.append(
+                    {
+                        "severity": "critical",
+                        "page": slug,
+                        "theme": theme,
+                        "blocking": True,
+                        "layout_overflow": True,
+                        "width": w,
+                        "title": f"layout check failed at {w}px viewport",
+                        "description": f"could not render the {tab} tab at {w}px: {str(e)[:500]}",
+                        "recommendation": f"check the {tab} tab renders at {w}px and rerun the layout check",
+                    }
+                )
+                results.append(
+                    {
+                        "width": w,
+                        "shot": str(shot),
+                        "status": "error",
+                        "doc_scroll_width": 0,
+                        "overflowing": [],
+                        "clipped": [],
+                    }
+                )
+        return {
+            "ok": not findings,
+            "tab": slug,
+            "widths": list(widths),
+            "results": results,
+            "findings": findings,
+            "error": error,
+        }
+    finally:
+        if proc is not None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.wait()
+        if tmp_db_dir is not None:
+            shutil.rmtree(tmp_db_dir, ignore_errors=True)
+
+
+def record_breakpoint_findings(
+    store,
+    run_id: str,
+    report: dict,
+    *,
+    cycle: int = 0,
+    source: str = "layout",
+    line: int | None = None,
+) -> int:
+    """Persist a render_breakpoints report's findings; returns how many were recorded."""
+    n = 0
+    for f in report.get("findings") or []:
+        store.record_finding(
+            run_id,
+            cycle=cycle,
+            source=source,
+            severity=f["severity"],
+            file=f"{f['page']} ({f.get('width', '')}px)".strip(),
+            line=line,
+            title=f["title"],
+            description=f["description"],
+            recommendation=f["recommendation"],
+        )
+        n += 1
+    return n
