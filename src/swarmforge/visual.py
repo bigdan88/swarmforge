@@ -927,3 +927,39 @@ def audit(tab_url, **kwargs):
     See swarmforge.a11y.audit for options; returns {ok, url, tab, themes, results, findings, error}."""
     from . import a11y
     return a11y.audit(tab_url, **kwargs)
+
+
+async def audit_pages(ctx, pv, *, log=None, min_ratio=4.5) -> list[dict]:
+    """Run the accessibility audit against every page/theme of a preview config.
+
+    Returns a list of Finding dicts (missing accessible names [major], low contrast [minor])
+    consumable by state.repair_tasks_from_findings. Never raises on per-page failures;
+    the preview process is always stopped."""
+    from . import a11y
+    from .agent.devtools import browse_raw, start_process, stop_process
+    from .agent.tools import ToolError
+
+    findings: list[dict] = []
+    await start_process(ctx, "preview", pv.command, ready_port=pv.port, ready_text=pv.ready_text,
+                        wait_s=pv.wait_s)
+    try:
+        for page in pv.pages:
+            for theme in pv.themes:
+                try:
+                    data = await browse_raw(ctx, f"http://localhost:{pv.port}{page.path}",
+                                            actions=page.actions, color_scheme=theme,
+                                            a11y=True, timeout_s=90)
+                except ToolError as e:
+                    if log:
+                        log(f"a11y audit skipped for {page.name} ({theme}): {e}")
+                    continue
+                if data.get("a11y"):
+                    findings.extend(a11y.label_findings(page.name, theme, data["a11y"]))
+                findings.extend(a11y.contrast_findings(page.name, theme, data.get("contrast") or [],
+                                                       min_ratio=min_ratio))
+    finally:
+        try:
+            await stop_process(ctx, "preview")
+        except ToolError:
+            pass
+    return findings
