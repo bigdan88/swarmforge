@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from swarmforge import cli, visual
 from swarmforge.visual import DIFF_THRESHOLD, RegressError
 from tests.test_visual_regress import (
