@@ -640,6 +640,7 @@ def breakpoint_findings(
             {
                 "severity": "major",
                 "page": page,
+                "file": f"{page} ({int(width)}px)",
                 "theme": theme,
                 "blocking": True,
                 "layout_overflow": True,
@@ -664,6 +665,7 @@ def breakpoint_findings(
             {
                 "severity": "minor",
                 "page": page,
+                "file": f"{page} ({int(width)}px)",
                 "theme": theme,
                 "blocking": False,
                 "layout_overflow": True,
@@ -764,6 +766,7 @@ def render_breakpoints(
         raise RegressError(f"unknown theme {theme!r}: expected 'light' or 'dark'")
 
     slug = slugify(tab)
+    auto_out = not out_dir
     out_dir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="layout-"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -850,6 +853,7 @@ def render_breakpoints(
                     {
                         "severity": "critical",
                         "page": slug,
+                        "file": f"{slug} ({w}px)",
                         "theme": theme,
                         "blocking": True,
                         "layout_overflow": True,
@@ -886,6 +890,8 @@ def render_breakpoints(
             proc.wait()
         if tmp_db_dir is not None:
             shutil.rmtree(tmp_db_dir, ignore_errors=True)
+        if auto_out:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def record_breakpoint_findings(
