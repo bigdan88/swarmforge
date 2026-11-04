@@ -173,6 +173,11 @@ def build_report(store, run_id: str) -> str:
     L += [f"- {_ts(e['ts'])} [{e['level']}] {e['kind']} {e['task_key'] or ''}: {e['message'][:300]}" for e in errs] or ["None."]
     L.append("")
 
+    from . import evidence
+    shots = evidence.shots_from_events(events)
+    if shots:
+        L += [evidence.evidence_markdown(shots, failed=run['state'] == 'FAILED')]
+
     L += ["## Known limitations of this result", ""]
     lim = []
     if run["state"] != "COMPLETED":

@@ -175,6 +175,15 @@ class PublicationService:
         title = f"[SwarmForge] {issue.title}" + (f" (#{issue.number})" if issue.number else "")
         url = await asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
                                       ws.base_branch, title, body)
+        from .. import evidence
+        shots = evidence.shots_from_events(self.store.events(self.run_id))
+        if shots and gh.token:
+            try:
+                await asyncio.to_thread(evidence.attach_to_pr, gh, owner, name, url, shots)
+            except (GitHubError, OSError, ValueError) as e:
+                self.log("pr", f"screenshot upload skipped: {e}", level="warn")
+        elif shots:
+            self.log("pr", "skipping screenshot upload: no GitHub token", level="warn")
         self.store.update_run(self.run_id, pr_url=url)
         self.log("pr", f"draft pull request: {url}")
         return url
