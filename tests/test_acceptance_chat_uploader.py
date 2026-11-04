@@ -84,6 +84,12 @@ def _recording_ask(calls: list):
     return fake_ask
 
 
+def _thumbnail_images(at):
+    """Transcript attachment thumbnails only: captioned st.image elements, excluding
+    page-level branding images (sidebar lockup / login wordmark) that also render."""
+    return [img for img in at.image if any(c for c in (getattr(img, "captions", None) or [getattr(i, "caption", "") for i in getattr(getattr(img, "proto", None), "imgs", [])]))]
+
+
 def _open_chat(at) -> "AppTest":
     _go(at, "Chat")
     assert not at.exception, [e.value for e in at.exception]
@@ -116,7 +122,7 @@ def test_ac1_chat_upload_png_and_txt_renders_thumbnail_chip_and_answer(tmp_path,
     assert atts is not None and len(atts) == 2 and all(Path(p).is_file() for p in atts)
     assert {Path(p).name for p in atts} == {"shot.png", "notes.txt"}
     # an image thumbnail element is rendered in the transcript
-    assert len(at.image) == 1
+    assert len(_thumbnail_images(at)) == 1
     # a chip/markdown containing the .txt name is rendered
     assert any("notes.txt" in t for t in texts)
     # attachment metadata is persisted on the user message in the chat history
@@ -142,7 +148,7 @@ def test_ac1_attachments_re_render_from_history_on_next_rerun(tmp_path, monkeypa
     at.chat_input[0].set_value("second question").run()
     assert not at.exception, [e.value for e in at.exception]
     # turn 1 (from history) + turn 2 (live) each render one image thumbnail
-    assert len(at.image) == 2
+    assert len(_thumbnail_images(at)) == 2
     texts = [m.value for m in at.markdown]
     # the first turn's chip persists from history; the second send saved a
     # collision-suffixed copy, so its chip shows notes_1.txt
@@ -315,7 +321,7 @@ def test_ac4_no_upload_send_calls_ask_with_exactly_todays_arguments(tmp_path, mo
     assert set(kw) == {"conversation", "on_tool"}
     assert calls[0]["history"] == []
     # nothing image-like is rendered, and the answer still comes through
-    assert not at.image
+    assert not _thumbnail_images(at)
     texts = [m.value for m in at.markdown]
     assert any("still works?" in t for t in texts)
     assert any("FAKE-ANSWER: both files received" in t for t in texts)

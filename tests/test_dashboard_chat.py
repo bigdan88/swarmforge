@@ -185,6 +185,12 @@ class FakeFile:
         return self._data
 
 
+def _thumbnail_images(at):
+    """Transcript attachment thumbnails only: captioned st.image elements, excluding
+    page-level branding images (sidebar lockup / login wordmark) that also render."""
+    return [img for img in at.image if any(c for c in (getattr(img, "captions", None) or [getattr(i, "caption", "") for i in getattr(getattr(img, "proto", None), "imgs", [])]))]
+
+
 def _fake_ask_recording(calls):
     def fake_ask(c, store, question, history=None, **kw):
         calls.append({"question": question, "history": list(history or []), "kw": dict(kw)})
@@ -217,7 +223,7 @@ def test_chat_uploads_attachments_and_renders_them(tmp_path, monkeypatch):
     names = {Path(p).name for p in atts}
     assert names == {"pic.png", "notes.txt"}
     # the transcript renders an image thumbnail and a chip with the .txt name
-    assert len(at.image) == 1
+    assert len(_thumbnail_images(at)) == 1
     texts = [m.value for m in at.markdown]
     assert any("notes.txt" in t for t in texts)
     assert any("**2 attachments** seen." in t for t in texts)
@@ -241,7 +247,7 @@ def test_chat_without_uploads_calls_ask_without_attachments_kwarg(tmp_path, monk
     assert len(calls) == 1
     assert "attachments" not in calls[0]["kw"]  # today's exact call signature
     assert calls[0]["kw"].get("conversation")
-    assert len(at.image) == 0
+    assert len(_thumbnail_images(at)) == 0
     assert at.session_state["chat_history"][0].get("attachments") is None
 
 
