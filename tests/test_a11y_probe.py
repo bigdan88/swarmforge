@@ -2,7 +2,6 @@
 and the Chat page's accessible names. Offline except for the optional real-browser probe test."""
 
 import importlib.util
-import inspect
 import json
 import os
 import socket
@@ -243,6 +242,9 @@ def _chat_app(tmp_path, monkeypatch):
         state_reason="done",
         config_json="{}",
     )
+    from swarmforge import chatbot
+
+    chatbot.create_conversation(store, "Demo thread")
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(APP), default_timeout=60)
@@ -305,28 +307,19 @@ def test_nameless_icon_button_is_flagged_major(tmp_path, monkeypatch):
         "swarmforge.a11y", reason="the a11y analysis core provides label_findings"
     )
     at = _chat_app(tmp_path, monkeypatch)
-    edit_key = next(b.key for b in at.button if (b.key or "").startswith("chat_edit_"))
+    edit_key = next(
+        (b.key for b in at.button if (b.key or "").startswith("chat_edit_")), None
+    )
+    assert edit_key is not None, "Chat rail must render a chat_edit_<id> button"
     snapshot = _chat_snapshot_from(at, strip_help_keys={edit_key})
     assert any(c["role"] == "button" and not c["name"] for c in snapshot["children"])
 
-    params = inspect.signature(a11y.label_findings).parameters
-    findings = (
-        a11y.label_findings(snapshot, page="chat")
-        if "page" in params
-        else a11y.label_findings(snapshot)
-    )
+    findings = a11y.label_findings("chat", "light", snapshot)
     majors = [f for f in findings if (f.get("severity") or "").lower() == "major"]
     assert len(majors) == 1, findings
-    blob = json.dumps(majors[0]).lower()
-    assert (
-        "chat" in blob
-        or majors[0].get("file") == "chat"
-        or majors[0].get("page") == "chat"
-    )
+    assert majors[0].get("file") == "src/swarmforge/dashboard_pages/chat.py"
     # the finding is a repair-task-ready Finding dict
-    assert majors[0].get("severity") == "major" and (
-        "file" in majors[0] or "page" in majors[0]
-    )
+    assert majors[0].get("severity") == "major" and majors[0].get("blocking") is True
 
 
 def test_fully_labelled_chat_snapshot_has_no_major_label_findings(
@@ -337,12 +330,7 @@ def test_fully_labelled_chat_snapshot_has_no_major_label_findings(
     )
     at = _chat_app(tmp_path, monkeypatch)
     snapshot = _chat_snapshot_from(at, strip_help_keys=set())
-    params = inspect.signature(a11y.label_findings).parameters
-    findings = (
-        a11y.label_findings(snapshot, page="chat")
-        if "page" in params
-        else a11y.label_findings(snapshot)
-    )
+    findings = a11y.label_findings("chat", "light", snapshot)
     assert not [f for f in findings if (f.get("severity") or "").lower() == "major"], (
         findings
     )
