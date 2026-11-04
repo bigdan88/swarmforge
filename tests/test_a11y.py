@@ -15,6 +15,7 @@ from swarmforge.a11y import (
     contrast_ratio,
     flatten_a11y_tree,
     label_findings,
+    parse_aria_snapshot,
     parse_color,
 )
 
@@ -390,6 +391,118 @@ def test_visual_audit_delegates_to_a11y_audit(monkeypatch):
     assert result == {"ok": True}
     assert seen["url"] == "http://localhost/?page=Chat"
     assert seen["kwargs"] == {"wait_ms": 5}
+
+
+def test_parse_aria_snapshot_yaml_lines():
+    text = """- heading "Chat" [level=1]
+- button "Named": "n"
+- button
+- textbox "Prompt"
+name: "ignored key"
+"""
+    nodes = parse_aria_snapshot(text)
+    assert nodes == [
+        {"role": "heading", "name": "Chat"},
+        {"role": "button", "name": "Named"},
+        {"role": "button", "name": ""},
+        {"role": "textbox", "name": "Prompt"},
+    ]
+    assert parse_aria_snapshot("") == []
+    assert parse_aria_snapshot(None) == []  # type: ignore[arg-type]
+
+
+def test_flatten_a11y_tree_accepts_aria_snapshot_string():
+    nodes = flatten_a11y_tree('- button\n- textbox "Prompt"')
+    assert nodes == [
+        {"role": "button", "name": ""},
+        {"role": "textbox", "name": "Prompt"},
+    ]
+    findings = label_findings("Chat", "light", '- button\n- link "Home"')
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "major"
+    assert findings[0]["blocking"] is True
+    assert findings[0]["title"] == "button without an accessible name"
+
+
+def test_audit_aria_snapshot_only_page_yields_major_finding():
+    class AriaOnlyPage:
+        def __init__(self):
+            self.closed = False
+
+        def goto(self, url, **kw):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def aria_snapshot(self):
+            return '- heading "Chat" [level=1]\n- button\n- textbox "Prompt"'
+
+        def evaluate(self, js, arg=None):
+            assert js == CONTRAST_JS
+            return []
+
+        def close(self):
+            self.closed = True
+
+    result = visual.audit(
+        "http://localhost/?page=Chat",
+        open_page=lambda theme: AriaOnlyPage(),
+        wait_ms=0,
+    )
+    assert result["ok"] is True
+    assert all(r["error"] is None for r in result["results"])
+    assert all(r["interactive"] == 2 for r in result["results"])
+    majors = [f for f in result["findings"] if f["severity"] == "major"]
+    assert len(majors) == 2  # one per theme
+    assert majors[0]["title"] == "button without an accessible name"
+    assert majors[0]["blocking"] is True
+
+
+def test_audit_snapshot_error_still_yields_contrast_findings():
+    low_pair = {
+        "selector": "p.muted",
+        "text": "hi",
+        "color": "#777777",
+        "background": "#ffffff",
+    }
+
+    class BrokenSnapshotPage:
+        def __init__(self):
+            self.closed = False
+
+        def goto(self, url, **kw):
+            pass
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def aria_snapshot(self):
+            raise AttributeError("no accessibility API")
+
+        def evaluate(self, js, arg=None):
+            assert js == CONTRAST_JS
+            return [low_pair]
+
+        def close(self):
+            self.closed = True
+
+    result = visual.audit(
+        "http://localhost/?page=Chat",
+        open_page=lambda theme: BrokenSnapshotPage(),
+        themes=("light",),
+        wait_ms=0,
+    )
+    assert result["ok"] is False  # the only theme recorded a snapshot error
+    for r in result["results"]:
+        assert r["error"] is not None
+        assert "accessibility snapshot failed" in r["error"]
+        assert r["interactive"] == 0
+        assert r["text_pairs"] == 1
+    minors = [f for f in result["findings"] if f["severity"] == "minor"]
+    assert len(minors) == 1  # contrast findings survive the snapshot failure
+    assert "below WCAG AA" in minors[0]["title"]
+    assert not [f for f in result["findings"] if f["severity"] == "major"]
 
 
 def test_interactive_roles_contents():
