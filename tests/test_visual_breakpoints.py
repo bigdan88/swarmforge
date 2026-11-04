@@ -81,6 +81,7 @@ def test_breakpoint_findings_document_overflow_is_major():
     assert f["severity"] == "major" and f["blocking"] is True
     assert f["page"] == "chat" and f["theme"] == "light" and f["width"] == 375
     assert f["title"] == "layout overflow at 375px viewport"
+    assert f["file"] == "chat (375px)"
     assert "420" in f["description"]
 
 
@@ -101,16 +102,17 @@ def test_breakpoint_findings_only_clipped_is_minor_non_blocking():
     f = fs[0]
     assert f["severity"] == "minor" and f["blocking"] is False
     assert f["title"] == "content clipped at 375px viewport"
+    assert f["file"] == "review (375px)"
     assert "p.caption" in f["description"]
 
 
-def test_breakpoint_findings_clean_is_empty():
+def test_breakpoint_findings_clean_returns_nothing():
     assert breakpoint_findings("Chat", 768, {"doc_scroll_width": 760, "overflowing": [], "clipped": []}) == []
 
 
 def test_breakpoint_findings_keys_match_gate_schema():
     f = breakpoint_findings("Chat", 375, WIDE_DOM)[0]
-    assert set(f) == {"severity", "page", "theme", "title", "description",
+    assert set(f) == {"severity", "page", "file", "theme", "title", "description",
                       "recommendation", "blocking", "layout_overflow", "width"}
     json.dumps(f)  # all JSON-safe
 
@@ -178,11 +180,26 @@ def test_render_breakpoints_page_error_becomes_critical_finding(tmp_path):
     assert report["results"][0]["status"] == "error"
     f = report["findings"][0]
     assert f["severity"] == "critical" and f["blocking"] is True
+    assert f["file"] == "chat (375px)"
     assert "ERR_CONNECTION_REFUSED" in f["description"]
 
 
 def test_render_breakpoints_default_widths_constant():
     assert BREAKPOINT_WIDTHS == (375, 768, 1280)
+
+
+def test_render_breakpoints_removes_auto_out_dir():
+    report = render_breakpoints("Chat", widths=[768], url="http://example.invalid/",
+                                open_page=fake_open_page({}, []))
+    shot_parent = Path(report["results"][0]["shot"]).parent
+    assert not shot_parent.exists()
+
+
+def test_render_breakpoints_keeps_explicit_out_dir(tmp_path):
+    report = render_breakpoints("Chat", widths=[768], url="http://example.invalid/",
+                                open_page=fake_open_page({}, []), out_dir=tmp_path)
+    shot = Path(report["results"][0]["shot"])
+    assert shot.exists() and shot.parent == tmp_path
 
 
 # ------------------------------------------------------------- validation
@@ -236,6 +253,8 @@ def test_findings_feed_repair_tasks_and_store(tmp_path):
     assert tasks[0].id == "R1F1"
     assert "layout overflow at 375px viewport" in tasks[0].title
     assert "div.wide-panel" in tasks[0].description
+    assert "File: chat (375px)" in tasks[0].description
+    assert tasks[0].expected_files == ["chat (375px)"]
 
     # minor-only report produces no repair tasks
     minor_report = {"findings": [{"severity": "minor", "page": "review", "theme": "light",

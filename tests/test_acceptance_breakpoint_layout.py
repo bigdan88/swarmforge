@@ -10,6 +10,9 @@ tests/test_cli_visual.py with the gaps they leave per criterion:
   Chromium is genuinely unavailable.
 - AC3: layout findings recorded via `record_breakpoint_findings` are visible
   in the dashboard Review-tab findings table (AppTest, offline).
+- AC4: the auto-created temporary screenshot directory is removed both when
+  `render_breakpoints` succeeds and when it raises, while a caller-supplied
+  `out_dir` is never deleted (not even on error).
 """
 
 from __future__ import annotations
@@ -22,9 +25,10 @@ from pathlib import Path
 
 import pytest
 
-from swarmforge import cli, state
+from swarmforge import cli, state, visual
 from swarmforge.db import Store
 from swarmforge.visual import (
+    RegressError,
     breakpoint_findings,
     record_breakpoint_findings,
     render_breakpoints,
@@ -159,11 +163,77 @@ def test_review_tab_table_lists_recorded_layout_findings(tmp_path, monkeypatch):
     assert r["recommendation"].startswith("make the Chat tab responsive at 375px")
 
 
+# ------------------------------------------------------- AC4: temp screenshot dir
+
+
+def test_auto_out_dir_removed_when_page_render_errors():
+    """AC4 (per-viewport error): with no out_dir given, the auto-created temp
+    dir is gone after the call even though every viewport errored."""
+
+    class BoomPage:
+        def goto(self, url, **kw):
+            raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+
+        def close(self):
+            pass
+
+    report = render_breakpoints(
+        "Chat",
+        widths=[375],
+        url="http://example.invalid/",
+        open_page=lambda w, t: BoomPage(),
+    )
+    assert report["results"][0]["status"] == "error"
+    shot_parent = Path(report["results"][0]["shot"]).parent
+    assert not shot_parent.exists(), f"auto out_dir leaked: {shot_parent}"
+
+
+def test_auto_out_dir_removed_when_dashboard_launch_fails(monkeypatch):
+    """AC4 (raised error): when the local-dashboard launch raises inside
+    render_breakpoints, the auto-created screenshot dir (and temp db dir) are
+    removed before the exception propagates."""
+    import tempfile as tempfile_mod
+
+    created: list[Path] = []
+    real_mkdtemp = tempfile_mod.mkdtemp
+
+    def spy_mkdtemp(*a, **kw):
+        p = real_mkdtemp(*a, **kw)
+        created.append(Path(p))
+        return p
+
+    monkeypatch.setattr(tempfile_mod, "mkdtemp", spy_mkdtemp)
+
+    def boom(*a, **kw):
+        raise RegressError("streamlit is not installed")
+
+    monkeypatch.setattr(visual, "_streamlit_env", boom)
+    with pytest.raises(RegressError, match="streamlit"):
+        render_breakpoints("Chat", widths=[375])
+    assert created, "expected temp dirs to have been created during the attempt"
+    for p in created:
+        assert not p.exists(), f"temp dir leaked: {p}"
+
+
+def test_explicit_out_dir_survives_launch_failure(tmp_path, monkeypatch):
+    """AC4: a caller-supplied out_dir is never deleted, even when the render
+    raises before any screenshot is written."""
+
+    def boom(*a, **kw):
+        raise RegressError("streamlit is not installed")
+
+    monkeypatch.setattr(visual, "_streamlit_env", boom)
+    with pytest.raises(RegressError, match="streamlit"):
+        render_breakpoints("Chat", widths=[375], out_dir=tmp_path)
+    assert tmp_path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 # ------------------------------------------------------- AC2: real browser
 
 
 @pytest.mark.slow
-def test_real_browser_flags_400px_div_at_375_only(tmp_path, browser_slot):
+def test_real_browser_flags_400px_div_at_375(tmp_path, browser_slot):
     """Render a genuinely 400 px-wide div in headless Chromium at the three
     issue breakpoints: overflow finding at 375 px, clean at 768 and 1280 px.
 
