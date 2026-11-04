@@ -111,8 +111,48 @@ def contrast_ratio(fg: Any, bg: Any) -> float:
     return (lf + 0.05) / (lb + 0.05)
 
 
+_ARIA_LINE_RE = re.compile(r"^\s*-\s+(\S+)\s*(.*)$")
+_ARIA_NAME_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def parse_aria_snapshot(text: str) -> list[dict]:
+    """Parse Playwright's aria_snapshot YAML into flat node dicts.
+
+    Handles lines like ``- heading "Chat" [level=1]``,
+    ``- button "Named": "n"``, ``- button`` and ``- textbox "Prompt"``.
+    ``[attributes]`` and ``: value`` suffixes are ignored; lines that do
+    not start with ``- role`` are skipped. Each node is
+    ``{'role': <role>, 'name': <quoted string or ''>}``.
+    """
+    if not isinstance(text, str):
+        return []
+    nodes: list[dict] = []
+    for line in text.splitlines():
+        m = _ARIA_LINE_RE.match(line)
+        if not m:
+            continue
+        role = m.group(1)
+        rest = m.group(2)
+        # drop [attribute] blocks and ": value" suffixes
+        rest = re.sub(r"\[[^\]]*\]", "", rest)
+        colon = rest.find(":")
+        if colon != -1:
+            rest = rest[:colon]
+        nm = _ARIA_NAME_RE.search(rest)
+        name = nm.group(1) if nm else ""
+        name = name.replace('\\"', '"').replace("\\\\", "\\")
+        nodes.append({"role": role, "name": name})
+    return nodes
+
+
 def flatten_a11y_tree(node: Any) -> list[dict]:
-    """Depth-first flattening of a Playwright accessibility snapshot."""
+    """Depth-first flattening of a Playwright accessibility snapshot.
+
+    Accepts a dict/list snapshot (legacy ``accessibility.snapshot()``) or the
+    YAML string returned by ``locator(...).aria_snapshot()``.
+    """
+    if isinstance(node, str):
+        return parse_aria_snapshot(node)
     out: list[dict] = []
     stack: list[Any] = [node] if not isinstance(node, list) else list(reversed(node))
     while stack:
@@ -298,9 +338,12 @@ def _default_open_page(viewport: dict | None = None) -> Callable[[str], Any]:
             def evaluate(self, js, arg=None):
                 return page.evaluate(js, arg)
 
+            def aria_snapshot(self):
+                return page.locator("body").aria_snapshot()
+
             @property
             def accessibility(self):
-                return page.accessibility
+                return getattr(page, "accessibility", None)
 
             def close(self):
                 try:
@@ -363,23 +406,34 @@ def audit(
             page = factory(theme)
             page.goto(tab_url, wait_until="load")
             page.wait_for_timeout(wait_ms)
+            snapshot_error: str | None = None
+            contrast_error: str | None = None
             try:
-                snapshot = page.accessibility.snapshot()
+                acc = getattr(page, "accessibility", None)
+                if acc is not None and hasattr(acc, "snapshot"):
+                    snapshot = acc.snapshot()
+                else:
+                    snapshot = page.aria_snapshot()
             except Exception as e:  # noqa: BLE001 - any browser failure is recorded
-                error = f"accessibility snapshot failed: {e}"
-            if snapshot is None and error is None:
-                error = "accessibility snapshot returned no data"
+                snapshot = None
+                snapshot_error = f"accessibility snapshot failed: {e}"
+            if snapshot is None and snapshot_error is None:
+                snapshot_error = "accessibility snapshot returned no data"
             try:
                 pairs = page.evaluate(CONTRAST_JS)
             except Exception as e:  # noqa: BLE001 - any browser failure is recorded
-                error = (error + "; " if error else "") + f"contrast probe failed: {e}"
+                pairs = []
+                contrast_error = f"contrast probe failed: {e}"
             if not isinstance(pairs, list):
                 pairs = []
-            if error is None:
+            # label findings need the snapshot; contrast findings run regardless
+            if snapshot_error is None:
                 findings.extend(label_findings(tab, theme, snapshot))
-                findings.extend(
-                    contrast_findings(tab, theme, pairs, min_ratio=min_ratio)
-                )
+            findings.extend(contrast_findings(tab, theme, pairs, min_ratio=min_ratio))
+            error = (
+                "; ".join(e for e in (snapshot_error, contrast_error) if e is not None)
+                or None
+            )
         except Exception as e:  # noqa: BLE001 - any browser failure is recorded
             error = str(e)
         finally:
