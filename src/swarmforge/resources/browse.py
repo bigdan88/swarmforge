@@ -8,7 +8,8 @@ import time
 MARK = "__SF_BROWSE__"
 args = json.loads(os.environ.get("SF_BROWSE_ARGS") or "{}")
 result = {"url": args.get("url"), "console": [], "page_errors": [], "failed_requests": [],
-          "action_errors": [], "app_errors": [], "exceptions": [], "controls": []}
+          "action_errors": [], "app_errors": [], "exceptions": [], "controls": [],
+          "a11y": None, "contrast": []}
 
 
 def emit():
@@ -37,6 +38,35 @@ CONTROL_JS = """() => {
     const id = el.id ? '#' + el.id : '';
     out.push(role + (id ? ' ' + id : '') + (name ? ' "' + name + '"' : ''));
     if (out.length >= 40) break;
+  }
+  return out;
+}"""
+
+# Inlined (the probe runs standalone in the sandbox and cannot import swarmforge.a11y): walk visible
+# text-bearing elements, read their computed color and the first non-transparent ancestor background.
+CONTRAST_JS = """() => {
+  const out = [];
+  const els = document.body ? document.body.querySelectorAll('*') : [];
+  for (const el of els) {
+    if (out.length >= 200) break;
+    const r = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    if (!r.width || !r.height) continue;
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const own = Array.from(el.childNodes).filter(n => n.nodeType === 3 && n.textContent.trim()).length;
+    if (!own) continue;
+    const text = (el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+    if (!text) continue;
+    let bg = 'rgba(0, 0, 0, 0)';
+    let node = el;
+    while (node && node !== document.documentElement) {
+      const c = window.getComputedStyle(node).backgroundColor;
+      if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent') { bg = c; break; }
+      node = node.parentElement;
+    }
+    if (bg === 'rgba(0, 0, 0, 0)') bg = '#ffffff';
+    const sel = (el.id ? '#' + el.id : '') || el.tagName.toLowerCase() + (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.') : '');
+    out.push({selector: sel, text: text, color: style.color, background: bg});
   }
   return out;
 }"""
@@ -140,6 +170,19 @@ with sync_playwright() as p:
                 if t and t[:800] not in result["exceptions"]:
                     result["exceptions"].append(t[:800])
         result["controls"] = page.evaluate(CONTROL_JS)
+        if args.get("a11y"):
+            try:
+                # modern Playwright (>=1.49) ARIA snapshot; older versions keep page.accessibility
+                result["a11y"] = page.locator("body").aria_snapshot()
+            except Exception:  # noqa: BLE001
+                try:
+                    result["a11y"] = page.accessibility.snapshot() or {}  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001
+                    result["a11y"] = None
+            try:
+                result["contrast"] = page.evaluate(CONTRAST_JS)
+            except Exception:  # noqa: BLE001
+                result["contrast"] = []
         shot = args.get("screenshot")
         if shot:
             try:
