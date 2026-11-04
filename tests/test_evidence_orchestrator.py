@@ -59,7 +59,13 @@ def test_collect_evidence_records_shots_for_ui_plans(tmp_path, cfg, monkeypatch)
 
     def fake_tabs(repo, out_dir, files, **kw):
         calls.append((repo, list(files), kw.get("failed")))
-        return [{"tab": "chat", "theme": "light", "file": str(tmp_path / "shots" / "chat-light.png")}]
+        return [
+            {
+                "tab": "chat",
+                "theme": "light",
+                "file": str(tmp_path / "shots" / "chat-light.png"),
+            }
+        ]
 
     monkeypatch.setattr(evidence, "screenshot_tabs", fake_tabs)
     asyncio.run(orch._collect_evidence())
@@ -70,14 +76,21 @@ def test_collect_evidence_records_shots_for_ui_plans(tmp_path, cfg, monkeypatch)
     data = evs[0]["data"]
     if isinstance(data, str):
         data = json.loads(data)
-    assert data["shots"] == [{"tab": "chat", "theme": "light",
-                              "file": str(tmp_path / "shots" / "chat-light.png")}]
+    assert data["shots"] == [
+        {
+            "tab": "chat",
+            "theme": "light",
+            "file": str(tmp_path / "shots" / "chat-light.png"),
+        }
+    ]
     assert calls and calls[0][1] == ["src/app/dashboard.py"]
 
 
 def test_collect_evidence_skips_non_ui_plans(tmp_path, cfg, monkeypatch):
     """AC3: state.py/llm.py-only plans never trigger a screenshot."""
-    orch, store = _orch(tmp_path, cfg, changed=("src/swarmforge/state.py", "src/swarmforge/llm.py"))
+    orch, store = _orch(
+        tmp_path, cfg, changed=("src/swarmforge/state.py", "src/swarmforge/llm.py")
+    )
 
     def never(*a, **kw):  # pragma: no cover - must not be reached
         raise AssertionError("screenshot_tabs must not be called for non-UI plans")
@@ -92,19 +105,27 @@ def test_collect_evidence_skips_non_ui_plans(tmp_path, cfg, monkeypatch):
 
 def test_collect_evidence_skips_single_mode(tmp_path, cfg, monkeypatch):
     orch, store = _orch(tmp_path, cfg, mode="single")
-    monkeypatch.setattr(evidence, "screenshot_tabs",
-                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not run")))
+    monkeypatch.setattr(
+        evidence,
+        "screenshot_tabs",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
     asyncio.run(orch._collect_evidence())
     assert any("single-agent mode" in e["message"] for e in _events(store, "evidence"))
 
 
-@pytest.mark.parametrize("exc", [
-    OSError("playwright not installed"),
-    RuntimeError("chromium crashed"),
-    visual.RegressError("command failed"),
-    visual.PreviewError("dashboard did not answer HTTP"),
-])
-def test_collect_evidence_warns_and_survives_capture_failures(tmp_path, cfg, monkeypatch, exc):
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError("playwright not installed"),
+        RuntimeError("chromium crashed"),
+        visual.RegressError("command failed"),
+        visual.PreviewError("dashboard did not answer HTTP"),
+    ],
+)
+def test_collect_evidence_warns_and_survives_capture_failures(
+    tmp_path, cfg, monkeypatch, exc
+):
     """Capture errors become a warn event; the run state is untouched and no shots are recorded."""
     orch, store = _orch(tmp_path, cfg)
 
@@ -123,6 +144,57 @@ def test_collect_evidence_warns_and_survives_capture_failures(tmp_path, cfg, mon
     assert orch._evidence_done is True
 
 
+def test_collect_evidence_swallows_unexpected_exception_captures(
+    tmp_path, cfg, monkeypatch
+):
+    """F1 regression: even exception types we did not anticipate must not escape."""
+
+    class PlaywrightLikeError(Exception):
+        pass
+
+    orch, store = _orch(tmp_path, cfg)
+
+    def broken(repo, out_dir, files, **kw):
+        raise PlaywrightLikeError("target closed unexpectedly")
+
+    monkeypatch.setattr(evidence, "screenshot_tabs", broken)
+    asyncio.run(orch._collect_evidence())  # must not raise
+
+    evs = _events(store, "evidence")
+    assert len(evs) == 1 and evs[0]["level"] == "warn"
+    assert "screenshots skipped" in evs[0]["message"]
+    assert "PlaywrightLikeError" in evs[0]["message"]
+    assert orch._evidence_done is False  # a retry is still possible
+
+
+def test_collect_evidence_captures_time_out(tmp_path, cfg, monkeypatch):
+    """F1 regression: a capture that blocks longer than the timeout is cut short."""
+    import time
+
+    import swarmforge.orchestrator as orch_mod
+
+    orch, store = _orch(tmp_path, cfg)
+    monkeypatch.setattr(orch_mod, "_EVIDENCE_CAPTURE_TIMEOUT_S", 0.2)
+
+    def blocking(repo, out_dir, files, **kw):
+        time.sleep(5)
+        return [{"tab": "chat", "theme": "light", "file": "x.png"}]  # pragma: no cover
+
+    monkeypatch.setattr(evidence, "screenshot_tabs", blocking)
+    asyncio.run(orch._collect_evidence())  # must not raise
+
+    evs = _events(store, "evidence")
+    assert len(evs) == 1 and evs[0]["level"] == "warn"
+    assert "screenshots skipped" in evs[0]["message"]
+    assert "timed out" in evs[0]["message"]
+    data = evs[0].get("data")
+    if data:
+        if isinstance(data, str):
+            data = json.loads(data)
+        assert not data.get("shots")
+    assert orch._evidence_done is False
+
+
 def test_collect_evidence_is_idempotent(tmp_path, cfg, monkeypatch):
     """Collected once: a second call (e.g. the finally path after the COMPLETED path) is a no-op."""
     orch, store = _orch(tmp_path, cfg)
@@ -130,7 +202,13 @@ def test_collect_evidence_is_idempotent(tmp_path, cfg, monkeypatch):
 
     def fake(repo, out_dir, files, **kw):
         calls.append(files)
-        return [{"tab": "chat", "theme": "light", "file": str(tmp_path / "shots" / "chat-light.png")}]
+        return [
+            {
+                "tab": "chat",
+                "theme": "light",
+                "file": str(tmp_path / "shots" / "chat-light.png"),
+            }
+        ]
 
     monkeypatch.setattr(evidence, "screenshot_tabs", fake)
     asyncio.run(orch._collect_evidence())
@@ -143,7 +221,10 @@ def test_collect_evidence_is_idempotent(tmp_path, cfg, monkeypatch):
 def test_plan_file_set_unions_plan_and_workspace(tmp_path, cfg):
     orch, _ = _orch(tmp_path, cfg, changed=("src/app/dashboard_pages/chat.py",))
     orch.plan = _Plan(tasks=[{"expected_files": ["src/app/dashboard.py"]}])
-    assert orch._plan_file_set() == ["src/app/dashboard.py", "src/app/dashboard_pages/chat.py"]
+    assert orch._plan_file_set() == [
+        "src/app/dashboard.py",
+        "src/app/dashboard_pages/chat.py",
+    ]
 
 
 def test_failed_run_includes_failures_tab(tmp_path, cfg, monkeypatch):
@@ -154,7 +235,13 @@ def test_failed_run_includes_failures_tab(tmp_path, cfg, monkeypatch):
 
     def fake(repo, out_dir, files, **kw):
         seen["failed"] = kw.get("failed")
-        return [{"tab": "failures", "theme": "light", "file": str(tmp_path / "shots" / "failures-light.png")}]
+        return [
+            {
+                "tab": "failures",
+                "theme": "light",
+                "file": str(tmp_path / "shots" / "failures-light.png"),
+            }
+        ]
 
     monkeypatch.setattr(evidence, "screenshot_tabs", fake)
     asyncio.run(orch._collect_evidence())
