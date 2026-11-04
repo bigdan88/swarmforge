@@ -113,6 +113,25 @@ def test_label_findings_flags_nameless_button_major():
     assert label_findings("Chat", "light", {"role": "generic", "name": ""}) == []
 
 
+def test_label_findings_flags_slider_and_tab_roles():
+    snap = {
+        "role": "WebArea",
+        "name": "Chat",
+        "children": [
+            {"role": "slider", "name": ""},
+            {"role": "tab", "name": ""},
+            {"role": "slider", "name": "Volume"},
+        ],
+    }
+    findings = label_findings("Chat", "dark", snap)
+    assert [f["title"] for f in findings] == [
+        "slider without an accessible name",
+        "tab without an accessible name",
+    ]
+    assert all(f["severity"] == "major" and f["blocking"] is True for f in findings)
+    assert all(f["theme"] == "dark" and f["page"] == "chat" for f in findings)
+
+
 def test_label_findings_description_truncated():
     children = [{"role": "checkbox", "name": ""} for _ in range(20)]
     findings = label_findings("Chat", "dark", {"role": "WebArea", "children": children})
