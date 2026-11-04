@@ -230,6 +230,7 @@ def _open_chat(at):
 
 
 def _chat_app(tmp_path, monkeypatch):
+    from swarmforge import chatbot
     from swarmforge.db import Store
 
     cfg = _write_cfg(tmp_path, monkeypatch)
@@ -243,6 +244,9 @@ def _chat_app(tmp_path, monkeypatch):
         state_reason="done",
         config_json="{}",
     )
+    # the Chat page only renders per-conversation edit buttons when a conversation
+    # exists; seed one so the snapshot always contains a chat_edit_ control.
+    chatbot.create_conversation(store, last_run_id="20990101-000000-aaaaaa")
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(APP), default_timeout=60)
@@ -305,7 +309,11 @@ def test_nameless_icon_button_is_flagged_major(tmp_path, monkeypatch):
         "swarmforge.a11y", reason="the a11y analysis core provides label_findings"
     )
     at = _chat_app(tmp_path, monkeypatch)
-    edit_key = next(b.key for b in at.button if (b.key or "").startswith("chat_edit_"))
+    edit_key = next(
+        (b.key for b in at.button if (b.key or "").startswith("chat_edit_")),
+        None,
+    )
+    assert edit_key, "expected a chat_edit_ button (requires a seeded conversation)"
     snapshot = _chat_snapshot_from(at, strip_help_keys={edit_key})
     assert any(c["role"] == "button" and not c["name"] for c in snapshot["children"])
 
