@@ -233,7 +233,7 @@ def test_explicit_out_dir_survives_launch_failure(tmp_path, monkeypatch):
 
 
 @pytest.mark.slow
-def test_real_browser_flags_400px_div_at_375_only(tmp_path, browser_slot):
+def test_real_browser_flags_400px_div_at_375(tmp_path, browser_slot):
     """Render a genuinely 400 px-wide div in headless Chromium at the three
     issue breakpoints: overflow finding at 375 px, clean at 768 and 1280 px.
 

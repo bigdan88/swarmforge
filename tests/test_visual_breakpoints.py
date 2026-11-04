@@ -106,7 +106,7 @@ def test_breakpoint_findings_only_clipped_is_minor_non_blocking():
     assert "p.caption" in f["description"]
 
 
-def test_breakpoint_findings_clean_is_empty():
+def test_breakpoint_findings_clean_returns_nothing():
     assert breakpoint_findings("Chat", 768, {"doc_scroll_width": 760, "overflowing": [], "clipped": []}) == []
 
 
