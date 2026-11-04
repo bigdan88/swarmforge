@@ -112,7 +112,7 @@ MINOR = {
 }
 
 
-def test_a11y_gate_major_finding_blocks_and_creates_repair_task(tmp_path, monkeypatch, sample_repo):
+def test_a11y_gate_runs_audit_and_feeds_findings_into_the_gate(tmp_path, monkeypatch, sample_repo):
     """AC: with review.a11y_gate=true an unnamed-button [major] on the chat page becomes a
     kind='visual' gate problem and a repair task."""
     cfg = _cfg(tmp_path, a11y_gate=True)
@@ -144,7 +144,7 @@ def test_a11y_gate_major_finding_blocks_and_creates_repair_task(tmp_path, monkey
     assert any("accessible name" in t.title for t in tasks)
 
 
-def test_a11y_gate_off_by_default_never_runs_the_audit(tmp_path, monkeypatch, sample_repo):
+def test_a11y_gate_defaults_off_and_skips_audit(tmp_path, monkeypatch, sample_repo):
     """AC: with the flag off (the default) audit_pages is never called and behavior is unchanged."""
     cfg = _cfg(tmp_path, a11y_gate=False)
     assert cfg.review.a11y_gate is False
@@ -181,7 +181,7 @@ def test_audit_pages_failure_is_skipped_not_fatal(tmp_path, monkeypatch, sample_
     assert orch._gate(1, _ev(), None, None, []) == []
 
 
-def test_minor_contrast_findings_do_not_block(tmp_path, monkeypatch, sample_repo):
+def test_minor_only_findings_do_not_block_the_gate(tmp_path, monkeypatch, sample_repo):
     """AC: minor contrast findings are recorded for the judge/PR but do not block the gate."""
     cfg = _cfg(tmp_path, a11y_gate=True)
     orch, store = _orch(tmp_path, cfg, sample_repo)
@@ -199,7 +199,7 @@ def test_minor_contrast_findings_do_not_block(tmp_path, monkeypatch, sample_repo
     assert orch._gate(1, _ev(), None, None, []) == []
 
 
-def test_config_parses_a11y_gate_default_and_true(tmp_path, monkeypatch):
+def test_a11y_gate_config_parses_and_defaults_off(tmp_path, monkeypatch):
     """AC: review.a11y_gate is accepted by the parser and defaults to False."""
     monkeypatch.setenv("FAKE_KEY", "test-key")
     raw = base_raw(tmp_path / "work")
