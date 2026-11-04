@@ -164,7 +164,7 @@ def test_collect_evidence_swallows_unexpected_exception_captures(
     assert len(evs) == 1 and evs[0]["level"] == "warn"
     assert "screenshots skipped" in evs[0]["message"]
     assert "PlaywrightLikeError" in evs[0]["message"]
-    assert orch._evidence_done is False  # a retry is still possible
+    assert orch._evidence_done is True  # flag is set before capture: evidence never retried
 
 
 def test_collect_evidence_captures_time_out(tmp_path, cfg, monkeypatch):
@@ -192,7 +192,7 @@ def test_collect_evidence_captures_time_out(tmp_path, cfg, monkeypatch):
         if isinstance(data, str):
             data = json.loads(data)
         assert not data.get("shots")
-    assert orch._evidence_done is False
+    assert orch._evidence_done is True
 
 
 def test_collect_evidence_is_idempotent(tmp_path, cfg, monkeypatch):
