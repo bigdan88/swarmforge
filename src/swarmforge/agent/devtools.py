@@ -369,12 +369,9 @@ def format_browse(data: dict, max_chars: int) -> str:
 
 async def browse_raw(ctx: ToolContext, url: str, *, actions: list | None = None, screenshot_name: str | None = None,
                      color_scheme: str | None = None, viewport: dict | None = None, full_page: bool = True,
-                     timeout_s: int = 60, a11y: bool = False) -> dict:
+                     timeout_s: int = 60) -> dict:
     """Load a local page in the sandbox's headless Chromium and return the probe's raw result (text,
-    errors, controls, and `screenshot_file`: the PNG on the host when `screenshot_name` was given).
-
-    With `a11y=True` the probe also returns `a11y` (the Playwright accessibility snapshot, or None)
-    and `contrast` (a list of {selector, text, color, background} pairs for visible text)."""
+    errors, controls, and `screenshot_file`: the PNG on the host when `screenshot_name` was given)."""
     if not LOCAL_URL_RE.match(url or ""):
         raise ToolError("browse only opens local apps, e.g. http://localhost:8501 (start the app with "
                         "start_process first). The sandbox has no internet access.")
@@ -386,7 +383,7 @@ async def browse_raw(ctx: ToolContext, url: str, *, actions: list | None = None,
     args = {"url": url, "actions": actions or [], "timeout_ms": max(5, min(int(timeout_s or 60), 180)) * 1000,
             "screenshot": (f"{s.artifacts_path}/{screenshot_name}" if screenshot_name and s.artifacts_path else None),
             "color_scheme": color_scheme if color_scheme in ("light", "dark") else None,
-            "viewport": viewport or None, "full_page": full_page, "a11y": bool(a11y)}
+            "viewport": viewport or None, "full_page": full_page}
     r = await s.exec(f"{s.python} -", stdin=_browse_script(), env={"SF_BROWSE_ARGS": json.dumps(args)},
                      timeout_s=args["timeout_ms"] // 1000 + 60)
     ctx.commands_run.append({"command": f"[browse] {url}", "exit_code": r.exit_code,
