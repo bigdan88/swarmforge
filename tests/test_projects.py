@@ -364,8 +364,10 @@ def test_fixed_spec_must_preserve_decisions_and_plan_history(state):
     d = proposal()
     p["spec"] = service.validate_plan(p, d, 3)
     d["living"] = d["living"].replace("2026-11-03: choose Flask", "Choose Django")
-    with pytest.raises(ProjectError, match="Preserve"):
-        service.validate_plan(p, d, 3)
+    updated = service.validate_plan(p, d, 3)
+    assert fixed(updated) == fixed(p["spec"])
+    assert "2026-11-03: choose Flask" in updated
+    assert "Choose Django" in updated
 
 
 async def test_restart_recovers_completed_run_without_starting_it_again(state, cfg, monkeypatch):

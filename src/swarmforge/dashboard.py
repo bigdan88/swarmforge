@@ -923,12 +923,12 @@ def run_detail(run_id, header=True):
                         st.markdown("Waits for: " + ", ".join(t["depends_on"]))
                 with b:
                     st.markdown("**Reported back**")
-                    st.write(t["summary"] or t["error"] or "_(still working)_")
+                    st.write(t["summary"] or t["error"] or ("_(run ended)_" if run["finished_at"] else "_(still working)_"))
                     st.caption(f"attempts {t['attempts']} · duration "
-                               f"{fmt_dur((t['ended_at'] or time.time()) - t['started_at']) if t['started_at'] else '-'}")
+                               f"{fmt_dur((t['ended_at'] or run['finished_at'] or time.time()) - t['started_at']) if t['started_at'] else '-'}")
 
     with tabs[1]:
-        running = [t for t in tasks if t["state"] == "RUNNING"]
+        running = [t for t in tasks if t["state"] == "RUNNING" and not run["finished_at"]]
         last_agent = {}
         for e in events:
             if e["kind"] == "agent" and e["task_key"]:
@@ -945,7 +945,7 @@ def run_detail(run_id, header=True):
             other = [e for e in events if e["kind"] == "agent"][-1:]
             st.caption("No coding task running." + (f" Last agent activity: {other[0]['message'][:150]}" if other else ""))
         rows = [{"task": f"{t['task_key']} ({t['role']})", "start": datetime.fromtimestamp(t["started_at"]),
-                 "end": datetime.fromtimestamp(t["ended_at"] or time.time()), "model": short_model(t["model"]),
+                 "end": datetime.fromtimestamp(t["ended_at"] or run["finished_at"] or time.time()), "model": short_model(t["model"]),
                  "state": t["state"]} for t in tasks if t["started_at"]]
         if rows:
             st.markdown("#### Timeline (overlapping bars = agents working in parallel)")

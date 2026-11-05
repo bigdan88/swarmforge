@@ -147,14 +147,17 @@ def validate_plan(p, result, horizon):
         living = re.sub(r"\A\s*## Living[ \t]*\r?\n(?:[ \t]*\r?\n)*", "", living, count=1)
     if not isinstance(living, str) or any("### " + h not in living for h in ("Current state", "Decisions made", "Plan", "Plan changes", "Open questions")):
         raise ProjectError("Lead must supply all living sections")
-    spec = fixed(p["spec"]) + "## Living\n\n" + living
-    replace_living(p["spec"], spec)
+    fixed_text = fixed(p["spec"])
+    replace_living(p["spec"], fixed_text + "## Living\n\n" + living)
     for heading in ("Decisions made", "Plan changes"):
-        pattern = rf"(?ms)^### {heading}\n(.*?)(?=^### |\Z)"
-        old = re.search(pattern, p["spec"])
+        pattern = rf"(?ms)^### {heading}\r?\n(.*?)(?=^### |\Z)"
+        old = re.search(pattern, p["spec"][len(fixed_text):])
         new = re.search(pattern, living)
-        if old and old.group(1).strip() and (not new or old.group(1).strip() not in new.group(1)):
-            raise ProjectError(f"Preserve the existing {heading.lower()} history and append new entries")
+        if not new:
+            raise ProjectError(f"Lead must supply the {heading.lower()} section")
+        if old and old.group(1).strip() and old.group(1).strip() not in new.group(1):
+            living = living[:new.start(1)] + old.group(1).rstrip() + "\n\n" + living[new.start(1):]
+    spec = fixed_text + "## Living\n\n" + living
     if action == "escalate":
         attempts = result.get("attempts", [])
         steps = {a.get("step") for a in attempts if isinstance(a, dict) and a.get("step") in (1, 2, 3, 4) and str(a.get("result", "")).strip()}
@@ -344,6 +347,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
                     raise ProjectError("Milestone checks failed; schedule repairs instead of declaring completion")
                 break
             except ProjectError as e:
+                proposal = None
                 ps.event(pid, "proposal_rejected", {"reason": str(e)})
                 context["rejected_proposal"] = result
                 context["correction_required"] = str(e)
