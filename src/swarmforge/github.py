@@ -149,12 +149,14 @@ class GitHubClient:
             raise GitHubError(f"creating draft PR failed: HTTP {r.status_code} {r.text[:500]}")
         return r.json()["html_url"]
 
-    def upload_pr_asset(self, owner: str, repo: str, pr_number: int, path: str | Path) -> str:
+    def upload_pr_asset(self, owner: str, repo: str, pr_number_or_branch: int | str,
+                         path: str | Path) -> str:
         """Commit a file (e.g. a screenshot PNG) to the PR's head branch and return its raw URL.
 
         GitHub has no REST endpoint for uploading assets to issues/PRs, so the file is
         committed under ``.swarmforge/evidence/`` on the branch the PR was opened from and
-        referenced via its raw.githubusercontent.com URL.
+        referenced via its raw.githubusercontent.com URL. The head branch can be given
+        directly (a string) or resolved from a pull-request number (an int).
         """
         if not self.token:
             raise GitHubError(f"no GitHub token ({self.cfg.token_env}) available")
@@ -162,10 +164,13 @@ class GitHubClient:
 
         path = Path(path)
 
-        r = self._client.get(f"/repos/{owner}/{repo}/pulls/{pr_number}")
-        if r.status_code >= 400:
-            raise GitHubError(f"fetching PR failed: HTTP {r.status_code} {r.text[:300]}")
-        branch = r.json()["head"]["ref"]
+        if isinstance(pr_number_or_branch, str):
+            branch = pr_number_or_branch
+        else:
+            r = self._client.get(f"/repos/{owner}/{repo}/pulls/{pr_number_or_branch}")
+            if r.status_code >= 400:
+                raise GitHubError(f"fetching PR failed: HTTP {r.status_code} {r.text[:300]}")
+            branch = r.json()["head"]["ref"]
 
         remote_path = f".swarmforge/evidence/{path.name}"
         quoted = quote(remote_path, safe="/")
