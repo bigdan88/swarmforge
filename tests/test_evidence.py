@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -109,26 +110,55 @@ def _client(handler) -> GitHubClient:
     )
 
 
-def test_upload_pr_asset_posts_multipart_and_returns_url(tmp_path):
+def test_upload_pr_asset_commits_to_branch_and_returns_raw_url(tmp_path):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["content_type"] = request.headers.get("content-type", "")
-        seen["body"] = request.content
-        return httpx.Response(
-            201, json={"url": "https://api.github.com/repos/o/r/assets/1"}
-        )
+        seen.setdefault("calls", []).append((request.method, str(request.url.path), request.url.params.get("ref")))
+        if request.method == "GET" and request.url.path == "/repos/o/r/pulls/41":
+            return httpx.Response(200, json={"head": {"ref": "sf/feature"}})
+        if request.method == "GET" and request.url.path == "/repos/o/r/contents/.swarmforge/evidence/work-light.png":
+            return httpx.Response(404, json={})
+        if request.method == "PUT" and request.url.path == "/repos/o/r/contents/.swarmforge/evidence/work-light.png":
+            seen["put_json"] = json.loads(request.content)
+            return httpx.Response(201, json={"content": {"sha": "abc"}})
+        return httpx.Response(404, json={})
 
     png = tmp_path / "work-light.png"
     png.write_bytes(b"\x89PNG fake")
     client = _client(handler)
     client.token = "tok"  # simulate an available token
     url = client.upload_pr_asset("o", "r", 41, png)
-    assert url == "https://api.github.com/repos/o/r/assets/1"
-    assert seen["path"] == "/repos/o/r/issues/41/assets"
-    assert "multipart/form-data" in seen["content_type"]
-    assert b"\x89PNG fake" in seen["body"]
+    assert url == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    assert seen["calls"] == [
+        ("GET", "/repos/o/r/pulls/41", None),
+        ("GET", "/repos/o/r/contents/.swarmforge/evidence/work-light.png", "sf/feature"),
+        ("PUT", "/repos/o/r/contents/.swarmforge/evidence/work-light.png", None),
+    ]
+    assert seen["put_json"]["branch"] == "sf/feature"
+    assert seen["put_json"]["message"] == "Add visual evidence work-light.png"
+    assert base64.b64decode(seen["put_json"]["content"]) == b"\x89PNG fake"
+    assert "sha" not in seen["put_json"]  # new file, no sha needed
+
+
+def test_upload_pr_asset_updates_existing_file_with_sha(tmp_path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/repos/o/r/pulls/41":
+            return httpx.Response(200, json={"head": {"ref": "sf/feature"}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"sha": "oldsha"})
+        seen["put_json"] = json.loads(request.content)
+        return httpx.Response(200, json={"content": {"sha": "newsha"}})
+
+    png = tmp_path / "work-light.png"
+    png.write_bytes(b"png")
+    client = _client(handler)
+    client.token = "tok"
+    url = client.upload_pr_asset("o", "r", 41, png)
+    assert url == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    assert seen["put_json"]["sha"] == "oldsha"
 
 
 def test_upload_pr_asset_without_token_raises(tmp_path):
@@ -141,7 +171,13 @@ def test_upload_pr_asset_without_token_raises(tmp_path):
 def test_upload_pr_asset_http_error(tmp_path):
     png = tmp_path / "x.png"
     png.write_bytes(b"png")
-    client = _client(lambda request: httpx.Response(422, json={}, text="boom"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/repos/o/r/pulls/41":
+            return httpx.Response(200, json={"head": {"ref": "sf/feature"}})
+        return httpx.Response(422, json={}, text="boom")
+
+    client = _client(handler)
     client.token = "tok"
     with pytest.raises(GitHubError, match="HTTP 422"):
         client.upload_pr_asset("o", "r", 41, png)

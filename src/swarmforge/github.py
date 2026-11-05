@@ -149,17 +149,41 @@ class GitHubClient:
         return r.json()["html_url"]
 
     def upload_pr_asset(self, owner: str, repo: str, pr_number: int, path: str | Path) -> str:
-        """Upload a file (e.g. a screenshot PNG) as an asset on a PR. Returns its URL."""
+        """Commit a file (e.g. a screenshot PNG) to the PR's head branch and return its raw URL.
+
+        GitHub has no REST endpoint for uploading assets to issues/PRs, so the file is
+        committed under ``.swarmforge/evidence/`` on the branch the PR was opened from and
+        referenced via its raw.githubusercontent.com URL.
+        """
         if not self.token:
             raise GitHubError(f"no GitHub token ({self.cfg.token_env}) available")
+        from urllib.parse import quote
+
         path = Path(path)
-        r = self._client.post(
-            f"/repos/{owner}/{repo}/issues/{pr_number}/assets",
-            files={"file": (path.name, path.read_bytes(), "image/png")})
+
+        r = self._client.get(f"/repos/{owner}/{repo}/pulls/{pr_number}")
         if r.status_code >= 400:
-            raise GitHubError(f"uploading PR asset failed: HTTP {r.status_code} {r.text[:300]}")
-        data = r.json()
-        return data.get("url") or data.get("href") or ""
+            raise GitHubError(f"fetching PR failed: HTTP {r.status_code} {r.text[:300]}")
+        branch = r.json()["head"]["ref"]
+
+        remote_path = f".swarmforge/evidence/{path.name}"
+        quoted = quote(remote_path, safe="/")
+        existing = self._client.get(
+            f"/repos/{owner}/{repo}/contents/{quoted}", params={"ref": branch}
+        )
+        sha = existing.json().get("sha") if existing.status_code == 200 else None
+
+        payload = {
+            "message": f"Add visual evidence {path.name}",
+            "content": base64.b64encode(path.read_bytes()).decode("ascii"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        put = self._client.put(f"/repos/{owner}/{repo}/contents/{quoted}", json=payload)
+        if put.status_code >= 400:
+            raise GitHubError(f"uploading PR asset failed: HTTP {put.status_code} {put.text[:300]}")
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{remote_path}"
 
     def update_pr_body(self, owner: str, repo: str, pr_number: int, body: str) -> None:
         """Replace the body of an existing pull request."""
