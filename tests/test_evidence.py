@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from base64 import b64decode
 from pathlib import Path
@@ -110,66 +111,77 @@ def _client(handler) -> GitHubClient:
     )
 
 
-def test_upload_pr_asset_commits_via_contents_api(tmp_path):
+def test_upload_pr_asset_commits_to_branch_and_returns_raw_url(tmp_path):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            seen["get_path"] = request.url.path
-            seen["ref"] = request.url.params.get("ref")
+        seen.setdefault("calls", []).append((request.method, str(request.url.path), request.url.params.get("ref")))
+        if request.method == "GET" and request.url.path == "/repos/o/r/pulls/41":
+            return httpx.Response(200, json={"head": {"ref": "sf/feature"}})
+        if request.method == "GET" and request.url.path == "/repos/o/r/contents/.swarmforge/evidence/work-light.png":
             return httpx.Response(404, json={})
-        seen["put_path"] = request.url.path
-        seen["payload"] = json.loads(request.content)
-        return httpx.Response(200, json={"content": {"sha": "new"}})
+        if request.method == "PUT" and request.url.path == "/repos/o/r/contents/.swarmforge/evidence/work-light.png":
+            seen["put_json"] = json.loads(request.content)
+            return httpx.Response(201, json={"content": {"sha": "abc"}})
+        return httpx.Response(404, json={})
 
-    png = tmp_path / "dash-light.png"
+    png = tmp_path / "work-light.png"
     png.write_bytes(b"\x89PNG fake")
     client = _client(handler)
-    client.token = "tok"
-    url = client.upload_pr_asset("o", "r", "sf/result", png)
-    assert url == "https://raw.githubusercontent.com/o/r/sf/result/.swarmforge/evidence/dash-light.png"
-    assert seen["get_path"] == "/repos/o/r/contents/.swarmforge/evidence/dash-light.png"
-    assert seen["ref"] == "sf/result"
-    assert seen["put_path"] == seen["get_path"]
-    payload = seen["payload"]
-    assert b64decode(payload["content"]) == b"\x89PNG fake"
-    assert payload["branch"] == "sf/result"
-    assert payload["message"]
-    assert "sha" not in payload
+    client.token = "tok"  # simulate an available token
+    url = client.upload_pr_asset("o", "r", 41, png)
+    assert url == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    assert seen["calls"] == [
+        ("GET", "/repos/o/r/pulls/41", None),
+        ("GET", "/repos/o/r/contents/.swarmforge/evidence/work-light.png", "sf/feature"),
+        ("PUT", "/repos/o/r/contents/.swarmforge/evidence/work-light.png", None),
+    ]
+    assert seen["put_json"]["branch"] == "sf/feature"
+    assert seen["put_json"]["message"] == "Add visual evidence work-light.png"
+    assert base64.b64decode(seen["put_json"]["content"]) == b"\x89PNG fake"
+    assert "sha" not in seen["put_json"]  # new file, no sha needed
 
 
 def test_upload_pr_asset_updates_existing_file_with_sha(tmp_path):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/repos/o/r/pulls/41":
+            return httpx.Response(200, json={"head": {"ref": "sf/feature"}})
         if request.method == "GET":
-            return httpx.Response(200, json={"sha": "old"})
-        seen["payload"] = json.loads(request.content)
-        return httpx.Response(200, json={"content": {"sha": "new"}})
+            return httpx.Response(200, json={"sha": "oldsha"})
+        seen["put_json"] = json.loads(request.content)
+        return httpx.Response(200, json={"content": {"sha": "newsha"}})
 
-    png = tmp_path / "dash-light.png"
+    png = tmp_path / "work-light.png"
     png.write_bytes(b"png")
     client = _client(handler)
     client.token = "tok"
-    url = client.upload_pr_asset("o", "r", "sf/result", png)
-    assert url == "https://raw.githubusercontent.com/o/r/sf/result/.swarmforge/evidence/dash-light.png"
-    assert seen["payload"]["sha"] == "old"
+    url = client.upload_pr_asset("o", "r", 41, png)
+    assert url == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    assert seen["put_json"]["sha"] == "oldsha"
 
 
 def test_upload_pr_asset_without_token_raises(tmp_path):
     client = _client(lambda request: httpx.Response(200, json={}))
     client.token = None
     with pytest.raises(GitHubError, match="no GitHub token"):
-        client.upload_pr_asset("o", "r", "sf/result", tmp_path / "x.png")
+        client.upload_pr_asset("o", "r", 41, tmp_path / "x.png")
 
 
 def test_upload_pr_asset_http_error(tmp_path):
     png = tmp_path / "x.png"
     png.write_bytes(b"png")
-    client = _client(lambda request: httpx.Response(500, json={}, text="boom"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/repos/o/r/pulls/41":
+            return httpx.Response(200, json={"head": {"ref": "sf/feature"}})
+        return httpx.Response(422, json={}, text="boom")
+
+    client = _client(handler)
     client.token = "tok"
-    with pytest.raises(GitHubError, match="HTTP 500"):
-        client.upload_pr_asset("o", "r", "sf/result", png)
+    with pytest.raises(GitHubError, match="HTTP 422"):
+        client.upload_pr_asset("o", "r", 41, png)
 
 
 def test_get_pr_body_returns_body():
