@@ -84,6 +84,20 @@ def test_collect_and_manifest_roundtrip(tmp_path, monkeypatch):
     assert evidence.read_manifest(shots_dir) == shots
 
 
+def test_manifest_path_and_write_manifest(tmp_path):
+    """write_manifest returns the manifest path; read_manifest round-trips it and
+    also finds it in the <run_dir>/evidence layout the orchestrator uses."""
+    shots = [{"tab": "work", "theme": "light", "file": "/tmp/x.png"}]
+    path = evidence.write_manifest(tmp_path, shots)
+    assert path == tmp_path / evidence.MANIFEST_NAME
+    assert json.loads(path.read_text(encoding="utf-8")) == shots
+    assert evidence.read_manifest(tmp_path) == shots
+
+    run_dir = tmp_path / "run"
+    evidence.write_manifest(run_dir / "evidence", shots)
+    assert evidence.read_manifest(run_dir) == shots  # evidence/ sub-directory layout
+
+
 def test_read_manifest_missing_or_corrupt(tmp_path):
     assert evidence.read_manifest(tmp_path) == []
     (tmp_path / "manifest.json").write_text("{not json", encoding="utf-8")

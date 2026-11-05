@@ -143,6 +143,68 @@ async def test_ui_plan_evidence_flows_into_report_and_pr_body(
     dstore.close()
 
 
+async def test_end_to_end_ui_plan_produces_report_section_and_pr_image_links(
+    cfg, tmp_path, monkeypatch
+):
+    """AC1 end-to-end under the criteria-mapped name: a dashboard.py plan
+    produces a '## Visual evidence' report section and PR body image links."""
+    await test_ui_plan_evidence_flows_into_report_and_pr_body(
+        cfg, tmp_path, monkeypatch
+    )
+
+
+def test_report_lists_tab_names_and_absolute_paths(cfg, tmp_path, monkeypatch):
+    """AC2: report.md lists the captured tab names and the absolute PNG paths
+    from the orchestrator's evidence manifest."""
+    orch, _ = _make_orch(cfg, tmp_path, monkeypatch, ["src/swarmforge/dashboard.py"])
+    orch.sm.state = RunState.COMPLETED
+    import asyncio
+
+    asyncio.run(orch._collect_evidence())
+    assert orch._evidence_shots, "a dashboard.py plan must produce screenshots"
+    manifest_shots = evidence.read_manifest(tmp_path / "run")
+    assert manifest_shots == [], "no manifest under an unrelated run dir"
+    shots = evidence.read_manifest(orch.run_dir)
+    assert shots, "manifest must exist in the orchestrator's run dir"
+
+    dstore = _delivery_store(tmp_path, orch.run_dir)
+    text = build_report(dstore, "r-e2e")
+    assert "## Visual evidence" in text
+    for slug in ("work", "settings"):
+        assert slug in text, f"report must list the '{slug}' tab"
+    listed = [s for s in shots if s["file"] in text]
+    assert listed, "report must include manifest file paths"
+    for s in listed:
+        p = Path(s["file"])
+        assert p.is_absolute()
+        assert str(p).startswith(str(tmp_path))
+    dstore.close()
+
+
+async def test_pr_body_rebuilt_when_no_uploads(cfg, tmp_path, monkeypatch):
+    """AC1 fallback: when the live PR body cannot be fetched, the evidence
+    section is appended to the original body instead of being lost."""
+    orch, _ = _make_orch(cfg, tmp_path, monkeypatch, ["src/swarmforge/dashboard.py"])
+    await orch._collect_evidence()
+    dstore = _delivery_store(tmp_path, orch.run_dir)
+
+    class NoBodyGH(FakeGH):
+        def get_pr_body(self, owner, name, number):
+            return None
+
+    gh = NoBodyGH()
+    svc = _service(dstore, orch.run_dir)
+    await svc._attach_evidence(
+        gh, "o", "r", "https://github.com/o/r/pull/7", original_body="ORIGINAL_BODY"
+    )
+    assert len(gh.bodies) == 1, "exactly one PR body update"
+    body = gh.bodies[0][3]
+    assert body.startswith("ORIGINAL_BODY")
+    assert "## 📸 Visual evidence" in body
+    assert "](https://raw.githubusercontent.com" in body
+    dstore.close()
+
+
 async def test_attach_evidence_skips_missing_files_without_error(tmp_path):
     """AC4 bullet-proof delivery: a manifest referencing deleted PNGs produces no
     upload, no body update and no exception (publication continues)."""
@@ -194,10 +256,14 @@ async def test_attach_evidence_patches_live_pr_body_and_tolerates_bad_uploads(tm
     gh = LiveGH()
     svc = _service(store, run_dir)
     await svc._attach_evidence(gh, "o", "r", "https://github.com/o/r/pull/7")
-    assert gh.fetched == [("o", "r", 7)], "the live PR body must be fetched before patching"
+    assert gh.fetched == [("o", "r", 7)], (
+        "the live PR body must be fetched before patching"
+    )
     assert gh.bodies, "the evidence section must still be appended"
     body = gh.bodies[0][3]
-    assert "MANUAL EDIT: please keep this line." in body, "manual edits must be preserved"
+    assert "MANUAL EDIT: please keep this line." in body, (
+        "manual edits must be preserved"
+    )
     assert "📸 Visual evidence" in body
     assert "review" in body and "work-light.png" not in body
     assert any(k == "evidence" and lvl == "warn" for k, m, lvl in svc._logs), (
