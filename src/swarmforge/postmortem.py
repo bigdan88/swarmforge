@@ -365,6 +365,58 @@ def heal_context(fail: dict, attempt: int, max_attempts: int) -> str:
 Launch = Callable[[Config, "str | None", "str | None", str, int], Awaitable[str]]
 
 
+def heal_chain(store: Store, run_id: str) -> list[str]:
+    """The self-healing chain containing `run_id`, head-first: walk back via runs.heal_of, then
+    forward via failures.heal_run_id. Bounded and cycle-safe; always contains at least one id."""
+    head = run_id
+    for _ in range(12):
+        run = store.get_run(head)
+        if not run or not run.get("heal_of"):
+            break
+        head = run["heal_of"]
+    chain = [head]
+    cur = head
+    for _ in range(12):
+        fail = store.failure(cur)
+        nxt = fail.get("heal_run_id") if fail else None
+        if not nxt or nxt in chain:
+            break
+        chain.append(nxt)
+        cur = nxt
+    return chain
+
+
+def chain_usage(store: Store, cfg: Config, run_id: str) -> dict:
+    """Accumulated time and cost across the self-healing chain of `run_id`, with the chain caps.
+    Failure columns win, then run rows, then config defaults; never raises on odd data."""
+    chain = heal_chain(store, run_id)
+    elapsed = 0.0
+    runtime_cap = 0.0
+    cost = 0.0
+    for rid in chain:
+        run = store.get_run(rid)
+        fail = store.failure(rid)
+        if fail and fail.get("elapsed_s") is not None:
+            elapsed += fail["elapsed_s"]
+        elif run:
+            end = run.get("finished_at") or run.get("updated_at")
+            elapsed += max(0.0, end - run["created_at"]) if end is not None else 0.0
+        if run and run.get("max_runtime_s"):
+            runtime_cap += run["max_runtime_s"]
+        else:
+            runtime_cap += cfg.limits.max_runtime_s
+        if fail and fail.get("cost_usd") is not None:
+            cost += fail["cost_usd"]
+        else:
+            cost += store.cost_summary(rid)["total"]
+    head = store.get_run(chain[0])
+    cap = cfg.self_heal.max_total_budget_usd or 3 * (
+        (head.get("budget_usd") if head else None) or cfg.limits.budget_usd)
+    return {"chain": chain, "attempts": len(chain) - 1, "elapsed_s": float(elapsed),
+            "runtime_cap_s": float(runtime_cap), "cost_usd": float(cost),
+            "budget_cap_usd": float(cap)}
+
+
 async def heal(cfg: Config, store: Store, run_id: str, launch: Launch, *, attempts: int | None = None,
                echo=None) -> str:
     """After `run_id` finished: while it failed in a fixable way, diagnose and start a new attempt with
