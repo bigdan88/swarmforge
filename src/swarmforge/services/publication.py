@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -151,6 +152,10 @@ class PublicationService:
         """Upload the run's dashboard screenshots as PR assets and append them to the draft PR body.
         Best effort: any problem is logged as a warning and never affects the PR itself."""
         run = self.store.get_run(self.run_id) or {}
+        branch = run.get("integration_branch") or getattr(self.ws, "integration_branch", None)
+        if not branch:
+            self.log("evidence", "screenshot upload skipped: no integration branch", level="warn")
+            return
         try:
             from .. import evidence
         except Exception as e:  # noqa: BLE001 - evidence support is optional
@@ -159,8 +164,9 @@ class PublicationService:
         try:
             from ..github import pr_number_from_url
         except ImportError:  # T1 helper not present: parse the number from the URL ourselves
-            def pr_number_from_url(u: str) -> int:
-                return int(u.rstrip("/").split("/")[-1])
+            def pr_number_from_url(u: str) -> int | None:  # type: ignore[misc]
+                m = re.search(r"/pull/(\d+)", str(u))
+                return int(m.group(1)) if m else None
         try:
             shots = evidence.read_manifest(Path(run.get("run_dir") or ""))
             if not shots:
@@ -169,6 +175,9 @@ class PublicationService:
                 self.log("evidence", "screenshot upload skipped: no GitHub token", level="warn")
                 return
             number = pr_number_from_url(url)
+            if number is None:
+                self.log("evidence", f"screenshot upload skipped: not a PR url: {url}", level="warn")
+                return
             lines = []
             for s in shots:
                 p = Path(s["file"])
@@ -176,12 +185,16 @@ class PublicationService:
                     p = Path(run.get("run_dir") or ".") / p
                 if not p.is_file():
                     continue
-                asset = await asyncio.to_thread(gh.upload_pr_asset, owner, name, number, p)
-                lines.append(f"![{s['tab']} — {s['theme']}]({asset})")
+                raw_url = await asyncio.to_thread(gh.upload_pr_asset, owner, name, branch, p)
+                lines.append(f"![{s['tab']} — {s['theme']}]({raw_url})")
             if not lines:
                 return
+            try:
+                existing = await asyncio.to_thread(gh.get_pr_body, owner, name, number)
+            except Exception:  # noqa: BLE001 - fall back to the generated body
+                existing = build_pr_body(self.store, self.run_id)
             section = "## 📸 Visual evidence\n\n" + "\n".join(lines)
-            body = build_pr_body(self.store, self.run_id) + "\n\n" + section
+            body = (existing or "") + "\n\n" + section
             await asyncio.to_thread(gh.update_pr_body, owner, name, number, body)
             self.log("evidence", f"attached {len(lines)} dashboard screenshot(s) to {url}")
         except Exception as e:  # noqa: BLE001 - never let evidence problems break publication

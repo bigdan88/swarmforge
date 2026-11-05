@@ -17,18 +17,21 @@ class FakeGH:
     def __init__(self, token="tok", upload_error=None):
         self.token = token
         self.upload_error = upload_error
-        self.uploads = []  # (owner, name, number, path)
+        self.uploads = []  # (owner, name, branch, path)
         self.bodies = []  # (owner, name, number, body)
-        self.upload_results = []  # asset url per upload call
+        self.upload_results = []  # raw url per upload call
 
     def create_draft_pr(self, owner, name, head, base, title, body):
         return "https://github.com/o/r/pull/7"
 
-    def upload_pr_asset(self, owner, name, number, path):
+    def get_pr_body(self, owner, name, number):
+        return "ORIGINAL_BODY"
+
+    def upload_pr_asset(self, owner, name, branch, path):
         if self.upload_error:
             raise self.upload_error
-        self.uploads.append((owner, name, number, Path(path)))
-        url = f"https://camo.example.com/{path.name}"
+        self.uploads.append((owner, name, branch, Path(path)))
+        url = f"https://raw.githubusercontent.com/o/r/{branch}/{Path(path).name}"
         self.upload_results.append(url)
         return url
 
@@ -144,11 +147,15 @@ async def test_publish_attaches_screenshots_to_pr_body(tmp_path):
     )()
     url = await svc.publish(gh, "o", "r")
     assert url == "https://github.com/o/r/pull/7"
-    assert gh.uploads and gh.uploads[0][:3] == ("o", "r", 7)
+    assert gh.uploads and gh.uploads[0][:3] == ("o", "r", "sf/result")
     assert gh.bodies, "PR body must be updated with the evidence section"
     body = gh.bodies[0][3]
+    assert "ORIGINAL_BODY" in body  # appended to the live body, not rebuilt
     assert "📸 Visual evidence" in body
-    assert "![Dashboard — light](https://camo.example.com/dashboard-light.png)" in body
+    assert (
+        "![Dashboard — light](https://raw.githubusercontent.com/o/r/sf/result/dashboard-light.png)"
+        in body
+    )
     assert svc.store.get_run("r")["pr_url"] == url
 
 
@@ -200,6 +207,21 @@ async def test_publish_survives_upload_error(tmp_path):
     assert url == "https://github.com/o/r/pull/7"  # AC4: run completes
     assert any(
         k == "evidence" and lvl == "warn" and "GitHubError" in m
+        for k, m, lvl in svc._logs
+    )
+
+
+async def test_attach_evidence_without_branch_warns_and_skips(tmp_path):
+    """AC4: no integration branch anywhere -> warn-level log, no upload, no crash."""
+    run_dir = tmp_path / "run"
+    gh = FakeGH()
+    svc = make_service(tmp_path, gh, run_dir)
+    svc.store.update_run("r", integration_branch=None)
+    svc.ws = None
+    await svc._attach_evidence(gh, "o", "r", "https://github.com/o/r/pull/7")
+    assert not gh.uploads and not gh.bodies
+    assert any(
+        k == "evidence" and lvl == "warn" and "no integration branch" in m
         for k, m, lvl in svc._logs
     )
 
