@@ -53,6 +53,7 @@ class Preview:
     wait_s: int = 90
     viewport: dict = field(default_factory=lambda: {"width": 1400, "height": 1000})
     max_shots: int = MAX_SHOTS
+    a11y: bool = False
 
 
 def _slug(s: str) -> str:
@@ -64,7 +65,7 @@ def parse_preview(raw) -> Preview:
     if not isinstance(raw, dict):
         raise PreviewError("preview must be a mapping with at least `command` and `port`")
     unknown = set(raw) - {"command", "port", "pages", "themes", "when_changed", "ready_text", "wait_s",
-                          "viewport", "max_shots"}
+                          "viewport", "max_shots", "a11y"}
     if unknown:
         raise PreviewError(f"unknown preview keys: {sorted(unknown)}")
     cmd = raw.get("command")
@@ -97,9 +98,12 @@ def parse_preview(raw) -> Preview:
     viewport = {"width": int(vp.get("width") or 1400), "height": int(vp.get("height") or 1000)}
     if not (320 <= viewport["width"] <= 3000 and 300 <= viewport["height"] <= 6000):
         raise PreviewError("preview.viewport is out of range (width 320-3000, height 300-6000)")
+    a11y = raw.get("a11y", False)
+    if not isinstance(a11y, bool):
+        raise PreviewError("preview.a11y must be true or false")
     return Preview(cmd.strip(), port, pages, themes, when, raw.get("ready_text"),
                    max(10, min(int(raw.get("wait_s") or 90), 300)), viewport,
-                   max(1, min(int(raw.get("max_shots") or MAX_SHOTS), 24)))
+                   max(1, min(int(raw.get("max_shots") or MAX_SHOTS), 24)), a11y)
 
 
 def should_capture(pv: Preview, changed_files: list[str]) -> bool:
@@ -146,7 +150,7 @@ async def capture(ctx, pv: Preview, cycle: int, log=None) -> list[dict]:
                 url = f"http://localhost:{pv.port}{page.path}"
                 name = f"visual/c{cycle}-{_slug(page.name)}-{theme}.png"
                 shot: dict = {"page": page.name, "path": page.path, "theme": theme, "url": url, "file": None,
-                        "problems": [], "text": ""}
+                        "problems": [], "text": "", "a11y_findings": []}
                 try:
                     data = await browse_raw(ctx, url, actions=page.actions, screenshot_name=name,
                                             color_scheme=theme, viewport=pv.viewport, timeout_s=90)
@@ -161,6 +165,14 @@ async def capture(ctx, pv: Preview, cycle: int, log=None) -> list[dict]:
                     shot["text"] = (data.get("text") or "")[:1500]
                 except ToolError as e:
                     shot["problems"] = [f"could not load the page: {e}"]
+                if pv.a11y:
+                    try:
+                        adata = await _browse_probe(ctx, url, actions=page.actions, color_scheme=theme,
+                                                    viewport=pv.viewport, a11y=True, timeout_s=90)
+                        shot["a11y_findings"] = _a11y_findings_for(page.name, theme, adata)
+                    except ToolError as e:
+                        if log:
+                            log(f"a11y audit skipped for {page.name} ({theme}): {e}")
                 shots.append(shot)
                 if log:
                     log(f"screenshot {page.name} ({theme}): "
@@ -171,6 +183,10 @@ async def capture(ctx, pv: Preview, cycle: int, log=None) -> list[dict]:
             await stop_process(ctx, "preview")
         except ToolError:
             pass
+    if pv.a11y and log:
+        total = sum(len(s["a11y_findings"]) for s in shots)
+        if total:
+            log(f"a11y audit: {total} finding(s)")
     return shots
 
 
@@ -185,6 +201,7 @@ def page_error_findings(shots: list[dict]) -> list[dict]:
                         "title": f"{s['page']} ({s['theme']}) shows an error",
                         "description": "\n".join(bad)[:1500],
                         "recommendation": f"Open {s['path']} and fix the error shown there."})
+        out.extend(s.get("a11y_findings") or [])
     return out
 
 
@@ -922,11 +939,74 @@ def record_breakpoint_findings(
 
 
 # ------------------------------------------------------------- a11y audit
+async def _browse_probe(ctx, url, *, actions=None, screenshot_name=None, color_scheme=None,
+                        viewport=None, full_page=True, timeout_s=60, a11y=False) -> dict:
+    """Local copy of the sandbox browser probe (devtools.browse_raw) with an opt-in a11y flag.
+
+    With `a11y=True` the probe also returns `a11y` (the Playwright accessibility snapshot, or
+    None) and `contrast` (a list of {selector, text, color, background} pairs for visible text)."""
+    from .agent.devtools import (
+        BROWSE_MARK,
+        LOCAL_URL_RE,
+        NO_BROWSER,
+        _browse_script,
+        open_session,
+    )
+    from .agent.tools import ToolError
+    if not LOCAL_URL_RE.match(url or ""):
+        raise ToolError("browse only opens local apps, e.g. http://localhost:8501 (start the app with "
+                        "start_process first). The sandbox has no internet access.")
+    if actions is not None and not isinstance(actions, list):
+        raise ToolError("actions must be a list of objects, e.g. [{\"click\": \"text=Save\"}]")
+    if screenshot_name is not None and not re.fullmatch(r"[\w.-]+/?[\w.-]*\.png", screenshot_name):
+        raise ToolError(f"bad screenshot name {screenshot_name!r}")
+    s = open_session(ctx)
+    args = {"url": url, "actions": actions or [], "timeout_ms": max(5, min(int(timeout_s or 60), 180)) * 1000,
+            "screenshot": (f"{s.artifacts_path}/{screenshot_name}" if screenshot_name and s.artifacts_path else None),
+            "color_scheme": color_scheme if color_scheme in ("light", "dark") else None,
+            "viewport": viewport or None, "full_page": full_page}
+    if a11y:
+        args["a11y"] = True
+    r = await s.exec(f"{s.python} -", stdin=_browse_script(), env={"SF_BROWSE_ARGS": json.dumps(args)},
+                     timeout_s=args["timeout_ms"] // 1000 + 60)
+    ctx.commands_run.append({"command": f"[browse] {url}", "exit_code": r.exit_code,
+                             "timed_out": r.timed_out, "duration_s": round(r.duration_s, 2)})
+    if r.timed_out:
+        raise ToolError(f"the browser timed out after {r.duration_s:.0f}s")
+    line = next((ln for ln in reversed(r.output.splitlines()) if ln.startswith(BROWSE_MARK)), None)
+    if line is None:
+        if "No module named 'playwright'" in r.output or "Executable doesn't exist" in r.output:
+            raise ToolError(NO_BROWSER)
+        raise ToolError(f"the browser failed: {r.output[-1500:]}")
+    data = json.loads(line[len(BROWSE_MARK):])
+    if data.get("fatal"):
+        msg = data["fatal"]
+        if "Executable doesn't exist" in msg:
+            raise ToolError(NO_BROWSER)
+        raise ToolError(f"could not load {url}: {msg}")
+    data["screenshot_file"] = None
+    if data.get("screenshot") and ctx.artifacts_dir is not None and screenshot_name:
+        f = Path(ctx.artifacts_dir) / screenshot_name
+        data["screenshot_file"] = str(f) if f.is_file() else None
+    return data
+
+
 def audit(tab_url, **kwargs):
     """Accessibility audit of a served page (Playwright a11y snapshot + WCAG AA contrast).
     See swarmforge.a11y.audit for options; returns {ok, url, tab, themes, results, findings, error}."""
     from . import a11y
     return a11y.audit(tab_url, **kwargs)
+
+
+def _a11y_findings_for(tab, theme, data, *, min_ratio=4.5) -> list[dict]:
+    """Finding dicts from one probe result. F1: an EMPTY-but-successful a11y snapshot
+    ({} or '') is still processed; only None (probe failure) skips label findings."""
+    from . import a11y
+    out: list[dict] = []
+    if data.get("a11y") is not None:
+        out.extend(a11y.label_findings(tab, theme, data["a11y"]))
+    out.extend(a11y.contrast_findings(tab, theme, data.get("contrast") or [], min_ratio=min_ratio))
+    return out
 
 
 async def audit_pages(ctx, pv, *, log=None, min_ratio=4.5) -> list[dict]:
@@ -935,8 +1015,7 @@ async def audit_pages(ctx, pv, *, log=None, min_ratio=4.5) -> list[dict]:
     Returns a list of Finding dicts (missing accessible names [major], low contrast [minor])
     consumable by state.repair_tasks_from_findings. Never raises on per-page failures;
     the preview process is always stopped."""
-    from . import a11y
-    from .agent.devtools import browse_raw, start_process, stop_process
+    from .agent.devtools import start_process, stop_process
     from .agent.tools import ToolError
 
     findings: list[dict] = []
@@ -946,17 +1025,14 @@ async def audit_pages(ctx, pv, *, log=None, min_ratio=4.5) -> list[dict]:
         for page in pv.pages:
             for theme in pv.themes:
                 try:
-                    data = await browse_raw(ctx, f"http://localhost:{pv.port}{page.path}",
-                                            actions=page.actions, color_scheme=theme,
-                                            a11y=True, timeout_s=90)
+                    data = await _browse_probe(ctx, f"http://localhost:{pv.port}{page.path}",
+                                               actions=page.actions, color_scheme=theme,
+                                               viewport=pv.viewport, a11y=True, timeout_s=90)
                 except ToolError as e:
                     if log:
                         log(f"a11y audit skipped for {page.name} ({theme}): {e}")
                     continue
-                if data.get("a11y"):
-                    findings.extend(a11y.label_findings(page.name, theme, data["a11y"]))
-                findings.extend(a11y.contrast_findings(page.name, theme, data.get("contrast") or [],
-                                                       min_ratio=min_ratio))
+                findings.extend(_a11y_findings_for(page.name, theme, data, min_ratio=min_ratio))
     finally:
         try:
             await stop_process(ctx, "preview")

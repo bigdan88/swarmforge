@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -509,3 +510,137 @@ def test_interactive_roles_contents():
     assert "button" in INTERACTIVE_ROLES
     assert "checkbox" in INTERACTIVE_ROLES
     assert "generic" not in INTERACTIVE_ROLES
+
+
+# ------------------------------------------------- shared browser + shutdown
+
+
+def _install_fake_playwright(monkeypatch):
+    """Install a fake playwright.sync_api module counting launches/pages."""
+    import sys
+
+    class FakeBrowser:
+        def __init__(self):
+            self.close_count = 0
+            self.pages: list[FakePwPage] = []
+
+        def launch(self, *a, **kw):
+            return self
+
+        def new_page(self, **kw):
+            page = FakePwPage()
+            self.pages.append(page)
+            return page
+
+        def close(self):
+            self.close_count += 1
+
+    class FakePwPage:
+        def __init__(self):
+            self.goto_calls: list[str] = []
+            self.closed = False
+            self.accessibility = SimpleNamespace(
+                snapshot=lambda: {
+                    "role": "WebArea",
+                    "name": "Chat",
+                    "children": [{"role": "button", "name": "Send"}],
+                }
+            )
+
+        def goto(self, url, **kw):
+            self.goto_calls.append(url)
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def evaluate(self, js, arg=None):
+            return []
+
+        def close(self):
+            self.closed = True
+
+    browser = FakeBrowser()
+
+    class FakeApi:
+        def __init__(self):
+            self.stop_count = 0
+
+        def stop(self):
+            self.stop_count += 1
+
+    api = FakeApi()
+
+    class FakeSyncPlaywright:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def start(self):
+            return api
+
+    api.chromium = browser
+
+    fake_sync_api = SimpleNamespace(sync_playwright=lambda: FakeSyncPlaywright())
+    fake_parent = types.ModuleType("playwright")
+    fake_sync = types.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = fake_sync_api.sync_playwright
+    fake_parent.sync_api = fake_sync
+    monkeypatch.setitem(sys.modules, "playwright", fake_parent)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    return browser, api
+
+
+def test_default_open_page_reuses_one_browser_across_themes(monkeypatch):
+    from swarmforge import a11y
+
+    browser, api = _install_fake_playwright(monkeypatch)
+    op = a11y._default_open_page()
+    page_light = op("light")
+    page_dark = op("dark")
+    # one browser, one page per theme
+    assert len(browser.pages) == 2
+    page_light.goto("http://localhost:8501/")
+    page_dark.goto("http://localhost:8501/")
+    assert [p.goto_calls for p in browser.pages] == [
+        ["http://localhost:8501/"],
+        ["http://localhost:8501/"],
+    ]
+    # closing a page must not tear down the shared browser
+    page_light.close()
+    assert browser.pages[0].closed
+    op.shutdown()
+    assert browser.close_count == 1
+    assert api.stop_count == 1
+    # shutdown is idempotent-safe: a second call does not raise
+    op.shutdown()
+    assert browser.close_count == 1
+    assert api.stop_count == 1
+
+
+def test_audit_calls_open_page_shutdown_hook():
+    from swarmforge import a11y
+
+    class FakeFactory:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def __call__(self, theme):
+            return FakePage({"role": "WebArea", "name": "Chat", "children": []}, [])
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    fake = FakeFactory()
+    a11y.audit("http://localhost:8501/?page=Chat", open_page=fake, themes=("light",))
+    assert fake.shutdown_calls == 1
+
+    # a plain callable without a shutdown attribute must not raise
+    a11y.audit(
+        "http://localhost:8501/?page=Chat",
+        open_page=lambda theme: FakePage(
+            {"role": "WebArea", "name": "Chat", "children": []}, []
+        ),
+        themes=("light",),
+    )
