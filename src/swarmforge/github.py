@@ -149,33 +149,42 @@ class GitHubClient:
             raise GitHubError(f"creating draft PR failed: HTTP {r.status_code} {r.text[:500]}")
         return r.json()["html_url"]
 
-    def upload_pr_asset(self, owner: str, repo: str, branch: str, path: str | Path,
-                        dest_dir: str = ".swarmforge/evidence") -> str:
-        """Commit a file (e.g. a screenshot PNG) to a branch via the Contents API.
+    def upload_pr_asset(self, owner: str, repo: str, pr_number: int, path: str | Path) -> str:
+        """Commit a file (e.g. a screenshot PNG) to the PR's head branch and return its raw URL.
 
-        Returns a raw.githubusercontent.com URL for the committed file.
+        GitHub has no REST endpoint for uploading assets to issues/PRs, so the file is
+        committed under ``.swarmforge/evidence/`` on the branch the PR was opened from and
+        referenced via its raw.githubusercontent.com URL.
         """
         if not self.token:
             raise GitHubError(f"no GitHub token ({self.cfg.token_env}) available")
+        from urllib.parse import quote
+
         path = Path(path)
-        api_path = quote(f"{dest_dir}/{path.name}", safe="/")
-        content = base64.b64encode(path.read_bytes()).decode("ascii")
-        sha: str | None = None
-        r = self._client.get(
-            f"/repos/{owner}/{repo}/contents/{api_path}", params={"ref": branch})
-        if r.status_code == 200:
-            sha = r.json().get("sha")
+
+        r = self._client.get(f"/repos/{owner}/{repo}/pulls/{pr_number}")
+        if r.status_code >= 400:
+            raise GitHubError(f"fetching PR failed: HTTP {r.status_code} {r.text[:300]}")
+        branch = r.json()["head"]["ref"]
+
+        remote_path = f".swarmforge/evidence/{path.name}"
+        quoted = quote(remote_path, safe="/")
+        existing = self._client.get(
+            f"/repos/{owner}/{repo}/contents/{quoted}", params={"ref": branch}
+        )
+        sha = existing.json().get("sha") if existing.status_code == 200 else None
+
         payload = {
-            "message": f"Add visual evidence: {path.name}",
-            "content": content,
+            "message": f"Add visual evidence {path.name}",
+            "content": base64.b64encode(path.read_bytes()).decode("ascii"),
             "branch": branch,
         }
         if sha:
             payload["sha"] = sha
-        r = self._client.put(f"/repos/{owner}/{repo}/contents/{api_path}", json=payload)
-        if r.status_code >= 400:
-            raise GitHubError(f"uploading PR asset failed: HTTP {r.status_code} {r.text[:300]}")
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{api_path}"
+        put = self._client.put(f"/repos/{owner}/{repo}/contents/{quoted}", json=payload)
+        if put.status_code >= 400:
+            raise GitHubError(f"uploading PR asset failed: HTTP {put.status_code} {put.text[:300]}")
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{remote_path}"
 
     def get_pr_body(self, owner: str, repo: str, pr_number: int) -> str:
         """Return the body of an existing pull request."""
