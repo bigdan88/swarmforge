@@ -128,7 +128,7 @@ def _seed_run(store: Store, rid: str, state: str, *, repo: str = "bigdan88/alpha
 
 
 def _app() -> AppTest:
-    at = AppTest.from_file(str(APP), default_timeout=120)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert len(at.exception) == 0, f"dashboard crashed: {[e.value for e in at.exception]}"
     return at

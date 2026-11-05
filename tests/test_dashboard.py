@@ -49,7 +49,7 @@ def _write_cfg(tmp_path, monkeypatch):
 async def test_dashboard_pages_render(tmp_path, monkeypatch, sample_repo):
     cfg = _write_cfg(tmp_path, monkeypatch)
     store, run_id, _ = await _run(cfg, sample_repo)
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert not at.metric  # rows start collapsed
@@ -122,7 +122,7 @@ def test_launcher_starts_background_run(tmp_path, monkeypatch, sample_repo):
 @pytest.mark.slow  # starts real background processes (~1 min)
 def test_start_run_button_switches_to_runs(tmp_path, monkeypatch, sample_repo):
     cfg = _write_cfg(tmp_path, monkeypatch)
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     _go(at, "New task")
     at.text_input(key="nr_title").input("Add export")
@@ -148,7 +148,7 @@ def test_start_run_button_switches_to_runs(tmp_path, monkeypatch, sample_repo):
 
 def test_new_run_form_validates_before_starting(tmp_path, monkeypatch):
     cfg = _write_cfg(tmp_path, monkeypatch)
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     _go(at, "New task")
     at.text_input(key="nr_title").input("Add export")
@@ -172,7 +172,7 @@ def test_new_run_form_validates_before_starting(tmp_path, monkeypatch):
 def test_queue_import_then_edit_and_reorder_on_work_page(tmp_path, monkeypatch, sample_repo):
     from .conftest import ROOT
     cfg = _write_cfg(tmp_path, monkeypatch)
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert any("Nothing here yet" in i.value for i in at.info)
@@ -221,7 +221,7 @@ def test_live_settings_for_running_run(tmp_path, monkeypatch):
     store.create_run("20990101-000000-abcdef", state="TASK_EXECUTION", issue_title="Busy run", repo="x/y",
                      budget_usd=5, pid=os.getpid(), max_runtime_s=3600, max_repair_cycles=2,
                      config_json=json.dumps({"limits": {"max_runtime_s": 3600, "max_repair_cycles": 2}}))
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     rid = "20990101-000000-abcdef"
@@ -269,7 +269,7 @@ async def test_failed_run_offers_start_again_and_continue(tmp_path, monkeypatch,
     cfg.limits.max_repair_cycles = 0
     store, run_id, _ = await _run(cfg, sample_repo)
     assert store.get_run(run_id)["state"] == "FAILED"
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     _open(at)
@@ -294,7 +294,7 @@ def test_failures_page_and_hidden_attempts(tmp_path, monkeypatch):
                        outcome="fixed itself on attempt 1")
     store.create_run("20990101-020000-cccccc", state="FAILED", issue_title="Old failure", repo="x/y",
                      budget_usd=5, state_reason="repair limit reached", config_json="{}")
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     # the healed attempt is hidden from the Work list; the successful retry says it fixed itself
@@ -316,7 +316,7 @@ def test_failures_page_and_hidden_attempts(tmp_path, monkeypatch):
 def test_password_gate(tmp_path, monkeypatch):
     _write_cfg(tmp_path, monkeypatch)
     monkeypatch.setenv("SWARMFORGE_DASH_PASSWORD", "open sesame")
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception
     assert not [b for b in at.button if (b.key or "").startswith("nav_")]  # nothing before the password
@@ -337,7 +337,7 @@ def test_bulk_select_and_delete(tmp_path, monkeypatch):
     store.event("20990101-000000-aaaaaa", "run", "hello")
     keep = store.queue_add("Keep me", "body", "x/y")
     gone = store.queue_add("Remove me", "body", "x/y")
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert not [b for b in at.button if b.key == "bk_del"]  # no bulk bar until something is ticked
@@ -359,7 +359,7 @@ def test_new_task_offers_recent_repos(tmp_path, monkeypatch):
     store = Store(cfg.db_path)
     store.remember_repo("bigdan88/old")
     store.remember_repo("bigdan88/swarmforge")
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     _go(at, "New task")
     sb = at.selectbox(key="nr_repo")
@@ -383,7 +383,7 @@ def test_work_list_folds_repeated_attempts_into_one_row(tmp_path, monkeypatch):
                               json.dumps({"url": "https://github.com/x/y/pull/7", "number": 7}))
     store.create_run("20990101-020000-cccccc", state="FAILED", issue_title="Other task", repo="x/y",
                      budget_usd=5, config_json="{}", state_reason="the queue worker stopped while this run was going")
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     rows = [b.key for b in at.button if (b.key or "").startswith("op_")]

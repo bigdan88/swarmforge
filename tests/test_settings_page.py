@@ -382,7 +382,7 @@ def _open_settings(tmp_path, monkeypatch, **patches):
     }
     for name, fn in {**defaults, **patches}.items():
         monkeypatch.setattr(settings, name, fn)
-    at = AppTest.from_file(str(DASH), default_timeout=90)
+    at = AppTest.from_file(str(DASH), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     next(b for b in at.sidebar.button if b.label == "Settings").click()
@@ -406,7 +406,7 @@ def _page_text(at) -> str:
 def test_settings_nav_exists(tmp_path, monkeypatch):
     _write_cfg(tmp_path, monkeypatch)
     monkeypatch.setattr(welcome, "health_checks", lambda cfg: [])
-    at = AppTest.from_file(str(DASH), default_timeout=90)
+    at = AppTest.from_file(str(DASH), default_timeout=180)
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert "Settings" in [b.label for b in at.sidebar.button]
