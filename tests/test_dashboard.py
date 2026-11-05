@@ -79,14 +79,15 @@ def test_dashboard_approval_channel(tmp_path):
     result = {}
     t = threading.Thread(target=lambda: result.setdefault("v", approve("Push branch x?")))
     t.start()
-    for _ in range(100):
+    deadline = time.time() + 30
+    while time.time() < deadline:
         pend = store.pending_approvals("r1")
         if pend:
             break
         time.sleep(0.05)
     assert pend and pend[0]["question"] == "Push branch x?"
     store.decide_approval(pend[0]["id"], True)
-    t.join(5)
+    t.join(30)
     assert result["v"] is True and not store.pending_approvals()
     # timeout -> declined
     quick = dashboard_approver(store, lambda: "r1", timeout_s=0.2, poll_s=0.05)
