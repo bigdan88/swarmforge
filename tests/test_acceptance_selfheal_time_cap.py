@@ -93,6 +93,10 @@ async def test_ac2_escalate_time_cap_clamps_roles_and_model_unavailable_path(cfg
     mu = escalate(cfg, 1, category="model_unavailable", time_cap=1000)
     assert mu.limits.max_runtime_s == 1000
     assert all(r.timeout_s <= base_role_timeout for r in mu.roles.values())
+    # 600 is below the base role timeout of 900, so the clamp must actually apply
+    mu2 = escalate(cfg, 1, category="model_unavailable", time_cap=600)
+    assert all(r.timeout_s <= 600 for r in mu2.roles.values())
+    assert mu2.roles["planner"].timeout_s == 600
 
 
 # ------------------------------------------------------------------ AC3
