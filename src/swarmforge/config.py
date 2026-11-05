@@ -194,6 +194,7 @@ class SelfHealConfig:
     extra_repair_cycles: int = 1       # ... and repair cycles ...
     steps_factor: float = 1.5          # ... and agent steps per session
     max_total_budget_usd: float = 0.0  # cap for a run plus all its retries; 0 = 3x the first run's budget
+    max_total_runtime_s: int = 0     # cap on wall-clock for a run plus all its retries; 0 = 3x the first run's limits.max_runtime_s
     diagnose: bool = True              # ask a model why a run failed (cheap, ~1 call)
     diagnosis_role: str = "planner"
     diagnosis_budget_usd: float = 0.5
@@ -387,6 +388,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("self_heal.max_attempts must be between 0 and 5")
     if sh.time_factor < 1 or sh.budget_factor < 1 or sh.steps_factor < 1:
         raise ConfigError("self_heal factors must be >= 1")
+    if sh.max_total_runtime_s < 0:
+        raise ConfigError("self_heal.max_total_runtime_s must be >= 0")
     if sh.diagnosis_role not in cfg.roles:
         sh.diagnosis_role = "planner"
     if cfg.sandbox.mode not in ("docker", "local"):
