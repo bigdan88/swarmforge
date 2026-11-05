@@ -19,6 +19,18 @@ async def test_escalate_time_cap_clamps_runtime_and_role_timeouts(cfg):
     assert escalate(cfg, 2).limits.max_runtime_s == 8100
 
 
+async def test_escalate_model_unavailable_clamps_role_timeouts(cfg):
+    """Regression: the model_unavailable early-return path must also clamp role timeouts."""
+    mu = escalate(cfg, 1, category="model_unavailable", time_cap=300)
+    # 300 is below the base role timeout of 900, so the clamp must actually apply
+    assert all(r.timeout_s == 300 for r in mu.roles.values())
+    assert mu.limits.max_runtime_s == 300
+    # model_unavailable semantics preserved: no steps/time escalation, doubled busy_wait
+    assert mu.roles["planner"].max_steps == cfg.roles["planner"].max_steps
+    assert mu.limits.busy_wait_s == cfg.limits.busy_wait_s * 2
+    assert mu.limits.max_repair_cycles == cfg.limits.max_repair_cycles
+
+
 async def test_heal_time_cap_blocks_and_records_outcome(cfg):
     store = Store(cfg.db_path)
     now = time.time()

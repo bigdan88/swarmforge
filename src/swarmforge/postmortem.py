@@ -344,11 +344,12 @@ def escalate(cfg: Config, attempt: int, *, budget_cap: float | None = None,
         # Provider availability is not evidence that the task needs more tokens or repairs.
         c.limits.budget_usd = round(min(cfg.limits.budget_usd, budget_cap or cfg.limits.budget_usd), 2)
         c.limits.max_repair_cycles = cfg.limits.max_repair_cycles
-        return c
-    for r in c.roles.values():
-        r.max_steps = int(min(200, r.max_steps * sh.steps_factor ** attempt))
-        r.timeout_s = int(min(6 * 3600, r.timeout_s * sh.time_factor ** attempt))
-        if time_cap is not None:
+    else:
+        for r in c.roles.values():
+            r.max_steps = int(min(200, r.max_steps * sh.steps_factor ** attempt))
+            r.timeout_s = int(min(6 * 3600, r.timeout_s * sh.time_factor ** attempt))
+    if time_cap is not None:
+        for r in c.roles.values():
             r.timeout_s = min(r.timeout_s, int(time_cap))
     return c
 
