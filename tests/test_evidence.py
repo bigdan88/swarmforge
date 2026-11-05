@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-from base64 import b64decode
 from pathlib import Path
 
 import httpx
@@ -111,16 +110,28 @@ def _client(handler) -> GitHubClient:
     )
 
 
-def test_upload_pr_asset_commits_to_branch_and_returns_raw_url(tmp_path):
+def test_upload_pr_asset_posts_multipart_and_returns_raw_url(tmp_path):
+    # "posts" = posting the file content payload via the GitHub contents API
+    # (there is no dedicated REST endpoint for PR assets).
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.setdefault("calls", []).append((request.method, str(request.url.path), request.url.params.get("ref")))
+        seen.setdefault("calls", []).append(
+            (request.method, str(request.url.path), request.url.params.get("ref"))
+        )
         if request.method == "GET" and request.url.path == "/repos/o/r/pulls/41":
             return httpx.Response(200, json={"head": {"ref": "sf/feature"}})
-        if request.method == "GET" and request.url.path == "/repos/o/r/contents/.swarmforge/evidence/work-light.png":
+        if (
+            request.method == "GET"
+            and request.url.path
+            == "/repos/o/r/contents/.swarmforge/evidence/work-light.png"
+        ):
             return httpx.Response(404, json={})
-        if request.method == "PUT" and request.url.path == "/repos/o/r/contents/.swarmforge/evidence/work-light.png":
+        if (
+            request.method == "PUT"
+            and request.url.path
+            == "/repos/o/r/contents/.swarmforge/evidence/work-light.png"
+        ):
             seen["put_json"] = json.loads(request.content)
             return httpx.Response(201, json={"content": {"sha": "abc"}})
         return httpx.Response(404, json={})
@@ -130,10 +141,17 @@ def test_upload_pr_asset_commits_to_branch_and_returns_raw_url(tmp_path):
     client = _client(handler)
     client.token = "tok"  # simulate an available token
     url = client.upload_pr_asset("o", "r", 41, png)
-    assert url == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    assert (
+        url
+        == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    )
     assert seen["calls"] == [
         ("GET", "/repos/o/r/pulls/41", None),
-        ("GET", "/repos/o/r/contents/.swarmforge/evidence/work-light.png", "sf/feature"),
+        (
+            "GET",
+            "/repos/o/r/contents/.swarmforge/evidence/work-light.png",
+            "sf/feature",
+        ),
         ("PUT", "/repos/o/r/contents/.swarmforge/evidence/work-light.png", None),
     ]
     assert seen["put_json"]["branch"] == "sf/feature"
@@ -158,7 +176,10 @@ def test_upload_pr_asset_updates_existing_file_with_sha(tmp_path):
     client = _client(handler)
     client.token = "tok"
     url = client.upload_pr_asset("o", "r", 41, png)
-    assert url == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    assert (
+        url
+        == "https://raw.githubusercontent.com/o/r/sf/feature/.swarmforge/evidence/work-light.png"
+    )
     assert seen["put_json"]["sha"] == "oldsha"
 
 
