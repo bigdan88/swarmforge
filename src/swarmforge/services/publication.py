@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -152,6 +153,10 @@ class PublicationService:
         """Upload the run's dashboard screenshots as PR assets and append them to the draft PR body.
         Best effort: any problem is logged as a warning and never affects the PR itself."""
         run = self.store.get_run(self.run_id) or {}
+        branch = run.get("integration_branch") or getattr(self.ws, "integration_branch", None)
+        if not branch:
+            self.log("evidence", "screenshot upload skipped: no integration branch", level="warn")
+            return
         try:
             from .. import evidence
         except Exception as e:  # noqa: BLE001 - evidence support is optional
@@ -177,7 +182,7 @@ class PublicationService:
                 if not p.is_file():
                     continue
                 try:
-                    asset = await asyncio.to_thread(gh.upload_pr_asset, owner, name, number, p)
+                    asset = await asyncio.to_thread(gh.upload_pr_asset, owner, name, branch, p)
                 except Exception as e:  # noqa: BLE001 - one bad asset must not drop the rest
                     self.log("evidence", f"could not upload {p.name}: {type(e).__name__}: {e}",
                              level="warn")

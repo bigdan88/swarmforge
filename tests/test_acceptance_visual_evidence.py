@@ -29,9 +29,12 @@ class FakeGH:
         self.uploads: list[tuple] = []
         self.bodies: list[tuple] = []
 
-    def upload_pr_asset(self, owner, name, number, path):
-        self.uploads.append((owner, name, number, Path(path)))
-        return f"https://camo.example.com/{Path(path).name}"
+    def get_pr_body(self, owner, name, number):
+        return "ORIGINAL_BODY"
+
+    def upload_pr_asset(self, owner, name, branch, path):
+        self.uploads.append((owner, name, branch, Path(path)))
+        return f"https://raw.githubusercontent.com/o/r/{branch}/{Path(path).name}"
 
     def update_pr_body(self, owner, name, number, body):
         self.bodies.append((owner, name, number, body))
@@ -129,11 +132,13 @@ async def test_ui_plan_evidence_flows_into_report_and_pr_body(
     assert {p.name for _, _, _, p in gh.uploads} == {
         Path(s["file"]).name for s in orch._evidence_shots
     }
+    assert {b for _, _, b, _ in gh.uploads} == {"sf/result"}
     assert gh.bodies, "PR body must be updated with the evidence section"
     body = gh.bodies[0][3]
+    assert "ORIGINAL_BODY" in body  # appended to the live body, not rebuilt
     assert "📸 Visual evidence" in body
-    for _, _, _, p in gh.uploads:
-        assert f"(https://camo.example.com/{p.name})" in body
+    for _, _, b, p in gh.uploads:
+        assert f"(https://raw.githubusercontent.com/o/r/{b}/{p.name})" in body
     assert any(k == "evidence" and "attached" in m for k, m, lvl in svc._logs)
     dstore.close()
 
