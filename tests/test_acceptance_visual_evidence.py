@@ -155,3 +155,47 @@ async def test_attach_evidence_skips_missing_files_without_error(tmp_path):
     )  # must not raise
     assert not gh.uploads and not gh.bodies
     store.close()
+
+
+async def test_attach_evidence_patches_live_pr_body_and_tolerates_bad_uploads(tmp_path):
+    """Reviewer fix: the evidence section must be appended to the PR's *live* body
+    (manual edits preserved, never rebuilt from scratch), and a single failed
+    asset upload must not drop the remaining screenshots or the section."""
+    run_dir = tmp_path / "run"
+    out = run_dir / "evidence"
+    out.mkdir(parents=True)
+    shots = []
+    for t in ("work", "review"):
+        p = out / f"{t}-light.png"
+        p.write_bytes(b"\x89PNG fake")
+        shots.append({"tab": t, "theme": "light", "file": str(p)})
+    evidence.write_manifest(out, shots)
+    store = _delivery_store(tmp_path, run_dir)
+
+    class LiveGH(FakeGH):
+        def __init__(self):
+            super().__init__()
+            self.fetched = []
+
+        def get_pr_body(self, owner, name, number):
+            self.fetched.append((owner, name, number))
+            return "MANUAL EDIT: please keep this line."
+
+        def upload_pr_asset(self, owner, name, number, path):
+            if Path(path).name == "work-light.png":
+                raise RuntimeError("boom")
+            return super().upload_pr_asset(owner, name, number, path)
+
+    gh = LiveGH()
+    svc = _service(store, run_dir)
+    await svc._attach_evidence(gh, "o", "r", "https://github.com/o/r/pull/7")
+    assert gh.fetched == [("o", "r", 7)], "the live PR body must be fetched before patching"
+    assert gh.bodies, "the evidence section must still be appended"
+    body = gh.bodies[0][3]
+    assert "MANUAL EDIT: please keep this line." in body, "manual edits must be preserved"
+    assert "📸 Visual evidence" in body
+    assert "review" in body and "work-light.png" not in body
+    assert any(k == "evidence" and lvl == "warn" for k, m, lvl in svc._logs), (
+        "the failed upload must be logged as a warning, not raise"
+    )
+    store.close()
