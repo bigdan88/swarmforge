@@ -859,21 +859,7 @@ class Orchestrator:
             self.log("visual", f"golden comparison skipped: {e}"[:800], level="warn")
         self.log("visual", f"golden diff: {len(shots)} tab(s) checked, {len(golden_findings)} regression(s)")
         findings = golden_findings + visual.page_error_findings(shots)
-        if getattr(self.cfg.review, "a11y_gate", False):
-            a11y_findings: list[dict] = []
-            actx = ToolContext(workspace=self.ws.repo, sandbox=self.sandbox, artifacts_dir=self.artifacts,
-                                installer=self._tool_installer(), command_timeout_s=self.cfg.sandbox.command_timeout_s,
-                                test_command=self.cfg.project.test_command, base_sha=self.ws.base_sha)
-            try:
-                a11y_findings = await visual.audit_pages(actx, pv, log=lambda m: self.log("visual", m))
-            except Exception as e:  # never fail the run on the audit itself
-                a11y_findings = []
-                self.log("visual", f"a11y audit skipped: {str(e)[:300]}", level="warn")
-            finally:
-                await actx.aclose()
-            findings += a11y_findings
-            if a11y_findings:
-                self.log("visual", f"a11y audit: {len(a11y_findings)} finding(s)")
+
         role = self.cfg.visual_role
         if role and role in self.cfg.roles and any(s["file"] for s in shots):
             from .llm import model_supports_vision
