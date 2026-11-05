@@ -474,8 +474,11 @@ If a retry can fix the failure, SwarmForge **heals itself**:
   attempt, plus one more repair cycle.
 * It never retries problems a human must fix first, such as Docker being down, a missing key or
   a bad repository.
-* Retries are capped by *Auto-fix attempts* (default 2, settable per task) and by a total budget
-  of 3x the task's budget. See `self_heal:` in `swarmforge.example.yaml`.
+* Retries are capped by *Auto-fix attempts* (default 2, settable per task), by a total budget
+  of 3x the task's budget (`self_heal.max_total_budget_usd`) and by a total wall-clock of 3x the
+  run's time limit (`self_heal.max_total_runtime_s`, seconds; 0 = the default 3x). When a cap is
+  reached, the failure records "not retried: self-healing budget/time cap reached" instead of
+  launching another attempt. See `self_heal:` in `swarmforge.example.yaml`.
 
 On the Work page, a task that healed itself shows as "Done (fixed itself, attempt N)". Its earlier
 attempts are listed under Failures.
