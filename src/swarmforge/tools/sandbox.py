@@ -132,6 +132,7 @@ class ChatSandboxTools:
                         "--line-number",
                         "--color",
                         "never",
+                        "--threads=1",
                         "--",
                         pattern,
                         str(target),
@@ -142,12 +143,12 @@ class ChatSandboxTools:
                     timeout=30,
                     check=False,
                 )
-            except subprocess.TimeoutExpired as e:
-                raise SandboxToolError(f"grep timed out: {e}") from e
+            except subprocess.TimeoutExpired:
+                return self._python_grep(pattern, target, max_lines)
             if proc.returncode == 1:
                 return f"No matches for {pattern!r}"
             if proc.returncode > 1:
-                raise SandboxToolError(f"grep failed: {proc.stderr.strip()}")
+                return self._python_grep(pattern, target, max_lines)
             return self._truncate_lines(proc.stdout.splitlines(), pattern, max_lines)
         return self._python_grep(pattern, target, max_lines)
 

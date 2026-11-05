@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from .. import prompts
 from ..config import Config
 from ..db import Store
-from ..github import GitHubClient, GitHubError, Issue
+from ..github import GitHubClient, GitHubError, Issue, pr_number_from_url
 from ..llm import LLMClient, LLMError
 from ..report import build_pr_body
 from ..workspace import GitError, GitWorkspace
@@ -146,6 +148,71 @@ class PublicationService:
         self.log("merge", f"waiting for you to merge {info['url']}: {info.get('reason')}", level="warn")
 
 
+    async def _attach_evidence(self, gh: GitHubClient, owner: str, name: str, url: str,
+                               original_body: str | None = None) -> None:
+        """Upload the run's dashboard screenshots as PR assets and append them to the draft PR body.
+        Best effort: any problem is logged as a warning and never affects the PR itself."""
+        run = self.store.get_run(self.run_id) or {}
+        branch = run.get("integration_branch") or getattr(self.ws, "integration_branch", None)
+        if not branch:
+            self.log("evidence", "screenshot upload skipped: no integration branch", level="warn")
+            return
+        try:
+            from .. import evidence
+        except Exception as e:  # noqa: BLE001 - evidence support is optional
+            self.log("evidence", f"screenshot upload skipped: {type(e).__name__}: {e}", level="warn")
+            return
+        try:
+            shots = evidence.read_manifest(Path(run.get("run_dir") or ""))
+            if not shots:
+                return
+            if not gh.token:
+                self.log("evidence", "screenshot upload skipped: no GitHub token", level="warn")
+                return
+            number = pr_number_from_url(url)
+            if number is None:
+                self.log("evidence", f"cannot parse a PR number from {url}; skipping screenshots",
+                         level="warn")
+                return
+            lines = []
+            for s in shots:
+                p = Path(s["file"])
+                if not p.is_absolute():
+                    p = Path(run.get("run_dir") or ".") / p
+                if not p.is_file():
+                    continue
+                try:
+                    asset = await asyncio.to_thread(gh.upload_pr_asset, owner, name, branch, p)
+                except Exception as e:  # noqa: BLE001 - one bad asset must not drop the rest
+                    self.log("evidence", f"could not upload {p.name}: {type(e).__name__}: {e}",
+                             level="warn")
+                    continue
+                if not asset:
+                    self.log("evidence", f"upload of {p.name} returned no URL; skipping it", level="warn")
+                    continue
+                lines.append(f"![{s['tab']} — {s['theme']}]({asset})")
+            if not lines:
+                return
+            section = "## 📸 Visual evidence\n\n" + "\n".join(lines)
+            # Patch the PR's *live* body so manual edits made after the PR was
+            # created are preserved; only fall back to a rebuilt body when the
+            # live one cannot be fetched.
+            current = None
+            getter = getattr(gh, "get_pr_body", None)
+            if getter is not None:
+                try:
+                    current = await asyncio.to_thread(getter, owner, name, number)
+                except Exception as e:  # noqa: BLE001 - fall back to the original body
+                    self.log("evidence", f"could not fetch the PR body: {type(e).__name__}: {e}",
+                             level="warn")
+            if not current:
+                current = original_body or build_pr_body(self.store, self.run_id)
+            body = current.rstrip() + "\n\n" + section
+            await asyncio.to_thread(gh.update_pr_body, owner, name, number, body)
+            self.log("evidence", f"attached {len(lines)} dashboard screenshot(s) to {url}")
+        except Exception as e:  # noqa: BLE001 - never let evidence problems break publication
+            self.log("evidence", f"screenshot upload skipped: {type(e).__name__}: {e}", level="warn")
+
     async def publish(self, gh: GitHubClient, owner: str, name: str) -> str | None:
         issue, ws = self.issue, self.ws
         project_item = self.store._one("SELECT project_id FROM queue_items WHERE run_id=? AND project_id IS NOT NULL", (self.run_id,))
@@ -175,6 +242,7 @@ class PublicationService:
         title = f"[SwarmForge] {issue.title}" + (f" (#{issue.number})" if issue.number else "")
         url = await asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
                                       ws.base_branch, title, body)
+        await self._attach_evidence(gh, owner, name, url, original_body=body)
         self.store.update_run(self.run_id, pr_url=url)
         self.log("pr", f"draft pull request: {url}")
         return url
