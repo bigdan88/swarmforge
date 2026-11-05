@@ -21,6 +21,7 @@ from typing import Callable
 import yaml
 
 from . import prompts
+from . import evidence
 from .agent.runtime import AgentResult, AgentSpec, run_agent
 from .agent.navtools import NAV_READONLY, NAV_TOOLS
 from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext, ToolError
@@ -86,6 +87,8 @@ class Orchestrator:
         self._llm_transport = llm_transport
         self._integration_lock = asyncio.Lock()
         self._conflicts_used = 0
+        self._evidence_done = False
+        self._evidence_shots: list[dict] = []
         self.run_id: str | None = None
 
     # ================================================================ logging
@@ -178,6 +181,7 @@ class Orchestrator:
                     await asyncio.wait_for(self._capture_knowledge(), timeout=900)
                 except Exception as e:  # knowledge capture must never change the run outcome
                     self.log("knowledge", f"knowledge capture failed: {type(e).__name__}: {e}", level="warn")
+            await self._collect_evidence()  # no-op when already collected on the COMPLETED path
             try:
                 path = write_report(self.store, self.run_id, self.run_dir)
                 self.log("report", f"execution report written to {path}")
@@ -957,8 +961,45 @@ class Orchestrator:
                            task_rows=self.store.tasks(self.run_id), scope=self._repair_scope(),
                            visual_findings=getattr(self, "_visual_findings", []), policy=self.cfg.review)
 
+    # =========================================================== visual evidence
+    async def _collect_evidence(self) -> None:
+        """Capture dashboard screenshots for UI-touching plans at run end.
+
+        Idempotent and failure-proof: the done-flag is set BEFORE any capture attempt
+        (never retry, even after a failure — this runs from both the COMPLETED path and
+        the FAILED/finally path) and every exception is swallowed with a warn event so
+        evidence problems can never change the run outcome.
+        """
+        if self._evidence_done:
+            return
+        self._evidence_done = True
+        try:
+            if self.ws is None:
+                self.log("evidence", "no workspace; skipping screenshots", level="warn")
+                return
+            if getattr(self, "plan", None):
+                files = evidence.plan_file_set(self.plan.tasks)
+            else:
+                changed = self.ws.changed_files
+                files = changed() if callable(changed) else changed
+            if not evidence.touches_ui(files):
+                self.log("evidence", "plan touches only non-UI modules; skipping dashboard screenshots")
+                return
+            tabs = evidence.tabs_for(files, failed=self.sm.state is not RunState.APPROVED)
+            out = Path(self.run_dir) / "evidence"
+            repo_dir = getattr(self.ws, "integration", None) or self.ws.repo
+            shots = await asyncio.wait_for(
+                asyncio.to_thread(evidence.collect, str(repo_dir), out, tabs=tabs),
+                timeout=evidence.MAX_CAPTURE_S)
+            self._evidence_shots = shots
+            self.log("evidence", f'captured {len(shots)} screenshot(s) for tabs '
+                                 f'{sorted({s["tab"] for s in shots})}', data=shots)
+        except Exception as e:  # evidence must never change the run outcome
+            self.log("evidence", f"evidence collection skipped: {type(e).__name__}: {e}", level="warn")
+
     # ================================================================ delivery
     async def _deliver(self) -> None:
+        await self._collect_evidence()  # manifest must exist before the PR is published
         issue = self.issue
         if self.mode == "single":
             self.sm.transition(RunState.COMPLETED, "single-agent run finished (no independent review, so no PR is created)")
