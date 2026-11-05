@@ -8,11 +8,14 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from .conftest import ISSUE
 from swarmforge import evidence
 from swarmforge.db import Store
+from swarmforge.github import Issue
 from swarmforge.orchestrator import Orchestrator
+from swarmforge.services.publication import PublicationService
 from swarmforge.state import RunState
+
+from .conftest import ISSUE
 
 
 def _orch(cfg, tmp_path) -> Orchestrator:
@@ -285,3 +288,121 @@ def test_deliver_and_finally_call_sites_exist():
     assert (
         full.count("await self._collect_evidence()") == 2
     )  # _deliver start + execute() finally
+
+
+# ------------------------------------------------ acceptance-mapped behaviour
+# These two node ids are the fixed AC3/AC4 anchors of the acceptance mapping.
+# They verify the same behaviour as the focused tests above, through the names
+# the criteria reference; renaming or removing them breaks the AC gate.
+
+
+async def test_no_screenshots_for_non_ui_plan(cfg, tmp_path, monkeypatch):
+    """AC3: a plan touching only non-UI modules (state.py, llm.py, ...) must not
+    trigger any dashboard screenshot capture and must write no evidence files."""
+    files = [
+        "src/swarmforge/state.py",
+        "src/swarmforge/llm.py",
+        "src/swarmforge/report.py",
+        "src/swarmforge/github.py",
+    ]
+    # pure-helper level: the file set is classified as non-UI
+    assert evidence.touches_ui(files) is False
+    assert evidence.tabs_for(files) == []
+
+    orch = _orch(cfg, tmp_path)
+    orch.sm = SimpleNamespace(state=RunState.APPROVED)
+    orch.ws = _stub_ws(tmp_path)
+    orch.plan = _stub_plan(files)
+
+    calls = []
+
+    def spy_collect(repo_dir, out_dir, *, tabs=None):
+        calls.append((repo_dir, out_dir, list(tabs or [])))
+        return []
+
+    monkeypatch.setattr(evidence, "collect", spy_collect)
+
+    await orch._collect_evidence()  # must not raise
+
+    assert calls == [], "capture must never be attempted for a non-UI plan"
+    assert orch._evidence_shots == []
+    assert not (tmp_path / "runs" / "test-evidence" / "evidence").exists()
+    assert any(
+        "non-UI" in e["message"] and "skipping" in e["message"] for e in _events(orch)
+    ), "the skip must be recorded as an evidence event"
+
+
+async def test_missing_github_token_skips_upload(cfg, tmp_path, monkeypatch):
+    """AC4: with screenshots captured but no GitHub token, the upload stage is
+    skipped with a logged warning; nothing raises and the run still completes."""
+    orch = _orch(cfg, tmp_path)
+    orch.sm = SimpleNamespace(state=RunState.APPROVED)
+    orch.ws = _stub_ws(tmp_path)
+    orch.plan = _stub_plan(["src/swarmforge/dashboard.py"])
+
+    def fake_collect(repo_dir, out_dir, *, tabs=None):
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        shots = []
+        for t in tabs or []:
+            p = out / f"{t}-light.png"
+            p.write_bytes(b"\x89PNG fake")
+            shots.append({"tab": t, "theme": "light", "file": str(p)})
+        evidence.write_manifest(out, shots)
+        return shots
+
+    monkeypatch.setattr(evidence, "collect", fake_collect)
+    await orch._collect_evidence()
+    assert orch._evidence_shots, "precondition: UI plan captured screenshots"
+
+    # the run row publication reads (same layout the orchestrator writes)
+    orch.store.create_run(
+        orch.run_id,
+        mode="swarm",
+        issue_title="T",
+        state="APPROVED",
+        run_dir=str(orch.run_dir),
+        base_branch="main",
+        integration_branch="sf/result",
+        config_json="{}",
+    )
+
+    class NoTokenGH:
+        token = ""  # GitHub token absent, exactly as in a token-less environment
+
+        def __init__(self):
+            self.calls = []
+
+        def get_pr_body(self, *a):
+            self.calls.append("get_pr_body")
+
+        def upload_pr_asset(self, *a):
+            self.calls.append("upload_pr_asset")
+            return "https://raw.githubusercontent.com/o/r/sf/result/x.png"
+
+        def update_pr_body(self, *a):
+            self.calls.append("update_pr_body")
+
+    gh = NoTokenGH()
+    svc = PublicationService(
+        cfg=None,
+        store=orch.store,
+        run_id=orch.run_id,
+        issue=Issue("T", "body"),
+        ws=None,
+        llm=None,
+        log=orch.log,  # warnings land in the orchestrator's own event store
+        update_base=None,
+        push=lambda *a, **k: None,
+    )
+
+    await svc._attach_evidence(  # must not raise: the run still completes
+        gh, "o", "r", "https://github.com/o/r/pull/7"
+    )
+
+    assert gh.calls == [], "no upload or body update may be attempted without a token"
+    warns = _events(orch, level="warn")
+    assert any("no GitHub token" in e["message"] for e in warns), (
+        "the skipped upload must be logged as a warning"
+    )
+    assert orch.sm.state is RunState.APPROVED  # run outcome untouched
