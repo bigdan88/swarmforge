@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from .conftest import ISSUE
 from swarmforge import evidence
 from swarmforge.db import Store
 from swarmforge.orchestrator import Orchestrator
@@ -122,7 +123,7 @@ async def test_collect_evidence_swallows_capture_exception(cfg, tmp_path, monkey
     assert orch._evidence_done is True
 
 
-async def test_collect_evidence_idempotent_single_capture(cfg, tmp_path, monkeypatch):
+async def test_collect_evidence_is_idempotent(cfg, tmp_path, monkeypatch):
     orch = _orch(cfg, tmp_path)
     orch.sm = SimpleNamespace(state=RunState.APPROVED)
     orch.ws = _stub_ws(tmp_path)
@@ -140,6 +141,64 @@ async def test_collect_evidence_idempotent_single_capture(cfg, tmp_path, monkeyp
     await orch._collect_evidence()  # second call is a no-op
 
     assert len(calls) == 1
+    # the done-flag is set before capture: a second call must never re-enter
+    assert orch._evidence_done is True
+    assert orch._evidence_shots
+
+
+async def test_collect_evidence_happy_path_sets_done_flag(cfg, tmp_path, monkeypatch):
+    orch = _orch(cfg, tmp_path)
+    orch.sm = SimpleNamespace(state=RunState.APPROVED)
+    orch.ws = _stub_ws(tmp_path)
+    orch.plan = _stub_plan(["src/swarmforge/dashboard.py"])
+
+    calls = []
+
+    def fake_collect(repo_dir, out_dir, *, tabs=None):
+        calls.append(1)
+        shots = [
+            {"tab": t, "theme": "light", "path": str(Path(out_dir) / f"{t}.png")}
+            for t in (tabs or [])
+        ]
+        evidence.write_manifest(out_dir, shots)
+        return shots
+
+    monkeypatch.setattr(evidence, "collect", fake_collect)
+
+    await orch._collect_evidence()
+
+    assert len(calls) == 1
+    assert orch._evidence_shots  # non-empty
+    assert orch._evidence_done is True
+    manifest = tmp_path / "runs" / "test-evidence" / "evidence" / "manifest.json"
+    assert manifest.exists()
+
+
+async def test_execute_finally_collects_evidence_on_failure_path(
+    cfg, tmp_path, monkeypatch
+):
+    cfg.self_heal.diagnose = False  # rules-only post-mortem: no model call in this test
+    store = Store(cfg.db_path)
+    orch = Orchestrator(cfg, store, mode="single", echo=None, llm_transport=None)
+
+    async def boom_pipeline(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(Orchestrator, "_pipeline", boom_pipeline)
+
+    calls = []
+
+    async def spy_evidence():
+        calls.append(1)
+
+    orch._collect_evidence = (
+        spy_evidence  # instance attribute: the finally hits the spy
+    )
+
+    run_id = await orch.execute(issue_file=str(ISSUE), repo=str(tmp_path / "nope"))
+
+    assert len(calls) == 1  # evidence collection reached on the FAILED path
+    assert store.get_run(run_id)["state"] == "FAILED"
 
 
 async def test_collect_evidence_timeout_is_swallowed(cfg, tmp_path, monkeypatch):
