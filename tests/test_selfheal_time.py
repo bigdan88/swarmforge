@@ -1,13 +1,16 @@
 import time
+from pathlib import Path
+
+import yaml
 
 from swarmforge.config import ConfigError, SelfHealConfig, parse_config
 from swarmforge.db import Store
 from swarmforge.postmortem import escalate, heal
 
-from .conftest import base_raw
+from .conftest import ROOT, base_raw
 
 
-async def test_escalate_time_cap_clamps(cfg):
+async def test_escalate_time_cap_clamps_runtime_and_role_timeouts(cfg):
     cfg.limits.max_runtime_s = 3600
     c = escalate(cfg, 2, time_cap=1800)
     assert c.limits.max_runtime_s == 1800  # escalated would be int(3600 * 1.5**2) = 8100
@@ -16,7 +19,7 @@ async def test_escalate_time_cap_clamps(cfg):
     assert escalate(cfg, 2).limits.max_runtime_s == 8100
 
 
-async def test_heal_time_cap_blocks_attempt(cfg):
+async def test_heal_time_cap_blocks_and_records_outcome(cfg):
     store = Store(cfg.db_path)
     now = time.time()
     store.create_run("r-time", budget_usd=5, max_runtime_s=3600, state="FAILED",
@@ -36,7 +39,7 @@ async def test_heal_time_cap_blocks_attempt(cfg):
     assert "not retried: self-healing time cap 1.0h reached" in store.failure("r-time")["outcome"]
 
 
-async def test_heal_time_cap_default_is_3x_first_run(cfg):
+async def test_heal_time_cap_default_is_3x_runtime(cfg):
     store = Store(cfg.db_path)
     now = time.time()
     cfg.self_heal.max_total_runtime_s = 0  # default: 3x the first run's max_runtime_s
@@ -83,3 +86,45 @@ def test_config_validation_max_total_runtime_s(tmp_path):
     except ConfigError as e:
         assert "max_total_runtime_s" in str(e)
     assert SelfHealConfig().max_total_runtime_s == 0
+
+
+async def test_heal_echo_reports_time_cap_clamp(cfg):
+    store = Store(cfg.db_path)
+    now = time.time()
+    cfg.limits.max_runtime_s = 3600
+    cfg.self_heal.max_total_runtime_s = 0  # default: 3x the first run's max_runtime_s
+    cfg.self_heal.max_attempts = 2
+    store.create_run("r-echo", budget_usd=5, max_runtime_s=3600, state="FAILED",
+                     state_reason="maximum runtime exceeded")
+    store.update_run("r-echo", created_at=now - 10100, finished_at=now - 100)  # elapsed 10000
+    store.failure_save("r-echo", category="time_limit", retry=1, root_cause="x", fix="y")
+
+    async def launch(c, seed, ctx, heal_of, attempt):
+        store.create_run("r-echo-next", budget_usd=5, max_runtime_s=c.limits.max_runtime_s,
+                          state="COMPLETED")
+        return "r-echo-next"
+
+    lines = []
+    await heal(cfg, store, "r-echo", launch, echo=lines.append)
+    assert len(lines) == 1
+    echo = lines[0]
+    assert "clamped" in echo
+    assert "0.2 h" in echo  # the clamped runtime (800 s left)
+    assert "3.0 h" in echo  # the chain cap it was clamped against
+    events = [e for e in store.events("r-echo") if e["kind"] == "selfheal"]
+    assert events and "clamped" in events[0]["message"]
+
+
+def test_example_yaml_documents_max_total_runtime_s():
+    raw = yaml.safe_load((ROOT / "swarmforge.example.yaml").read_text(encoding="utf-8"))
+    assert raw["self_heal"]["max_total_runtime_s"] == 0
+    yaml_text = (ROOT / "swarmforge.example.yaml").read_text(encoding="utf-8")
+    line = next(
+        l for l in yaml_text.splitlines() if l.strip().startswith("max_total_runtime_s:")
+    )
+    assert "#" in line and "3x" in line  # documented with the default semantics
+
+    readme = (Path(ROOT) / "README.md").read_text(encoding="utf-8")
+    section = readme.split("## Failures and self-healing", 1)[1].split("\n## ", 1)[0]
+    assert "self_heal.max_total_runtime_s" in section
+    assert "3x" in section
