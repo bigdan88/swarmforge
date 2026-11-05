@@ -1338,11 +1338,23 @@ def _short_result(text: str) -> str:
     return t[:120]
 
 
+def _recovery_pr(item: dict | None) -> str | None:
+    if item and item.get("project_id") and item["status"] in ("failed", "cancelled"):
+        match = re.search(r"(?:Recovered in|Superseded by) verified recovery PR (https://github\.com/[\w.-]+/[\w.-]+/pull/\d+)", item.get("note") or "")
+        if match:
+            return match[1]
+    return None
+
+
 def _cells(w: dict, costs: dict[str, float]) -> dict:
     r, i = w["run"], w["item"]
     now = ""
     pr = re.search(r"/pull/(\d+)", (r.get("pr_url") or r.get("state_reason") or "")) if r else None
-    if pr and w["group"] == "done":
+    recovery = _recovery_pr(i)
+    if recovery:
+        label = "Superseded by" if i["status"] == "cancelled" else "Recovered in"
+        now = f"{label} PR #{recovery.rsplit('/', 1)[-1]}"
+    elif pr and w["group"] == "done":
         now = f"PR #{pr.group(1)}" + (f" · {w['merge']}" if w.get("merge") else "")
     elif w["group"] == "active" and r and (r["state_reason"] or "").startswith("waiting for the repository"):
         now = r["state_reason"][:120]
@@ -1802,6 +1814,8 @@ def item_detail(w: dict, every) -> None:
     st.caption(" · ".join(bits))
     if blocker := w.get("waiting_on"):
         st.info(f"Waiting for task #{blocker['id']} to leave this queue slot. {blocker['title']}")
+    if recovery := _recovery_pr(i):
+        st.link_button("View merged recovery PR", recovery)
     if i and i["status"] != "queued":
         extra = []
         if i["base_branch"]:
