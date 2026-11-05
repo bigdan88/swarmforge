@@ -148,6 +148,33 @@ class GitHubClient:
             raise GitHubError(f"creating draft PR failed: HTTP {r.status_code} {r.text[:500]}")
         return r.json()["html_url"]
 
+    def upload_pr_asset(self, owner: str, repo: str, pr_number: int, path: str | Path) -> str:
+        """Upload a file (e.g. a screenshot PNG) as an asset on a PR. Returns its URL."""
+        if not self.token:
+            raise GitHubError(f"no GitHub token ({self.cfg.token_env}) available")
+        path = Path(path)
+        r = self._client.post(
+            f"/repos/{owner}/{repo}/issues/{pr_number}/assets",
+            files={"file": (path.name, path.read_bytes(), "image/png")})
+        if r.status_code >= 400:
+            raise GitHubError(f"uploading PR asset failed: HTTP {r.status_code} {r.text[:300]}")
+        data = r.json()
+        return data.get("url") or data.get("href") or ""
+
+    def update_pr_body(self, owner: str, repo: str, pr_number: int, body: str) -> None:
+        """Replace the body of an existing pull request."""
+        if not self.token:
+            raise GitHubError(f"no GitHub token ({self.cfg.token_env}) available")
+        r = self._client.patch(f"/repos/{owner}/{repo}/pulls/{pr_number}", json={"body": body})
+        if r.status_code >= 400:
+            raise GitHubError(f"updating PR body failed: HTTP {r.status_code} {r.text[:300]}")
+
+
+def pr_number_from_url(url: str) -> int | None:
+    """Extract the PR number from a .../pull/N URL; None when it is not one."""
+    m = re.search(r"/pull/(\d+)", str(url))
+    return int(m.group(1)) if m else None
+
 
 def check_branch_safe(branch: str, default_branch: str, prefix: str) -> None:
     if not branch.startswith(prefix):
