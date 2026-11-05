@@ -2,6 +2,7 @@
 
 import asyncio
 import shutil
+import subprocess
 import sys
 import time
 
@@ -186,3 +187,45 @@ def test_chat_command_cannot_modify_project_in_docker(tmp_path):
     )
     assert "[exit 0" not in output
     assert original.read_text() == "keep me"
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+def test_grep_rg_runs_single_threaded(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="code.py:2:beta\n", stderr=""
+        )
+
+    monkeypatch.setattr("swarmforge.tools.sandbox.subprocess.run", fake_run)
+    tools = make_tools(tmp_path)
+    (tmp_path / "code.py").write_text("alpha\nbeta\n")
+    out = tools.grep("beta")
+    assert "--threads=1" in captured["argv"]
+    assert "code.py:2:beta" in out
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+def test_grep_rg_timeout_falls_back_to_python_grep(tmp_path, monkeypatch):
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 30)
+
+    monkeypatch.setattr("swarmforge.tools.sandbox.subprocess.run", fake_run)
+    tools = make_tools(tmp_path)
+    (tmp_path / "code.py").write_text("alpha\nbeta\n")
+    out = tools.grep("beta")
+    assert "code.py:2:beta" in out
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+def test_grep_rg_error_exit_falls_back_to_python_grep(tmp_path, monkeypatch):
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 101, stdout="", stderr="panic")
+
+    monkeypatch.setattr("swarmforge.tools.sandbox.subprocess.run", fake_run)
+    tools = make_tools(tmp_path)
+    (tmp_path / "code.py").write_text("alpha\nbeta\n")
+    out = tools.grep("beta")
+    assert "code.py:2:beta" in out
