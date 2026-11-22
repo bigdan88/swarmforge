@@ -36,7 +36,8 @@ def test_chat_page_renders(tmp_path, monkeypatch):
     assert not at.exception, [e.value for e in at.exception]
     assert any(b.key == "nav_chat" for b in at.button)
     _open_chat(at)
-    assert any("Chat: improve SwarmForge and fix failed tasks" in h.value for h in at.header)
+    assert not at.header  # no page header: the transcript gets the height
+    assert any(b.key == "chat_new" for b in at.button) and any(b.key == "chat_project" for b in at.button)
     assert len(at.chat_input) == 1
     assert any(b.key == "chat_reset" for b in at.button)
 
@@ -217,7 +218,7 @@ def test_chat_uploads_attachments_and_renders_them(tmp_path, monkeypatch):
     names = {Path(p).name for p in atts}
     assert names == {"pic.png", "notes.txt"}
     # the transcript renders an image thumbnail and a chip with the .txt name
-    assert len(at.image) == 1
+    assert len(at.main.image) == 1
     texts = [m.value for m in at.markdown]
     assert any("notes.txt" in t for t in texts)
     assert any("**2 attachments** seen." in t for t in texts)
@@ -241,7 +242,7 @@ def test_chat_without_uploads_calls_ask_without_attachments_kwarg(tmp_path, monk
     assert len(calls) == 1
     assert "attachments" not in calls[0]["kw"]  # today's exact call signature
     assert calls[0]["kw"].get("conversation")
-    assert len(at.image) == 0
+    assert len(at.main.image) == 0
     assert at.session_state["chat_history"][0].get("attachments") is None
 
 

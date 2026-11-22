@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .config import Config
 from .db import Store
+from .execution import external_once
 from .github import GitHubClient, push_branch
 from .report import build_pr_body, write_report
 
@@ -45,12 +46,14 @@ async def publish_run(cfg: Config, store: Store, run_id: str, approve) -> int:
         print("declined")
         return 1
     repo_dir = Path(run["run_dir"]) / "repo"
-    await asyncio.to_thread(push_branch, repo_dir, owner, repo, run["integration_branch"], gh.token,
-                            run["base_branch"], cfg.github.branch_prefix)
+    await external_once(store, run_id, f"push:{owner}/{repo}:{run['integration_branch']}",
+                        lambda: asyncio.to_thread(push_branch, repo_dir, owner, repo, run["integration_branch"], gh.token,
+                                                  run["base_branch"], cfg.github.branch_prefix), enforce_allowance=False)
     issue_title = run["issue_title"] or "SwarmForge change"
-    url = gh.create_draft_pr(owner, repo, run["integration_branch"], run["base_branch"],
-                             f"[SwarmForge] {issue_title}" + (f" (#{run['issue_number']})" if run["issue_number"] else ""),
-                             build_pr_body(store, run_id))
+    url = await external_once(store, run_id, f"pr:{owner}/{repo}:{run['integration_branch']}",
+                              lambda: asyncio.to_thread(gh.create_draft_pr, owner, repo, run["integration_branch"], run["base_branch"],
+                                                        f"[SwarmForge] {issue_title}" + (f" (#{run['issue_number']})" if run["issue_number"] else ""),
+                                                        build_pr_body(store, run_id)), enforce_allowance=False)
     store.update_run(run_id, pr_url=url, state_reason=f"draft PR created: {url}")
     store.event(run_id, "pr", f"draft pull request (manual publish): {url}")
     write_report(store, run_id, Path(run["run_dir"]))

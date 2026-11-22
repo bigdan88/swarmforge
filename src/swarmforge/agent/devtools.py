@@ -108,6 +108,12 @@ class DockerSession(Session):
                                             timeout=timeout_s)
             return CommandResult(command, p.returncode, _truncate(out.decode(errors="replace")),
                                  time.time() - start)
+        except asyncio.CancelledError:
+            await self.close()
+            if p.returncode is None:
+                p.kill()
+            await p.wait()
+            raise
         except asyncio.TimeoutError:
             p.kill()
             return CommandResult(command, 124, "", time.time() - start, timed_out=True)
@@ -127,6 +133,12 @@ class DockerSession(Session):
             out, _ = await asyncio.wait_for(p.communicate(), timeout=timeout_s)
             return CommandResult(" ".join(argv[:3]), p.returncode, _truncate(out.decode(errors="replace")),
                                  time.time() - start)
+        except asyncio.CancelledError:
+            await self.close()
+            if p.returncode is None:
+                p.kill()
+            await p.wait()
+            raise
         except asyncio.TimeoutError:
             p.kill()
             return CommandResult(" ".join(argv[:3]), 124, "", time.time() - start, timed_out=True)
@@ -190,15 +202,20 @@ class LocalSession(Session):
 
     async def exec(self, command, *, timeout_s=60, stdin=None, env=None):
         start = time.time()
+        kw = {"start_new_session": True} if sys.platform != "win32" else {}
         p = await asyncio.create_subprocess_shell(
             command, cwd=str(self.workspace), env=self._env(env),
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, **kw)
         try:
             out, _ = await asyncio.wait_for(p.communicate(stdin.encode() if stdin is not None else None),
                                             timeout=timeout_s)
             return CommandResult(command, p.returncode, _truncate(out.decode(errors="replace")),
                                  time.time() - start)
+        except asyncio.CancelledError:
+            _kill_tree(p)
+            await p.wait()
+            raise
         except asyncio.TimeoutError:
             _kill_tree(p)
             return CommandResult(command, 124, "", time.time() - start, timed_out=True)

@@ -394,3 +394,21 @@ def test_work_list_folds_repeated_attempts_into_one_row(tmp_path, monkeypatch):
     assert not any("queue tasks done" in t for t in texts)
     at.toggle(key="w_all").set_value(True).run()
     assert len([b for b in at.button if (b.key or "").startswith("op_")]) == 3
+
+
+def test_queued_task_keeps_the_chosen_model_team(tmp_path, monkeypatch, sample_repo):
+    from .conftest import ROOT
+    cfg = _write_cfg(tmp_path, monkeypatch)
+    Store(cfg.db_path).remember_repo(str(sample_repo))
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    _go(at, "New task")
+    at.radio(key="nt_how").set_value("Add to the queue").run()
+    picker = at.selectbox(key="qi_team")
+    assert {"", "chinese", "american-premium", "american-open"} <= set(picker.options) | {""}
+    at.text_input(key="qi_path").input(str(ROOT / "docs" / "SELF_IMPROVEMENT_BACKLOG.md")).run()
+    at.selectbox(key="qi_repo").set_value(str(sample_repo)).run()
+    at.selectbox(key="qi_team").set_value("american-open").run()
+    next(b for b in at.button if b.label == "Import into queue").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert {i["team"] for i in Store(cfg.db_path).queue_items()} == {"american-open"}

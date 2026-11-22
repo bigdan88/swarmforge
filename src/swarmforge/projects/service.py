@@ -18,13 +18,17 @@ def lane(pid):
     return "project-" + pid
 
 
-def approve(store, pid):
+def approve(store, pid, *, expected_spec=None):
     ps = Projects(store)
     with store._lock, store.conn:
         store.conn.execute("BEGIN IMMEDIATE")
         p = ps.get(pid)
         if p["status"] != "drafting":
             raise ProjectError("This project has already been launched")
+        if expected_spec is not None:
+            import hashlib
+            if expected_spec != hashlib.sha256(p["spec"].encode()).hexdigest():
+                raise ProjectError("The spec changed. Reload and review before launching.")
         validate(p["definition"])
         if any(x["id"] != pid and x["repo"].lower() == p["repo"].lower() and x["status"] not in ("drafting", "done", "cancelled") for x in ps.list()):
             raise ProjectError("Another active project owns this repository; finish or cancel it first")
@@ -131,9 +135,16 @@ def can_start(store, item):
     p = ps.get(item["project_id"])
     if p["status"] != "running" or not p["observed_sha"] or item["milestone"] != p["current_milestone"]:
         return False
+    if store._one("SELECT project_id FROM project_lead_claims WHERE project_id=?", (p["id"],)):
+        return False
     queued = [q for q in ps.items(p["id"]) if q["status"] == "queued" and q["milestone"] == p["current_milestone"]]
     if item.get("queue") != lane(p["id"]) or not queued or queued[0]["id"] != item["id"]:
         return False
+    dependencies = json.loads(item.get("depends_on") or "[]")
+    for key in dependencies:
+        matches = [q for q in ps.items(p["id"]) if q["milestone"] == item["milestone"] and q["project_key"] == key]
+        if not matches or not (matches[-1].get("merged_sha") or matches[-1]["status"] == "done" and matches[-1]["mode"] == "single" and matches[-1]["project_processed"]):
+            return False
     return not any(q["id"] != item["id"] and (q["status"] == "running" or (q["status"] in ("done", "failed", "cancelled") and not q["project_processed"])) for q in ps.items(p["id"]))
 
 
@@ -234,6 +245,26 @@ def checkpoint(store, p, reason):
 
 
 async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None):
+    from .decisions import LeadTurn
+    turn = LeadTurn.claim(store, pid)
+    if turn is None:
+        return
+    try:
+        return await _advance(cfg, store, pid, repository=repository, ask=ask, transport=transport, turn=turn)
+    except BaseException as exc:
+        turn.mark("failed", {"error": f"{type(exc).__name__}: {exc}"})
+        ps = Projects(store)
+        current = ps.get(pid)
+        if current["status"] == "running":
+            stop(ps, current, f"Project lead stopped: {type(exc).__name__}: {exc}. Review the saved decision before resuming.",
+                 {"decision_id": turn.decision_id, "error": str(exc)})
+        raise
+    finally:
+        turn.mark("superseded", {"reason": "A current-state guard prevented applying this proposal"})
+        turn.release()
+
+
+async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None, turn):
     ps = Projects(store)
     p = ps.get(pid)
     if p["status"] != "running":
@@ -252,9 +283,12 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
         if any(q["status"] == "running" for q in items):
             return
         progress = False
+        recovery_lineages = {q["execution_id"] for q in items
+                             if q["status"] in ("queued", "tentative") and q.get("execution_id")}
         for q in items:
             if q["project_processed"] or q["status"] not in ("done", "failed", "cancelled"):
                 continue
+            run = store.get_run(q["run_id"]) if q.get("run_id") else None
             if q["status"] == "done":
                 run = store.get_run(q["run_id"]) if q.get("run_id") else None
                 if q["mode"] == "single" and q["project_key"].startswith("spike:"):
@@ -293,18 +327,39 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
                 progress = True
             else:
                 store.queue_update(q["id"], project_processed=1)
+                if run and run.get("execution_id"):
+                    recovery_lineages.add(run["execution_id"])
+                if run and run.get("stop_kind"):
+                    from ..execution import snapshot as execution_snapshot
+                    allowance = execution_snapshot(store, run["id"])
+                    exhausted_recovery = run["stop_kind"] in ("stalled", "lost_worker") and allowance and allowance["recoveries"] >= allowance["max_recoveries"]
+                    if run["stop_kind"] in ("cancelled", "allowance_exhausted", "external_uncertain") or exhausted_recovery:
+                        stop(ps, p, "Task execution stopped: review its retained evidence and allowance before continuing.",
+                             {"task": q["project_key"], "run_id": run["id"], "stop_kind": run["stop_kind"], "reason": run.get("state_reason")})
+                        return
                 failures = sum(x["project_key"] == q["project_key"] and (x["status"] == "failed" or (x["status"] == "cancelled" and bool(x.get("run_id")))) for x in ps.items(pid))
                 if failures >= cfg.projects.escalate_failures:
                     stop(ps, p, "The same problem has failed three times. Propose a correction before resuming.", {"task": q["project_key"], "failures": failures})
                     return
                 if failures < cfg.projects.max_task_failures:
                     store._exec("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
-                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + str(q.get("note")), p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=q.get("seed_run_id"))
+                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + str(q.get("note")), p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=q.get("seed_run_id"), execution_id=(run or {}).get("execution_id"))
                     from ..runqueue import set_lane_paused
                     set_lane_paused(store, lane(pid), False)
                     return
                 progress = True
         spent = ps.spent(pid)
+        if len(recovery_lineages) > 1:
+            stop(ps, p, "The replacement plan spans multiple task allowances. Review its scope before continuing.",
+                 {"execution_ids": sorted(recovery_lineages)})
+            return
+        recovery_lineage = next(iter(recovery_lineages), None)
+        if recovery_lineage:
+            allowance = store._one("SELECT deadline,budget_usd,spent_usd FROM execution_allowances WHERE id=?", (recovery_lineage,))
+            if allowance and (time.time() >= allowance["deadline"] or allowance["spent_usd"] >= allowance["budget_usd"]):
+                stop(ps, p, "The task's shared allowance is exhausted. Review its scope and retained evidence before replanning.",
+                     {"execution_id": recovery_lineage})
+                return
         ms = ps.milestones(pid)[p["current_milestone"]]
         mspent = ps.spent(pid, p["current_milestone"])
         if spent >= p["budget_usd"] or mspent >= ms["estimate_usd"] * cfg.projects.escalate_budget_factor:
@@ -337,22 +392,35 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
             run = store.get_run(landed["run_id"])
             if run and run.get("pr_url"):
                 context["latest_diff"] = await asyncio.to_thread(repo.change, run["pr_url"])
-        proposal = None
-        for attempt in range(2):
-            store.kv_set(activity_key, "Planning the next tasks" if p["observed_sha"] else "Planning the first tasks")
-            result = await ask(cfg, store, p, lead.LEAD, context, transport)
-            try:
-                proposal = validate_plan(p, result, cfg.projects.horizon)
-                if result["action"] == "checkpoint" and any(c["status"] == "failed" for c in context["verification"]):
-                    raise ProjectError("Milestone checks failed; schedule repairs instead of declaring completion")
-                break
-            except ProjectError as e:
-                proposal = None
-                ps.event(pid, "proposal_rejected", {"reason": str(e)})
-                context["rejected_proposal"] = result
-                context["correction_required"] = str(e)
-        if proposal is None:
-            raise ProjectError("Lead returned two invalid proposals. Retry after correcting the model configuration.")
+        from .actions import ActionKind
+        from .decisions import choose_action
+        store.kv_set(activity_key, "Choosing the next bounded project action")
+        selected = await choose_action(cfg, store, p, repo, snapshot, ps.items(pid), context, ask, transport,
+                                       turn, validate_plan,
+                                       lambda message, detail, **journal: stop(ps, ps.get(pid), message, detail, turn=turn if journal else None, **journal))
+        if selected is None:
+            return
+        action, result, proposal = selected
+        from ..execution import ensure_allowance
+        for task in action.tasks:
+            for target_id in task.replaces:
+                target = next(q for q in ps.items(pid) if q["id"] == target_id)
+                target_run = store.get_run(target["run_id"]) if target.get("run_id") else None
+                inherited = target.get("execution_id") or (ensure_allowance(store, target_run["id"], cfg,
+                            target_run.get("heal_of") or target_run.get("retry_of") or target_run.get("seed_run_id")) if target_run else None)
+                if inherited:
+                    recovery_lineages.add(inherited)
+        if len(recovery_lineages) > 1:
+            turn.mark("blocked", {"error": "Replacement targets span multiple task allowances"})
+            stop(ps, p, "Replacement targets span multiple task allowances. Review the saved decision before continuing.", {"decision_id": turn.decision_id})
+            return
+        recovery_lineage = next(iter(recovery_lineages), None)
+        if recovery_lineage:
+            allowance = store._one("SELECT deadline,budget_usd,spent_usd,cancelled FROM execution_allowances WHERE id=?", (recovery_lineage,))
+            if allowance and (allowance["cancelled"] or time.time() >= allowance["deadline"] or allowance["spent_usd"] >= allowance["budget_usd"]):
+                turn.mark("blocked", {"error": "Replacement allowance is exhausted or intentionally cancelled"})
+                stop(ps, p, "The replacement retains a stopped task allowance. Review it before continuing.", {"decision_id": turn.decision_id})
+                return
         current = ps.get(pid)
         if current["status"] != "running" or current["spec"] != p["spec"]:
             return  # A pause, cancellation or human spec revision supersedes an in-flight proposal.
@@ -377,6 +445,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
                 return
         # Protect fixed bytes in repository too; persist the living spec before dispatch.
         store.kv_set(activity_key, "Saving the plan to the repository")
+        turn.mark("executing", {"repository_sha": snapshot["sha"]})
         await asyncio.to_thread(repo.write_spec, p, proposal, snapshot)
         snapshot = await asyncio.to_thread(repo.snapshot)
         if ps.get(pid)["status"] != "running":
@@ -384,12 +453,14 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
         ps.update(pid, spec=proposal, observed_sha=snapshot["sha"], last_error=None, previous_spec=None)
         p = ps.get(pid)
         if result["action"] == "escalate":
-            stop(ps, p, result["proposal"], result)
+            stop(ps, p, result["proposal"], result, turn=turn, decision_status="applied",
+                 decision_result={"result": "Escalated for a human decision", "proposal": result["proposal"]})
             return
         if result["action"] == "checkpoint":
             if not any(q["merged_sha"] and q["milestone"] == p["current_milestone"] for q in ps.items(pid)):
                 raise ProjectError("A milestone cannot finish without merged work")
             checkpoint(store, p, result["reason"])
+            turn.mark("applied", {"result": "Milestone checks evaluated; human checkpoint retained"})
             return
         ready = [t for t in result["tasks"] if t.get("ready")]
         next_budget = ready[0]["budget_usd"]
@@ -404,9 +475,14 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
                 key = ("spike:" if t["kind"] == "spike" else "") + t["key"].removeprefix("spike:")
                 body = t["description"] + "\n\nAcceptance criteria:\n" + "\n".join(t.get("acceptance_criteria", [])) + "\nLikely files: " + ", ".join(t.get("files", [])) + "\n\nApproved project spec (fixed part must be unchanged):\n" + proposal
                 status = "queued" if t.get("ready") else "tentative"
-                store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                   (pos + i + 1, t["title"], body, p["repo"], time.time(), status, lane(pid), 0, "yes", pid, p["current_milestone"], key, t["budget_usd"], "single" if t["kind"] == "spike" else "swarm", 0))
+                store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts,execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                   (pos + i + 1, t["title"], body, p["repo"], time.time(), status, lane(pid), 0, "yes", pid, p["current_milestone"], key, t["budget_usd"], "single" if t["kind"] == "spike" else "reviewed" if action.kind == ActionKind.REVIEW else "swarm", 0, recovery_lineage))
+                qid = store.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                runtime = t.get("max_runtime_s") or (min(cfg.projects.investigation_timeout_s, cfg.limits.max_runtime_s) if t["kind"] == "spike" else cfg.limits.max_runtime_s)
+                store.conn.execute("UPDATE queue_items SET depends_on=?,project_action=?,max_runtime_s=? WHERE id=?",
+                                   (json.dumps(t.get("depends_on", [])), action.kind.value, runtime, qid))
             store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, time.time(), "replan", json.dumps({"sha": snapshot["sha"], "reason": result["reason"], "tasks": result["tasks"], "changed_keys": changed})))
+            turn.mark("applied", {"result": "Scheduled approved tasks in the existing project lane", "task_keys": [t["key"] for t in result["tasks"]]}, connection=store.conn)
         from ..runqueue import set_lane_paused
         set_lane_paused(store, lane(pid), False)
     finally:
@@ -415,10 +491,21 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
             repo.close()
 
 
-def stop(ps, p, proposal, detail):
-    ps.update(p["id"], status="waiting_for_you", last_error=proposal)
-    ps.event(p["id"], "escalation", detail)
-    ps.store.conversation_append(p["conversation_id"], "assistant", proposal)
+def stop(ps, p, proposal, detail, *, turn=None, decision_status=None, decision_result=None):
+    from ..execution import transaction
+    now = time.time()
+    with transaction(ps.store) as db:
+        current = db.execute("SELECT status FROM projects WHERE id=?", (p["id"],)).fetchone()
+        if not current or current["status"] != "running":
+            if turn:
+                turn.mark("superseded", {"reason": "Project state changed before applying the decision"}, connection=db)
+            return
+        db.execute("UPDATE projects SET status='waiting_for_you',last_error=? WHERE id=?", (proposal, p["id"]))
+        db.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (p["id"], now, "escalation", json.dumps(detail)))
+        db.execute("INSERT INTO chat_messages(conversation_id,role,content,created_at) VALUES (?,'assistant',?,?)", (p["conversation_id"], proposal, now))
+        db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, p["conversation_id"]))
+        if turn and decision_status:
+            turn.mark(decision_status, decision_result, connection=db)
 
 
 async def tick(cfg, store, **kw):
@@ -432,6 +519,6 @@ async def tick(cfg, store, **kw):
                 await advance(cfg, store, p["id"], **kw)
         except Exception as e:  # One project must never stop the worker or another lane.
             ps = Projects(store)
-            ps.update(p["id"], status="waiting_for_you", last_error=f"Project service needs attention: {type(e).__name__}: {e}")
-            ps.event(p["id"], "service_error", {"error": str(e)})
+            if ps.get(p["id"])["status"] == "running":
+                stop(ps, ps.get(p["id"]), f"Project service needs attention: {type(e).__name__}: {e}", {"error": str(e)})
     await asyncio.gather(*(one(p) for p in Projects(store).list()))

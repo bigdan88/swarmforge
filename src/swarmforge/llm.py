@@ -11,6 +11,8 @@ Cost accounting distinguishes three sources, recorded per call:
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import random
 import threading
 import time
@@ -152,6 +154,15 @@ class _ModelUnavailable(Exception):
     """This model can't serve the request right now; try the role's next fallback model."""
 
 
+class NothingBilled(LLMError):
+    """The provider produced no completion for this request on any model (it was never sent,
+    or was rejected as busy/unavailable), so a spending reservation can be released at $0."""
+
+
+# Errors raised before the request leaves this machine: nothing can have been billed.
+_NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
 # Model-name fragments that usually indicate vision-capable models (used when the
 # config's explicit `vision_models` list doesn't match).
 VISION_MODEL_HINTS: tuple[str, ...] = ("vision", "-vl", "vl-", "omni", "4o", "4v", "image", "multimodal")
@@ -208,6 +219,7 @@ class LLMClient:
                  budget: Budget | None = None, transport: httpx.AsyncBaseTransport | None = None,
                  max_retries: int = 4, busy_wait_s: float | None = None,
                  record_errors: bool = True):
+        self.model_overrides: dict[str, str] = {}   # task_key -> model used first (escalation)
         self.config = config
         self.busy_wait_s = busy_wait_s
         self.store = store
@@ -220,6 +232,42 @@ class LLMClient:
 
     async def chat(self, role: str, messages: list[dict], *, tools: list[dict] | None = None,
                    task_key: str | None = None, tool_choice: Any = None) -> ChatResult:
+        from .execution import SharedBudget
+        if not isinstance(self.budget, SharedBudget):
+            return await self._chat(role, messages, tools=tools, task_key=task_key, tool_choice=tool_choice)
+        rc = self.config.role(role)
+        pc = self.config.providers[rc.provider]
+        models = {rc.model, *rc.fallback_models, self.model_overrides.get(task_key or "", rc.model)}
+        prices = [await self.prices.get(pc, rc, m) for m in models]
+        # UTF-8 bytes upper-bound ordinary text tokens, including tool schemas. Images and
+        # unavailable prices reserve the entire remainder and serialize requests safely.
+        amount = None
+        if all(p and all(math.isfinite(p[k]) and p[k] >= 0 for k in ("in", "out")) for p in prices) and not messages_contain_images(messages):
+            prompt = len(json.dumps([messages, tools], ensure_ascii=False).encode("utf-8")) + 2048
+            output = max(rc.max_output_tokens, int(rc.extra_body.get("max_tokens", 0)))
+            amount = max((prompt * p["in"] + output * p["out"]) / 1_000_000 for p in prices)
+        call_id = None
+        while call_id is None:
+            call_id = self.budget.reserve(amount)
+            if call_id is None:
+                await asyncio.sleep(0.05)
+        try:
+            result = await self._chat(role, messages, tools=tools, task_key=task_key,
+                                      tool_choice=tool_choice, reservation=call_id)
+        except NothingBilled:
+            # No model produced a completion (never sent, busy or unavailable): release at $0.
+            self.budget.settle(call_id, 0.0)
+            raise
+        except BaseException:
+            # A cancelled/unknown request may have been billed. Keep its reservation.
+            self.budget.settle(call_id, uncertain=True)
+            raise
+        self.budget.settle(call_id, result.usage.cost_usd)
+        return result
+
+    async def _chat(self, role: str, messages: list[dict], *, tools: list[dict] | None = None,
+                   reservation: str | None = None,
+                   task_key: str | None = None, tool_choice: Any = None) -> ChatResult:
         """Call the role's model. Busy/overloaded responses (429/503/529…) are retried patiently
         for up to `limits.busy_wait_s` per model; then the role's `fallback_models` are tried in
         order. Every attempt that fails is recorded; the successful call records the model used.
@@ -230,21 +278,26 @@ class LLMClient:
         pc = self.config.providers[rc.provider]
         key = pc.api_key()
         if not key:
-            raise LLMError(f"environment variable {pc.api_key_env} is not set (provider {pc.name})")
+            raise NothingBilled(f"environment variable {pc.api_key_env} is not set (provider {pc.name})")
         self.budget.check()
-        models = [rc.model, *[m for m in rc.fallback_models if m != rc.model]]
+        primary = self.model_overrides.get(task_key or "") or rc.model
+        models = [primary]
+        for m in (rc.model, *rc.fallback_models):
+            if m not in models:
+                models.append(m)
         errors: list[str] = []
         for idx, model in enumerate(models):
             if idx > 0:
                 self._event(f"{role}: {models[idx - 1]} unavailable; falling back to {model}", task_key, role)
             try:
-                return await self._chat_model(role, rc, pc, key, model, messages, tools, tool_choice, task_key)
+                self.budget.check()
+                return await self._chat_model(role, rc, pc, key, model, messages, tools, tool_choice, task_key, reservation)
             except _ModelUnavailable as e:
                 errors.append(f"{model}: {e}")
                 continue
-        raise LLMError(f"{role} call failed on every configured model: " + " | ".join(errors))
+        raise NothingBilled(f"{role} call failed on every configured model: " + " | ".join(errors))
 
-    async def _chat_model(self, role, rc, pc, key, model, messages, tools, tool_choice, task_key) -> ChatResult:
+    async def _chat_model(self, role, rc, pc, key, model, messages, tools, tool_choice, task_key, reservation=None) -> ChatResult:
         vision = model_supports_vision(model, self.config.vision_models)
         msgs, stripped = normalize_messages(messages, vision)
         if stripped:
@@ -277,10 +330,13 @@ class LLMClient:
         async with httpx.AsyncClient(timeout=httpx.Timeout(rc.timeout_s, connect=30),
                                      transport=self._transport) as client:
             while True:
+                self.budget.check()
                 try:
                     r = await client.post(url, headers=headers, json=body)
                 except (httpx.TimeoutException, httpx.TransportError) as e:
                     last_err = f"{type(e).__name__}: {e}"
+                    if reservation and not isinstance(e, _NOT_SENT):
+                        raise LLMError(f"Request outcome uncertain; retained spending reservation: {last_err}") from e
                     transient += 1
                     if transient <= self.max_retries:
                         await asyncio.sleep(_backoff(transient - 1))
@@ -315,6 +371,8 @@ class LLMClient:
                     data = None
                 if not data or not data.get("choices"):
                     last_err = f"no choices in response: {r.text[:300]}"
+                    if reservation:
+                        raise LLMError("Response outcome uncertain; retained spending reservation: " + last_err)
                     transient += 1
                     if transient <= self.max_retries:
                         await asyncio.sleep(_backoff(transient - 1))
@@ -325,11 +383,17 @@ class LLMClient:
 
         prices = await self.prices.get(pc, rc, model)
         usage = parse_usage(data.get("usage"), prices)
+        if usage.cost_usd is not None and (not math.isfinite(usage.cost_usd) or usage.cost_usd < 0):
+            usage.cost_usd = None
+        if reservation and usage.cost_usd is None:
+            row = self.store._one("SELECT reserved_usd FROM execution_calls WHERE id=?", (reservation,))
+            usage.cost_usd = row["reserved_usd"]
+            usage.cost_source = "estimated"
         self.budget.add(usage)
         choice = data["choices"][0]
         msg = dict(choice.get("message") or {})
         msg.setdefault("role", "assistant")
-        self._record(role, model, pc, task_key, started, usage, "ok", None)
+        self._record(role, model, pc, task_key, started, usage, "ok", None, reservation=reservation)
         return ChatResult(message=msg, finish_reason=choice.get("finish_reason"), usage=usage, raw=data)
 
     def _event(self, message: str, task_key, role, level: str = "info") -> None:
@@ -339,7 +403,7 @@ class LLMClient:
             except Exception:
                 pass
 
-    def _record(self, role, model, pc, task_key, started, usage: Usage, status, error):
+    def _record(self, role, model, pc, task_key, started, usage: Usage, status, error, reservation=None):
         if not self.store or not self.run_id:
             return
         if status != "ok" and not self.record_errors:
@@ -347,14 +411,19 @@ class LLMClient:
             # cost summaries (used by per-conversation chat attribution).
             self._event(f"llm call failed ({status}): {error}", task_key, role, level="error")
             return
-        self.store.record_llm_call(
-            self.run_id, task_key=task_key, role=role, provider=pc.name, model=model,
+        fields = dict(task_key=task_key, role=role, provider=pc.name, model=model,
             started_at=started, ended_at=time.time(), prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens, total_tokens=usage.total_tokens,
             cached_tokens=usage.cached_tokens, cost_usd=usage.cost_usd,
             cost_source=usage.cost_source if status == "ok" else "unavailable",
             status=status, error=error,
         )
+        if reservation:
+            # The request result and reservation settlement commit together. A restart
+            # cannot charge a known successful response as an additional unknown call.
+            self.budget.settle(reservation, usage.cost_usd, record=fields)
+        else:
+            self.store.record_llm_call(self.run_id, **fields)
 
 
 def _busy_backoff(attempt: int, resp: httpx.Response | None = None) -> float:

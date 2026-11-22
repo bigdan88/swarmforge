@@ -18,6 +18,10 @@ def describe(store, project, tasks):
         return f"{activity}. Tasks will appear on Work when the plan is saved."
     running = next((task for task in tasks if task["status"] == "running"), None)
     if running:
+        from swarmforge.execution import progress_text
+        progress = progress_text(store, running.get("run_id")) if running.get("run_id") else None
+        if progress:
+            return f"Working on {running['title']}. Follow the task on Work.\n\n{progress}"
         return f"Working on {running['title']}. Follow the task on Work."
     if lane_paused(store, lane(project["id"])):
         return "This project's queue is paused. Resume its lane on Work."

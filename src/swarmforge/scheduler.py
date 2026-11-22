@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable
 
 from .plan import Task
+from .execution import ExecutionStopped
 from .state import RunAborted, TaskState
 
 
@@ -100,11 +101,12 @@ class Scheduler:
         finally:
             for fut in running:
                 fut.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
 
     async def _guarded(self, t: Task) -> tuple[bool, str]:
         try:
             return bool(await self.execute(t)), ""
-        except (asyncio.CancelledError, RunAborted):
+        except (asyncio.CancelledError, RunAborted, ExecutionStopped):
             raise
         except Exception as e:  # a crashing task must not take down the scheduler
             return False, f"{type(e).__name__}: {e}"

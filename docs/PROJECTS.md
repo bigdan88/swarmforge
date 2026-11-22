@@ -18,6 +18,13 @@ It makes a short structured planning call rather than starting a new agent runti
 is an ordinary swarm run in the project's own queue lane. A spike is a single-agent run with no PR
 publication; its report feeds the next plan.
 
+The lead can also request bounded repository/evidence inspection, investigations, independent review,
+milestone evaluation, a pause or a concrete question. Application code validates each typed action and
+retains its evidence and outcome in **Projects → Plan** and `swarmforge project status`. Decision
+calls share a persisted cap; they cannot repeat inspections or rewrite the plan indefinitely. Browser
+verification requests remain explicitly blocked/unverified until Stage 3 adds journey execution.
+See [validated lead actions](LEAD_ACTIONS.md) for contracts, defaults and recovery behavior.
+
 Only the short horizon is ready to run. Tentative tasks are visible in Projects and greyed on Work,
 but the worker never starts them. The lead replaces the pending horizon after a merge. Completed and
 failed attempts remain in the project history. A completed run does not unlock later work until
@@ -52,6 +59,9 @@ using the existing provider-reported/estimated accounting; provider requests can
 cost of the final in-flight response.
 
 The worker recovers terminal project runs after a restart instead of repeating their PR creation.
+Tasks and their retries/replacements now share a persisted spending allowance and wall-clock deadline.
+See [bounded execution and recovery](EXECUTION.md) for progress detection, recovery caps, waiting-time
+semantics and the handling of uncertain publication. Project and milestone limits remain separate.
 Pending plans and all approvals/checkpoints are in SQLite. If the worker is no longer running, use
 the Work page's **Start queue** or `swarmforge queue work`. Repository/API/model errors appear on the
 project card; fix the cause and resume. Pause stops new work; cancel also requests cancellation of

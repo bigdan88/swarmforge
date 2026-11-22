@@ -9,6 +9,7 @@ from typing import Awaitable, Callable
 from .. import prompts
 from ..config import Config
 from ..db import Store
+from ..execution import external_once
 from ..github import GitHubClient, GitHubError, Issue
 from ..llm import LLMClient, LLMError
 from ..report import build_pr_body
@@ -74,7 +75,8 @@ class PublicationService:
             if d.merge:
                 if pr.state == "dirty" or pr.mergeable is False:
                     pr = await self._resolve_pr_conflict(gh, repo, pr)
-                info["sha"] = await asyncio.to_thread(am.apply, gh, pr, amc.method)
+                info["sha"] = await external_once(self.store, self.run_id, f"merge:{repo}:{number}",
+                                                  lambda: asyncio.to_thread(am.apply, gh, pr, amc.method))
                 self.store.record_intervention(self.run_id, am.MERGED, json.dumps(info))
                 self.store.update_run(self.run_id, state_reason=f"draft PR created: {url} · auto-merged")
                 self.log("merge", f"auto-merged {url}: {d.reason}")
@@ -109,8 +111,9 @@ class PublicationService:
         if not old or old == url or "/pull/" not in old:
             return
         try:
-            await asyncio.to_thread(am.close_pr, gh, repo, int(old.rstrip("/").split("/")[-1]),
-                                    f"Superseded by {url} (SwarmForge fix-up).")
+            await external_once(self.store, self.run_id, f"close:{old}",
+                                lambda: asyncio.to_thread(am.close_pr, gh, repo, int(old.rstrip("/").split("/")[-1]),
+                                                          f"Superseded by {url} (SwarmForge fix-up)."))
             self.store.record_intervention(self.run_id, am.CLOSED, json.dumps({"url": old, "replaced_by": url}))
             self.log("merge", f"closed {old}: replaced by {url}")
         except (GitHubError, ValueError) as e:
@@ -126,6 +129,8 @@ class PublicationService:
             args = dict(title=self.issue.title, body=self.issue.body, repo=info["repo"], url=info["url"],
                         reason=info.get("reason", ""), findings=[f for f in open_findings if f["severity"] != "info"])
             try:
+                if (self.store.get_run(self.run_id) or {}).get("execution_id"):
+                    raise ValueError("Shared task allowance: schedule the replacement in the queue after this attempt releases it")
                 info["fix_run"] = am.start_fix(self.cfg, self.run_id, **args)       # starts right away
                 self.store.record_intervention(self.run_id, am.FIXING, json.dumps(info))
                 self.log("merge", f"not merged ({info.get('reason')}); started fix-up run {info['fix_run']} that "
@@ -168,13 +173,15 @@ class PublicationService:
                                            f"{'approved' if approved else 'declined'}: {q}")
             if not approved:
                 return None
-        await asyncio.to_thread(self.push, ws.repo, owner, name, ws.integration_branch,
-                                gh.token, ws.base_branch, self.cfg.github.branch_prefix)
+        await external_once(self.store, self.run_id, f"push:{full}:{ws.integration_branch}",
+                            lambda: asyncio.to_thread(self.push, ws.repo, owner, name, ws.integration_branch,
+                                                      gh.token, ws.base_branch, self.cfg.github.branch_prefix))
         self.log("pr", f"pushed {ws.integration_branch} to {full}")
         body = build_pr_body(self.store, self.run_id)
         title = f"[SwarmForge] {issue.title}" + (f" (#{issue.number})" if issue.number else "")
-        url = await asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
-                                      ws.base_branch, title, body)
+        url = await external_once(self.store, self.run_id, f"pr:{full}:{ws.integration_branch}",
+                                  lambda: asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
+                                                            ws.base_branch, title, body))
         self.store.update_run(self.run_id, pr_url=url)
         self.log("pr", f"draft pull request: {url}")
         return url

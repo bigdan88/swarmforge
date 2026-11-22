@@ -85,6 +85,10 @@ def build_report(store, run_id: str) -> str:
     cfg = json.loads(run["config_json"] or "{}")
 
     L = [f"# SwarmForge execution report - run `{run_id}`", ""]
+    from .execution import progress_text
+    progress = progress_text(store, run_id)
+    if progress:
+        L += ["## Task allowance and progress", "", progress, ""]
     L += [
         "| Field | Value |", "|---|---|",
         f"| Issue | {run['issue_title'] or '-'} |",
@@ -93,6 +97,7 @@ def build_report(store, run_id: str) -> str:
         f"| Mode | {run['mode']} |",
         f"| Final state | **{run['state']}** |",
         f"| Reason | {run['state_reason'] or '-'} |",
+        f"| Stopping category | {run.get('stop_kind') or '-'} |",
         f"| Started | {_ts(run['created_at'])} |",
         f"| Finished | {_ts(run['finished_at'])} |",
         f"| Elapsed | {_dur(run['created_at'], run['finished_at'] or run['updated_at'])} |",

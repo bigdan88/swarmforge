@@ -31,6 +31,16 @@ CREATE TABLE IF NOT EXISTS milestones (
 CREATE TABLE IF NOT EXISTS project_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, ts REAL NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS project_lead_claims (
+    project_id TEXT PRIMARY KEY, token TEXT NOT NULL, owner_pid INTEGER NOT NULL, claimed_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, epoch TEXT NOT NULL,
+    ordinal INTEGER NOT NULL, created_at REAL NOT NULL, finished_at REAL,
+    action TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, proposal TEXT,
+    evidence TEXT NOT NULL, result TEXT, UNIQUE(project_id, epoch, ordinal)
+);
+CREATE INDEX IF NOT EXISTS project_decisions_history ON project_decisions(project_id, id);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
     created_at REAL NOT NULL,
@@ -253,11 +263,22 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        from .execution import SCHEMA as EXECUTION_SCHEMA
+        self.conn.executescript(EXECUTION_SCHEMA)
         self._migrate()
         self.conn.commit()
 
     # columns added after the first release; existing databases get them on open
     MIGRATIONS = [
+        ("queue_items", "depends_on", "TEXT"),
+        ("queue_items", "project_action", "TEXT"),
+        ("runs", "execution_id", "TEXT"),
+        ("runs", "retry_of", "TEXT"),
+        ("queue_items", "retry_of", "TEXT"),
+        ("runs", "stop_kind", "TEXT"),
+        ("queue_items", "execution_id", "TEXT"),
+        ("execution_attempts", "progress_wait_started", "REAL"),
+        ("execution_attempts", "progress_wait_s", "REAL NOT NULL DEFAULT 0"),
         ("queue_items", "project_id", "TEXT"),
         ("queue_items", "milestone", "INTEGER"),
         ("queue_items", "project_key", "TEXT"),
@@ -278,6 +299,8 @@ class Store:
         ("queue_items", "heal_attempts", "INTEGER"),
         ("runs", "archived", "INTEGER NOT NULL DEFAULT 0"),
         ("chat_messages", "tool_calls", "TEXT"),
+        ("queue_items", "team", "TEXT"),
+        ("projects", "team", "TEXT"),
     ]
 
     def _migrate(self) -> None:
@@ -336,6 +359,10 @@ class Store:
 
     def request_cancel(self, run_id: str) -> None:
         self.update_run(run_id, cancel_requested=1)
+        run = self.get_run(run_id)
+        if run and run.get("execution_id"):
+            self._exec("UPDATE execution_allowances SET cancelled=1 WHERE id=?", (run["execution_id"],))
+            self._exec("UPDATE runs SET cancel_requested=1 WHERE execution_id=?", (run["execution_id"],))
 
     def cancel_requested(self, run_id: str) -> bool:
         row = self._one("SELECT cancel_requested FROM runs WHERE id = ?", (run_id,))
@@ -519,7 +546,8 @@ class Store:
     QUEUE_FIELDS = ("title", "body", "repo", "mode", "budget", "max_cycles", "chain", "approval",
                     "status", "run_id", "base_branch", "result_branch", "note", "started_at",
                     "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts", "issue_url",
-                    "queue", "project_id", "milestone", "project_key", "merged_sha", "project_processed")
+                    "queue", "project_id", "milestone", "project_key", "merged_sha", "project_processed",
+                    "team", "execution_id", "retry_of", "depends_on", "project_action")
 
     def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
         row = self._one("SELECT MAX(position) AS m FROM queue_items")

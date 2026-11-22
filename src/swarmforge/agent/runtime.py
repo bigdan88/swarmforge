@@ -6,6 +6,7 @@ must be metered for tokens/cost against the run budget, and each role must get a
 toolset. Owning the loop makes those guarantees enforceable in code.
 """
 from __future__ import annotations
+import asyncio
 
 import dataclasses
 import json
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..llm import BudgetExceeded, LLMClient, LLMError
+from ..execution import ExecutionStopped, refresh_changed_files
 from .tools import (ASYNC_IMPLS, SYNC_IMPLS, TOOL_SCHEMAS, TerminalTool, ToolContext, ToolError,
                     parse_args)
 
@@ -169,6 +171,7 @@ async def run_agent(llm: LLMClient, spec: AgentSpec) -> AgentResult:
             for tc in amsg["tool_calls"]:
                 name = tc["function"]["name"]
                 result.tool_calls += 1
+                args = {}
                 try:
                     args = parse_args(tc["function"]["arguments"])
                     if name == spec.terminal.name:
@@ -201,6 +204,9 @@ async def run_agent(llm: LLMClient, spec: AgentSpec) -> AgentResult:
                 except (OSError, UnicodeError) as e:
                     out = f"ERROR: {type(e).__name__}: {e}"
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
+                if name in {"run_command", "run_tests", "format_code", "apply_patch"}:
+                    await asyncio.to_thread(refresh_changed_files, spec.ctx)
+                log("tool_result", name, {"name": name, "args": args, "output": out})
                 tx({"type": "tool", "name": name, "args": tc["function"]["arguments"][:4000],
                     "output": out[:8000]})
             # budget reminders so agents wrap up before the hard limit
@@ -220,6 +226,8 @@ async def run_agent(llm: LLMClient, spec: AgentSpec) -> AgentResult:
     except LLMError as e:
         result.status, result.error = "error", str(e)
         return result
+    except ExecutionStopped:
+        raise
     except Exception as e:  # never let an agent crash the orchestrator silently
         result.status, result.error = "error", f"{type(e).__name__}: {e}"
         return result
