@@ -3,16 +3,35 @@ import {num,record,rows,saveLocal,str,useAction,useDraft,type Row,type Session} 
 import {Feedback,Heading,type Navigate} from './ui';
 
 export function NewTask({session,navigate}:{session:Session|null;navigate:Navigate}){
-  const [draft,setDraft]=useDraft('sf-new-task',{title:'',body:'',repo:'',budget:String(session?.settings.limits.budget_usd??5),mode:'swarm'});
+  const limits=session?.settings.limits??{};
+  const [draft,setDraft]=useDraft('sf-new-task',{source:'describe',issue_url:'',title:'',body:'',repo:'',budget:String(limits.budget_usd??5),mode:'swarm',team:'',max_cycles:String(limits.max_repair_cycles??''),hours:limits.max_runtime_s?String(Math.round(limits.max_runtime_s/360)/10):'',heal_attempts:''});
   const [authorized,setAuthorized]=useState(false);const action=useAction('new-task');
   const field=(key:string,value:string)=>setDraft(old=>({...old,[key]:value}));
-  async function submit(e:FormEvent){e.preventDefault();const result=await action.send('queue_task','',{...draft,budget:Number(draft.budget),spending_authorized:authorized});if(result?.item_id){saveLocal('sf-new-task','{}');navigate('work',result.item_id);}}
+  const issue=draft.source==='issue';
+  async function submit(e:FormEvent){
+    e.preventDefault();
+    const optional=(v:string)=>v.trim()===''?null:Number(v);
+    const args={title:draft.title,body:draft.body,repo:draft.repo,budget:Number(draft.budget),mode:draft.mode,team:draft.team||null,
+      max_cycles:optional(draft.max_cycles),hours:optional(draft.hours),heal_attempts:optional(draft.heal_attempts),
+      ...(issue?{issue_url:draft.issue_url}:{}),spending_authorized:authorized};
+    const result=await action.send('queue_task','',args);if(result?.item_id){saveLocal('sf-new-task','{}');navigate('work',result.item_id);}
+  }
+  const teams=session?.settings.teams??[];
   return <><Heading title="New task" description="Describe the outcome. The team will plan, build, test and request publication approval."/>
     <form className="panel editor" onSubmit={submit}><fieldset disabled={action.pending||!session?.models_enabled}>
-      <label>Title<input required maxLength={300} value={draft.title} onChange={e=>field('title',e.target.value)} placeholder="Add CSV export to reports"/></label>
-      <label>Repository<input required value={draft.repo} onChange={e=>field('repo',e.target.value)} placeholder="owner/repository or a local repository path"/></label>
-      <label>Requirements and acceptance criteria<textarea required rows={10} maxLength={30000} value={draft.body} onChange={e=>field('body',e.target.value)} placeholder="What should users be able to do? How should the team verify it?"/></label>
-      <div className="form-grid"><label>Task allowance (USD)<input required type="number" min="0.5" max="500" step="0.5" value={draft.budget} onChange={e=>field('budget',e.target.value)}/></label><label>Workflow<select value={draft.mode} onChange={e=>field('mode',e.target.value)}><option value="swarm">Swarm</option><option value="reviewed">One developer + test/review</option><option value="single">Single agent</option><option value="auto">Choose by task size</option></select></label></div>
+      <div className="segmented" role="radiogroup" aria-label="What should the team work on?"><label className="check"><input type="radio" name="source" checked={!issue} onChange={()=>field('source','describe')}/>Describe it here</label><label className="check"><input type="radio" name="source" checked={issue} onChange={()=>field('source','issue')}/>GitHub issue</label></div>
+      {issue?<><label>Issue URL<input required type="url" maxLength={500} value={draft.issue_url} onChange={e=>field('issue_url',e.target.value)} placeholder="https://github.com/owner/repo/issues/42"/></label>
+        <label>Repository override (optional)<input value={draft.repo} onChange={e=>field('repo',e.target.value)} placeholder="Leave empty to use the issue's repository"/></label></>
+      :<><label>Title<input required maxLength={300} value={draft.title} onChange={e=>field('title',e.target.value)} placeholder="Add CSV export to reports"/></label>
+        <label>Repository<input required value={draft.repo} onChange={e=>field('repo',e.target.value)} placeholder="owner/repository or a local repository path"/></label>
+        <label>Requirements and acceptance criteria<textarea required rows={10} maxLength={30000} value={draft.body} onChange={e=>field('body',e.target.value)} placeholder="What should users be able to do? How should the team verify it?"/></label></>}
+      <div className="form-grid"><label>Task allowance (USD)<input required type="number" min="0.5" max="500" step="0.5" value={draft.budget} onChange={e=>field('budget',e.target.value)}/></label><label>Workflow<select value={draft.mode} onChange={e=>field('mode',e.target.value)}><option value="swarm">Swarm (5 roles)</option><option value="reviewed">One developer + test/review</option><option value="single">Single agent (baseline)</option><option value="auto">Auto (pick by task size)</option></select></label>
+        <label>Model team<select value={draft.team} onChange={e=>field('team',e.target.value)}><option value="">{session?.settings.team?`Default (${session.settings.team})`:'Default (configuration)'}</option>{teams.map(t=><option key={t.name} value={t.name}>{t.name}</option>)}</select></label></div>
+      <details className="advanced"><summary>Advanced: repair cycles, time limit and auto-fix</summary><div className="form-grid">
+        <label>Max repair cycles<input type="number" min="0" max="10" step="1" value={draft.max_cycles} onChange={e=>field('max_cycles',e.target.value)} placeholder="Configured default"/></label>
+        <label>Time limit (hours)<input type="number" min="0.05" max="72" step="0.05" value={draft.hours} onChange={e=>field('hours',e.target.value)} placeholder="Configured default"/></label>
+        <label>Auto-fix attempts<input type="number" min="0" max="5" step="1" value={draft.heal_attempts} onChange={e=>field('heal_attempts',e.target.value)} placeholder="Configured default"/></label></div>
+        <p className="muted">The whole run stops at the time limit. Auto-fix retries a failed run with its diagnosis, within the task allowance. Test command and sandbox image overrides start a run directly and remain in the previous dashboard.</p></details>
       <p className="muted">Retries share the original task allowance. Publishing still asks for your approval. A queue worker must be running to start queued work.</p>
       <label className="check"><input type="checkbox" checked={authorized} onChange={e=>setAuthorized(e.target.checked)}/>I authorize this task to use its displayed allowance.</label>
       <button className="primary" type="submit" disabled={!authorized||action.pending}>{action.pending?'Adding task…':'Add to queue'}</button>

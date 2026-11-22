@@ -11,6 +11,7 @@ from swarmforge.db import Store
 from swarmforge.projects import service
 from swarmforge.projects.spec import ProjectError
 from swarmforge.projects.store import Projects
+from swarmforge.services.chat_requests import wait_idle
 from swarmforge.services.dashboard import ActionConflict, DashboardActions
 from swarmforge.webapp.app import create_app
 from .test_projects import definition
@@ -141,6 +142,8 @@ def test_chat_duplicate_uses_fake_adapter_once_and_keeps_project_conversations_s
     body = {"message": "What is blocked?", "spending_authorized": True}
     first = actions.execute("chat-message-000001", "send_message", cid, body)
     assert first["ok"] and actions.execute("chat-message-000001", "send_message", cid, body) == first
+    assert wait_idle(store, cid)["status"] == "done"
+    assert actions.execute("chat-message-000001", "send_message", cid, body) == first
     assert len(calls) == 1 and len(store.conversation_messages(cid)) == 2
     pid = Projects(store).create()["id"]
     assert not actions.execute("chat-project-000001", "send_message", "project-" + pid, body)["ok"]
@@ -181,6 +184,8 @@ def test_interactive_demo_journeys_never_call_models_or_start_processes(tmp_path
                 assert client.get("/api/v1/work?view=" + view).status_code == 200
             chat = {"operation": "send_message", "target": "demo-chat", "args": {"message": "Show current work", "spending_authorized": True}}
             assert client.post("/api/v1/actions", json=chat, headers=headers).json()["ok"]
+            assert client.get("/api/v1/conversations/demo-chat").json()["requests"][0]["status"] == "thinking"
+            assert wait_idle(store, "demo-chat")["status"] == "done"
             assert "Demo reply" in client.get("/api/v1/conversations/demo-chat").text
             project = client.get("/api/v1/projects").json()["items"][0]
             pid = project["id"]

@@ -1,4 +1,4 @@
-import {useEffect,useRef,useState} from 'react';
+import {useCallback,useEffect,useRef,useState} from 'react';
 
 export type Row=Record<string,unknown>;
 export type Collection={items:Row[];total:number;limit:number;offset:number};
@@ -51,7 +51,8 @@ export function useGet<T>(url:string,parse:(value:unknown)=>T,poll=0){
     }
     void load();return()=>{controller.abort();clearTimeout(timer);};
   },[url,parse,poll,revision]);
-  return {...(state.url===url?state:{data:null,error:''}),refresh:()=>setRevision(n=>n+1)};
+  const refresh=useCallback(()=>setRevision(n=>n+1),[]);
+  return {...(state.url===url?state:{data:null,error:''}),refresh};
 }
 export async function performAction(operation:string,target:string,args:Row,key:string):Promise<Result>{
   const session=record(await getJSON('/api/v1/session'));
@@ -80,3 +81,18 @@ export function useAction(scope:string){
   }
   return {pending,error,message,send};
 }
+export type Staged={id:string;name:string;kind:'image'|'text';size:number};
+const fileData=(file:File)=>new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',',2)[1]??'');reader.onerror=()=>reject(new Error(`Could not read ${file.name}`));reader.readAsDataURL(file);});
+export async function uploadAttachment(file:File):Promise<Staged>{
+  if(file.size>5*1024*1024)throw new Error(`${file.name} is larger than 5 MB`);
+  const session=record(await getJSON('/api/v1/session'));
+  if(!session.actions_enabled||typeof session.csrf_token!=='string')throw new Error('Controls are disabled. Start the web interface with --allow-actions to attach files.');
+  const response=await fetch('/api/v1/chat/uploads',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':session.csrf_token},body:JSON.stringify({name:file.name,data:await fileData(file)})});
+  const value=record(await response.json());
+  if(!response.ok)throw new Error(typeof value.detail==='string'?value.detail:`Could not attach ${file.name}`);
+  if(typeof value.id!=='string'||typeof value.name!=='string'||(value.kind!=='image'&&value.kind!=='text'))throw new Error('The upload response was incompatible.');
+  return value as Staged;
+}
+/** The newest reply request, or null. A thinking reply blocks sending and speeds up polling. */
+export function latestRequest(value:unknown):Row|null{const r=rows(value);return r.length?r[0]:null;}
+export const elapsed=(start:unknown,end:unknown,now:number)=>{const s=Math.max(0,Math.round((typeof end==='number'?end:now)-num(start)));return s<60?`${s}s`:`${Math.floor(s/60)}m ${s%60}s`;};

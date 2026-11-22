@@ -360,7 +360,10 @@ def test_ac5_ask_and_answer_gained_exactly_one_optional_keyword_only_param():
 def test_ac5_single_attachment_module_with_explicit_chat_page_consumer():
     pkg = Path(chatbot.__file__).parent
     assert (pkg / "attachments.py").is_file()
-    touched = {"attachments.py", "chatbot.py", "dashboard.py", "dashboard_pages/chat.py"}
+    touched = {"attachments.py", "chatbot.py", "dashboard.py", "dashboard_pages/chat.py",
+               # React web chat: stages uploads through attachments.py and passes paths to chatbot.answer.
+               "services/chat_requests.py", "services/dashboard.py", "webapp/app.py", "webapp/contracts.py",
+               "webapp/workspace.py", "webapp/demo.py"}
     for f in sorted(pkg.rglob("*.py")):
         if f.name == "__init__.py" or f.relative_to(pkg).as_posix() in touched:
             continue
@@ -372,6 +375,8 @@ def test_ac5_single_attachment_module_with_explicit_chat_page_consumer():
     assert "from swarmforge.attachments import" in dash
     page = (pkg / "dashboard_pages" / "chat.py").read_text(encoding="utf-8")
     assert "from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS" in page
+    web = (pkg / "services" / "chat_requests.py").read_text(encoding="utf-8")
+    assert "from ..attachments import" in web and "IMAGE_SIGNATURES" not in web
 
 
 def test_ac5_dashboard_attachment_code_is_chat_page_only():

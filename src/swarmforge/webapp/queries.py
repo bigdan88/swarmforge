@@ -48,7 +48,10 @@ class WorkReader:
         WHERE r.id NOT IN (SELECT run_id FROM queue_items WHERE run_id IS NOT NULL)
     """
 
-    def list(self, *, limit=25, offset=0, status=None, search="", view="all"):
+    def list(self, *, limit=25, offset=0, status=None, search="", view="all", archived=False, fold=False):
+        """One bounded page of work. Archived runs are hidden unless asked for; with fold, repeated
+        attempts of the same task (same title and repository) collapse into their most relevant row
+        (running, then waiting, then newest) and report how many attempts exist."""
         if not 1 <= limit <= 100 or not 0 <= offset <= 100000:
             raise ValueError("Invalid page bounds")
         where, args = [], []
@@ -57,6 +60,8 @@ class WorkReader:
         if view not in views:
             raise ValueError("Unknown Work view")
         where.append(views[view])
+        if not archived:
+            where.append("archived=0")
         if status:
             where.append("status=?")
             args.append(status)
@@ -64,17 +69,30 @@ class WorkReader:
             where.append("(instr(lower(title),lower(?))>0 OR instr(lower(COALESCE(repo,'')),lower(?))>0)")
             args.extend([search, search])
         clause = " WHERE " + " AND ".join(where) if where else ""
+        rank = "CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'tentative' THEN 2 ELSE 3 END"
         with self.connection() as conn:
             # One read transaction keeps total, counts and page internally consistent.
             conn.execute("BEGIN")
-            base = "WITH work AS (" + self.projection + ") "
-            total = conn.execute(base + "SELECT COUNT(*) FROM work" + clause, args).fetchone()[0]
-            counts = {r[0]: r[1] for r in conn.execute(base + "SELECT status,COUNT(*) FROM work GROUP BY status")}
-            rows = conn.execute(base + "SELECT * FROM work" + clause +
-                                " ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 "
-                                "WHEN 'tentative' THEN 2 ELSE 3 END,created_at DESC,id DESC LIMIT ? OFFSET ?", [*args, limit, offset])
-            return {"items": [dict(r) for r in rows], "total": total, "counts": counts,
-                    "limit": limit, "offset": offset}
+            has_archived = any(r[1] == "archived" for r in conn.execute("PRAGMA table_info(runs)"))
+            flag = "COALESCE((SELECT archived FROM runs WHERE id=b.run_id),0)" if has_archived else "0"
+            base = ("WITH raw AS (" + self.projection + "), work AS (SELECT b.*, " + flag + " AS archived FROM raw b), "
+                    "picked AS (SELECT * FROM work" + clause + ")")
+            if fold:
+                base += (", keyed AS (SELECT *, lower(trim(title))||'|'||lower(COALESCE(repo,'')) AS fold_key FROM picked), "
+                         "ranked AS (SELECT *, COUNT(*) OVER (PARTITION BY fold_key) AS attempts, ROW_NUMBER() OVER "
+                         "(PARTITION BY fold_key ORDER BY " + rank + ",created_at DESC,id DESC) AS fold_rank FROM keyed), "
+                         "shown AS (SELECT * FROM ranked WHERE fold_rank=1) ")
+            else:
+                base += ", shown AS (SELECT *, 1 AS attempts FROM picked) "
+            total = conn.execute(base + "SELECT COUNT(*) FROM shown", args).fetchone()[0]
+            counts = {r[0]: r[1] for r in conn.execute("WITH work AS (" + self.projection + ") SELECT status,COUNT(*) FROM work GROUP BY status")}
+            rows = conn.execute(base + "SELECT id,title,repo,status,stage,run_id,created_at,updated_at,finished_at,reason,pr_url,"
+                                "archived,attempts FROM shown ORDER BY " + rank + ",created_at DESC,id DESC LIMIT ? OFFSET ?",
+                                [*args, limit, offset])
+            items = [dict(r) for r in rows]
+            for item in items:
+                item["archived"] = bool(item["archived"])
+            return {"items": items, "total": total, "counts": counts, "limit": limit, "offset": offset}
 
     def _detail_query(self, item_id):
         # Look up the actual primary key; filtering a concatenated public ID over
@@ -98,7 +116,14 @@ class WorkReader:
             return None
         with self.connection() as conn:
             row = conn.execute(*query).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            item = dict(row)
+            item["archived"], item["attempts"] = False, 1
+            if item["run_id"] and any(r[1] == "archived" for r in conn.execute("PRAGMA table_info(runs)")):
+                flag = conn.execute("SELECT archived FROM runs WHERE id=?", (item["run_id"],)).fetchone()
+                item["archived"] = bool(flag and flag[0])
+            return item
 
     def evidence(self, item_id, *, after=0, limit=50):
         """Bounded database evidence only: never open run paths or raw event data.

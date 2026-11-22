@@ -247,3 +247,36 @@ The UI-only review snapshot and manifest under `.swarmforge/ui-migration/review/
 Still open: publication (needs an owner decision and write access), Docker CI job, real-history check,
 chat streaming/attachments in the web chat (milestone 3), parity items in milestone 4.
 No milestone was marked complete, nothing was committed or pushed, and no paid model calls were made.
+
+
+## Milestones 3 and 4 continuation (Claude, November 22, 2026)
+
+Built on pushed commit 44be5cf. Uncommitted in the working tree; nothing pushed, no paid model calls.
+
+Milestone 3: chat replies now run in the background with polled progress (tool steps, elapsed time),
+visible failures with a one-click "put this message back", one pending reply per conversation, replies
+interrupted by a restart released at startup, and image/text attachments staged through a separate
+protected upload endpoint (`/api/v1/chat/uploads`, 5 MB per file; the 128 KB action limit is unchanged).
+Browser journeys: project draft edit, lead interview, explicit launch, pause, checkpoint reply and cancel;
+keyboard-only Work, Projects and Chat (visible focus, Enter to open, Ctrl+Enter to send).
+
+Milestone 4: Failures (post-mortems, cause filter, authorized re-diagnosis), Pull requests (review gate,
+merges pinned to the reviewed head commit, Merge all ready, Update branch), Knowledge (nested notes,
+type/repo filters, create/edit/delete with conflict protection), What's new (filters, read marks shared
+with Streamlit, nav badges), Settings (health, key presence only, validated role/limit edits with backup
+and stale-file protection, model test), Speed, Benchmarks, New task advanced options (GitHub issue, team,
+repair cycles, time limit, auto-fix) and Work archive plus retry folding. The parity table in
+`docs/WEB_INTERFACE.md` lists every deliberate difference.
+
+Fixed along the way: a phone rule hid Knowledge row titles; radio buttons and a hidden file input
+inherited full-width styles (the latter caused 600 px horizontal overflow and an invisible Tab stop);
+action confirmations vanished when their button unmounted (PRs, What's new, project launch/pause/cancel,
+draft save). `settings.py` now imports Streamlit only inside `render()`. The single-attachment-module
+acceptance test lists the web chat as an explicit consumer; raster signature checks moved into
+`attachments.py`.
+
+Verification (Linux, CI install line, tokens/proxies unset): 1349 fast tests passed (34 new web tests),
+28 slow passed, frontend tests/build, docs, Ruff, mypy. Browser (Playwright, fresh `--demo` per script):
+24 journeys passed, 52 page/theme/width views clean. Scripts and screenshots:
+`.swarmforge/ui-migration/screenshots/browser-qa-m3-m4/`. Not run: Docker CI job, your real database,
+real GitHub merges (fake adapter only). No milestone was marked complete in the project draft.

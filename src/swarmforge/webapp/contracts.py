@@ -20,6 +20,8 @@ class WorkItem(PublicResponse):
     finished_at: float | None
     reason: str | None
     pr_url: str | None
+    archived: bool = False
+    attempts: int = Field(default=1, ge=1)
 
 
 class WorkPage(PublicResponse):
@@ -124,9 +126,16 @@ class RetainedReport(PublicResponse):
 class ActionCommand(PublicResponse):
     operation: Literal["cancel_work", "retry_work", "decide_approval", "queue_task", "start_queue", "pause_queue",
                        "create_project", "save_project", "launch_project", "pause_project", "cancel_project", "resume_project",
-                       "create_conversation", "send_message", "project_message"]
+                       "create_conversation", "send_message", "project_message",
+                       "create_note", "save_note", "delete_note", "diagnose_failure", "merge_pr", "update_pr",
+                       "mark_features_read", "set_archived", "save_settings", "test_models"]
     target: str = Field(default="", max_length=128)
     args: dict = Field(default_factory=dict)
+
+
+class UploadCommand(PublicResponse):
+    name: str = Field(min_length=1, max_length=200)
+    data: str = Field(min_length=1, max_length=7_000_000)
 
 
 class ActionResult(PublicResponse):
@@ -135,6 +144,8 @@ class ActionResult(PublicResponse):
     item_id: str | None = None
     project_id: str | None = None
     conversation_id: str | None = None
+    note_id: str | None = None
+    details: list[dict[str, str | bool | float | None]] | None = Field(default=None, max_length=50)
 
 
 class ProjectSummary(PublicResponse):
@@ -158,12 +169,37 @@ class ProjectPage(PublicResponse):
     offset: int
 
 
+class Attachment(PublicResponse):
+    id: str
+    name: str
+    kind: Literal["image", "text"]
+    size: int
+
+
 class Message(PublicResponse):
     id: int
     role: str
     content: str
     created_at: float
     truncated: bool
+    attachments: list[Attachment] = Field(default_factory=list, max_length=6)
+
+
+class ChatStep(PublicResponse):
+    tool: str
+    ok: bool
+    at: float
+
+
+class ChatRequest(PublicResponse):
+    id: str
+    status: Literal["thinking", "done", "failed", "interrupted"]
+    question: str
+    steps: list[ChatStep] = Field(max_length=40)
+    error: str | None
+    started_at: float
+    finished_at: float | None
+    attachments: list[Attachment] = Field(max_length=6)
 
 
 class ProjectMilestone(PublicResponse):
@@ -214,6 +250,7 @@ class ConversationDetail(PublicResponse):
     conversation: ConversationSummary
     messages: list[Message] = Field(max_length=100)
     costs: dict[str, float | int | None]
+    requests: list[ChatRequest] = Field(default_factory=list, max_length=5)
 
 
 class ApprovalSummary(PublicResponse):
@@ -245,6 +282,9 @@ class NoteSummary(PublicResponse):
     id: str
     title: str
     excerpt: str
+    type: str = "user-note"
+    repo: str | None = None
+    folder: str | None = None
 
 
 class NotesPage(PublicResponse):
@@ -254,6 +294,8 @@ class NotesPage(PublicResponse):
     offset: int
     configured: bool
     limited: bool
+    types: list[str] = Field(default_factory=list, max_length=50)
+    repos: list[str] = Field(default_factory=list, max_length=200)
 
 
 class NoteDetail(PublicResponse):
@@ -262,3 +304,46 @@ class NoteDetail(PublicResponse):
     text: str
     size_bytes: int
     truncated: bool
+    type: str = "user-note"
+    repo: str | None = None
+    tags: list[str] = Field(default_factory=list, max_length=30)
+    folder: str | None = None
+    source: str | None = None
+    created: str | None = None
+    sha: str | None = None
+    editable: bool = False
+
+
+class FailureSummary(PublicResponse):
+    run_id: str
+    created_at: float
+    title: str | None
+    repo: str | None
+    state: str | None
+    category: str | None
+    category_label: str
+    root_cause: str | None
+    outcome: str | None
+    cost_usd: float | None
+    heal_run_id: str | None
+    work_item: str
+
+
+class FailurePage(PublicResponse):
+    items: list[FailureSummary] = Field(max_length=25)
+    total: int
+    limit: int
+    offset: int
+    counts: dict[str, int]
+    categories: list[dict[str, str | int]] = Field(max_length=50)
+    undiagnosed: int
+
+
+class FailureDetail(FailureSummary):
+    reason: str | None
+    fix: str | None
+    lesson: str | None
+    evidence: str | None
+    evidence_truncated: bool
+    diagnosed_by: str | None
+    heal_work_item: str | None

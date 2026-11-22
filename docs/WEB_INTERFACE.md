@@ -78,22 +78,26 @@ the optional-dependency message.
 
 ## Workflows
 
-| Page | React behavior | Current boundary |
+| Page | React behavior | Deliberate differences (deferred or kept elsewhere) |
 | --- | --- | --- |
-| Work | Search, status filters, 25-row pages, direct/attached runs, detail, four-second refresh, queue status | Retry folding, archive preferences and queue filters remain to migrate |
-| Task detail | Shared allowance, charged/reserved/available spending, run costs, events, checks, tests, report and screenshots | Older evidence archive remains in the existing dashboard |
-| Task controls | Cancel, bounded retry, approve/decline pending publication requests | Opt-in controls; project retries stay with the lead; durable execution support is required for retries |
+| Work | Search, status filters, 25-row pages, direct/attached runs, detail, four-second refresh, queue status; one row per task with an attempt count (Every attempt lists them); Show archived; archive/unarchive finished runs | Streamlit's extra state/repository/mode filters, project progress banner and storage readout are not migrated; search and status cover the same rows |
+| Task detail | Shared allowance, charged/reserved/available spending, run costs, events, checks, tests, report and screenshots | Older evidence archive and free-disk tools remain in the existing dashboard |
+| Task controls | Cancel, bounded retry, approve/decline pending publication requests, archive | Opt-in controls; project retries stay with the lead; durable execution support is required for retries |
 | Queue | Start/resume worker, pause new starts, lane counts | Explicit spending authorization before starting; running work can finish when paused |
-| New task | Preserved draft, repository, requirements, workflow and allowance; add to existing queue | Publication always asks for approval; direct-run advanced options remain in the previous dashboard |
+| New task | Describe it or a GitHub issue URL (optional repository override); allowance, workflow, model team, repair cycles, time limit, auto-fix attempts; preserved draft | Always queued with publication approval ("Pre-approve" is not offered). Test command/sandbox image overrides, the sample-repository helper and immediate direct runs remain in the existing dashboard |
 | Projects | Lists, exact shared cost accounting, milestones, tasks, spec, conversation and events | Shows up to 100 connected tasks and 50 recent events |
 | Project planning | Structured draft editor and lead conversation before launch | Saving/replying does not launch; forms remain in the browser across navigation |
-| Project controls | Approve displayed spec, pause/cancel, checkpoint reply and manual-check confirmation | Existing fixed-spec, repository ownership, merge, launch and spending barriers remain in application services |
-| Chat | Separate conversations, retained messages, preserved message drafts and configured model replies | Replies are not streamed; suggested actions never execute automatically; attachments remain in the previous dashboard |
-| PRs, Failures, History | Bounded filtered run/queue history with the same detail/evidence views | PR merge/close actions and detailed failure editing remain in the previous dashboard |
-| Knowledge | Search and read bounded top-level notes with opaque IDs | Up to 1024 entries; nested notes and note editing remain in the vault editor/previous dashboard |
-| Outcomes | Recorded workflow outcome/cost totals | Not a controlled team benchmark; benchmark suite launches remain in the previous dashboard |
-| Teams and Settings | Active policy, role/model assignments, named lineups, no credentials | Configuration/secret editing and experimental speed settings remain in the previous dashboard |
-| What's new | Packaged user-visible history and preview labels | Read-marking and category filters remain to migrate |
+| Project controls | Approve displayed spec, pause/cancel, checkpoint reply and manual-check confirmation, with page-level confirmations | Existing fixed-spec, repository ownership, merge, launch and spending barriers remain in application services. Post-launch fixed-spec amendment is not exposed |
+| Chat | Separate conversations, retained messages, preserved drafts, background replies with live tool steps and elapsed time, visible failures with "put this message back", one pending reply per conversation, image (PNG/JPEG/GIF/WebP) and text attachments with thumbnails, Ctrl+Enter | Progress is polled each second, not token-streamed (the chat model call is not a streaming API). Suggested actions never execute automatically. SVG attachments are refused |
+| Pull requests | Open PRs per known repository (60-second cache, Refresh from GitHub), status, size, head commit, link to the run; merge (squash/merge/rebase, delete branch), Merge all ready, Update branch, all behind "I've reviewed these changes" | Each merge names the reviewed head commit and is refused if new commits arrived. Auto-merge settings and "update and restart SwarmForge" after merging its own repository remain in the existing dashboard |
+| Failures | Post-mortems with counts (fixed themselves / need you / not diagnosed), cause filter, why/fix/lesson/evidence, links to the run and its retry, authorized re-diagnosis | Bulk "diagnose all older failures" remains in the existing dashboard (one model call per run); the cause chart is shown as counts |
+| History | Finished work with the same detail/evidence views | None |
+| Knowledge | Nested vault notes (hidden and linked folders skipped), type/repository filters, read, create, edit and delete with conflict protection against edits made in Obsidian | Generated note types (hub, run log, failure) are read-only. Backlinks and the note graph remain in the existing dashboard and Obsidian. Up to 2048 vault entries are scanned |
+| Speed | Median run/working time/repair cycles/cost, time per phase per run, phase medians, by-settings groups, agents by role and model, self-healing outcomes | CSV export stays on the command line (`swarmforge metrics --csv`) |
+| Benchmarks | Suite comparisons per team/mode (delivery %, time, cost per success) and recorded everyday outcomes | Suites run real paid tasks, so they are started from the command line (`swarmforge bench-suite`) |
+| Settings | Health checks on demand, which API key variables are set (never values), per-role model/temperature/max steps with optional provider model list, limits; validated save with comment-preserving backup and stale-file protection; authorized model test | Saved values apply after restarting the web interface (the page says so). Sandbox image build (long Docker build) stays on the command line or existing dashboard. Secrets are never editable here |
+| Model teams | Named lineups and current roles | Team files are edited in `teams/` |
+| What's new | Packaged history grouped by day, search, category filter, New-to-you marks, Mark all as read (shared with the existing dashboard), links to pages; nav badges for unread highlights and failures needing you | None |
 
 In task details, a retry keeps the original persisted task budget and deadline. Retrying a project
 item cannot detach it from project accounting or bypass a merge barrier. Queue start requires an
@@ -162,7 +166,7 @@ rules. Project cost totals reuse existing accounting across retries and planning
 ## Verification and release gates
 
 ```sh
-python -m pytest -q tests/test_webapp.py tests/test_web_artifacts.py tests/test_web_controls.py
+python -m pytest -q tests/test_webapp.py tests/test_web_artifacts.py tests/test_web_controls.py tests/test_web_chat.py tests/test_web_parity.py
 python scripts/check_docs.py
 npm test --prefix frontend
 npm run build --prefix frontend
@@ -173,8 +177,9 @@ read-only behavior, public fields, pagination, origins/hosts, session/CSRF autho
 uncertain outcomes, stale specs, project retry/accounting barriers and demo journeys without network
 or subprocesses. Frontend checks cover contracts, reconnect windows, accessible React navigation,
 spending-disabled forms, draft-only project creation and rendering every route without network calls.
-Server rendering is not browser evidence. New pages still need desktop, light/dark and 390px browser
-review; the computer-use service previously ended because it could not confidently determine the URL.
+Server rendering is not browser evidence. Browser evidence for every page (desktop and 390px, light and
+dark) and the main journeys was captured with Playwright against `--demo` on November 22, 2026; the
+scripts and screenshots are under ignored `.swarmforge/ui-migration/screenshots/`. Rerun them after UI changes.
 
 The interface project has five milestones: Work/API; controls/evidence; Projects/Chat; secondary parity;
 release/handoff. It remains drafting and unlaunched. No milestone is marked complete by these local

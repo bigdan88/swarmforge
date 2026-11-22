@@ -4,6 +4,7 @@ export type Work = {
   stage: string | null; run_id: string | null; created_at: number | null;
   updated_at: number | null; finished_at: number | null;
   reason: string | null; pr_url: string | null;
+  archived?: boolean; attempts?: number;
 };
 export type Page = {items: Work[]; total: number; counts: Record<string, number>; limit: number; offset: number};
 
@@ -18,7 +19,9 @@ const integer = (v: unknown, max = Number.MAX_SAFE_INTEGER): v is number =>
 export function parseWork(value: unknown): Work {
   if (!object(value) || !text(value.id) || !text(value.title) || !text(value.status) ||
       !['repo', 'stage', 'run_id', 'reason', 'pr_url'].every(key => nullableText(value[key])) ||
-      !['created_at', 'updated_at', 'finished_at'].every(key => timestamp(value[key]))) throw invalid();
+      !['created_at', 'updated_at', 'finished_at'].every(key => timestamp(value[key])) ||
+      !(value.archived === undefined || typeof value.archived === 'boolean') ||
+      !(value.attempts === undefined || (integer(value.attempts) && value.attempts >= 1))) throw invalid();
   return value as Work;
 }
 

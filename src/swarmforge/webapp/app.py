@@ -14,11 +14,17 @@ from .artifacts import ArtifactReader, ArtifactUnavailable
 from .contracts import RetainedReport, WorkArtifacts, WorkEvidence, WorkItem, WorkPage
 from .queries import WorkReader
 from .auth import LocalSession
-from .contracts import ActionCommand, ActionResult
-from .workspace import WorkspaceReader, feature_history, public_settings
+from .contracts import ActionCommand, ActionResult, Attachment, UploadCommand
+from .workspace import (WorkspaceReader, benchmarks, failure, failures, feature_history, public_settings,
+                        settings_details, speed)
 from .notes import NotesReader
 from .contracts import (ProjectPage, ProjectDetail, ConversationPage, ConversationDetail,
-                        WorkControls, QueueSnapshot, NotesPage, NoteDetail)
+                        WorkControls, QueueSnapshot, NotesPage, NoteDetail, FailurePage, FailureDetail)
+
+
+# Writable endpoints and their request-size limits. Actions stay small; staged chat uploads are
+# base64 JSON for one file of at most 5 MB.
+WRITE_LIMITS = {"/api/v1/actions": 128000, "/api/v1/chat/uploads": 7_100_000}
 
 
 def create_app(database: Path, assets: Path | None = None, runs_root: Path | None = None, *, config=None, actions=None, demo=False) -> FastAPI:
@@ -42,7 +48,7 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
         if cross_site_api or (origin and origin != str(request.base_url).rstrip("/")):
             return JSONResponse({"detail": "Cross-origin access is disabled"}, status_code=403)
         if request.method not in ("GET", "HEAD"):
-            if actions is None or request.method != "POST" or request.url.path != "/api/v1/actions":
+            if actions is None or request.method != "POST" or request.url.path not in WRITE_LIMITS:
                 return JSONResponse({"detail": "This preview is read-only"}, status_code=405)
             if origin != str(request.base_url).rstrip("/") or not session.authorized(request.cookies.get(session.cookie), request.headers.get("x-csrf-token")):
                 return JSONResponse({"detail": "Refresh this page to authorize local controls"}, status_code=403)
@@ -52,7 +58,7 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
                 size = int(request.headers.get("content-length", "-1"))
             except ValueError:
                 size = -1
-            if not 0 <= size <= 128000:
+            if not 0 <= size <= WRITE_LIMITS[request.url.path]:
                 return JSONResponse({"detail": "Request is too large or has no length"}, status_code=413)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -93,6 +99,27 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
 
+    @app.post("/api/v1/chat/uploads", response_model=Attachment)
+    def chat_upload(upload: UploadCommand):
+        from ..services.chat_requests import stage_upload
+        try:
+            return stage_upload(actions.store, config, upload.name, upload.data)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @app.get("/api/v1/conversations/{cid}/attachments/{upload_id}")
+    def chat_attachment(cid: str, upload_id: str):
+        from ..attachments import IMAGE_MIME, RASTER_SIGNATURES
+        from ..services.chat_requests import upload_root
+        row = workspace.chat_upload(cid, upload_id) if len(upload_id) == 32 else None
+        if row is None or row["kind"] != "image" or config is None:
+            raise HTTPException(404, "Attachment unavailable")
+        path, root = Path(row["path"]).resolve(), upload_root(config)
+        media = IMAGE_MIME.get(path.suffix.lower()) if path.suffix.lower() in RASTER_SIGNATURES else None
+        if root not in path.parents or media is None or not path.is_file() or path.stat().st_size > 5 * 1024 * 1024:
+            raise HTTPException(404, "Attachment unavailable")
+        return Response(path.read_bytes(), media_type=media, headers={"Content-Disposition": 'inline; filename="attachment"'})
+
     @app.get("/api/v1/projects", response_model=ProjectPage)
     def projects(limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0, le=100000), search: str = Query("", max_length=200)):
         return workspace.projects(limit=limit, offset=offset, search=search)
@@ -132,11 +159,95 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
 
     @app.get("/api/v1/features")
     def features():
-        return {"items": feature_history()[:100]}
+        seen = set((workspace.kv("feature_history_seen") or "").split(","))
+        items = [{**e, "unread": e["id"] not in seen} for e in feature_history()[:100]]
+        return {"items": items, "unread": sum(e["unread"] for e in items), "categories": sorted({str(e.get("category", "")) for e in items})}
+
+    @app.get("/api/v1/badges")
+    def badges():
+        seen = set((workspace.kv("feature_history_seen") or "").split(","))
+        counts = failures(workspace, limit=1)["counts"]
+        return {"failures_need_you": counts["needs_you"], "features_unread": sum(e["id"] not in seen for e in feature_history()[:100])}
+
+    pull_requests = actions.pull_requests if actions is not None else None
+    if pull_requests is None and config is not None:
+        from ..db import Store
+        from ..services.pull_requests import PullRequests
+
+        class _ReadOnlyRuns:
+            """Run/queue lookups for PR listing without opening a writable Store."""
+            RECENT_REPOS_KEY = Store.RECENT_REPOS_KEY
+            recent_repos = Store.recent_repos
+
+            def _all(self, sql, args=()):
+                with workspace.connection() as conn:
+                    return [dict(r) for r in conn.execute(sql, args)]
+
+            def _one(self, sql, args=()):
+                found = self._all(sql, args)
+                return found[0] if found else None
+
+            def list_runs(self, limit):
+                return self._all("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))
+
+            def kv_get(self, key):
+                return workspace.kv(key)
+        pull_requests = PullRequests(_ReadOnlyRuns(), config)
+
+    @app.get("/api/v1/settings/details")
+    def settings_view():
+        return settings_details(config)
+
+    @app.get("/api/v1/settings/health")
+    def settings_health():
+        if config is None:
+            raise HTTPException(404, "Configuration not loaded")
+        check = getattr(actions, "health_checks", None)
+        if check is None:
+            from ..settings import get_health_checks as check
+        safe = lambda v: v if isinstance(v, (str, bool, int, float)) or v is None else str(v)
+        return {"checks": [{k: safe(v) for k, v in row.items() if k in ("name", "status", "message", "fix", "optional")} for row in check(config)][:30]}
+
+    @app.get("/api/v1/settings/models")
+    def settings_models(provider: str = Query(..., max_length=100)):
+        if config is None or provider not in config.providers:
+            raise HTTPException(404, "Provider not configured")
+        lister = getattr(actions, "provider_models", None)
+        if lister is None:
+            from ..settings import provider_models as lister
+        found = lister(config, provider)
+        return {"available": found is not None, "models": (found or [])[:2000]}
+
+    @app.get("/api/v1/speed")
+    def speed_view(n: int = Query(30, ge=5, le=200)):
+        return speed(workspace, n)
+
+    @app.get("/api/v1/benchmarks")
+    def benchmark_view():
+        return benchmarks(workspace)
+
+    @app.get("/api/v1/prs")
+    def pull_request_list(refresh: bool = False):
+        if pull_requests is None:
+            return {"configured": False, "token": False, "repos": [], "items": [], "errors": {}, "fetched_at": None}
+        return pull_requests.listing(refresh=refresh)
 
     @app.get("/api/v1/knowledge", response_model=NotesPage)
-    def knowledge(search: str = Query("", max_length=200), offset: int = Query(0, ge=0, le=100000)):
-        return notes.list(search=search, offset=offset)
+    def knowledge(search: str = Query("", max_length=200), offset: int = Query(0, ge=0, le=100000),
+                  type: str = Query("", max_length=40), repo: str = Query("", max_length=300)):
+        return notes.list(search=search, offset=offset, type=type, repo=repo)
+
+    @app.get("/api/v1/failures", response_model=FailurePage)
+    def failure_list(limit: int = Query(25, ge=1, le=25), offset: int = Query(0, ge=0, le=100000),
+                     category: str = Query("", max_length=60)):
+        return failures(workspace, limit=limit, offset=offset, category=category)
+
+    @app.get("/api/v1/failures/{run_id}", response_model=FailureDetail)
+    def failure_detail(run_id: str):
+        row = failure(workspace, run_id)
+        if row is None:
+            raise HTTPException(404, "Failure not recorded")
+        return row
 
     @app.get("/api/v1/knowledge/{note_id}", response_model=NoteDetail)
     def knowledge_note(note_id: str):
@@ -148,8 +259,9 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
     @app.get("/api/v1/work", response_model=WorkPage)
     def work(limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0, le=100000),
              status: Literal["queued", "running", "tentative", "done", "failed", "cancelled", "skipped"] | None = None,
-             search: str = Query("", max_length=200), view: Literal["all", "prs", "failures", "history"] = "all"):
-        return reader.list(limit=limit, offset=offset, status=status, search=search, view=view)
+             search: str = Query("", max_length=200), view: Literal["all", "prs", "failures", "history"] = "all",
+             archived: bool = False, fold: bool = False):
+        return reader.list(limit=limit, offset=offset, status=status, search=search, view=view, archived=archived, fold=fold)
 
     @app.get("/api/v1/work/{item_id}", response_model=WorkItem)
     def detail(item_id: str):

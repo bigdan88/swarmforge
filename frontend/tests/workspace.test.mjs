@@ -63,3 +63,13 @@ test('each workspace route renders without a DOM or automatic network/model call
     }
   }finally{globalThis.location.search='';}
 });
+
+test('chat reply status helpers report the newest request and readable elapsed time',async()=>{
+  const {latestRequest,elapsed}=await import(pathToFileURL(join(output,'api.js')));
+  assert.equal(latestRequest([]),null);
+  assert.equal(latestRequest([{id:'b',status:'thinking'},{id:'a',status:'done'}]).id,'b');
+  assert.equal(latestRequest('not a list'),null);
+  assert.equal(elapsed(100,null,145),'45s');
+  assert.equal(elapsed(100,230,9999),'2m 10s');
+  assert.equal(elapsed(200,null,100),'0s');
+});

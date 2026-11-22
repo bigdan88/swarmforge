@@ -83,6 +83,25 @@ _MAX_STEM_CHARS = 80
 _SAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 
+# Raster images accepted from a browser upload, with their leading file signatures. SVG is
+# excluded because it can carry script.
+RASTER_SIGNATURES: dict[str, tuple[bytes, ...]] = {
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".gif": (b"GIF87a", b"GIF89a"),
+    ".webp": (b"RIFF",),
+}
+
+
+def raster_image_matches(ext: str, content: bytes) -> bool:
+    """True when *content* really is the raster image format its extension claims."""
+    signatures = RASTER_SIGNATURES.get(ext.lower())
+    if not signatures or not content.startswith(signatures):
+        return False
+    return ext.lower() != ".webp" or content[8:12] == b"WEBP"
+
+
 def sanitize_name(name: str) -> str:
     """Return a safe filename for *name*.
 
