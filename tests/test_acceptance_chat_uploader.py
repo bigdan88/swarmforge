@@ -360,7 +360,10 @@ def test_ac5_ask_and_answer_gained_exactly_one_optional_keyword_only_param():
         "on_tool"}
     assert set(inspect.signature(chatbot.answer).parameters) == {
         "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "budget",
-        "attachments", "on_tool"}
+        "attachments", "on_tool", "question_saved"}
+    # question_saved (web chat jobs store the question first) is keyword-only and off by default.
+    saved = inspect.signature(chatbot.answer).parameters["question_saved"]
+    assert saved.kind is inspect.Parameter.KEYWORD_ONLY and saved.default is False
 
 
 def test_ac5_single_attachment_module_with_explicit_chat_page_consumer():

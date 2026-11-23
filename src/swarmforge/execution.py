@@ -58,6 +58,11 @@ class ExecutionStopped(RuntimeError):
 
 @contextmanager
 def transaction(store):
+    """Kept for existing callers: the Store's own transaction (one boundary, nested calls join it)."""
+    if hasattr(store, "transaction"):
+        with store.transaction() as conn:
+            yield conn
+        return
     with store._lock, store.conn:
         store.conn.execute("BEGIN IMMEDIATE")
         yield store.conn

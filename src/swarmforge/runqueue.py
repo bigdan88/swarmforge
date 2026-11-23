@@ -194,7 +194,8 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     with store._lock, store.conn:
         store.conn.execute("BEGIN IMMEDIATE")
         if item.get("project_id"):
-            claim = store.conn.execute("SELECT project_id FROM project_lead_claims WHERE project_id=?", (item["project_id"],)).fetchone()
+            from .projects.decisions import lead_active
+            claim = lead_active(store.conn, item["project_id"])
             state = store.conn.execute("SELECT status FROM projects WHERE id=?", (item["project_id"],)).fetchone()
             if claim or not state or state["status"] != "running":
                 return {**store.queue_item(item["id"]), "_deferred": True}

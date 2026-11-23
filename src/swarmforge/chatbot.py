@@ -631,8 +631,12 @@ async def answer(
     budget=None,
     attachments: list | None = None,
     on_tool=None,
+    question_saved: bool = False,
 ) -> dict:
     """Ask the status chatbot a question; returns {answer, role, model, question}.
+
+    `question_saved=True` means the caller already stored the question as the conversation's newest
+    user message (the web chat does this in the same transaction that starts the reply job).
 
     With `conversation` set, the question and reply are persisted to that
     conversation, the prompt context comes only from that conversation's stored
@@ -673,7 +677,8 @@ async def answer(
         }
     ]
     if conversation:
-        store.conversation_append(conversation, "user", question)
+        if not question_saved:
+            store.conversation_append(conversation, "user", question)
         msgs = store.conversation_messages(conversation)
         reserved = estimate_tokens(messages)
         if len(msgs) > cfg.chat.context_max_messages:  # leave room for the summary of older messages
@@ -1040,7 +1045,7 @@ def improvement_context(cfg: Config, store: Store) -> str:
         except OSError:
             continue
     if mods:
-        L.append("Modules:\n  " + "\n  ".join(mods[:45]))
+        L.append("Modules:\n  " + "\n  ".join(mods[:80]))
     # statistics
     runs = store.list_runs(40)
     done = [r for r in runs if r["state"] in TERMINAL]

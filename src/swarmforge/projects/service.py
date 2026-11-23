@@ -135,8 +135,10 @@ def can_start(store, item):
     p = ps.get(item["project_id"])
     if p["status"] != "running" or not p["observed_sha"] or item["milestone"] != p["current_milestone"]:
         return False
-    if store._one("SELECT project_id FROM project_lead_claims WHERE project_id=?", (p["id"],)):
-        return False
+    from .decisions import lead_active
+    with store._lock:
+        if lead_active(store.conn, p["id"]):
+            return False
     queued = [q for q in ps.items(p["id"]) if q["status"] == "queued" and q["milestone"] == p["current_milestone"]]
     if item.get("queue") != lane(p["id"]) or not queued or queued[0]["id"] != item["id"]:
         return False
@@ -249,9 +251,12 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
     turn = LeadTurn.claim(store, pid)
     if turn is None:
         return
+    failed = ""
     try:
-        return await _advance(cfg, store, pid, repository=repository, ask=ask, transport=transport, turn=turn)
+        with turn.keep_alive():
+            return await _advance(cfg, store, pid, repository=repository, ask=ask, transport=transport, turn=turn)
     except BaseException as exc:
+        failed = f"{type(exc).__name__}: {exc}"
         turn.mark("failed", {"error": f"{type(exc).__name__}: {exc}"})
         ps = Projects(store)
         current = ps.get(pid)
@@ -261,7 +266,7 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
         raise
     finally:
         turn.mark("superseded", {"reason": "A current-state guard prevented applying this proposal"})
-        turn.release()
+        turn.release(failed=bool(failed), reason=failed[:1000])
 
 
 async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None, turn):

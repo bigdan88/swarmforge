@@ -114,6 +114,32 @@ access but does not enforce relay-only egress. See [SECURITY.md](SECURITY.md).
 The README records the local team as of 2026-11-02. The committed example configuration has a
 different team and uses the built-in runtime; model names are configuration, not fixed architecture.
 
+## Background jobs and transactions
+
+Background work is recorded in the `jobs` table (`src/swarmforge/jobs.py`). Each job has a kind, a
+subject, one owner (a per-start process identity, its PID and host) and a lease the owner renews while it
+works. The database allows one active job per kind and subject across all connections and processes.
+
+- **States:** pending → running → succeeded / failed / interrupted / uncertain / cancelled. Terminal
+  states never change; a retry is a new job that names its predecessor and counts the attempt.
+- **Owner-only finish:** only the current owner can end a running job, so a process that lost its lease
+  can never overwrite what recovery decided.
+- **Recovery needs proof:** any process may recover a running job whose lease expired, or whose owner
+  process on the same host has exited. A live owner elsewhere is never disturbed. Recovery is an explicit
+  transition, recorded with its reason in `job_transitions`. Work that may already have reached the
+  outside world recovers as `uncertain`; nothing is replayed automatically.
+- **Hooks:** a kind registers a hook that updates its own rows inside the transition's transaction (the
+  chat request the browser shows, a project's lead decisions), so the two can never disagree.
+
+On jobs today: chat replies (`chat_reply`) and project-lead turns (`project_lead`, recovers as
+uncertain and stops the project for a human). Runs and the queue worker still use their allowance claims
+(docs/EXECUTION.md) and move next.
+
+`Store.transaction()` is the boundary for one business operation: it takes the write lock up front
+(`BEGIN IMMEDIATE`), store helpers called inside join it rather than committing, and nested calls join
+the outer one. Network and model calls never happen inside a transaction: record the intent, commit,
+make the call, then record the outcome in a new transaction.
+
 ## Data & observability
 
 Everything lives under `workdir` (default `~/.swarmforge`):

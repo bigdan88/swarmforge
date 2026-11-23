@@ -81,7 +81,7 @@ records use `swarmforge project status PROJECT_ID`; its JSON includes `lead_deci
 bounded when read; inspection excerpts and evidence catalogs are capped. No extra model calls run
 on dashboard refreshes.
 
-Opening an existing database adds the journal/claim tables and nullable queue `depends_on` and
+Opening an existing database adds the journal/job tables (lead turns are `project_lead` jobs; a claim row left by an older version is still honoured until its process exits) and nullable queue `depends_on` and
 `project_action` fields. Existing tasks have no additional dependencies and retain their existing
 workflow. No database migration launches work or changes an approved specification. Runtime
 configuration, credentials and user databases are not part of this source change.

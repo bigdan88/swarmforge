@@ -13,6 +13,8 @@ import sqlite3
 import stat
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -259,12 +261,15 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.RLock()
+        self._tx_depth = 0  # >0 while transaction() is open on this connection (same thread holds _lock)
         self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         from .execution import SCHEMA as EXECUTION_SCHEMA
         self.conn.executescript(EXECUTION_SCHEMA)
+        from .jobs import SCHEMA as JOBS_SCHEMA
+        self.conn.executescript(JOBS_SCHEMA)
         self._migrate()
         self.conn.commit()
 
@@ -313,8 +318,38 @@ class Store:
     def _exec(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         with self._lock:
             cur = self.conn.execute(sql, params)
-            self.conn.commit()
+            if not self._tx_depth:  # inside transaction() the statement joins it; commit happens at the end
+                self.conn.commit()
             return cur
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """One business operation, one transaction: all or nothing.
+
+        Takes the write lock up front (BEGIN IMMEDIATE), so a read-then-write decision cannot race
+        another connection or process. Store helpers called inside join it instead of committing.
+        Nested calls join the outer transaction. Never make network or model calls inside: record
+        the intent, commit, make the call, then record the outcome in a new transaction."""
+        with self._lock:
+            if self._tx_depth:
+                self._tx_depth += 1
+                try:
+                    yield self.conn
+                finally:
+                    self._tx_depth -= 1
+                return
+            if self.conn.in_transaction:  # a stray implicit transaction must not be swallowed silently
+                self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+            self._tx_depth = 1
+            try:
+                yield self.conn
+            except BaseException:
+                self._tx_depth = 0
+                self.conn.rollback()
+                raise
+            self._tx_depth = 0
+            self.conn.commit()
 
     def _all(self, sql: str, params: tuple = ()) -> list[dict]:
         with self._lock:

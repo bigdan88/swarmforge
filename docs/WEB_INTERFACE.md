@@ -99,12 +99,13 @@ the optional-dependency message.
 | Model teams | Named lineups and current roles | Team files are edited in `teams/` |
 | What's new | Packaged history grouped by day, search, category filter, New-to-you marks, Mark all as read (shared with the existing dashboard), links to pages; nav badges for unread highlights and failures needing you | None |
 
-Chat replies run in the background and are owned by the web process that started them (a per-start
-identity plus a heartbeat). Starting another web instance never interrupts a live reply; a reply whose
-owner process has exited or stopped heartbeating for a minute is marked interrupted when the next
-instance starts or the conversation is used, and is never re-sent automatically. Pressing Send is the
-consent for one chat or project-lead reply; queue starts, task creation, retries, launches and paid
-model tests still ask for explicit confirmation.
+Chat replies run in the background as durable jobs (see docs/ARCHITECTURE.md, Background jobs) owned
+by the web process that started them. The question is stored in the same transaction that starts the
+job, so a crash never loses it. Starting another web instance never interrupts a live reply; a reply
+whose owner process has exited, or which stopped renewing its lease for a minute, is marked interrupted
+when the next instance starts or the conversation is used, and is never re-sent automatically. Pressing
+Send is the consent for one chat or project-lead reply; queue starts, task creation, retries, launches
+and paid model tests still ask for explicit confirmation.
 
 When a conversation is longer than the configured window, older messages are summarized once
 (a stored rolling summary, extended only with newly dropped messages) and sent with the recent ones;

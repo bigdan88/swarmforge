@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
-import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .. import jobs
 from ..execution import transaction
 from .spec import ProjectError, fixed
 
@@ -38,47 +37,82 @@ def epoch(store: Store, project: dict) -> str:
     return hashlib.sha256(encoded(source).encode()).hexdigest()
 
 
+LEAD_JOB = "project_lead"
+LOST = "Project lead worker was lost. Inspect its saved decision and repository state before resuming; no action was replayed."
+
+
+def _on_lead_transition(db, job: dict, to_state: str, reason: str) -> None:
+    """A lead turn whose owner vanished may have been mid-action: stop for a human, replay nothing."""
+    if to_state not in ("interrupted", "uncertain"):
+        return
+    _fail_unfinished(db, job["subject"])
+
+
+def _fail_unfinished(db, project_id: str) -> bool:
+    unfinished = db.execute("SELECT id FROM project_decisions WHERE project_id=? AND status IN ('proposed','validated','executing')", (project_id,)).fetchall()
+    if not unfinished:
+        return False
+    db.execute("UPDATE project_decisions SET status='failed',finished_at=?,result=? WHERE project_id=? AND status IN ('proposed','validated','executing')",
+               (time.time(), encoded({"error": LOST}), project_id))
+    db.execute("UPDATE projects SET status='waiting_for_you',last_error=? WHERE id=?", (LOST, project_id))
+    db.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)",
+               (project_id, time.time(), "lead_recovery", encoded({"reason": LOST, "decision_ids": [r["id"] for r in unfinished]})))
+    return True
+
+
+jobs.register(LEAD_JOB, on_transition=_on_lead_transition, recover_to="uncertain")
+
+
+def lead_active(db, project_id: str) -> bool:
+    """True while a lead turn holds the project (a running job, or a claim left by an older version)."""
+    if db.execute("SELECT 1 FROM jobs WHERE kind=? AND subject=? AND state IN ('pending','running')", (LEAD_JOB, project_id)).fetchone():
+        return True
+    return db.execute("SELECT 1 FROM project_lead_claims WHERE project_id=?", (project_id,)).fetchone() is not None
+
+
 @dataclass
 class LeadTurn:
     store: Store
     project_id: str
-    token: str
+    job_id: str
     decision_id: int | None = None
 
     @classmethod
     def claim(cls, store: Store, project_id: str) -> LeadTurn | None:
         from ..launcher import pid_alive
-        token = uuid.uuid4().hex
+        jobs.ensure_tables(store)
+        jobs.recover(store, LEAD_JOB, project_id)  # a turn whose owner is gone stops for a human first
         with transaction(store) as db:
             p = db.execute("SELECT status,approved_at FROM projects WHERE id=?", (project_id,)).fetchone()
             if not p or p["status"] != "running" or not p["approved_at"]:
                 return None
             if db.execute("SELECT id FROM queue_items WHERE project_id=? AND status='running' LIMIT 1", (project_id,)).fetchone():
                 return None
-            old = db.execute("SELECT * FROM project_lead_claims WHERE project_id=?", (project_id,)).fetchone()
-            if old:
-                if pid_alive(old["owner_pid"]):
+            legacy = db.execute("SELECT * FROM project_lead_claims WHERE project_id=?", (project_id,)).fetchone()
+            if legacy:  # written by a version before jobs
+                if pid_alive(legacy["owner_pid"]):
                     return None
-                unfinished = db.execute("SELECT id FROM project_decisions WHERE project_id=? AND status IN ('proposed','validated','executing')", (project_id,)).fetchall()
                 db.execute("DELETE FROM project_lead_claims WHERE project_id=?", (project_id,))
-                if unfinished:
-                    reason = "Project lead worker was lost. Inspect its saved decision and repository state before resuming; no action was replayed."
-                    db.execute("UPDATE project_decisions SET status='failed',finished_at=?,result=? WHERE project_id=? AND status IN ('proposed','validated','executing')",
-                               (time.time(), encoded({"error": reason}), project_id))
-                    db.execute("UPDATE projects SET status='waiting_for_you',last_error=? WHERE id=?", (reason, project_id))
-                    db.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)",
-                               (project_id, time.time(), "lead_recovery", encoded({"reason": reason, "decision_ids": [r["id"] for r in unfinished]})))
+                if _fail_unfinished(db, project_id):
                     return None
-            db.execute("INSERT INTO project_lead_claims VALUES (?,?,?,?)", (project_id, token, os.getpid(), time.time()))
-        return cls(store, project_id, token)
+            try:
+                job = jobs.create(store, LEAD_JOB, project_id)
+            except jobs.JobBusy:
+                return None
+        return cls(store, project_id, job["id"])
 
-    def release(self) -> None:
-        self.store._exec("DELETE FROM project_lead_claims WHERE project_id=? AND token=?", (self.project_id, self.token))
+    def keep_alive(self):
+        """Renew this turn's lease while the lead works (model calls can take minutes)."""
+        return jobs.keep_alive(self.store, self.job_id)
+
+    def release(self, *, failed: bool = False, reason: str = "") -> None:
+        jobs.finish(self.store, self.job_id, "failed" if failed else "succeeded", error=reason or None,
+                    reason=reason or "lead turn ended")
 
     def begin(self, cycle: str, evidence: dict, max_actions: int) -> int | None:
         with transaction(self.store) as db:
-            owner = db.execute("SELECT token FROM project_lead_claims WHERE project_id=?", (self.project_id,)).fetchone()
-            if not owner or owner["token"] != self.token:
+            owner = db.execute("SELECT state,owner FROM jobs WHERE id=?", (self.job_id,)).fetchone()
+            if not owner or owner["state"] != "running" or owner["owner"] != jobs.ME.instance:
                 raise ProjectError("Lead turn lost its ownership claim")
             count = db.execute("SELECT COUNT(*) FROM project_decisions WHERE project_id=? AND epoch=?", (self.project_id, cycle)).fetchone()[0]
             if count >= max_actions:

@@ -11,10 +11,11 @@ from ..services.dashboard import DashboardActions
 DEMO_REPLY_DELAY_S = 1.5
 
 
-async def fake_answer(config, store, question, *, conversation, attachments=None, on_tool=None):
+async def fake_answer(config, store, question, *, conversation, attachments=None, on_tool=None, question_saved=False):
     import asyncio
     from ..chatbot import ChatError
-    store.conversation_append(conversation, "user", question)
+    if not question_saved:
+        store.conversation_append(conversation, "user", question)
     if on_tool:
         on_tool("status_snapshot", {}, "Demo status read")
     await asyncio.sleep(DEMO_REPLY_DELAY_S)

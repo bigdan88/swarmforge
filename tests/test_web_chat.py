@@ -223,3 +223,49 @@ def test_sending_is_the_consent_for_one_reply_but_bigger_spending_still_needs_ap
     task = {"title": "T", "body": "B", "repo": "owner/app", "budget": 2}
     assert not actions.execute("plain-queue-0000001", "queue_task", "", task)["ok"]
     assert not actions.execute("plain-start-0000001", "start_queue", "", {})["ok"]
+
+
+KILLED_REPLY = """
+import asyncio, sys
+from pathlib import Path
+from swarmforge.db import Store
+from swarmforge.services.chat_requests import start_reply
+store = Store(Path(sys.argv[1]))
+store.conversation_create("k1", "Kill test")
+async def answer(config, store, question, *, conversation, question_saved=False):
+    print("started", flush=True)
+    await asyncio.sleep(60)
+start_reply(store, None, answer, "k1", "Keep my message", background=False)
+"""
+
+
+@pytest.mark.skipif(__import__("sys").platform == "win32", reason="SIGKILL")
+def test_a_killed_web_process_loses_no_message_and_frees_the_conversation(tmp_path):
+    import os
+    import signal
+    import subprocess
+    import sys
+    script = tmp_path / "reply.py"
+    script.write_text(KILLED_REPLY)
+    db = tmp_path / "kill.db"
+    proc = subprocess.Popen([sys.executable, str(script), str(db)], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "started"
+    os.kill(proc.pid, signal.SIGKILL)
+    proc.wait()
+    store = Store(db)
+    try:
+        # The question was stored with the job, before the reply began: nothing to retype.
+        assert [m["content"] for m in store.conversation_messages("k1")] == ["Keep my message"]
+        request = store._one("SELECT * FROM chat_requests")
+        assert request["status"] == "thinking" and request["user_message_id"]
+        assert release_interrupted(store, "k1") == 1  # recovered at once: its process is gone
+        request = store._one("SELECT * FROM chat_requests")
+        assert request["status"] == "interrupted" and "Send the message again" in request["error"]
+        from swarmforge import jobs
+        assert jobs.get(store, request["job_id"])["state"] == "interrupted"
+        gate = threading.Event()
+        gate.set()
+        start_reply(store, None, gated_answer(gate, []), "k1", "Next", background=False)
+        assert wait_idle(store, "k1")["status"] == "done"
+    finally:
+        store.close()

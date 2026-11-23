@@ -261,6 +261,8 @@ async def test_simultaneous_leads_make_one_call_and_queue_dispatch_is_fenced(pro
     finish.set()
     await first
     assert calls == [1] and not store._all("SELECT * FROM project_lead_claims")
+    lead_jobs = store._all("SELECT state FROM jobs WHERE kind='project_lead' AND subject=?", (pid,))
+    assert lead_jobs == [{"state": "succeeded"}]  # one turn ran; the concurrent attempt never got a job
     other.close()
 
 
@@ -271,7 +273,7 @@ async def test_lost_lead_does_not_replay_uncertain_repository_write(project, cfg
     turn.begin(epoch(store, p), {"_policy": {}}, 3)
     turn.candidate(proposal(), action="plan", reason="Save plan")
     turn.mark("executing", {"repository_sha": "main-1"})
-    store._exec("UPDATE project_lead_claims SET owner_pid=999999")
+    store._exec("UPDATE jobs SET owner='lost-worker', owner_pid=999999 WHERE kind='project_lead'")  # its process died
     monkeypatch.setattr("swarmforge.launcher.pid_alive", lambda _: False)
     repo = EvidenceRepo()
     async def forbidden(*args):

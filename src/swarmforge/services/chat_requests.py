@@ -13,20 +13,21 @@ import binascii
 import sqlite3
 import inspect
 import json
-import os
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .. import jobs
 from ..db import Store
 
+INSTANCE = jobs.ME.instance  # this process's identity as a job owner
+
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-HEARTBEAT_S = 5.0     # a running reply refreshes its heartbeat this often
-STALE_AFTER_S = 60.0  # a reply whose owner stopped heartbeating this long ago is recoverable
-# Identifies this server process across its lifetime; a restarted process gets a new identity.
-INSTANCE = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
+STALE_AFTER_S = 60.0  # legacy rows (before jobs): an owner silent this long is gone
+JOB_KIND = "chat_reply"
+INTERRUPTED = "The web service stopped before this reply finished. Send the message again if you still need it."
 MAX_ATTACHMENTS = 6
 MAX_STEPS = 40
 
@@ -42,7 +43,7 @@ def ensure_tables(store: Store) -> None:
         before_message_id INTEGER NOT NULL DEFAULT 0, user_message_id INTEGER, attachments TEXT NOT NULL DEFAULT '[]')""")
     store._exec("CREATE INDEX IF NOT EXISTS chat_requests_conversation ON chat_requests(conversation_id, started_at)")
     columns = {r["name"] for r in store._all("PRAGMA table_info(chat_requests)")}
-    for name, kind in (("owner", "TEXT"), ("heartbeat", "REAL")):
+    for name, kind in (("owner", "TEXT"), ("heartbeat", "REAL"), ("job_id", "TEXT")):
         if name not in columns:
             store._exec(f"ALTER TABLE chat_requests ADD COLUMN {name} {kind}")
     # One pending reply per conversation, enforced by the database across connections and processes.
@@ -50,10 +51,32 @@ def ensure_tables(store: Store) -> None:
     store._exec("""CREATE TABLE IF NOT EXISTS chat_uploads (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
         created_at REAL NOT NULL, request_id TEXT)""")
+    jobs.ensure_tables(store)
 
 
-def _owner_gone(owner, heartbeat, now: float) -> bool:
-    """True only when the owning process is verifiably not running this reply any more."""
+_STATUS = {"succeeded": "done", "failed": "failed", "interrupted": "interrupted", "uncertain": "interrupted",
+           "cancelled": "interrupted"}
+
+
+def _on_transition(conn, job: dict, to_state: str, reason: str) -> None:
+    """Keep the browser-visible request in step with its job, in the same transaction."""
+    status = _STATUS.get(to_state)
+    if status is None:
+        return
+    error = None
+    if status == "failed":
+        error = (reason or "The reply failed")[:1000]
+    elif status == "interrupted":
+        error = INTERRUPTED
+    conn.execute("UPDATE chat_requests SET status=?, error=?, finished_at=? WHERE job_id=? AND status='thinking'",
+                 (status, error, time.time(), job["id"]))
+
+
+jobs.register(JOB_KIND, on_transition=_on_transition, recover_to="interrupted")
+
+
+def _legacy_owner_gone(owner, heartbeat, now: float) -> bool:
+    """Rows written before replies were jobs: gone if silent for a minute or its process exited."""
     if owner == INSTANCE:
         return False
     if heartbeat is None or now - heartbeat > STALE_AFTER_S:
@@ -67,21 +90,19 @@ def _owner_gone(owner, heartbeat, now: float) -> bool:
 
 
 def release_interrupted(store: Store, conversation: str | None = None) -> int:
-    """Mark replies whose owner has stopped (crashed or restarted server) as interrupted.
+    """Recover replies whose owner has stopped (crashed or restarted server): they become interrupted.
     Replies still owned by a live process, including another web instance, are left alone.
     Nothing is retried automatically: the user decides whether to send again."""
     ensure_tables(store)
+    released = len(jobs.recover(store, JOB_KIND, conversation))
     now = time.time()
-    query = "SELECT id,owner,heartbeat FROM chat_requests WHERE status='thinking'" + (" AND conversation_id=?" if conversation else "")
-    released = 0
+    query = "SELECT id,owner,heartbeat FROM chat_requests WHERE status='thinking' AND job_id IS NULL" + (" AND conversation_id=?" if conversation else "")
     for row in store._all(query, (conversation,) if conversation else ()):
-        if not _owner_gone(row["owner"], row["heartbeat"], now):
+        if not _legacy_owner_gone(row["owner"], row["heartbeat"], now):
             continue
-        # Conditional on the row being unchanged since it was judged dead (no race with a late heartbeat).
-        cur = store._exec("UPDATE chat_requests SET status='interrupted', finished_at=?, "
-                          "error='The web service stopped before this reply finished. Send the message again if you still need it.' "
+        cur = store._exec("UPDATE chat_requests SET status='interrupted', finished_at=?, error=? "
                           "WHERE id=? AND status='thinking' AND COALESCE(owner,'')=COALESCE(?,'') AND COALESCE(heartbeat,-1)=COALESCE(?,-1)",
-                          (now, row["id"], row["owner"], row["heartbeat"]))
+                          (now, INTERRUPTED, row["id"], row["owner"], row["heartbeat"]))
         released += cur.rowcount
     return released
 
@@ -151,12 +172,19 @@ def _claim_uploads(store: Store, config, ids: Any) -> list[dict]:
     return found
 
 
-def _call_answer(answer_fn: Callable, config, store, question, conversation, attachments, on_tool):
+def _saves_question(answer_fn: Callable) -> bool:
+    """Adapters that accept question_saved let us store the user's message before the reply starts."""
+    return "question_saved" in inspect.signature(answer_fn).parameters
+
+
+def _call_answer(answer_fn: Callable, config, store, question, conversation, attachments, on_tool, saved: bool):
     params = inspect.signature(answer_fn).parameters
     accepts_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
     kwargs: dict[str, Any] = {"conversation": conversation}
     if accepts_any or "on_tool" in params:
         kwargs["on_tool"] = on_tool
+    if saved:
+        kwargs["question_saved"] = True
     if attachments:
         if not (accepts_any or "attachments" in params):
             raise ValueError("This chat adapter does not accept attachments")
@@ -166,26 +194,35 @@ def _call_answer(answer_fn: Callable, config, store, question, conversation, att
 
 def start_reply(store: Store, config, answer_fn: Callable, conversation: str, question: str,
                 attachment_ids: Any = None, *, background: bool = True) -> dict:
-    """Record a pending reply and run it; raises ChatBusy if one is already pending here."""
+    """Record a pending reply as a job owned by this process and run it; raises ChatBusy if a
+    reply is already active here.
+
+    One transaction creates the job, the browser-visible request, claims the attachments and (when
+    the adapter allows) stores the user's message, so a crash can never leave half of them."""
     ensure_tables(store)
     uploads = _claim_uploads(store, config, attachment_ids)
     request_id = uuid.uuid4().hex
     public = [{k: u[k] for k in ("id", "name", "kind", "size")} for u in uploads]
     release_interrupted(store, conversation)  # a dead owner's reply must not block the conversation forever
+    saved = _saves_question(answer_fn)
     busy = ChatBusy("A reply is still in progress in this conversation. Wait for it, or open another conversation.")
+
+    def record(conn, job):
+        if conn.execute("SELECT 1 FROM chat_requests WHERE conversation_id=? AND status='thinking'", (conversation,)).fetchone():
+            raise busy  # a reply from before jobs existed is still running here
+        before = conn.execute("SELECT COALESCE(MAX(id),0) FROM chat_messages WHERE conversation_id=?", (conversation,)).fetchone()[0]
+        user_id = store.conversation_append(conversation, "user", question) if saved else None
+        now = time.time()
+        conn.execute("INSERT INTO chat_requests(id,conversation_id,question,status,started_at,before_message_id,attachments,owner,heartbeat,job_id,user_message_id) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (request_id, conversation, question, "thinking", now, before, json.dumps(public),
+                                                        INSTANCE, now, job["id"], user_id))
+        for u in uploads:
+            conn.execute("UPDATE chat_uploads SET request_id=? WHERE id=?", (request_id, u["id"]))
+
     try:
-        with store._lock, store.conn:
-            store.conn.execute("BEGIN IMMEDIATE")
-            if store.conn.execute("SELECT 1 FROM chat_requests WHERE conversation_id=? AND status='thinking'", (conversation,)).fetchone():
-                raise busy
-            before = store.conn.execute("SELECT COALESCE(MAX(id),0) FROM chat_messages WHERE conversation_id=?", (conversation,)).fetchone()[0]
-            now = time.time()
-            store.conn.execute("INSERT INTO chat_requests(id,conversation_id,question,status,started_at,before_message_id,attachments,owner,heartbeat) "
-                               "VALUES (?,?,?,?,?,?,?,?,?)", (request_id, conversation, question, "thinking", now, before, json.dumps(public), INSTANCE, now))
-            for u in uploads:
-                store.conn.execute("UPDATE chat_uploads SET request_id=? WHERE id=?", (request_id, u["id"]))
-    except sqlite3.IntegrityError:
-        raise busy from None  # another connection won the race for this conversation
+        job = jobs.create(store, JOB_KIND, conversation, detail={"request_id": request_id}, also=record)
+    except (jobs.JobBusy, sqlite3.IntegrityError):
+        raise busy from None
 
     steps: list[dict] = []
     lock = threading.Lock()
@@ -197,34 +234,31 @@ def start_reply(store: Store, config, answer_fn: Callable, conversation: str, qu
                 steps.append({"tool": str(name)[:80], "ok": ok, "at": time.time()})
                 store._exec("UPDATE chat_requests SET steps=? WHERE id=?", (json.dumps(steps), request_id))
 
-    done = threading.Event()
-
-    def beat():
-        while not done.wait(HEARTBEAT_S):
-            store._exec("UPDATE chat_requests SET heartbeat=? WHERE id=? AND status='thinking' AND owner=?", (time.time(), request_id, INSTANCE))
-
-    def finish(status: str, error: str | None):
-        done.set()
-        user = store._one("SELECT id FROM chat_messages WHERE conversation_id=? AND id>? AND role='user' AND content=? ORDER BY id LIMIT 1",
-                          (conversation, before, question))
-        # A reply already recovered as interrupted keeps that terminal state; a late finish never overwrites it.
-        store._exec("UPDATE chat_requests SET status=?,error=?,finished_at=?,user_message_id=? WHERE id=? AND status='thinking' AND owner=?",
-                    (status, error, time.time(), user["id"] if user else None, request_id, INSTANCE))
+    def link_user_message(conn, _job):
+        if saved:
+            return
+        # Adapters that store the question themselves: find the first new user message with this text.
+        row = conn.execute("SELECT c.id FROM chat_messages c JOIN chat_requests r ON r.id=? WHERE c.conversation_id=? "
+                           "AND c.id>r.before_message_id AND c.role='user' AND c.content=? ORDER BY c.id LIMIT 1",
+                           (request_id, conversation, question)).fetchone()
+        if row:
+            conn.execute("UPDATE chat_requests SET user_message_id=? WHERE id=?", (row[0], request_id))
 
     def run():
-        try:
-            _call_answer(answer_fn, config, store, question, conversation, [u["path"] for u in uploads], on_tool)
-        except Exception as exc:  # noqa: BLE001 - every failure must become visible to the user
-            finish("failed", (str(exc) or type(exc).__name__)[:1000])
-        else:
-            finish("done", None)
+        with jobs.keep_alive(store, job["id"]):
+            try:
+                _call_answer(answer_fn, config, store, question, conversation, [u["path"] for u in uploads], on_tool, saved)
+            except Exception as exc:  # noqa: BLE001 - every failure must become visible to the user
+                # If the job was recovered meanwhile, finish() changes nothing: that terminal state stands.
+                jobs.finish(store, job["id"], "failed", error=(str(exc) or type(exc).__name__)[:1000], also=link_user_message)
+            else:
+                jobs.finish(store, job["id"], "succeeded", also=link_user_message)
 
-    threading.Thread(target=beat, name=f"chat-heartbeat-{request_id[:8]}", daemon=True).start()
     if background:
         threading.Thread(target=run, name=f"chat-reply-{request_id[:8]}", daemon=True).start()
     else:
         run()
-    return {"request_id": request_id}
+    return {"request_id": request_id, "job_id": job["id"]}
 
 
 def wait_idle(store: Store, conversation: str, timeout: float = 10.0) -> dict | None:
