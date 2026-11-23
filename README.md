@@ -487,6 +487,10 @@ If a retry can fix the failure, SwarmForge **heals itself**:
 * Retries are capped by *Auto-fix attempts* (default 2, settable per task), the original task budget,
   and a persisted wall-clock deadline. The clock includes pauses, approval waits and restart downtime
   after the first attempt starts. Stalls and lost workers share a separate recovery cap (default 1).
+  A self-healing chain is also capped at a total wall-clock of 3x the run's time limit
+  (`self_heal.max_total_runtime_s`, seconds; 0 = the default 3x). When a cap is reached, the failure
+  records "not retried: self-healing budget/time cap reached" instead of launching another attempt.
+  See `self_heal:` in `swarmforge.example.yaml`.
 
 Work run details, Projects activity, execution reports and `swarmforge status RUN --json` show
 the attempt, last meaningful result, next action and remaining task allowance. Repeated actions,
