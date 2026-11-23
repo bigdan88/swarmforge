@@ -257,6 +257,8 @@ async def test_environment_block_pauses_the_queue_instead_of_failing_every_task(
     assert store.queue_item(other)["status"] == "queued"
     blocked = [r for r in store.list_runs(10) if r["state"] == "BLOCKED"]
     assert len(blocked) == 2                                             # one try per queue, then paused
+    # the blocked run never cloned anything, so the retry must not try to continue from it
+    assert ia["seed_run_id"] is None
 
 
 def test_retry_blocked_puts_failed_blocked_items_back_in_order(tmp_path):

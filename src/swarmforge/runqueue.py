@@ -239,8 +239,11 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         name = lane(item)
         with store.transaction():  # the item goes back in line exactly when its lane pauses
             set_lane_paused(store, name, True)
+            # A run stopped by the environment check never cloned or wrote anything: the next attempt
+            # continues from whatever this item continued from before, not from the empty blocked run.
+            seed = run_id if run.get("integration_branch") else item.get("seed_run_id")
             store.queue_update(item["id"], status="queued", run_id=None, started_at=None,
-                               seed_run_id=run_id,
+                               seed_run_id=seed,
                                note=f"{ENV_PAUSE_NOTE}: {(run['state_reason'] or '')[:300]}")
         if echo:
             echo(f"queue '{name}' paused: environment problem ({(run['state_reason'] or '')[:200]}). "
