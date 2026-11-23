@@ -28,7 +28,8 @@ def authorize(client):
     response = client.get("/api/v1/session")
     assert response.status_code == 200
     assert "HttpOnly" in response.headers["set-cookie"] and "SameSite=strict" in response.headers["set-cookie"]
-    return {"origin": "http://127.0.0.1", "x-csrf-token": response.json()["csrf_token"], "idempotency-key": "request-00000000000001"}
+    return {"origin": "http://127.0.0.1", "x-csrf-token": response.json()["csrf_token"], "idempotency-key": "request-00000000000001",
+            "x-swarmforge-workspace": response.json()["workspace_id"]}
 
 
 def test_actions_require_opt_in_session_origin_csrf_and_json(workspace, tmp_path):
@@ -256,3 +257,34 @@ def test_demo_launcher_does_not_load_live_configuration(monkeypatch):
     monkeypatch.setattr("sys.argv", ["swarmforge.webapp", "--demo", "--port", "8612"])
     main()
     assert observed == [("127.0.0.1", 8612)]
+
+
+def test_actions_are_bound_to_the_workspace_the_page_displayed(workspace, tmp_path):
+    from swarmforge.webapp.demo import create_demo
+    cfg, store, actions = workspace
+    (tmp_path / "demo").mkdir()
+    demo_cfg, demo_store, demo_actions = create_demo(tmp_path / "demo")
+    try:
+        with TestClient(create_app(demo_cfg.db_path, actions=demo_actions, demo=True), base_url="http://127.0.0.1") as demo:
+            shown = demo.get("/api/v1/session").json()  # the page the user is looking at: demo A
+        # The demo is replaced by the real workspace B on the same origin. The old page can still
+        # obtain fresh credentials, but its requests name workspace A and are refused.
+        with TestClient(create_app(cfg.db_path, actions=actions), base_url="http://127.0.0.1") as real:
+            fresh = real.get("/api/v1/session").json()
+            assert fresh["workspace_id"] != shown["workspace_id"] and "tmp" not in fresh["workspace_id"]
+            stale = {"origin": "http://127.0.0.1", "x-csrf-token": fresh["csrf_token"], "idempotency-key": "stale-request-000001",
+                     "x-swarmforge-workspace": shown["workspace_id"]}
+            refused = real.post("/api/v1/actions", json={"operation": "pause_queue"}, headers=stale)
+            assert refused.status_code == 409 and refused.json()["code"] == "workspace_changed"
+            assert real.post("/api/v1/chat/uploads", json={"name": "a.txt", "data": "aGk="}, headers=stale).status_code == 409
+            missing = {k: v for k, v in stale.items() if k != "x-swarmforge-workspace"}
+            assert real.post("/api/v1/actions", json={"operation": "pause_queue"}, headers=missing).status_code == 409
+            assert store.kv_get("queue_paused") != "1"
+            ok = {**stale, "x-swarmforge-workspace": fresh["workspace_id"]}
+            assert real.post("/api/v1/actions", json={"operation": "pause_queue"}, headers=ok).json()["ok"]
+        # Restarting the same workspace keeps its identity (drafts stay usable) but is a new instance.
+        with TestClient(create_app(cfg.db_path, actions=DashboardActions(store, cfg)), base_url="http://127.0.0.1") as restarted:
+            again = restarted.get("/api/v1/session").json()
+            assert again["workspace_id"] == fresh["workspace_id"] and again["instance_id"] != fresh["instance_id"]
+    finally:
+        demo_store.close()

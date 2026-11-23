@@ -2,7 +2,19 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 
 export type Row=Record<string,unknown>;
 export type Collection={items:Row[];total:number;limit:number;offset:number};
-export type Session={actions_enabled:boolean;models_enabled:boolean;csrf_token:string|null;settings:Settings;demo_mode?:boolean};
+export type Session={actions_enabled:boolean;models_enabled:boolean;csrf_token:string|null;settings:Settings;demo_mode?:boolean;workspace_id?:string;instance_id?:string};
+/* The workspace this page displays. Browser storage and every write are bound to it, so a tab left
+   open while the server switches to another workspace (for example demo -> real) cannot act on it. */
+let bound:{workspace:string;instance:string}|null=null;
+const GLOBAL_KEYS=new Set(['sf-theme','sf-storage-check']);
+export function bindWorkspace(session:Session){if(!bound&&session.workspace_id)bound={workspace:session.workspace_id,instance:session.instance_id??''};return bound;}
+export function boundWorkspace(){return bound;}
+export function noteInstance(instance:string){if(bound)bound={...bound,instance};}
+const scoped=(key:string)=>GLOBAL_KEYS.has(key)||!bound?key:`${bound.workspace}:${key}`;
+export const WORKSPACE_CHANGED='sf-workspace-changed';
+function checkWorkspace(session:Row){
+  if(bound&&session.workspace_id!==bound.workspace){if(typeof window!=='undefined')window.dispatchEvent(new Event(WORKSPACE_CHANGED));throw new Error('This page shows a different workspace than the one now running here. Reload the page to continue.');}
+}
 export type Settings={configured:boolean;team:string|null;roles:{role:string;model:string;fallbacks:string[]}[];limits:Record<string,number>;teams:{name:string;description:string;models:Record<string,string>}[]};
 export type Result={ok:boolean;message:string;item_id?:string|null;project_id?:string|null;conversation_id?:string|null};
 export const isRow=(value:unknown):value is Row=>!!value&&typeof value==='object'&&!Array.isArray(value);
@@ -27,8 +39,8 @@ export const collection=(value:unknown):Collection=>{
 export const label=(value:unknown)=>str(value).replaceAll('_',' ');
 export const money=(value:unknown)=>`$${num(value).toFixed(2)}`;
 export const stamp=(value:unknown)=>typeof value==='number'?new Date(value*1000).toLocaleString():'Not recorded';
-export function readLocal(key:string,fallback:string){try{return localStorage.getItem(key)??fallback;}catch{return fallback;}}
-export function saveLocal(key:string,value:string){try{localStorage.setItem(key,value);return true;}catch{if(typeof window!=='undefined')window.dispatchEvent(new Event('sf-storage-unavailable'));return false;}}
+export function readLocal(key:string,fallback:string){try{return localStorage.getItem(scoped(key))??fallback;}catch{return fallback;}}
+export function saveLocal(key:string,value:string){try{localStorage.setItem(scoped(key),value);return true;}catch{if(typeof window!=='undefined')window.dispatchEvent(new Event('sf-storage-unavailable'));return false;}}
 export function useDraft(key:string,initial:Record<string,string>){
   const [value,setValue]=useState(()=>{try{const saved=JSON.parse(readLocal(key,'{}'));return Object.fromEntries(Object.entries(initial).map(([k,v])=>[k,typeof saved?.[k]==='string'?saved[k]:v]));}catch{return initial;}});
   useEffect(()=>{saveLocal(key,JSON.stringify(value));},[key,value]);
@@ -39,7 +51,8 @@ export async function getJSON(url:string,signal?:AbortSignal):Promise<unknown>{
   if(!response.ok)throw new Error(response.status===404?'This item is no longer available.':'Could not load this view. Check the local service and try again.');
   return response.json();
 }
-export function useGet<T>(url:string,parse:(value:unknown)=>T,poll=0){
+/** keep: while a new URL loads (search/filter change), keep showing the previous result instead of blanking. */
+export function useGet<T>(url:string,parse:(value:unknown)=>T,poll=0,keep=false){
   const [state,setState]=useState<{url:string;data:T|null;error:string}>({url,data:null,error:''});
   const [revision,setRevision]=useState(0);
   useEffect(()=>{
@@ -52,13 +65,15 @@ export function useGet<T>(url:string,parse:(value:unknown)=>T,poll=0){
     void load();return()=>{controller.abort();clearTimeout(timer);};
   },[url,parse,poll,revision]);
   const refresh=useCallback(()=>setRevision(n=>n+1),[]);
-  return {...(state.url===url?state:{data:null,error:''}),refresh};
+  return {...(state.url===url||keep?state:{data:null,error:''}),refresh};
 }
 export async function performAction(operation:string,target:string,args:Row,key:string):Promise<Result>{
   const session=record(await getJSON('/api/v1/session'));
+  checkWorkspace(session);
   if(!session.actions_enabled||typeof session.csrf_token!=='string')throw new Error('Controls are disabled. Start the web interface with --allow-actions to enable them.');
-  const response=await fetch('/api/v1/actions',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':session.csrf_token,'Idempotency-Key':key},body:JSON.stringify({operation,target,args})});
+  const response=await fetch('/api/v1/actions',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':session.csrf_token,'Idempotency-Key':key,'X-SwarmForge-Workspace':bound?.workspace??str(session.workspace_id)},body:JSON.stringify({operation,target,args})});
   const value=record(await response.json());
+  if(value.code==='workspace_changed')window.dispatchEvent(new Event(WORKSPACE_CHANGED));
   if(!response.ok)throw new Error(typeof value.detail==='string'?value.detail:'The request was rejected. Review the form and try again.');
   if(typeof value.ok!=='boolean'||typeof value.message!=='string')throw new Error('The action response was incompatible. Inspect current state before retrying.');
   return value as Result;
@@ -86,9 +101,11 @@ const fileData=(file:File)=>new Promise<string>((resolve,reject)=>{const reader=
 export async function uploadAttachment(file:File):Promise<Staged>{
   if(file.size>5*1024*1024)throw new Error(`${file.name} is larger than 5 MB`);
   const session=record(await getJSON('/api/v1/session'));
+  checkWorkspace(session);
   if(!session.actions_enabled||typeof session.csrf_token!=='string')throw new Error('Controls are disabled. Start the web interface with --allow-actions to attach files.');
-  const response=await fetch('/api/v1/chat/uploads',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':session.csrf_token},body:JSON.stringify({name:file.name,data:await fileData(file)})});
+  const response=await fetch('/api/v1/chat/uploads',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':session.csrf_token,'X-SwarmForge-Workspace':bound?.workspace??str(session.workspace_id)},body:JSON.stringify({name:file.name,data:await fileData(file)})});
   const value=record(await response.json());
+  if(value.code==='workspace_changed')window.dispatchEvent(new Event(WORKSPACE_CHANGED));
   if(!response.ok)throw new Error(typeof value.detail==='string'?value.detail:`Could not attach ${file.name}`);
   if(typeof value.id!=='string'||typeof value.name!=='string'||(value.kind!=='image'&&value.kind!=='text'))throw new Error('The upload response was incompatible.');
   return value as Staged;

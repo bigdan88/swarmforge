@@ -49,9 +49,11 @@ class WorkReader:
     """
 
     def list(self, *, limit=25, offset=0, status=None, search="", view="all", archived=False, fold=False):
-        """One bounded page of work. Archived runs are hidden unless asked for; with fold, repeated
-        attempts of the same task (same title and repository) collapse into their most relevant row
-        (running, then waiting, then newest) and report how many attempts exist."""
+        """One bounded page of work. Archived runs are hidden unless asked for. With fold, attempts that
+        share persisted lineage (the shared task allowance, or a retry/heal/continue chain) collapse into
+        their most relevant row (running, then waiting, then newest) with an attempt count. Titles are
+        never used: independent tasks with the same title stay separate, and legacy rows without
+        recorded lineage stay individually visible."""
         if not 1 <= limit <= 100 or not 0 <= offset <= 100000:
             raise ValueError("Invalid page bounds")
         where, args = [], []
@@ -73,18 +75,21 @@ class WorkReader:
         with self.connection() as conn:
             # One read transaction keeps total, counts and page internally consistent.
             conn.execute("BEGIN")
-            has_archived = any(r[1] == "archived" for r in conn.execute("PRAGMA table_info(runs)"))
-            flag = "COALESCE((SELECT archived FROM runs WHERE id=b.run_id),0)" if has_archived else "0"
-            base = ("WITH raw AS (" + self.projection + "), work AS (SELECT b.*, " + flag + " AS archived FROM raw b), "
-                    "picked AS (SELECT * FROM work" + clause + ")")
+            run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+            queue_cols = {r[1] for r in conn.execute("PRAGMA table_info(queue_items)")}
+            flag = "COALESCE((SELECT archived FROM runs WHERE id=b.run_id),0)" if "archived" in run_cols else "0"
+            base = "WITH RECURSIVE " + (self._lineage_cte(run_cols) + ", " if fold else "")
+            base += ("raw AS (" + self.projection + "), work AS (SELECT b.*, " + flag + " AS archived FROM raw b), "
+                     "picked AS (SELECT * FROM work" + clause + ")")
             if fold:
-                base += (", keyed AS (SELECT *, lower(trim(title))||'|'||lower(COALESCE(repo,'')) AS fold_key FROM picked), "
+                base += (", keyed AS (SELECT *, " + self._lineage_key(run_cols, queue_cols) + " AS fold_key FROM picked), "
                          "ranked AS (SELECT *, COUNT(*) OVER (PARTITION BY fold_key) AS attempts, ROW_NUMBER() OVER "
                          "(PARTITION BY fold_key ORDER BY " + rank + ",created_at DESC,id DESC) AS fold_rank FROM keyed), "
                          "shown AS (SELECT * FROM ranked WHERE fold_rank=1) ")
             else:
                 base += ", shown AS (SELECT *, 1 AS attempts FROM picked) "
             total = conn.execute(base + "SELECT COUNT(*) FROM shown", args).fetchone()[0]
+            attempts_total = conn.execute(base + "SELECT COUNT(*) FROM picked", args).fetchone()[0]
             counts = {r[0]: r[1] for r in conn.execute("WITH work AS (" + self.projection + ") SELECT status,COUNT(*) FROM work GROUP BY status")}
             rows = conn.execute(base + "SELECT id,title,repo,status,stage,run_id,created_at,updated_at,finished_at,reason,pr_url,"
                                 "archived,attempts FROM shown ORDER BY " + rank + ",created_at DESC,id DESC LIMIT ? OFFSET ?",
@@ -92,7 +97,33 @@ class WorkReader:
             items = [dict(r) for r in rows]
             for item in items:
                 item["archived"] = bool(item["archived"])
-            return {"items": items, "total": total, "counts": counts, "limit": limit, "offset": offset}
+            return {"items": items, "total": total, "counts": counts, "limit": limit, "offset": offset,
+                    "attempts_total": attempts_total}
+
+    @staticmethod
+    def _lineage_cte(run_cols):
+        """lineage(id, root): every run mapped to the first run of its task. Runs with a shared
+        allowance use it directly (its id is the root run); legacy runs follow heal/retry/continue
+        parents. Depth is bounded so a corrupt cycle cannot loop."""
+        parents = [c for c in ("heal_of", "retry_of", "seed_run_id") if c in run_cols]
+        parent = "COALESCE(" + ",".join(f"r.{c}" for c in parents) + ")" if len(parents) > 1 else (f"r.{parents[0]}" if parents else "NULL")
+        own = "COALESCE(r.execution_id, r.id)" if "execution_id" in run_cols else "r.id"
+        has_exec = "r.execution_id IS NOT NULL" if "execution_id" in run_cols else "0"
+        return ("lineage(id, root, depth) AS (SELECT r.id, " + own + ", 0 FROM runs r WHERE " + parent + " IS NULL OR " + has_exec +
+                " UNION ALL SELECT r.id, l.root, l.depth+1 FROM runs r JOIN lineage l ON " + parent + "=l.id"
+                " WHERE NOT (" + has_exec + ") AND l.depth<50)")
+
+    @staticmethod
+    def _lineage_key(run_cols, queue_cols):
+        root = "(SELECT root FROM lineage WHERE id={} LIMIT 1)"
+        queue = "(SELECT {} FROM queue_items WHERE id=CAST(substr(keyed_src.id,6) AS INTEGER))"
+        parts = []
+        if "execution_id" in queue_cols:
+            parts.append("CASE WHEN keyed_src.id LIKE 'task-%' THEN " + queue.format("execution_id") + " END")
+        parts.append(root.format("keyed_src.run_id"))
+        if "retry_of" in queue_cols:  # a queued retry that has not started yet
+            parts.append("CASE WHEN keyed_src.id LIKE 'task-%' THEN " + root.format(queue.format("retry_of")) + " END")
+        return ("COALESCE(" + ", ".join(parts) + ", keyed_src.id)").replace("keyed_src.", "picked.")
 
     def _detail_query(self, item_id):
         # Look up the actual primary key; filtering a concatenated public ID over

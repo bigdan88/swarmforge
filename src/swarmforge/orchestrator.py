@@ -57,6 +57,12 @@ def is_test_path(p: str) -> bool:
             or name.endswith("_test.py") or name == "conftest.py")
 
 
+# Stops whose cause a planner diagnosis can usefully explain, using only the remaining shared task
+# allowance. Cancellations, exhausted allowances, invalid lineage, concurrent or uncertain external
+# attempts keep the rule-based diagnosis and spend nothing more.
+MODEL_DIAGNOSABLE_STOPS = (None, "task_failure", "stalled")
+
+
 class Orchestrator:
     def __init__(self, config: Config, store: Store, *, mode: str = "swarm",
                  single_role: str | None = None,
@@ -231,7 +237,7 @@ class Orchestrator:
                     from .postmortem import diagnose
                     await asyncio.wait_for(diagnose(self.cfg, self.store, self.run_id,
                                                     transport=self._llm_transport, budget=self.budget,
-                                                    allow_model=acquired and not (self.store.get_run(self.run_id) or {}).get("stop_kind")),
+                                                    allow_model=acquired and (self.store.get_run(self.run_id) or {}).get("stop_kind") in MODEL_DIAGNOSABLE_STOPS),
                                            timeout=max(.01, min(600, self.execution.row()["deadline"] - time.time())))
                 except Exception as e:  # the post-mortem must never change the run outcome
                     self.log("postmortem", f"post-mortem failed: {type(e).__name__}: {e}", level="warn")
@@ -267,6 +273,10 @@ class Orchestrator:
 
     async def _watchdog(self, pipeline: asyncio.Future, every_s: float = 5.0) -> None:
         """Enforces the (live-adjustable) time limit; replaces a fixed asyncio.wait_for."""
+        if getattr(self, "execution", None) is None:
+            # A programming error, not a timeout or task failure: run() acquires the shared task
+            # allowance before any work starts, and the watchdog enforces its deadline.
+            raise RuntimeError("watchdog started before the shared task allowance was acquired")
         while not pipeline.done():
             self._apply_live_settings()
             try:

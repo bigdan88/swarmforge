@@ -37,6 +37,12 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
     reader = WorkReader(database)
     workspace = WorkspaceReader(database)
     session = LocalSession()
+    # Opaque identities: which workspace (database) this server serves, and this particular start.
+    # Writes must name the workspace the page displayed, so a stale tab cannot act on a replacement.
+    import hashlib
+    import uuid
+    workspace_id = hashlib.sha256(("swarmforge-workspace\0" + str(database.resolve()) + ("\0demo" if demo else "")).encode()).hexdigest()[:20]
+    instance_id = uuid.uuid4().hex[:12]
     notes = NotesReader(getattr(config.knowledge, "resolved_vault", None) if config is not None else None)
     artifacts = ArtifactReader(runs_root or database.resolve().parent / "runs")
     assets = assets or Path(__file__).parents[1] / "resources" / "web"
@@ -52,6 +58,9 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
                 return JSONResponse({"detail": "This preview is read-only"}, status_code=405)
             if origin != str(request.base_url).rstrip("/") or not session.authorized(request.cookies.get(session.cookie), request.headers.get("x-csrf-token")):
                 return JSONResponse({"detail": "Refresh this page to authorize local controls"}, status_code=403)
+            if request.headers.get("x-swarmforge-workspace") != workspace_id:
+                return JSONResponse({"detail": "This page shows a different SwarmForge workspace than the one now running here. "
+                                               "Reload the page and review it before taking actions.", "code": "workspace_changed"}, status_code=409)
             if request.headers.get("content-type", "").split(";")[0] != "application/json":
                 return JSONResponse({"detail": "JSON requests are required"}, status_code=415)
             try:
@@ -80,7 +89,8 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
     @app.get("/api/v1/session")
     def browser_session(request: Request):
         payload = {"actions_enabled": actions is not None, "models_enabled": actions is not None and config is not None,
-                   "csrf_token": None, "settings": public_settings(config), "demo_mode": demo}
+                   "csrf_token": None, "settings": public_settings(config), "demo_mode": demo,
+                   "workspace_id": workspace_id, "instance_id": instance_id}
         response = JSONResponse(payload)
         if actions is not None:
             cookie, token = session.issue(request.cookies.get(session.cookie))

@@ -235,8 +235,9 @@ class DashboardActions:
             store.conversation_create(cid, text(args, "title", 200, "New chat"))
             return {"conversation_id": cid, "message": "Conversation created"}
         if operation == "project_message":
-            if not self.config or args.get("spending_authorized") is not True:
-                raise ValueError("Configured model and explicit interview spending authorization are required")
+            # Sending a message is the consent for this one small lead reply; launching still needs approval.
+            if not self.config:
+                raise ValueError("Load model configuration before talking to the project lead")
             p = ps.get(target)
             expected = args.get("expected_spec")
             if p["status"] != "drafting" or expected != hashlib.sha256(p["spec"].encode()).hexdigest():
@@ -248,8 +249,7 @@ class DashboardActions:
         if operation == "send_message":
             if not self.config or not store.conversation_get(target) or target.startswith("project-"):
                 raise ValueError("Choose a general conversation with model configuration loaded")
-            if args.get("spending_authorized") is not True:
-                raise ValueError("Sending uses the configured model; explicit authorization is required")
+            # Pressing Send is the consent for one chat reply (bounded by the chat allowance).
             question = text(args, "message", 16000)
             from .. import chatbot
             from .chat_requests import start_reply

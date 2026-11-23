@@ -30,6 +30,7 @@ class WorkPage(PublicResponse):
     counts: dict[str, int]  # Global counts, independent of the current filter.
     limit: int = Field(ge=1, le=100)
     offset: int = Field(ge=0, le=100000)
+    attempts_total: int | None = Field(default=None, ge=0)  # matching attempts before folding
 
 
 class RunCost(PublicResponse):

@@ -17,8 +17,9 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
 
 def authorize(client, key="chat-request-0000001"):
-    token = client.get("/api/v1/session").json()["csrf_token"]
-    return {"origin": "http://127.0.0.1", "x-csrf-token": token, "idempotency-key": key}
+    session = client.get("/api/v1/session").json()
+    return {"origin": "http://127.0.0.1", "x-csrf-token": session["csrf_token"], "idempotency-key": key,
+            "x-swarmforge-workspace": session["workspace_id"]}
 
 
 @pytest.fixture
@@ -79,16 +80,87 @@ def test_failed_reply_is_recorded_and_the_conversation_can_continue(chat):
     assert wait_idle(store, "c1")["status"] == "done"
 
 
-def test_interrupted_reply_is_released_when_the_service_restarts(chat):
+def wait_for(predicate, timeout=5):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_another_live_instance_never_interrupts_a_running_reply(chat):
     cfg, store = chat
-    store._exec("CREATE TABLE IF NOT EXISTS chat_requests (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, question TEXT NOT NULL, status TEXT NOT NULL, "
-                "steps TEXT NOT NULL DEFAULT '[]', error TEXT, started_at REAL NOT NULL, finished_at REAL, before_message_id INTEGER NOT NULL DEFAULT 0, "
-                "user_message_id INTEGER, attachments TEXT NOT NULL DEFAULT '[]')")
-    store._exec("INSERT INTO chat_requests(id,conversation_id,question,status,started_at) VALUES ('x','c1','q','thinking',1)")
-    with pytest.raises(ChatBusy):
-        start_reply(store, cfg, gated_answer(threading.Event(), []), "c1", "blocked", background=False)
-    assert release_interrupted(store) == 1
+    gate, calls = threading.Event(), []
+    first = DashboardActions(store, cfg, chat_answer=gated_answer(gate, calls))
+    assert first.execute("owner-send-00000001", "send_message", "c1", {"message": "Long question"})["ok"]
+    assert wait_for(lambda: calls)
+    other_store = Store(cfg.db_path)  # a second web instance: its own connection and service object
+    try:
+        DashboardActions(other_store, cfg, chat_answer=gated_answer(gate, []))
+        assert store._one("SELECT status FROM chat_requests")["status"] == "thinking"
+        with pytest.raises(ChatBusy):
+            start_reply(other_store, cfg, gated_answer(gate, []), "c1", "Interleaved?", background=False)
+    finally:
+        other_store.close()
+    gate.set()
+    assert wait_idle(store, "c1")["status"] == "done"
+    assert [m["content"] for m in store.conversation_messages("c1")] == ["Long question", "Answer"]
+
+
+def _pending(store, owner, heartbeat):
+    from swarmforge.services.chat_requests import ensure_tables
+    ensure_tables(store)
+    store._exec("INSERT INTO chat_requests(id,conversation_id,question,status,started_at,owner,heartbeat) VALUES ('x','c1','q','thinking',1,?,?)",
+                (owner, heartbeat))
+
+
+@pytest.mark.parametrize("owner,age,released", [
+    ("2147480000:gone", 0, True),          # owner process no longer exists
+    (None, None, True),                     # replies recorded before ownership existed
+    ("{pid}:other", 0, False),              # another live instance with a fresh heartbeat
+    ("{pid}:other", 3600, True),            # live process, but it stopped heartbeating long ago
+])
+def test_recovery_releases_only_replies_whose_owner_is_gone(chat, owner, age, released):
+    import os
+    import time
+    cfg, store = chat
+    _pending(store, owner and owner.format(pid=os.getpid()), None if age is None else time.time() - age)
+    assert release_interrupted(store) == int(released)
+    assert store._one("SELECT status FROM chat_requests WHERE id='x'")["status"] == ("interrupted" if released else "thinking")
+
+
+def test_a_dead_owners_reply_does_not_block_the_conversation_or_get_resent(chat):
+    cfg, store = chat
+    _pending(store, "2147480000:gone", __import__("time").time())
+    calls = []
+    gate = threading.Event()
+    gate.set()
+    start_reply(store, cfg, gated_answer(gate, calls), "c1", "Fresh question", background=False)
+    assert [c["question"] for c in calls] == ["Fresh question"]  # the interrupted question is not replayed
     assert store._one("SELECT status FROM chat_requests WHERE id='x'")["status"] == "interrupted"
+
+
+def test_a_late_completion_cannot_overwrite_a_recovered_reply(chat):
+    cfg, store = chat
+    gate, calls = threading.Event(), []
+    start_reply(store, cfg, gated_answer(gate, calls), "c1", "Slow", background=True)
+    assert wait_for(lambda: calls)
+    store._exec("UPDATE chat_requests SET status='interrupted', finished_at=1")  # recovered meanwhile
+    gate.set()
+    assert wait_for(lambda: len(store.conversation_messages("c1")) == 2)
+    import time
+    time.sleep(0.1)
+    assert store._one("SELECT status FROM chat_requests")["status"] == "interrupted"
+
+
+def test_one_pending_reply_is_enforced_by_the_database(chat):
+    import sqlite3
+    cfg, store = chat
+    _pending(store, "{}:x".format(__import__("os").getpid()), __import__("time").time())
+    with pytest.raises(sqlite3.IntegrityError):
+        store._exec("INSERT INTO chat_requests(id,conversation_id,question,status,started_at) VALUES ('y','c1','q','thinking',1)")
 
 
 def test_uploads_are_validated_confined_and_attached_once(chat, tmp_path):
@@ -137,3 +209,17 @@ def test_upload_endpoint_requires_controls_session_and_bounds_size(chat, tmp_pat
         assert made["kind"] == "text" and len(made["id"]) == 32
         # The action endpoint keeps its small request limit.
         assert client.post("/api/v1/actions", json={"operation": "pause_queue"}, headers={**headers, "content-length": "200000"}).status_code == 413
+
+
+def test_sending_is_the_consent_for_one_reply_but_bigger_spending_still_needs_approval(chat):
+    cfg, store = chat
+    calls = []
+    gate = threading.Event()
+    gate.set()
+    actions = DashboardActions(store, cfg, chat_answer=gated_answer(gate, calls), chat_background=False)
+    assert actions.execute("plain-send-00000001", "send_message", "c1", {"message": "Just send it"})["ok"]
+    assert calls[0]["question"] == "Just send it"
+    # Queueing paid work, starting the worker and retries keep their explicit confirmation.
+    task = {"title": "T", "body": "B", "repo": "owner/app", "budget": 2}
+    assert not actions.execute("plain-queue-0000001", "queue_task", "", task)["ok"]
+    assert not actions.execute("plain-start-0000001", "start_queue", "", {})["ok"]

@@ -5,7 +5,7 @@ import {ActionButton,Feedback,Heading,Loading,Pager,type Navigate} from './ui';
 /* ---------------------------------------------------------------- Failures */
 export function FailuresPage({session,navigate,selected}:{session:Session|null;navigate:Navigate;selected:string}){
   const [category,setCategory]=useState(''),[offset,setOffset]=useState(0);
-  const list=useGet(`/api/v1/failures?offset=${offset}&category=${encodeURIComponent(category)}`,record,10000);
+  const list=useGet(`/api/v1/failures?offset=${offset}&category=${encodeURIComponent(category)}`,record,10000,true);
   const counts=record(list.data?.counts??{});
   return <><Heading title="Failures" description="Every unsuccessful run, why it failed and what happened next. Diagnoses also reach the knowledge vault so agents learn from them."/>
     <Feedback error={list.error}/>
@@ -71,8 +71,8 @@ function PullRequest({pr,method,remove,reviewed,session,navigate,onDone}:{pr:Row
   const target=`${str(pr.repo)}#${num(pr.number)}`,url=str(pr.url);
   return <section className="panel pr"><div className="detail-heading"><h2>{/^https:\/\/github\.com\//.test(url)?<a href={url} target="_blank" rel="noreferrer">#{num(pr.number)} {str(pr.title)} ↗</a>:<>#{num(pr.number)} {str(pr.title)}</>}</h2><span className={`badge ${pr.ready===true?'done':str(pr.state)==='dirty'?'failed':''}`}>{str(pr.status)}</span></div>
     <p className="muted">{str(pr.repo)} · <code>{str(pr.head)}</code> → <code>{str(pr.base)}</code> · by {str(pr.author)} · {str(pr.created_at).slice(0,10)} · +{num(pr.additions)} −{num(pr.deletions)} in {num(pr.changed_files)} file(s) · head <code>{str(pr.head_sha).slice(0,8)}</code></p>
-    <div className="button-row"><ActionButton operation="merge_pr" target={target} args={{method,delete_branch:remove,reviewed,expected_sha:str(pr.head_sha)}} disabled={!reviewed||pr.ready!==true||!session?.actions_enabled} onDone={onDone}>Merge</ActionButton>
-      {str(pr.state)==='behind'&&<ActionButton operation="update_pr" target={target} args={{expected_sha:str(pr.head_sha)}} disabled={!session?.actions_enabled} onDone={onDone}>Update branch</ActionButton>}
+    <div className="button-row"><ActionButton quiet operation="merge_pr" target={target} args={{method,delete_branch:remove,reviewed,expected_sha:str(pr.head_sha)}} disabled={!reviewed||pr.ready!==true||!session?.actions_enabled} onDone={onDone}>Merge</ActionButton>
+      {str(pr.state)==='behind'&&<ActionButton quiet operation="update_pr" target={target} args={{expected_sha:str(pr.head_sha)}} disabled={!session?.actions_enabled} onDone={onDone}>Update branch</ActionButton>}
       {str(pr.work_item)&&<button onClick={()=>navigate('work',str(pr.work_item))}>What the swarm did</button>}</div>
     {str(pr.state)==='dirty'&&<p className="muted">Resolve conflicts on GitHub, or retry its task so it rebuilds on the latest main.</p>}
     {!reviewed&&pr.ready===true&&<p className="muted">Tick “I've reviewed these changes” above to enable merging.</p>}
@@ -86,7 +86,7 @@ export function WhatsNew({navigate,session}:{navigate:Navigate;session:Session|n
   const q=query.trim().toLowerCase();
   const items=rows(view.data?.items).filter(f=>(!category||str(f.category)===category)&&(!q||['title','summary','benefit','where','category'].some(k=>str(f[k]).toLowerCase().includes(q))));
   let day='';
-  return <><Heading title="What's new" description="User-visible changes in this installed build. Unmerged work is labelled preview.">{num(view.data?.unread)>0&&<ActionButton operation="mark_features_read" disabled={!session?.actions_enabled} onDone={r=>{setFlash(r.message);view.refresh();window.dispatchEvent(new Event('sf-badges'));}}>Mark all as read ({num(view.data?.unread)})</ActionButton>}</Heading><Feedback error={view.error} message={flash}/>{!view.data&&!view.error&&<Loading error=""/>}
+  return <><Heading title="What's new" description="User-visible changes in this installed build. Unmerged work is labelled preview.">{num(view.data?.unread)>0&&<ActionButton quiet operation="mark_features_read" disabled={!session?.actions_enabled} onDone={r=>{setFlash(r.message);view.refresh();window.dispatchEvent(new Event('sf-badges'));}}>Mark all as read ({num(view.data?.unread)})</ActionButton>}</Heading><Feedback error={view.error} message={flash}/>{!view.data&&!view.error&&<Loading error=""/>}
     <section className="panel toolbar"><label><span className="sr-only">Search features</span><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Try chat, screenshots, benchmarks…"/></label><label><span className="sr-only">Category</span><select value={category} onChange={e=>setCategory(e.target.value)}><option value="">All categories</option>{(Array.isArray(view.data?.categories)?view.data.categories:[]).map(c=><option key={str(c)} value={str(c)}>{str(c)}</option>)}</select></label></section>
     {view.data&&!items.length&&<p className="empty">No highlights match. Try a different search or category.</p>}
     <div className="card-grid">{items.map(feature=>{const heading=str(feature.date)!==day;day=str(feature.date);const page=featurePage[str(feature.page)];return <article className="panel" key={str(feature.id)}>{heading&&<h3 className="day">{day}</h3>}<small className="muted">{str(feature.category)}{feature.unread===true?' · New to you':''}{feature.preview===true?' · Preview':''}</small><h2>{str(feature.title)}</h2><p>{str(feature.summary)}</p><p><strong>Why it helps:</strong> {str(feature.benefit)}</p><p className="muted">Find it: {str(feature.where)}</p><div className="button-row">{page&&page!=='speed'&&<button onClick={()=>navigate(page)}>Open {str(feature.page)}</button>}{/^https:\/\/github\.com\//.test(str(feature.url))&&<a href={str(feature.url)} target="_blank" rel="noreferrer">Source change ↗</a>}</div></article>;})}</div></>;
@@ -96,7 +96,7 @@ export function WhatsNew({navigate,session}:{navigate:Navigate;session:Session|n
 const noteTypes=['user-note','decision','pitfall','pattern','repo-fact','review-lesson','model-behavior'];
 export function Knowledge({selected,navigate,session}:{selected:string;navigate:Navigate;session:Session|null}){
   const [search,setSearch]=useState(''),[type,setType]=useState(''),[repo,setRepo]=useState(''),[offset,setOffset]=useState(0),[creating,setCreating]=useState(false);
-  const view=useGet(`/api/v1/knowledge?search=${encodeURIComponent(search)}&type=${encodeURIComponent(type)}&repo=${encodeURIComponent(repo)}&offset=${offset}`,collection);
+  const view=useGet(`/api/v1/knowledge?search=${encodeURIComponent(search)}&type=${encodeURIComponent(type)}&repo=${encodeURIComponent(repo)}&offset=${offset}`,collection,0,true);
   const facets=record(view.data??{});
   const refreshList=view.refresh;
   // Returning from a note (after an edit or delete) must show the vault as it is now.

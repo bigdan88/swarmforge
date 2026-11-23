@@ -9,8 +9,7 @@ import os
 import re
 import stat
 
-import yaml
-
+from ..knowledge import normalize_newlines, split_front_matter
 from .artifacts import ArtifactReader, ArtifactUnavailable
 
 MAX_ENTRIES = 2048
@@ -21,18 +20,6 @@ EDITABLE_TYPES = ("user-note", "decision", "pitfall", "pattern", "repo-fact", "r
 
 def note_id(parts: tuple[str, ...]) -> str:
     return hashlib.sha256("/".join(parts).encode()).hexdigest()[:24]
-
-
-def split_front_matter(text: str) -> tuple[dict, str]:
-    if text.startswith("---"):
-        head, sep, body = text[3:].partition("\n---")
-        if sep:
-            try:
-                meta = yaml.safe_load(head) or {}
-            except yaml.YAMLError:
-                meta = {}
-            return (meta if isinstance(meta, dict) else {}), body.lstrip("-").lstrip("\n")
-    return {}, text
 
 
 class NotesReader:
@@ -77,7 +64,8 @@ class NotesReader:
 
     def _note(self, opaque, parts):
         content, size, truncated = self.files._read_parts(parts, MAX_NOTE_BYTES)
-        text = content.decode("utf-8", errors="replace")
+        # Display parsing only: the SHA below still covers the original bytes, and files are never rewritten.
+        text = normalize_newlines(content.decode("utf-8", errors="replace"))
         meta, body = split_front_matter(text)
         heading = re.search(r"(?m)^#\s+(.+)$", body)
         title = meta.get("title") or (heading[1] if heading else parts[-1][:-3])

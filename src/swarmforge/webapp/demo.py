@@ -24,7 +24,9 @@ async def fake_answer(config, store, question, *, conversation, attachments=None
         on_tool("work_items", {}, "Demo work list")
     names = ", ".join(Path(a).name for a in attachments or [])
     store.conversation_append(conversation, "assistant", "Demo reply — no model was called. " + (f"I received {names}. " if names else "")
-                              + "Your running task is in testing; a queued task is waiting. Open Work to inspect the recorded checks and report, or create a project draft to try its approval flow.")
+                              + "Here is where things stand:\n\n**Current work**\n- *Make the task timeline easier to follow* is in **testing**\n"
+                              "- A queued task is waiting for the worker\n\nOpen `Work` to inspect the recorded checks and report, "
+                              "or create a project draft to try its approval flow.")
     return {"answer": "Demo reply"}
 
 

@@ -6,7 +6,7 @@ export type Work = {
   reason: string | null; pr_url: string | null;
   archived?: boolean; attempts?: number;
 };
-export type Page = {items: Work[]; total: number; counts: Record<string, number>; limit: number; offset: number};
+export type Page = {items: Work[]; total: number; counts: Record<string, number>; limit: number; offset: number; attempts_total?: number};
 
 const invalid = () => new Error('The local service returned an incompatible response. Refresh after updating the interface and service together.');
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);

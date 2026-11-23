@@ -181,6 +181,8 @@ def test_archive_hides_finished_runs_and_fold_groups_attempts(ws, tmp_path):
     actions = DashboardActions(store, cfg)
     for rid, state in (("a1", "FAILED"), ("a2", "FAILED"), ("a3", "RUNNING")):
         store.create_run(rid, state=state, repo="owner/app", issue_title="Fix login")
+    store.update_run("a2", retry_of="a1")  # genuine retries of one task
+    store.update_run("a3", retry_of="a2")
     store.update_run("a1", finished_at=1)
     store.update_run("a2", finished_at=2)
     store.create_run("solo", state="COMPLETED", repo="owner/app", issue_title="Other task")
@@ -272,3 +274,41 @@ def test_speed_benchmarks_and_health_views_are_read_only_and_bounded(ws, tmp_pat
         assert "incomplete" in bench["broken"]["error"]
         health = client.get("/api/v1/settings/health").json()["checks"]
         assert health == [{"name": "Docker running", "status": "fail", "message": "not running", "fix": "start Docker"}]
+
+
+def test_fold_groups_by_persisted_lineage_never_by_title(ws, tmp_path):
+    cfg, store, _ = ws
+    # Two independent tasks with identical title, repository and body stay separate.
+    q1 = store.queue_add("Add export", "Same body", "owner/app", status="queued")
+    q2 = store.queue_add("Add export", "Same body", "owner/app", status="queued")
+    # A genuine retry chain through the shared allowance, with a renamed later attempt.
+    store.create_run("x1", state="FAILED", repo="owner/app", issue_title="Fix login")
+    store.create_run("x2", state="FAILED", repo="owner/app", issue_title="Fix login (second try)")
+    store.update_run("x1", execution_id="x1", finished_at=1)
+    store.update_run("x2", execution_id="x1", retry_of="x1", finished_at=2)
+    store.queue_add("Fix login, retried", "b", "owner/app", status="queued", execution_id="x1", retry_of="x2")
+    # A legacy chain without allowances, linked only by heal_of.
+    store.create_run("h1", state="FAILED", repo="owner/app", issue_title="Heal me")
+    store.create_run("h2", state="COMPLETED", repo="owner/app", issue_title="Heal me", heal_of="h1")
+    # Legacy runs with no lineage at all stay visible individually, even with matching titles.
+    store.create_run("l1", state="FAILED", repo="owner/app", issue_title="Legacy")
+    store.create_run("l2", state="FAILED", repo="owner/app", issue_title="Legacy")
+    # Project tasks with the same title in different projects never share a row.
+    store.queue_add("Milestone task", "b", "owner/app", status="queued", project_id="p1")
+    store.queue_add("Milestone task", "b", "owner/app", status="queued", project_id="p2")
+    with TestClient(create_app(cfg.db_path, tmp_path), base_url="http://127.0.0.1") as client:
+        every = client.get("/api/v1/work?limit=100").json()
+        folded = client.get("/api/v1/work?limit=100&fold=true").json()
+        assert every["total"] == 11 and folded["attempts_total"] == 11
+        rows = {r["id"]: r for r in folded["items"]}
+        assert f"task-{q1}" in rows and f"task-{q2}" in rows  # same title, independent
+        login = [r for r in folded["items"] if r["title"].startswith("Fix login")]
+        assert len(login) == 1 and login[0]["attempts"] == 3 and login[0]["status"] == "queued"  # the waiting retry represents it
+        heal = [r for r in folded["items"] if r["title"] == "Heal me"]
+        assert len(heal) == 1 and heal[0]["attempts"] == 2
+        assert len([r for r in folded["items"] if r["title"] == "Legacy"]) == 2
+        assert len([r for r in folded["items"] if r["title"] == "Milestone task"]) == 2
+        assert folded["total"] == 8
+        # An older attempt can still be selected directly: it remains its own record.
+        assert client.get("/api/v1/work/run-x1").json()["run_id"] == "x1"
+        assert "run-x1" in {r["id"] for r in every["items"]}

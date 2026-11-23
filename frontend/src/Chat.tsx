@@ -1,8 +1,9 @@
 import {useEffect,useRef,useState,type FormEvent,type KeyboardEvent} from 'react';
 import {collection,elapsed,label,latestRequest,money,num,readLocal,record,rows,saveLocal,stamp,str,uploadAttachment,useAction,useDraft,useGet,type Row,type Session,type Staged} from './api';
 import {ActionButton,Feedback,Heading,Loading,Pager,type Navigate} from './ui';
+import {Markdown,Transcript,useFitToWindow} from './Messages';
 export function ChatPage({session,navigate,selected}:{session:Session|null;navigate:Navigate;selected:string}){
-  const [offset,setOffset]=useState(0);const list=useGet(`/api/v1/conversations?offset=${offset}`,collection,6000);
+  const [offset,setOffset]=useState(0);const list=useGet(`/api/v1/conversations?offset=${offset}`,collection,6000,true);
   return <><Heading title="Chat" description="Ask about the swarm, investigate work and keep each conversation separate."><ActionButton operation="create_conversation" disabled={!session?.actions_enabled} onDone={r=>{list.refresh();if(r.conversation_id)navigate('chat',r.conversation_id);}}>New conversation</ActionButton></Heading>
     <div className="chat-layout"><section className="panel thread-list"><h2>Conversations</h2><Feedback error={list.error}/>{list.data?.items.map(c=><button className={`thread ${str(c.id)===selected?'selected':''}`} aria-current={str(c.id)===selected?'true':undefined} key={str(c.id)} onClick={()=>navigate('chat',str(c.id))}><strong>{str(c.title)||'New chat'}</strong><small>{stamp(c.updated_at||c.created_at)}</small></button>)}{list.data&&<Pager offset={offset} total={list.data.total} setOffset={setOffset}/>}</section>
       {selected?<Conversation key={selected} id={selected} session={session}/>:<section className="panel empty"><h2>A place to work things through</h2><p>Open a conversation or start a new one. Model calls happen only when you send an authorized message.</p></section>}
@@ -21,11 +22,12 @@ function ReplyStatus({request,now,onReuse}:{request:Row;now:number;onReuse:(text
 function Conversation({id,session}:{id:string;session:Session|null}){
   const [fast,setFast]=useState(false);
   const view=useGet(`/api/v1/conversations/${encodeURIComponent(id)}`,record,fast?1000:3000);
-  const [draft,setDraft]=useDraft(`sf-chat-draft:${id}`,{message:''});const [authorized,setAuthorized]=useState(false);const action=useAction(`chat:${id}`);
+  const [draft,setDraft]=useDraft(`sf-chat-draft:${id}`,{message:''});const action=useAction(`chat:${id}`);
   const stagedKey=`sf-chat-attachments:${id}`;
   const [staged,setStaged]=useState<Staged[]>(()=>{try{const v=JSON.parse(readLocal(stagedKey,'[]'));return Array.isArray(v)?v.filter(a=>a&&typeof a.id==='string'&&typeof a.name==='string'):[];}catch{return [];}});
   const [uploading,setUploading]=useState(0),[uploadError,setUploadError]=useState('');
   const fileInput=useRef<HTMLInputElement>(null);
+  const panel=useFitToWindow<HTMLElement>(!!view.data);
   useEffect(()=>{saveLocal(stagedKey,JSON.stringify(staged));},[stagedKey,staged]);
   const latest=view.data?latestRequest(view.data.requests):null;
   const thinking=str(latest?.status)==='thinking';
@@ -39,22 +41,22 @@ function Conversation({id,session}:{id:string;session:Session|null}){
     if(fileInput.current)fileInput.current.value='';
   }
   async function submit(e?:FormEvent){
-    e?.preventDefault();if(!authorized||!draft.message.trim()||thinking||uploading)return;
-    const result=await action.send('send_message',id,{message:draft.message,spending_authorized:authorized,attachments:staged.map(a=>a.id)});
-    if(result){setDraft({message:''});saveLocal(`sf-chat-draft:${id}`,'{}');setStaged([]);setAuthorized(false);setFast(true);view.refresh();}
+    e?.preventDefault();if(!draft.message.trim()||thinking||uploading||action.pending)return;
+    const result=await action.send('send_message',id,{message:draft.message,attachments:staged.map(a=>a.id)});
+    if(result){setDraft({message:''});saveLocal(`sf-chat-draft:${id}`,'{}');setStaged([]);setFast(true);view.refresh();}
   }
-  function keys(e:KeyboardEvent<HTMLTextAreaElement>){if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();void submit();}}
+  // Enter sends; Shift+Enter starts a new line (Ctrl/Cmd+Enter also sends). Not while composing IME text.
+  function keys(e:KeyboardEvent<HTMLTextAreaElement>){if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void submit();}}
   if(!view.data)return <section className="panel"><Loading error={view.error}/></section>;
   const conversation=record(view.data.conversation),costs=record(view.data.costs);
-  return <section className="panel conversation"><div className="detail-heading"><h2>{str(conversation.title)||'Conversation'}</h2><span className="muted">{money(costs.total)} recorded usage</span></div><Feedback error={view.error}/>
-    <div className="transcript" aria-label="Conversation history">{rows(view.data.messages).map(m=><article className={`message ${str(m.role)}`} key={num(m.id)}><small>{label(m.role)} · {stamp(m.created_at)}</small><p>{str(m.content)}</p><Attachments conversation={id} items={rows(m.attachments)}/>{m.truncated===true&&<small>Long message shortened in this view.</small>}</article>)}{!rows(view.data.messages).length&&<p className="muted">No messages yet.</p>}</div>
-    {latest&&<ReplyStatus request={latest} now={now} onReuse={text=>setDraft({message:text})}/>}
+  return <section className="panel conversation" ref={panel}><div className="detail-heading"><h2>{str(conversation.title)||'Conversation'}</h2><span className="muted">{money(costs.total)} recorded usage</span></div><Feedback error={view.error}/>
+    <Transcript count={rows(view.data.messages).length+(thinking?1:0)}>{rows(view.data.messages).map(m=><article className={`message ${str(m.role)}`} key={num(m.id)}><small>{label(m.role)} · {stamp(m.created_at)}</small>{str(m.role)==='assistant'?<Markdown text={str(m.content)}/>:<p>{str(m.content)}</p>}<Attachments conversation={id} items={rows(m.attachments)}/>{m.truncated===true&&<small>Long message shortened in this view.</small>}</article>)}{!rows(view.data.messages).length&&<p className="muted">No messages yet.</p>}
+      {latest&&<ReplyStatus request={latest} now={now} onReuse={text=>setDraft({message:text})}/>}</Transcript>
     <form className="composer editor" onSubmit={submit}><fieldset disabled={action.pending||thinking||!session?.models_enabled}>
-      <label>Your message<textarea required rows={4} maxLength={16000} value={draft.message} onKeyDown={keys} onChange={e=>setDraft({message:e.target.value})} placeholder="What is blocking the current task?" aria-describedby="composer-help"/></label>
-      <div className="attach-row"><input ref={fileInput} id={`attach-${id}`} className="sr-only" tabIndex={-1} aria-hidden="true" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.py,.js,.ts,.tsx,.json,.yaml,.yml,.toml,.csv,.log,.sql,.sh,.html,.css" onChange={e=>void attach(e.target.files)}/><label htmlFor={`attach-${id}`} className="button-like" tabIndex={0} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();fileInput.current?.click();}}}>Attach files</label>
-        {staged.map(a=><span className="chip" key={a.id}>{a.name}<button type="button" aria-label={`Remove ${a.name}`} onClick={()=>setStaged(s=>s.filter(x=>x.id!==a.id))}>×</button></span>)}{uploading>0&&<span role="status">Uploading…</span>}</div>
-      <Feedback error={uploadError}/>
-      <label className="check"><input type="checkbox" checked={authorized} onChange={e=>setAuthorized(e.target.checked)}/>Send this message using the configured model and chat allowance.</label><button className="primary" disabled={!authorized||!draft.message.trim()||uploading>0} type="submit">{action.pending?'Sending…':thinking?'Waiting for reply…':'Send message'}</button></fieldset>
-      <Feedback error={action.error}/><p className="muted" id="composer-help">Ctrl+Enter sends. Images (PNG, JPEG, GIF, WebP) and text files up to 5 MB, six per message. Drafts and attachments stay in this browser until sent. Suggested actions never launch work automatically. Showing the latest 100 messages.</p></form>
+      <label>Your message<textarea required rows={3} maxLength={16000} value={draft.message} onKeyDown={keys} onChange={e=>setDraft({message:e.target.value})} placeholder="What is blocking the current task?" aria-describedby="composer-help"/></label>
+      <div className="composer-actions"><div className="attach-row"><input ref={fileInput} id={`attach-${id}`} className="sr-only" tabIndex={-1} aria-hidden="true" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.py,.js,.ts,.tsx,.json,.yaml,.yml,.toml,.csv,.log,.sql,.sh,.html,.css" onChange={e=>void attach(e.target.files)}/><label htmlFor={`attach-${id}`} className="button-like" tabIndex={0} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();fileInput.current?.click();}}}>Attach files</label>
+        {staged.map(a=><span className="chip" key={a.id}>{a.name}<button type="button" aria-label={`Remove ${a.name}`} onClick={()=>setStaged(s=>s.filter(x=>x.id!==a.id))}>×</button></span>)}{uploading>0&&<span role="status">Uploading…</span>}</div><div className="send-row"><button className="primary" disabled={!draft.message.trim()||uploading>0} type="submit">{action.pending?'Sending…':thinking?'Waiting for reply…':'Send message'}</button></div></div>
+      <Feedback error={uploadError}/></fieldset>
+      <Feedback error={action.error}/><p className="muted composer-help" id="composer-help">Enter sends · Shift+Enter for a new line · images and text files up to 5 MB · drafts stay in this browser</p></form>
   </section>;
 }

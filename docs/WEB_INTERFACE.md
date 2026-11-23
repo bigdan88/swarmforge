@@ -99,6 +99,22 @@ the optional-dependency message.
 | Model teams | Named lineups and current roles | Team files are edited in `teams/` |
 | What's new | Packaged history grouped by day, search, category filter, New-to-you marks, Mark all as read (shared with the existing dashboard), links to pages; nav badges for unread highlights and failures needing you | None |
 
+Chat replies run in the background and are owned by the web process that started them (a per-start
+identity plus a heartbeat). Starting another web instance never interrupts a live reply; a reply whose
+owner process has exited or stopped heartbeating for a minute is marked interrupted when the next
+instance starts or the conversation is used, and is never re-sent automatically. Pressing Send is the
+consent for one chat or project-lead reply; queue starts, task creation, retries, launches and paid
+model tests still ask for explicit confirmation.
+
+Work folds attempts by recorded lineage: the shared task allowance, or the retry/self-heal/continue
+chain. Tasks are never grouped by title, so independent tasks with the same title stay separate.
+
+Each server reports an opaque workspace identity (derived from its database path, which is not shown)
+and a per-start instance identity. The page binds browser drafts, staged attachments, pending request
+keys and every write to the workspace it loaded; writes naming another workspace are refused with 409.
+A tab left open across a workspace change shows an out-of-date banner until reloaded; a restart of the
+same workspace keeps drafts and shows a short notice.
+
 In task details, a retry keeps the original persisted task budget and deadline. Retrying a project
 item cannot detach it from project accounting or bypass a merge barrier. Queue start requires an
 explicit authorization of already queued work and launched projects. The web server starts no
