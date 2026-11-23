@@ -155,6 +155,7 @@ self_heal:                    # when a run fails: diagnose why, then retry with 
   extra_repair_cycles: 1      # ... one more repair cycle ...
   steps_factor: 1.5           # ... and 1.5x the agent steps per session
   max_total_budget_usd: 0     # cap for a task plus its retries; 0 = 3x the task's budget
+  max_total_runtime_s: 0      # cap on wall-clock for a task plus its retries; 0 = 3x the task's max_runtime_s (6h default -> 18h)
   diagnose: true              # ask a model why a run failed (one cheap call); stored under Failures
   diagnosis_role: planner
 
