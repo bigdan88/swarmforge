@@ -136,7 +136,7 @@ def create_demo(root: Path):
     store.update_run("demo-done", pr_url="https://github.com/example/inventory/pull/42")
     store.queue_add("Add keyboard shortcuts to project navigation", "Demo task", "example/inventory", budget=5)
     store.record_test_run("demo-running", label="Demo unit checks", exit_code=0, passed=12, failed=0, errors=0, skipped=0)
-    with store.conn:
+    with store.transaction():
         store.conn.execute("INSERT INTO acceptance(run_id,cycle,criterion_id,text,status,evidence) VALUES ('demo-running',0,'demo-check','A user can open retained evidence','passed','Fabricated demo evidence, not a real verification run')")
     definition = {"name": "Inventory app · demo", "goal": "Build a small inventory workspace", "users": "A small shop team", "repo": "example/inventory",
                   "repository_kind": "existing", "out_of_scope": "Payments", "stack": "React and Python", "hosting": "Local", "deadline": "None",

@@ -95,7 +95,13 @@ RESTARTED = "restarted as task #"
 
 def requeue(store: Store, item: dict, **kw) -> tuple[int, bool]:
     """Queue a finished/failed item again at the front of the waiting line. Returns (item id, created).
-    If a copy is already waiting or running, that copy is returned instead of adding another one."""
+    If a copy is already waiting or running, that copy is returned instead of adding another one.
+    The duplicate check and the insert are one transaction, so two retries cannot both add a copy."""
+    with store.transaction():
+        return _requeue(store, item, **kw)
+
+
+def _requeue(store: Store, item: dict, **kw) -> tuple[int, bool]:
     for q in store.queue_items(include_finished=False):
         if q["id"] != item["id"] and q["status"] in ("queued", "running") and \
                 q["title"] == item["title"] and q["body"] == item["body"] and q["repo"] == item["repo"]:
@@ -191,8 +197,7 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     issues.mkdir(parents=True, exist_ok=True)
     issue_file = issues / f"{run_id}.md"
     issue_file.write_text(f"# {item['title']}\n\n{item['body']}\n", encoding="utf-8")
-    with store._lock, store.conn:
-        store.conn.execute("BEGIN IMMEDIATE")
+    with store.transaction():  # the project check and the claim of this item are one decision
         if item.get("project_id"):
             from .projects.decisions import lead_active
             claim = lead_active(store.conn, item["project_id"])
@@ -232,10 +237,11 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         # Docker down, image missing, no API key...: every other task would hit the same wall, so keep
         # this one in line and pause its queue until the problem is fixed (Resume starts it again).
         name = lane(item)
-        set_lane_paused(store, name, True)
-        store.queue_update(item["id"], status="queued", run_id=None, started_at=None,
-                           seed_run_id=run_id,
-                           note=f"{ENV_PAUSE_NOTE}: {(run['state_reason'] or '')[:300]}")
+        with store.transaction():  # the item goes back in line exactly when its lane pauses
+            set_lane_paused(store, name, True)
+            store.queue_update(item["id"], status="queued", run_id=None, started_at=None,
+                               seed_run_id=run_id,
+                               note=f"{ENV_PAUSE_NOTE}: {(run['state_reason'] or '')[:300]}")
         if echo:
             echo(f"queue '{name}' paused: environment problem ({(run['state_reason'] or '')[:200]}). "
                  "Fix it, then resume the queue.")
@@ -337,8 +343,7 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
     The global pause stops new starts everywhere; a failed item (policy "stop") pauses only its queue."""
     # Two dashboard launches can race before either child records its PID. Claim the worker
     # inside a write transaction so a project cannot dispatch duplicate runs in that window.
-    with store._lock, store.conn:
-        store.conn.execute("BEGIN IMMEDIATE")
+    with store.transaction():
         other = worker_pid(store)
         if other and other != os.getpid():
             if echo:

@@ -43,8 +43,8 @@ class DashboardActions:
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", key):
             raise ValueError("A valid Idempotency-Key is required")
         fingerprint = hashlib.sha256(json.dumps([operation, target, args], sort_keys=True, allow_nan=False).encode()).hexdigest()
-        with self.store._lock, self.store.conn:
-            self.store.conn.execute("BEGIN IMMEDIATE")
+        # Intent first, in its own transaction; the action itself runs after the commit.
+        with self.store.transaction():
             old = self.store.conn.execute("SELECT * FROM dashboard_requests WHERE key=?", (key,)).fetchone()
             if old:
                 if old["fingerprint"] != fingerprint:

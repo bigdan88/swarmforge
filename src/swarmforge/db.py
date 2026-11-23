@@ -262,6 +262,7 @@ class Store:
         self.path = path
         self._lock = threading.RLock()
         self._tx_depth = 0  # >0 while transaction() is open on this connection (same thread holds _lock)
+        self._tx_thread: int | None = None
         self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -329,7 +330,8 @@ class Store:
         Takes the write lock up front (BEGIN IMMEDIATE), so a read-then-write decision cannot race
         another connection or process. Store helpers called inside join it instead of committing.
         Nested calls join the outer transaction. Never make network or model calls inside: record
-        the intent, commit, make the call, then record the outcome in a new transaction."""
+        the intent, commit, make the call, then record the outcome in a new transaction
+        (`outside_transaction` enforces this at the call sites that talk to the outside world)."""
         with self._lock:
             if self._tx_depth:
                 self._tx_depth += 1
@@ -341,15 +343,22 @@ class Store:
             if self.conn.in_transaction:  # a stray implicit transaction must not be swallowed silently
                 self.conn.commit()
             self.conn.execute("BEGIN IMMEDIATE")
-            self._tx_depth = 1
+            self._tx_depth, self._tx_thread = 1, threading.get_ident()
+            _OPEN.count = getattr(_OPEN, "count", 0) + 1
             try:
                 yield self.conn
             except BaseException:
-                self._tx_depth = 0
                 self.conn.rollback()
                 raise
-            self._tx_depth = 0
-            self.conn.commit()
+            else:
+                self.conn.commit()
+            finally:
+                self._tx_depth, self._tx_thread = 0, None
+                _OPEN.count -= 1
+
+    def in_transaction_here(self) -> bool:
+        """True when the calling thread is inside transaction() on this store."""
+        return bool(self._tx_depth) and self._tx_thread == threading.get_ident()
 
     def _all(self, sql: str, params: tuple = ()) -> list[dict]:
         with self._lock:
@@ -393,11 +402,12 @@ class Store:
         self.update_run(run_id, archived=1 if archived else 0)
 
     def request_cancel(self, run_id: str) -> None:
-        self.update_run(run_id, cancel_requested=1)
-        run = self.get_run(run_id)
-        if run and run.get("execution_id"):
-            self._exec("UPDATE execution_allowances SET cancelled=1 WHERE id=?", (run["execution_id"],))
-            self._exec("UPDATE runs SET cancel_requested=1 WHERE execution_id=?", (run["execution_id"],))
+        with self.transaction():  # the run, its allowance and its sibling attempts are cancelled together
+            self.update_run(run_id, cancel_requested=1)
+            run = self.get_run(run_id)
+            if run and run.get("execution_id"):
+                self._exec("UPDATE execution_allowances SET cancelled=1 WHERE id=?", (run["execution_id"],))
+                self._exec("UPDATE runs SET cancel_requested=1 WHERE execution_id=?", (run["execution_id"],))
 
     def cancel_requested(self, run_id: str) -> bool:
         row = self._one("SELECT cancel_requested FROM runs WHERE id = ?", (run_id,))
@@ -623,11 +633,10 @@ class Store:
         """Remove a run and everything recorded about it (its failure post-mortem is kept for learning)."""
         if self._one("SELECT id FROM queue_items WHERE run_id=? AND project_id IS NOT NULL", (run_id,)):
             raise ValueError("Project runs retain their evidence and budget history; archive instead")
-        with self._lock:
+        with self.transaction():
             for t in self.RUN_TABLES:
                 self.conn.execute(f"DELETE FROM {t} WHERE run_id = ?", (run_id,))
             self.conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
-            self.conn.commit()
 
     # ---------------------------------------------------------- recent repos
     RECENT_REPOS_KEY = "recent_repos"
@@ -673,10 +682,9 @@ class Store:
         j = idx + direction
         if 0 <= j < len(items):
             a, b = items[idx], items[j]
-            with self._lock:
+            with self.transaction():
                 self.conn.execute("UPDATE queue_items SET position = ? WHERE id = ?", (b["position"], a["id"]))
                 self.conn.execute("UPDATE queue_items SET position = ? WHERE id = ?", (a["position"], b["id"]))
-                self.conn.commit()
 
     def queue_clear_finished(self) -> int:
         return self._exec("DELETE FROM queue_items WHERE project_id IS NULL AND status IN ('done','failed','cancelled','skipped')").rowcount
@@ -722,10 +730,15 @@ class Store:
             "SELECT * FROM conversations ORDER BY COALESCE(updated_at, created_at) DESC")
 
     def conversation_delete(self, conv_id: str) -> None:
-        self._exec("DELETE FROM chat_messages WHERE conversation_id = ?", (conv_id,))
-        self._exec("DELETE FROM conversations WHERE id = ?", (conv_id,))
+        with self.transaction():
+            self._exec("DELETE FROM chat_messages WHERE conversation_id = ?", (conv_id,))
+            self._exec("DELETE FROM conversations WHERE id = ?", (conv_id,))
 
     def conversation_append(self, conv_id: str, role: str, content: str) -> int:
+        with self.transaction():
+            return self._conversation_append(conv_id, role, content)
+
+    def _conversation_append(self, conv_id: str, role: str, content: str) -> int:
         self.conversation_create(conv_id)
         cur = self._exec(
             "INSERT INTO chat_messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
@@ -810,3 +823,20 @@ def _variant_row(row: dict) -> dict:
     d["overlay"] = json.loads(d.get("overlay") or "{}")
     d["scores"] = json.loads(d.get("scores") or "[]")
     return d
+
+
+_OPEN = threading.local()  # write transactions this thread currently holds, across Store objects
+
+
+class TransactionViolation(RuntimeError):
+    """An external call (model, GitHub, git push) was attempted inside a database transaction."""
+
+
+def outside_transaction(what: str) -> None:
+    """Refuse an external call while this thread holds a write transaction on any Store.
+
+    Holding the database write lock across a network call blocks every other writer for its whole
+    duration, and a rollback after the call cannot undo what the outside world already did."""
+    if getattr(_OPEN, "count", 0):
+        raise TransactionViolation(f"{what} must not run inside a database transaction; record the intent, "
+                                   "commit, then make the call")

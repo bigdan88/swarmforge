@@ -232,7 +232,9 @@ class LLMClient:
 
     async def chat(self, role: str, messages: list[dict], *, tools: list[dict] | None = None,
                    task_key: str | None = None, tool_choice: Any = None) -> ChatResult:
+        from .db import outside_transaction
         from .execution import SharedBudget
+        outside_transaction("A model call")
         if not isinstance(self.budget, SharedBudget):
             return await self._chat(role, messages, tools=tools, task_key=task_key, tool_choice=tool_choice)
         rc = self.config.role(role)

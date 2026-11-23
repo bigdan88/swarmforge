@@ -137,8 +137,19 @@ uncertain and stops the project for a human). Runs and the queue worker still us
 
 `Store.transaction()` is the boundary for one business operation: it takes the write lock up front
 (`BEGIN IMMEDIATE`), store helpers called inside join it rather than committing, and nested calls join
-the outer one. Network and model calls never happen inside a transaction: record the intent, commit,
-make the call, then record the outcome in a new transaction.
+the outer one. An exception rolls the whole operation back.
+
+Network and model calls never happen inside a transaction: record the intent, commit, make the call,
+then record the outcome in a new transaction (the web action journal and chat reply jobs work this
+way). This is enforced: model calls (`LLMClient.chat`), GitHub API requests and `git push` raise
+`TransactionViolation` if the calling thread holds a write transaction.
+
+Operations that are one transaction each: project create, draft save, approve, pause, cancel (queued
+items, running-run cancellations and the status change together), spec amendment (its checks run inside
+the transaction), checkpoint reply (including reopening the lane), lead replans and fix-ups; queue item
+claim, worker claim, retry (`requeue`: the duplicate check and the insert together) and environment
+pause; conversation append, delete and clear; run deletion, cancellation and queue reordering. Opening a
+write transaction by hand anywhere else fails `tests/test_transactions.py`.
 
 ## Data & observability
 

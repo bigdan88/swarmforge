@@ -20,8 +20,7 @@ def lane(pid):
 
 def approve(store, pid, *, expected_spec=None):
     ps = Projects(store)
-    with store._lock, store.conn:
-        store.conn.execute("BEGIN IMMEDIATE")
+    with store.transaction():
         p = ps.get(pid)
         if p["status"] != "drafting":
             raise ProjectError("This project has already been launched")
@@ -42,29 +41,36 @@ def approve(store, pid, *, expected_spec=None):
 
 def pause(store, pid):
     ps = Projects(store)
-    p = ps.get(pid)
-    if p["status"] != "running":
-        raise ProjectError("Only a running project can be paused")
-    ps.update(pid, status="waiting_for_you", last_error="Paused by you. Running work will finish; no new task will start.")
-    ps.event(pid, "pause", {})
+    with store.transaction():  # check and change together: no second action slips in between
+        p = ps.get(pid)
+        if p["status"] != "running":
+            raise ProjectError("Only a running project can be paused")
+        ps.update(pid, status="waiting_for_you", last_error="Paused by you. Running work will finish; no new task will start.")
+        ps.event(pid, "pause", {})
 
 
 def cancel(store, pid):
     ps = Projects(store)
-    p = ps.get(pid)
-    for q in ps.items(pid):
-        if q["status"] in ("queued", "tentative"):
-            store.queue_update(q["id"], status="cancelled")
-        elif q["status"] == "running" and q.get("run_id"):
-            store.request_cancel(q["run_id"])
-    ps.update(pid, status="cancelled", last_error=None)
-    ps.event(pid, "cancel", {})
+    with store.transaction():  # all queued work, running cancellations and the status change, or none
+        ps.get(pid)
+        for q in ps.items(pid):
+            if q["status"] in ("queued", "tentative"):
+                store.queue_update(q["id"], status="cancelled")
+            elif q["status"] == "running" and q.get("run_id"):
+                store.request_cancel(q["run_id"])
+        ps.update(pid, status="cancelled", last_error=None)
+        ps.event(pid, "cancel", {})
 
 
 def amend(store, pid, definition):
     """Explicit human approval of a new fixed spec; the lead cannot call this operation."""
     from .spec import render
     ps = Projects(store)
+    with store.transaction():  # every check below holds when the new spec is written
+        _amend(store, ps, pid, definition, render)
+
+
+def _amend(store, ps, pid, definition, render):
     p = ps.get(pid)
     if p["status"] not in ("waiting_for_you", "at_checkpoint"):
         raise ProjectError("Pause at a checkpoint before approving a revised fixed spec")
@@ -76,23 +82,22 @@ def amend(store, pid, definition):
     if any(q["status"] == "running" for q in ps.items(pid)):
         raise ProjectError("Wait for running work to finish before revising the fixed spec")
     living = p["spec"][len(fixed(p["spec"])) + len("## Living\n"):]
-    with store._lock, store.conn:
-        store.conn.execute("UPDATE projects SET name=?,budget_usd=?,definition=?,spec=?,previous_spec=?,observed_sha=NULL WHERE id=?",
-                           (d["name"], d["budget_usd"], json.dumps(d), render(d, living), p.get("previous_spec") or p["spec"], pid))
-        for i, m in enumerate(d["milestones"]):
-            if i >= p["current_milestone"]:
-                store.conn.execute("UPDATE milestones SET name=?,estimate_usd=?,estimate_hours=?,report=NULL,status=? WHERE project_id=? AND idx=?",
-                                   (m["name"], m["estimate_usd"], m["estimate_hours"], "current" if i == p["current_milestone"] else "ahead", pid, i))
-        store.conn.execute("UPDATE projects SET status='waiting_for_you' WHERE id=?", (pid,))
-        store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, time.time(), "spec_approved", json.dumps({"before": p["spec"], "after": render(d, living)})))
+    store.conn.execute("UPDATE projects SET name=?,budget_usd=?,definition=?,spec=?,previous_spec=?,observed_sha=NULL WHERE id=?",
+                       (d["name"], d["budget_usd"], json.dumps(d), render(d, living), p.get("previous_spec") or p["spec"], pid))
+    for i, m in enumerate(d["milestones"]):
+        if i >= p["current_milestone"]:
+            store.conn.execute("UPDATE milestones SET name=?,estimate_usd=?,estimate_hours=?,report=NULL,status=? WHERE project_id=? AND idx=?",
+                               (m["name"], m["estimate_usd"], m["estimate_hours"], "current" if i == p["current_milestone"] else "ahead", pid, i))
+    store.conn.execute("UPDATE projects SET status='waiting_for_you' WHERE id=?", (pid,))
+    store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, time.time(), "spec_approved", json.dumps({"before": p["spec"], "after": render(d, living)})))
 
 
 def resume(store, pid, reply="continue", *, confirm_manual=False):
     ps = Projects(store)
     if not reply.strip():
         raise ProjectError("Add a reply or correction")
-    with store._lock, store.conn:
-        store.conn.execute("BEGIN IMMEDIATE")
+    from ..runqueue import set_lane_paused
+    with store.transaction():
         p = ps.get(pid)
         if p["status"] not in ("at_checkpoint", "waiting_for_you"):
             raise ProjectError("Project is not waiting for a reply")
@@ -114,8 +119,7 @@ def resume(store, pid, reply="continue", *, confirm_manual=False):
         store.conn.execute("INSERT INTO chat_messages(conversation_id,role,content,created_at) VALUES (?,'user',?,?)", (p["conversation_id"], reply, now))
         store.conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, p["conversation_id"]))
         store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, now, "completed" if status == "done" else "reply", json.dumps({"reply": reply, "confirmed_manual": confirm_manual})))
-    from ..runqueue import set_lane_paused
-    set_lane_paused(store, lane(pid), False)
+        set_lane_paused(store, lane(pid), False)  # the lane reopens with the reply, not in a later commit
 
 
 def github_repo_name(repo):
@@ -313,13 +317,13 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                             if budget <= 0 or ps.spent(pid, p["current_milestone"]) + budget > ms["estimate_usd"] * cfg.projects.escalate_budget_factor:
                                 stop(ps, p, "The held PR needs a fix-up, but its budget needs review first.", {"pr": run["pr_url"], "reason": reason})
                                 return
-                            with store._lock, store.conn:
+                            with store.transaction():
                                 store.conn.execute("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
                                 store.conn.execute("UPDATE queue_items SET project_processed=1 WHERE id=?", (q["id"],))
                                 pos = store.conn.execute("SELECT COALESCE(MAX(position),0)+1 FROM queue_items").fetchone()[0]
                                 store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts,seed_run_id) VALUES (?,?,?,?,?,'queued',?,0,'yes',?,?,?,?, 'swarm',0,?)",
                                                    (pos, title, body, p["repo"], time.time(), lane(pid), pid, p["current_milestone"], q["project_key"], budget, q["run_id"]))
-                            ps.event(pid, "fix_up", {"supersedes": q["id"], "reason": reason})
+                                ps.event(pid, "fix_up", {"supersedes": q["id"], "reason": reason})
                             return
                         ps.update(pid, last_error="Waiting for the previous task's PR to merge: " + run["pr_url"])
                         return
@@ -473,7 +477,8 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
             stop(ps, p, "The next task would exceed the approved project or milestone budget. Review its scope or budget.", {"next_task_budget": next_budget, "spent": spent})
             return
         # Retain completed/failed history; replace only the pending horizon, atomically.
-        with store._lock, store.conn:
+        from ..runqueue import set_lane_paused
+        with store.transaction():
             store.conn.execute("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
             pos = store.conn.execute("SELECT COALESCE(MAX(position),0) FROM queue_items").fetchone()[0]
             for i, t in enumerate(result["tasks"]):
@@ -488,8 +493,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                                    (json.dumps(t.get("depends_on", [])), action.kind.value, runtime, qid))
             store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, time.time(), "replan", json.dumps({"sha": snapshot["sha"], "reason": result["reason"], "tasks": result["tasks"], "changed_keys": changed})))
             turn.mark("applied", {"result": "Scheduled approved tasks in the existing project lane", "task_keys": [t["key"] for t in result["tasks"]]}, connection=store.conn)
-        from ..runqueue import set_lane_paused
-        set_lane_paused(store, lane(pid), False)
+            set_lane_paused(store, lane(pid), False)
     finally:
         store.kv_set(activity_key, None)
         if own:

@@ -896,11 +896,11 @@ def add_message(store: Store, conversation_id: str, role: str, content: str,
 
     `tool_calls` is an optional list of {"name", "args", "output"} dicts stored
     as JSON in the chat_messages.tool_calls column (NULL when omitted)."""
-    if get_conversation(store, conversation_id) is None:
-        raise ChatError(f"unknown conversation {conversation_id}")
     now = time.time()
     calls_json = json.dumps(tool_calls) if tool_calls else None
-    with store._lock:
+    with store.transaction():
+        if get_conversation(store, conversation_id) is None:
+            raise ChatError(f"unknown conversation {conversation_id}")
         cur = store.conn.execute(
             "INSERT INTO chat_messages (conversation_id, role, content, created_at, tool_calls) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -910,7 +910,6 @@ def add_message(store: Store, conversation_id: str, role: str, content: str,
             "UPDATE conversations SET updated_at = ? WHERE id = ?",
             (now, conversation_id),
         )
-        store.conn.commit()
         msg_id = cur.lastrowid
     msg = store._one("SELECT * FROM chat_messages WHERE id = ?", (msg_id,))
     assert msg is not None
@@ -940,13 +939,12 @@ def clear_messages(store: Store, conversation_id: str) -> int:
     Returns the number of deleted messages. Raises ChatError for an unknown id.
     Does NOT bump conversations.updated_at (sidebar order must not change).
     """
-    if get_conversation(store, conversation_id) is None:
-        raise ChatError(f"unknown conversation {conversation_id}")
-    with store._lock:
+    with store.transaction():
+        if get_conversation(store, conversation_id) is None:
+            raise ChatError(f"unknown conversation {conversation_id}")
         cur = store.conn.execute(
             "DELETE FROM chat_messages WHERE conversation_id = ?", (conversation_id,)
         )
-        store.conn.commit()
         return cur.rowcount
 
 
@@ -965,14 +963,13 @@ def rename_conversation(store: Store, conversation_id: str, title: str) -> dict:
 
 def delete_conversation(store: Store, conversation_id: str) -> bool:
     """Delete a conversation and all its messages. Returns True if it existed."""
-    with store._lock:
+    with store.transaction():
         store.conn.execute(
             "DELETE FROM chat_messages WHERE conversation_id = ?", (conversation_id,)
         )
         cur = store.conn.execute(
             "DELETE FROM conversations WHERE id = ?", (conversation_id,)
         )
-        store.conn.commit()
         return cur.rowcount > 0
 
 
