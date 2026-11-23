@@ -90,11 +90,9 @@ def register(kind: str, *, on_transition: Callable[[Any, dict, str, str], None] 
 
 
 def ensure_tables(store: Store) -> None:
-    if getattr(store, "_jobs_ready", False) or store.in_transaction_here():
-        return  # Store() creates the schema on open; executescript would commit an open transaction
-    with store._lock:
-        store.conn.executescript(SCHEMA)
-        store.conn.commit()
+    if getattr(store, "_jobs_ready", False):
+        return  # Store() creates the schema on open
+    store.ensure_schema(SCHEMA)
     store._jobs_ready = True  # type: ignore[attr-defined]
 
 

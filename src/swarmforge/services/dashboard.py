@@ -27,7 +27,8 @@ def text(args: dict[str, Any], key: str, maximum: int, default: str = "") -> str
 
 class DashboardActions:
     def __init__(self, store: Store, config: Config | None = None, *, chat_answer=None, project_interview=None, worker_start=None,
-                 chat_background: bool = True, diagnose=None, pr_api=None, model_test=None):
+                 chat_background: bool = True, diagnose=None, pr_api=None, model_test=None, reconciler=None,
+                 reconcile_on_start: bool = True):
         from .chat_requests import release_interrupted
         self.store, self.config = store, config
         self.chat_answer, self.project_interview, self.worker_start = chat_answer, project_interview, worker_start
@@ -38,6 +39,12 @@ class DashboardActions:
         store._exec("""CREATE TABLE IF NOT EXISTS dashboard_requests (
             key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, operation TEXT NOT NULL,
             target TEXT NOT NULL, status TEXT NOT NULL, created_at REAL NOT NULL, result TEXT)""")
+        if "intent" not in {r["name"] for r in store._all("PRAGMA table_info(dashboard_requests)")}:
+            store._exec("ALTER TABLE dashboard_requests ADD COLUMN intent TEXT")
+        # reconciler(operation, target, args) -> reconcile.Verdict; asks GitHub by default.
+        self.reconciler = reconciler
+        if reconcile_on_start and config is not None:
+            self._reconcile_in_background()
 
     def execute(self, key: str, operation: str, target: str, args: dict[str, Any]) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", key):
@@ -51,20 +58,61 @@ class DashboardActions:
                     raise ActionConflict("This request key belongs to a different action")
                 if old["result"]:
                     return json.loads(old["result"])
-                raise ActionConflict("This action is running or its outcome is uncertain. Inspect current state; do not repeat it.")
-            self.store.conn.execute("INSERT INTO dashboard_requests(key,fingerprint,operation,target,status,created_at) VALUES (?,?,?,?,'pending',?)",
-                                    (key, fingerprint, operation, target, time.time()))
+            else:
+                self.store.conn.execute("INSERT INTO dashboard_requests(key,fingerprint,operation,target,status,created_at,intent) VALUES (?,?,?,?,'pending',?,?)",
+                                        (key, fingerprint, operation, target, time.time(), json.dumps(args, default=str)[:16000]))
+        if old:
+            # Same request again with no recorded outcome: ask GitHub where it can tell (outside the transaction).
+            settled = self._reconcile_request(dict(old), args)
+            if settled is not None:
+                return settled
+            raise ActionConflict("This action is running or its outcome is uncertain. Inspect current state; do not repeat it.")
         try:
             result = {"ok": True, "message": "Action recorded", **self._apply(operation, target, args)}
         except (ValueError, ProjectError) as exc:
             result = {"ok": False, "message": str(exc)[:500]}
         except Exception:
-            # An external action may already have happened. Retain pending intent
-            # and never replay it automatically after a transport/process failure.
+            # An external action may already have happened. Keep the intent, mark the outcome uncertain
+            # and never replay it automatically; reconciliation asks GitHub what really happened.
+            self.store._exec("UPDATE dashboard_requests SET status='uncertain' WHERE key=? AND status='pending'", (key,))
             raise ActionConflict("Action outcome is uncertain. Inspect current state before taking another action.") from None
         self.store._exec("UPDATE dashboard_requests SET status=?,result=? WHERE key=? AND status='pending'",
                          ("done" if result["ok"] else "rejected", json.dumps(result), key))
         return result
+
+    def _verdict(self, operation, target, args):
+        if self.reconciler is not None:
+            return self.reconciler(operation, target, args)
+        if self.config is None:
+            return None
+        from ..github import GitHubClient
+        from ..reconcile import check_request
+        return check_request(GitHubClient(self.config.github), operation, target, args)
+
+    def _reconcile_request(self, row: dict, args) -> dict | None:
+        from ..reconcile import STALE_REQUEST_S, settle_request
+        if row["status"] == "pending" and time.time() - row["created_at"] < STALE_REQUEST_S:
+            return None  # may still be running in this or another web process
+        if row["operation"] not in ("merge_pr", "update_pr"):
+            return None
+        try:
+            verdict = self._verdict(row["operation"], row["target"], args)
+        except Exception:  # noqa: BLE001 - GitHub unreachable: the record stays open
+            return None
+        return settle_request(self.store, row["key"], verdict) if verdict is not None else None
+
+    def _reconcile_in_background(self) -> None:
+        from ..reconcile import open_checkpoints, open_requests, reconcile_all
+        if not open_checkpoints(self.store) and not open_requests(self.store):
+            return
+        import threading
+
+        def run():
+            try:
+                reconcile_all(self.store, self.config)
+            except Exception:  # noqa: BLE001 - best effort at startup; `swarmforge reconcile` reports details
+                pass
+        threading.Thread(target=run, name="reconcile-on-start", daemon=True).start()
 
     def _apply(self, operation, target, args):
         from ..projects import service

@@ -5,6 +5,7 @@ The total deadline is wall-clock time, including waits and downtime after first 
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -129,7 +130,8 @@ class Execution:
                 raise ExecutionStopped("lost_worker", "Recover the lost worker before starting another attempt")
             if row["cancelled"]:
                 raise ExecutionStopped("cancelled", "Task lineage was intentionally cancelled")
-            pending = db.execute("SELECT name FROM execution_checkpoints WHERE execution_id=? AND name LIKE 'external:%' AND status='pending' LIMIT 1", (self.id,)).fetchone()
+            pending = db.execute("SELECT name FROM execution_checkpoints WHERE execution_id=? AND name LIKE 'external:%' "
+                                 "AND status IN ('pending','uncertain','conflict') LIMIT 1", (self.id,)).fetchone()
             if pending:
                 raise ExecutionStopped("external_uncertain", "Confirm the remote outcome before another attempt: " + pending["name"])
             previous = db.execute("SELECT stop_kind FROM execution_attempts WHERE execution_id=? ORDER BY number DESC LIMIT 1", (self.id,)).fetchone()
@@ -377,29 +379,53 @@ def progress_text(store, run_id):
     return "\n\n".join(parts)
 
 
-async def external_once(store, run_id, name, action, *, enforce_allowance=True):
+async def external_once(store, run_id, name, action, *, enforce_allowance=True, intent=None, cfg=None):
     """Record intent before an external write; uncertain outcomes require reconciliation.
 
     The operation's scope key includes the branch/PR, so an authorized replacement can
     publish its own work. A completed operation returns its recorded result on replay.
+    `intent` (for example the commit being pushed) is kept with the record so reconciliation can
+    tell this operation's effect from someone else's. If the call fails, the record becomes
+    `uncertain`: the failure may have happened after GitHub acted. With `cfg`, an open record left by
+    an earlier attempt is reconciled against GitHub first (see reconcile.py) instead of stopping.
     """
     run = store.get_run(run_id) or {}
     eid = run.get("execution_id") or run_id
     name = "external:" + name
-    with transaction(store) as db:
-        existing = db.execute("SELECT * FROM execution_checkpoints WHERE execution_id=? AND name=?", (eid, name)).fetchone()
-        if existing:
-            if existing["status"] == "completed":
+    for reconciled in (False, True):
+        with transaction(store) as db:
+            existing = db.execute("SELECT * FROM execution_checkpoints WHERE execution_id=? AND name=?", (eid, name)).fetchone()
+            if existing and existing["status"] == "completed":
                 return json.loads(existing["detail"])
+            if existing and existing["status"] == "conflict":
+                raise ExecutionStopped("external_conflict", "External action needs you (reconciliation found a conflict): " + name)
+            if not existing or existing["status"] == "not_done":
+                allowance = db.execute("SELECT * FROM execution_allowances WHERE id=?", (eid,)).fetchone()
+                if allowance:
+                    if allowance["cancelled"]:
+                        raise ExecutionStopped("cancelled", "Task cancelled before external action")
+                    if enforce_allowance and (time.time() >= allowance["deadline"] or allowance["spent_usd"] >= allowance["budget_usd"]):
+                        raise ExecutionStopped("allowance_exhausted", "Task allowance exhausted before external action")
+                db.execute("INSERT INTO execution_checkpoints VALUES (?,?,?,?,?,?) ON CONFLICT(execution_id,name) DO UPDATE SET "
+                           "run_id=excluded.run_id,ts=excluded.ts,status=excluded.status,detail=excluded.detail",
+                           (eid, name, run_id, time.time(), "pending", json.dumps({"intent": intent or {}}, default=str)))
+                break
+        if reconciled or cfg is None:
             raise ExecutionStopped("external_uncertain", "External action outcome needs reconciliation before retry: " + name)
-        allowance = db.execute("SELECT * FROM execution_allowances WHERE id=?", (eid,)).fetchone()
-        if allowance:
-            if allowance["cancelled"]:
-                raise ExecutionStopped("cancelled", "Task cancelled before external action")
-            if enforce_allowance and (time.time() >= allowance["deadline"] or allowance["spent_usd"] >= allowance["budget_usd"]):
-                raise ExecutionStopped("allowance_exhausted", "Task allowance exhausted before external action")
-        db.execute("INSERT INTO execution_checkpoints VALUES (?,?,?,?,?,?)", (eid, name, run_id, time.time(), "pending", "null"))
-    result = await action()
+        # Open record from an earlier attempt: ask GitHub (outside any transaction), then decide again.
+        from .github import GitHubClient
+        from .reconcile import check_external, settle_checkpoint
+        detail = json.loads(existing["detail"] or "null")
+        verdict = await asyncio.to_thread(check_external, GitHubClient(cfg.github), name,
+                                          (detail or {}).get("intent") if isinstance(detail, dict) else None)
+        settle_checkpoint(store, eid, name, verdict)
+    try:
+        result = await action()
+    except BaseException as exc:
+        # The call may have failed after GitHub acted (timeout, dropped connection): never assume either way.
+        store._exec("UPDATE execution_checkpoints SET status='uncertain',detail=?,ts=? WHERE execution_id=? AND name=? AND status='pending'",
+                    (json.dumps({"intent": intent or {}, "error": f"{type(exc).__name__}: {exc}"[:500]}, default=str), time.time(), eid, name))
+        raise
     store._exec("UPDATE execution_checkpoints SET status='completed',detail=?,ts=? WHERE execution_id=? AND name=?",
                 (json.dumps(result, default=str), time.time(), eid, name))
     return result

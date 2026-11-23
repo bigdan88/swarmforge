@@ -155,6 +155,4 @@ def test_no_hand_rolled_write_transactions_outside_the_store():
             for m in re.finditer(pattern, text):
                 line = text[:m.start()].count("\n") + 1
                 offenders.append(f"{path.relative_to(SRC)}:{line}: {m.group(0)}")
-    # jobs.ensure_tables commits its schema script only outside a transaction (it checks first).
-    offenders = [o for o in offenders if not o.startswith("jobs.py:") or ".conn.commit()" not in o]
     assert offenders == [], "Use Store.transaction() instead:\n" + "\n".join(offenders)

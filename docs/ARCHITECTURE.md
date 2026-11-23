@@ -131,6 +131,11 @@ works. The database allows one active job per kind and subject across all connec
 - **Hooks:** a kind registers a hook that updates its own rows inside the transition's transaction (the
   chat request the browser shows, a project's lead decisions), so the two can never disagree.
 
+External effects (push, draft PR, merge, close) record their intent before they run and become
+`uncertain` if the call fails. `reconcile.py` later asks GitHub what really happened and settles each
+record as done (the real result is replayed), not done (safe to repeat once), conflict (a human
+decides) or unknown (left open), keeping the evidence. Details: docs/EXECUTION.md, Reconciliation.
+
 On jobs today: chat replies (`chat_reply`) and project-lead turns (`project_lead`, recovers as
 uncertain and stops the project for a human). Runs and the queue worker still use their allowance claims
 (docs/EXECUTION.md) and move next.

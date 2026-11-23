@@ -76,7 +76,8 @@ class PublicationService:
                 if pr.state == "dirty" or pr.mergeable is False:
                     pr = await self._resolve_pr_conflict(gh, repo, pr)
                 info["sha"] = await external_once(self.store, self.run_id, f"merge:{repo}:{number}",
-                                                  lambda: asyncio.to_thread(am.apply, gh, pr, amc.method))
+                                                  lambda: asyncio.to_thread(am.apply, gh, pr, amc.method),
+                                                  intent={"head_sha": pr.head_sha}, cfg=self.cfg)
                 self.store.record_intervention(self.run_id, am.MERGED, json.dumps(info))
                 self.store.update_run(self.run_id, state_reason=f"draft PR created: {url} · auto-merged")
                 self.log("merge", f"auto-merged {url}: {d.reason}")
@@ -113,7 +114,7 @@ class PublicationService:
         try:
             await external_once(self.store, self.run_id, f"close:{old}",
                                 lambda: asyncio.to_thread(am.close_pr, gh, repo, int(old.rstrip("/").split("/")[-1]),
-                                                          f"Superseded by {url} (SwarmForge fix-up)."))
+                                                          f"Superseded by {url} (SwarmForge fix-up)."), cfg=self.cfg)
             self.store.record_intervention(self.run_id, am.CLOSED, json.dumps({"url": old, "replaced_by": url}))
             self.log("merge", f"closed {old}: replaced by {url}")
         except (GitHubError, ValueError) as e:
@@ -173,15 +174,18 @@ class PublicationService:
                                            f"{'approved' if approved else 'declined'}: {q}")
             if not approved:
                 return None
+        from ..reconcile import local_head
+        head = local_head(ws.repo, ws.integration_branch)
         await external_once(self.store, self.run_id, f"push:{full}:{ws.integration_branch}",
                             lambda: asyncio.to_thread(self.push, ws.repo, owner, name, ws.integration_branch,
-                                                      gh.token, ws.base_branch, self.cfg.github.branch_prefix))
+                                                      gh.token, ws.base_branch, self.cfg.github.branch_prefix),
+                            intent={"sha": head}, cfg=self.cfg)
         self.log("pr", f"pushed {ws.integration_branch} to {full}")
         body = build_pr_body(self.store, self.run_id)
         title = f"[SwarmForge] {issue.title}" + (f" (#{issue.number})" if issue.number else "")
         url = await external_once(self.store, self.run_id, f"pr:{full}:{ws.integration_branch}",
                                   lambda: asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
-                                                            ws.base_branch, title, body))
+                                                            ws.base_branch, title, body), cfg=self.cfg)
         self.store.update_run(self.run_id, pr_url=url)
         self.log("pr", f"draft pull request: {url}")
         return url

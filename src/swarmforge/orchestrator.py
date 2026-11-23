@@ -98,6 +98,19 @@ class Orchestrator:
         self.run_id: str | None = None
 
     # ================================================================ logging
+    async def _reconcile_earlier_attempts(self) -> None:
+        """An earlier attempt may have left a push/PR/merge with an unknown outcome: ask GitHub first,
+        so a retry continues from what really happened instead of stopping (or repeating it)."""
+        from .reconcile import reconcile_execution
+        try:
+            lines = await reconcile_execution(self.store, self.cfg, self.execution_id)
+        except Exception as exc:  # noqa: BLE001 - an unreachable GitHub leaves the record open; acquire() then stops safely
+            self.log("reconcile", f"could not check earlier external actions: {type(exc).__name__}: {exc}", level="warn")
+            return
+        for line in lines:
+            self.log("reconcile", f"{line['operation']}: {line['outcome']} — {line['note']}",
+                     level="info" if line["outcome"] in ("done", "not_done") else "warn")
+
     def log(self, kind: str, msg: str, *, level: str = "info", task_key: str | None = None,
             role: str | None = None, data=None) -> None:
         self.store.event(self.run_id, kind, msg, level=level, task_key=task_key, role=role, data=data)
@@ -166,6 +179,7 @@ class Orchestrator:
         self._repo_arg, self._issue_url_arg = repo, issue_url
         self._git_auth: list[str] = []
         try:
+            await self._reconcile_earlier_attempts()
             self.execution.acquire(self.heal_of or self.retry_of or self.seed_run_id)
             acquired = True
             if self._same_repo_mode() == "serial":

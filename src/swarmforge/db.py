@@ -356,6 +356,15 @@ class Store:
                 self._tx_depth, self._tx_thread = 0, None
                 _OPEN.count -= 1
 
+    def ensure_schema(self, script: str) -> None:
+        """Create tables/indexes a module owns. A schema script commits implicitly, so inside an open
+        transaction it is skipped (the module's tables already exist by then)."""
+        if self.in_transaction_here():
+            return
+        with self._lock:
+            self.conn.executescript(script)
+            self.conn.commit()
+
     def in_transaction_here(self) -> bool:
         """True when the calling thread is inside transaction() on this store."""
         return bool(self._tx_depth) and self._tx_thread == threading.get_ident()

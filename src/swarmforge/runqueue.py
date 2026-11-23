@@ -336,6 +336,22 @@ async def _run_safe(cfg, store, item, *, echo, llm_transport, sandbox) -> dict:
         return store.queue_item(item["id"])
 
 
+async def _reconcile_on_start(store: Store, cfg: Config, echo) -> None:
+    """Settle pushes/PRs/merges a crashed worker left open, so their tasks can be retried."""
+    from .reconcile import open_checkpoints, open_requests, reconcile_all
+    if not open_checkpoints(store) and not open_requests(store):
+        return
+    try:
+        lines = await asyncio.to_thread(reconcile_all, store, cfg)
+    except Exception as exc:  # noqa: BLE001 - GitHub unreachable: records stay open, nothing is repeated
+        if echo:
+            echo(f"reconcile: could not check interrupted external actions ({type(exc).__name__}: {exc})")
+        return
+    for line in lines:
+        if echo:
+            echo(f"reconcile: {line['operation']}: {line['outcome']} — {line['note']}")
+
+
 async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, sandbox=None,
                max_items: int | None = None, poll_s: float = 2.0) -> int:
     """Work through every queue ("pile"). Each queue runs its items strictly in order, one at a time;
@@ -351,6 +367,7 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
             return 0
         store.conn.execute("INSERT INTO kv(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                            (WORKER_KEY, str(os.getpid())))
+    await _reconcile_on_start(store, cfg, echo)
     done = started = 0
     running: dict[str, tuple[dict, asyncio.Task]] = {}
     external_running: set[int] = set()

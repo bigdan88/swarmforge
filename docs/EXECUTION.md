@@ -97,11 +97,35 @@ treated as verified results.
 
 Push, draft PR creation, merge, superseded-PR closure and local delivery record intent before the
 external operation and its result afterward. Repeating a completed operation returns its recorded
-result. A pending/uncertain operation refuses replay and requires reconciliation. Automatic worker
-recovery stops at any retained external-operation checkpoint; it does not guess whether publication
-succeeded. Automatic held-PR fixes use the queue so the current attempt can release ownership first.
+result. A call that fails leaves the operation `uncertain` (it may have failed after GitHub acted);
+one interrupted by a crash stays `pending`. Neither is ever replayed blindly: reconciliation asks GitHub
+what really happened and keeps the evidence (see "Reconciliation" below). Automatic held-PR fixes use
+the queue so the current attempt can release ownership first.
 Explicit manual publication keeps its approval path; it can publish retained approved work after
 execution time expires, but cannot replay an uncertain operation.
+
+## Reconciliation
+
+`swarmforge reconcile` (and automatically: the queue worker and the web interface on start, a task's
+next attempt before it begins, and the same web request sent again) settles every open external
+operation GitHub can answer for:
+
+| Operation | What is checked | Done | Not done |
+| --- | --- | --- | --- |
+| Push | the branch on GitHub, against the commit the push meant to send | branch at that commit | no such branch |
+| Draft PR | pull requests from the branch | the PR (its URL becomes the recorded result) | none |
+| Merge (auto-merge, web Merge) | the PR's merged state and merged head commit | merged at the reviewed commit | still open |
+| Close superseded PR | the PR's state | closed | still open |
+| Update branch (web) | the PR's head commit | new head since the request | unchanged |
+
+*Done* records the real result, so a retry continues from it instead of repeating it. *Not done*
+frees the operation for one new attempt. A branch at another commit, or a merge at a commit other
+than the reviewed one, is a *conflict* and stops for you. If GitHub cannot be reached, or the
+operation is local delivery or another web action GitHub cannot describe, the record stays open
+(*unknown*). Every verdict, whichever way it went, is kept with its evidence (HTTP status, remote and
+expected commits, PR state) in the `reconciliations` table; `swarmforge reconcile --list` shows what
+is still open without contacting GitHub. Model calls are never reconciled: a provider cannot be asked
+whether it billed a request, so an uncertain call stays charged.
 
 ## Inspecting progress and migration
 

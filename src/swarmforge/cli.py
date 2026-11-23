@@ -484,6 +484,32 @@ def cmd_publish(args, cfg) -> int:
     return asyncio.run(publish_run(cfg, store, args.run_id, approve))
 
 
+def cmd_reconcile(args, cfg) -> int:
+    """Ask GitHub what really happened to interrupted pushes, PRs and merges; settle the records."""
+    from .reconcile import open_checkpoints, open_requests, reconcile_all, uncertain_model_calls
+    store = _store(cfg)
+    if args.list:
+        rows = [("task", r["run_id"], r["name"].removeprefix("external:"), r["status"]) for r in open_checkpoints(store)]
+        rows += [("web action", r["key"][:12], f"{r['operation']} {r['target']}".strip(), r["status"]) for r in open_requests(store)]
+        for source, ref, op, status in rows:
+            print(f"{source:10}  {ref:28}  {status:9}  {op}")
+        if not rows:
+            print("Nothing to reconcile.")
+    else:
+        lines = reconcile_all(store, cfg)
+        for line in lines:
+            print(f"{line['outcome']:9}  {line['source']:10}  {line['operation']}  — {line['note']}")
+        if not lines:
+            print("Nothing to reconcile.")
+        stuck = [x for x in lines if x["outcome"] in ("conflict", "unknown")]
+        if stuck:
+            print(f"\n{len(stuck)} need you: inspect them on GitHub (evidence is kept in the reconciliations table).")
+    calls = uncertain_model_calls(store)
+    if calls:
+        print(f"\n{calls} model call(s) ended with an unknown outcome and stay charged (providers cannot be asked).")
+    return 0
+
+
 def cmd_bench(args, cfg) -> int:
     from .benchmark import run_benchmark
     store = _store(cfg)
@@ -750,6 +776,10 @@ def build_parser() -> argparse.ArgumentParser:
     vu.add_argument("--tabs", help="comma-separated tab list (default: all dashboard tabs)")
     vu.add_argument("--port", type=int, default=None, help="port for the dashboard server")
     v.set_defaults(fn=cmd_visual)
+
+    s = sub.add_parser("reconcile", help="check on GitHub whether interrupted pushes, PRs and merges happened")
+    s.add_argument("--list", action="store_true", help="only list open records; do not contact GitHub")
+    s.set_defaults(fn=cmd_reconcile)
 
     s = sub.add_parser("publish", help="push an approved run's branch and open the draft PR")
     s.add_argument("run_id")
