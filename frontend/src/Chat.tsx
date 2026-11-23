@@ -6,7 +6,7 @@ export function ChatPage({session,navigate,selected}:{session:Session|null;navig
   const [offset,setOffset]=useState(0);const list=useGet(`/api/v1/conversations?offset=${offset}`,collection,6000,true);
   return <><Heading title="Chat" description="Ask about the swarm, investigate work and keep each conversation separate."><ActionButton operation="create_conversation" disabled={!session?.actions_enabled} onDone={r=>{list.refresh();if(r.conversation_id)navigate('chat',r.conversation_id);}}>New conversation</ActionButton></Heading>
     <div className="chat-layout"><section className="panel thread-list"><h2>Conversations</h2><Feedback error={list.error}/>{list.data?.items.map(c=><button className={`thread ${str(c.id)===selected?'selected':''}`} aria-current={str(c.id)===selected?'true':undefined} key={str(c.id)} onClick={()=>navigate('chat',str(c.id))}><strong>{str(c.title)||'New chat'}</strong><small>{stamp(c.updated_at||c.created_at)}</small></button>)}{list.data&&<Pager offset={offset} total={list.data.total} setOffset={setOffset}/>}</section>
-      {selected?<Conversation key={selected} id={selected} session={session}/>:<section className="panel empty"><h2>A place to work things through</h2><p>Open a conversation or start a new one. Model calls happen only when you send an authorized message.</p></section>}
+      {selected?<Conversation key={selected} id={selected} session={session} onRenamed={list.refresh}/>:<section className="panel empty"><h2>A place to work things through</h2><p>Open a conversation or start a new one. Model calls happen only when you send an authorized message.</p></section>}
     </div></>;
 }
 function Attachments({conversation,items}:{conversation:string;items:Row[]}){
@@ -19,7 +19,19 @@ function ReplyStatus({request,now,onReuse}:{request:Row;now:number;onReuse:(text
   if(status==='failed'||status==='interrupted')return <div className="reply-status error" role="alert"><strong>{status==='failed'?'The reply failed':'The reply was interrupted'}</strong><p>{str(request.error)||'No reason was recorded.'}</p><button onClick={()=>onReuse(str(request.question))}>Put this message back in the composer</button></div>;
   return null;
 }
-function Conversation({id,session}:{id:string;session:Session|null}){
+function ConversationTitle({id,title,enabled,onRenamed}:{id:string;title:string;enabled:boolean;onRenamed:()=>void}){
+  const [editing,setEditing]=useState(false),[value,setValue]=useState(title);const action=useAction(`rename:${id}`);
+  useEffect(()=>{if(!editing)setValue(title);},[title,editing]);
+  async function save(){
+    const next=value.trim();if(!next||next===title){setEditing(false);setValue(title);return;}
+    if(await action.send('rename_conversation',id,{title:next})){setEditing(false);onRenamed();}
+  }
+  if(!editing)return <div className="title-edit"><h2>{title||'New chat'}</h2>{enabled&&<button type="button" className="icon-button" aria-label="Rename conversation" title="Rename" onClick={()=>setEditing(true)}>✎</button>}</div>;
+  return <form className="title-edit" onSubmit={e=>{e.preventDefault();void save();}}>
+    <input autoFocus aria-label="Conversation name" maxLength={120} value={value} disabled={action.pending} onChange={e=>setValue(e.target.value)} onBlur={()=>void save()} onKeyDown={e=>{if(e.key==='Escape'){e.preventDefault();setValue(title);setEditing(false);}}}/>
+    <Feedback error={action.error}/></form>;
+}
+function Conversation({id,session,onRenamed}:{id:string;session:Session|null;onRenamed:()=>void}){
   const [fast,setFast]=useState(false);
   const view=useGet(`/api/v1/conversations/${encodeURIComponent(id)}`,record,fast?1000:3000);
   const [draft,setDraft]=useDraft(`sf-chat-draft:${id}`,{message:''});const action=useAction(`chat:${id}`);
@@ -32,6 +44,8 @@ function Conversation({id,session}:{id:string;session:Session|null}){
   const latest=view.data?latestRequest(view.data.requests):null;
   const thinking=str(latest?.status)==='thinking';
   useEffect(()=>setFast(thinking),[thinking]);
+  const wasThinking=useRef(false);
+  useEffect(()=>{if(wasThinking.current&&!thinking)onRenamed();wasThinking.current=thinking;},[thinking,onRenamed]);
   const now=Date.now()/1000;
   async function attach(files:FileList|null){
     if(!files?.length)return;setUploadError('');
@@ -49,7 +63,7 @@ function Conversation({id,session}:{id:string;session:Session|null}){
   function keys(e:KeyboardEvent<HTMLTextAreaElement>){if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void submit();}}
   if(!view.data)return <section className="panel"><Loading error={view.error}/></section>;
   const conversation=record(view.data.conversation),costs=record(view.data.costs);
-  return <section className="panel conversation" ref={panel}><div className="detail-heading"><h2>{str(conversation.title)||'Conversation'}</h2><span className="muted">{money(costs.total)} recorded usage</span></div><Feedback error={view.error}/>
+  return <section className="panel conversation" ref={panel}><div className="detail-heading"><ConversationTitle id={id} title={str(conversation.title)} enabled={!!session?.actions_enabled} onRenamed={()=>{view.refresh();onRenamed();}}/><span className="muted">{money(costs.total)} recorded usage</span></div><Feedback error={view.error}/>
     <Transcript count={rows(view.data.messages).length+(thinking?1:0)}>{rows(view.data.messages).map(m=><article className={`message ${str(m.role)}`} key={num(m.id)}><small>{label(m.role)} · {stamp(m.created_at)}</small>{str(m.role)==='assistant'?<Markdown text={str(m.content)}/>:<p>{str(m.content)}</p>}<Attachments conversation={id} items={rows(m.attachments)}/>{m.truncated===true&&<small>Long message shortened in this view.</small>}</article>)}{!rows(view.data.messages).length&&<p className="muted">No messages yet.</p>}
       {latest&&<ReplyStatus request={latest} now={now} onReuse={text=>setDraft({message:text})}/>}</Transcript>
     <form className="composer editor" onSubmit={submit}><fieldset disabled={action.pending||thinking||!session?.models_enabled}>

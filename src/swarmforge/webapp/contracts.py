@@ -127,7 +127,7 @@ class RetainedReport(PublicResponse):
 class ActionCommand(PublicResponse):
     operation: Literal["cancel_work", "retry_work", "decide_approval", "queue_task", "start_queue", "pause_queue",
                        "create_project", "save_project", "launch_project", "pause_project", "cancel_project", "resume_project",
-                       "create_conversation", "send_message", "project_message",
+                       "create_conversation", "rename_conversation", "send_message", "project_message",
                        "create_note", "save_note", "delete_note", "diagnose_failure", "merge_pr", "update_pr",
                        "mark_features_read", "set_archived", "save_settings", "test_models"]
     target: str = Field(default="", max_length=128)

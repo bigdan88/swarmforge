@@ -85,10 +85,10 @@ the optional-dependency message.
 | Task controls | Cancel, bounded retry, approve/decline pending publication requests, archive | Opt-in controls; project retries stay with the lead; durable execution support is required for retries |
 | Queue | Start/resume worker, pause new starts, lane counts | Explicit spending authorization before starting; running work can finish when paused |
 | New task | Describe it or a GitHub issue URL (optional repository override); allowance, workflow, model team, repair cycles, time limit, auto-fix attempts; preserved draft | Always queued with publication approval ("Pre-approve" is not offered). Test command/sandbox image overrides, the sample-repository helper and immediate direct runs remain in the existing dashboard |
-| Projects | Lists, exact shared cost accounting, milestones, tasks, spec, conversation and events | Shows up to 100 connected tasks and 50 recent events |
+| Projects | Lists, exact shared cost accounting; a project opens on a summary (plain-language status, last error with a suggested fix, milestone/tasks/spending, pending decision) with Overview, Milestones, Tasks, Conversation and Spec & history tabs (the last tab used is remembered per project; drafts open on Conversation) | Shows up to 100 connected tasks and 50 recent events |
 | Project planning | Structured draft editor and lead conversation before launch | Saving/replying does not launch; forms remain in the browser across navigation |
 | Project controls | Approve displayed spec, pause/cancel, checkpoint reply and manual-check confirmation, with page-level confirmations | Existing fixed-spec, repository ownership, merge, launch and spending barriers remain in application services. Post-launch fixed-spec amendment is not exposed |
-| Chat | Separate conversations, retained messages, preserved drafts, background replies with live tool steps and elapsed time, visible failures with "put this message back", one pending reply per conversation, image (PNG/JPEG/GIF/WebP) and text attachments with thumbnails, Ctrl+Enter | Progress is polled each second, not token-streamed (the chat model call is not a streaming API). Suggested actions never execute automatically. SVG attachments are refused |
+| Chat | Separate conversations (rename from the header; unnamed chats are titled after the first reply), retained messages, preserved drafts, background replies with live tool steps and elapsed time, visible failures with "put this message back", one pending reply per conversation, image (PNG/JPEG/GIF/WebP) and text attachments with thumbnails, Ctrl+Enter | Progress is polled each second, not token-streamed (the chat model call is not a streaming API). Suggested actions never execute automatically. SVG attachments are refused |
 | Pull requests | Open PRs per known repository (60-second cache, Refresh from GitHub), status, size, head commit, link to the run; merge (squash/merge/rebase, delete branch), Merge all ready, Update branch, all behind "I've reviewed these changes" | Each merge names the reviewed head commit and is refused if new commits arrived. Auto-merge settings and "update and restart SwarmForge" after merging its own repository remain in the existing dashboard |
 | Failures | Post-mortems with counts (fixed themselves / need you / not diagnosed), cause filter, why/fix/lesson/evidence, links to the run and its retry, authorized re-diagnosis | Bulk "diagnose all older failures" remains in the existing dashboard (one model call per run); the cause chart is shown as counts |
 | History | Finished work with the same detail/evidence views | None |
@@ -105,6 +105,13 @@ owner process has exited or stopped heartbeating for a minute is marked interrup
 instance starts or the conversation is used, and is never re-sent automatically. Pressing Send is the
 consent for one chat or project-lead reply; queue starts, task creation, retries, launches and paid
 model tests still ask for explicit confirmation.
+
+When a conversation is longer than the configured window, older messages are summarized once
+(a stored rolling summary, extended only with newly dropped messages) and sent with the recent ones;
+the project lead does the same past its last 30 messages. Agent sessions whose transcript passes about
+240k characters summarize their earlier tool turns and keep the latest six intact. Summaries and chat
+titles are small model calls charged to the same chat or project allowance; if one fails, the reply
+still goes out (older turns are dropped with a note, or the title comes from the first message).
 
 Work folds attempts by recorded lineage: the shared task allowance, or the retry/self-heal/continue
 chain. Tasks are never grouped by title, so independent tasks with the same title stay separate.

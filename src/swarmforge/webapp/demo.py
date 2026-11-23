@@ -27,6 +27,9 @@ async def fake_answer(config, store, question, *, conversation, attachments=None
                               + "Here is where things stand:\n\n**Current work**\n- *Make the task timeline easier to follow* is in **testing**\n"
                               "- A queued task is waiting for the worker\n\nOpen `Work` to inspect the recorded checks and report, "
                               "or create a project draft to try its approval flow.")
+    from ..chatbot import auto_title, needs_title
+    if needs_title(store, conversation):
+        await auto_title(store, conversation)  # no model in the demo: title from the first message
     return {"answer": "Demo reply"}
 
 

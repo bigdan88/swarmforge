@@ -78,8 +78,20 @@ async def interview(cfg, store, pid, question, transport=None, *, expected_spec=
     if p["status"] != "drafting":
         raise ValueError("Kickoff is only available before launch")
     store.conversation_append(p["conversation_id"], "user", question)
-    messages = store.conversation_messages(p["conversation_id"])[-30:]
+    history = store.conversation_messages(p["conversation_id"])
+    messages = history[-30:]
     context = {"messages": messages, "draft": p["definition"]}
+    if len(history) > len(messages):
+        # Keep what was agreed earlier in a long kickoff instead of silently forgetting it.
+        from ..compaction import compact_conversation
+
+        async def summarize(summary_messages):
+            reply = await call(cfg, store, p, summary_messages[0]["content"] + ' Answer as JSON: {"summary": "..."}',
+                               {"text": summary_messages[1]["content"]}, transport)
+            return str(reply.get("summary") or "")
+        summary = await compact_conversation(store, p["conversation_id"], history, messages, summarize)
+        if summary:
+            context["earlier_conversation_summary"] = summary
     if p["repo"]:
         context["repository_choice"] = {"repo": p["repo"], "repository_kind": p["definition"].get("repository_kind", "existing")}
     result = await call(cfg, store, p, KICKOFF, context, transport)

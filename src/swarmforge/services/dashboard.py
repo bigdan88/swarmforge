@@ -234,6 +234,12 @@ class DashboardActions:
             cid = uuid.uuid4().hex
             store.conversation_create(cid, text(args, "title", 200, "New chat"))
             return {"conversation_id": cid, "message": "Conversation created"}
+        if operation == "rename_conversation":
+            title = " ".join(text(args, "title", 120).split())
+            if not title or not store.conversation_get(target) or target.startswith("project-"):
+                raise ValueError("Give the conversation a name")
+            store._exec("UPDATE conversations SET title=? WHERE id=?", (title, target))
+            return {"conversation_id": target, "message": "Renamed"}
         if operation == "project_message":
             # Sending a message is the consent for this one small lead reply; launching still needs approval.
             if not self.config:

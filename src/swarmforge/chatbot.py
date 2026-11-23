@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import time
 import uuid
 from datetime import UTC, datetime
@@ -31,6 +33,8 @@ from .config import Config, ConfigError
 from .db import Store
 from .tools import github_repo as _ghrepo
 from .tools import web as _web
+
+log = logging.getLogger(__name__)
 
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"}
 
@@ -672,6 +676,9 @@ async def answer(
         store.conversation_append(conversation, "user", question)
         msgs = store.conversation_messages(conversation)
         reserved = estimate_tokens(messages)
+        if len(msgs) > cfg.chat.context_max_messages:  # leave room for the summary of older messages
+            from .compaction import SUMMARY_TOKENS_RESERVED
+            reserved += SUMMARY_TOKENS_RESERVED
         context = truncate_context(
             msgs,
             cfg.chat.context_max_messages,
@@ -707,11 +714,24 @@ async def answer(
                 transport=transport,
                 record_errors=False,
             )
+            if len(context) < len(msgs):
+                # Older messages fell out of the window: give the model a rolling summary of them.
+                from .compaction import compact_conversation, summary_message
+
+                async def summarize(summary_messages):
+                    return (await llm.chat(role, summary_messages, task_key="chat-summary")).message.get("content") or ""
+                summary = await compact_conversation(store, conversation, msgs, context, summarize)
+                if summary:
+                    messages.insert(1, summary_message(summary))
             text = await _run_chat(cfg, llm, role, messages, capture_tool)
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e
         text, actions = parse_actions(text, store)
         store.conversation_append(conversation, "assistant", text)
+        if needs_title(store, conversation):
+            async def name_it(title_messages):
+                return (await llm.chat(role, title_messages, task_key="chat-title")).message.get("content") or ""
+            await auto_title(store, conversation, name_it)
         return {
             "answer": text,
             "role": role,
@@ -782,6 +802,57 @@ def ask(
 
 # ======================================================== conversation persistence
 DEFAULT_CONVERSATION_TITLE = "General"
+# Titles a conversation gets before anyone names it; only these are ever replaced automatically.
+PLACEHOLDER_TITLES = ("New chat", "New conversation", "")
+TITLE_PROMPT = ("Write a short, specific title (2-6 words) for the conversation below, like a chat app does. "
+                "Reply with the title only: no quotes, no trailing punctuation.")
+
+
+def heuristic_title(text: str, limit: int = 48) -> str:
+    """A readable title from the first message, used when no model title is available."""
+    words = re.sub(r"[`*_#>\[\]()]+", " ", text or "").split()
+    title = ""
+    for w in words:
+        if len(title) + len(w) + 1 > limit:
+            break
+        title = f"{title} {w}".strip()
+    title = (title or " ".join(words)[:limit]).rstrip(".,;:!?-")
+    return (title[:1].upper() + title[1:]) if title else "New chat"
+
+
+def _clean_title(raw: str) -> str:
+    line = next((ln for ln in (raw or "").splitlines() if ln.strip()), "")
+    line = re.sub(r"^(title\s*:\s*)", "", line.strip(), flags=re.IGNORECASE).strip(" \"'`*#“”‘’")
+    return line.rstrip(".!?;:,")[:60].strip()
+
+
+def needs_title(store: Store, conversation_id: str) -> bool:
+    conv = store.conversation_get(conversation_id)
+    return bool(conv) and (conv.get("title") or "") in PLACEHOLDER_TITLES and not conversation_id.startswith("project-")
+
+
+async def auto_title(store: Store, conversation_id: str, chat=None) -> str | None:
+    """Name an unnamed conversation from its first exchange; never overrides a title someone chose.
+
+    `chat(messages) -> str` is an optional model call. Any failure falls back to a title made
+    from the first message, so naming never breaks a reply."""
+    msgs = [m for m in store.conversation_messages(conversation_id, limit=None) if m["role"] in ("user", "assistant")]
+    first = next((m["content"] for m in msgs if m["role"] == "user"), "")
+    if not first.strip():
+        return None
+    title = ""
+    if chat is not None:
+        reply = next((m["content"] for m in msgs if m["role"] == "assistant"), "")
+        try:
+            title = _clean_title(await chat([{"role": "system", "content": TITLE_PROMPT},
+                                             {"role": "user", "content": f"User: {first[:1500]}\n\nAssistant: {reply[:1500]}"}]))
+        except Exception as e:  # noqa: BLE001 - a title is a nicety; the reply already succeeded
+            log.info("chat title generation failed: %s", e)
+    title = title or heuristic_title(first)
+    placeholders = ",".join("?" * len(PLACEHOLDER_TITLES))
+    cur = store._exec(f"UPDATE conversations SET title=? WHERE id=? AND COALESCE(title,'') IN ({placeholders})",
+                      (title, conversation_id, *PLACEHOLDER_TITLES))
+    return title if cur.rowcount else None
 
 
 def create_conversation(
