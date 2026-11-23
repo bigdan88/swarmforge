@@ -279,6 +279,42 @@ def environment_blocked(store: Store, run: dict | None) -> bool:
                                    (run["id"],)))
 
 
+ENV_RECHECK_S = 60.0
+
+
+def environment_paused_lanes(store: Store) -> list[str]:
+    """Lanes that paused themselves for an environment problem (not by you, not for a failed task)."""
+    lanes = []
+    for item in store.queue_items(include_finished=False):
+        name = lane(item)
+        if item["status"] == "queued" and (item.get("note") or "").startswith(ENV_PAUSE_NOTE) \
+                and lane_paused(store, name) and name not in lanes:
+            lanes.append(name)
+    return lanes
+
+
+async def resume_environment_paused(store: Store, cfg: Config, echo=None, check=None) -> list[str]:
+    """When Docker/keys are fine again, resume the lanes the environment paused. They paused
+    themselves, so they resume themselves; a lane you paused stays paused."""
+    lanes = environment_paused_lanes(store)
+    if not lanes:
+        return []
+    from .preflight import environment_problems
+    problems = await asyncio.to_thread(check or environment_problems, cfg)
+    if problems:
+        return []
+    with store.transaction():
+        for name in lanes:
+            set_lane_paused(store, name, False)
+            for item in store.queue_items(include_finished=False):
+                if lane(item) == name and (item.get("note") or "").startswith(ENV_PAUSE_NOTE):
+                    store.queue_update(item["id"], note="environment fixed; resumed automatically")
+    if echo:
+        for name in lanes:
+            echo(f"queue[{name}] resumed: the environment problem is fixed")
+    return lanes
+
+
 def retry_blocked(store: Store, queue: str | None = None) -> list[int]:
     """Put failed items whose run was BLOCKED back in line, in their original order (same rows)."""
     out = []
@@ -417,7 +453,11 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                     store.update_run(run["id"], state="FAILED", finished_at=time.time(),
                                      state_reason="the queue worker stopped while this run was going")
         limit = max(1, int(getattr(cfg.limits, "max_parallel_queues", 3) or 1))
+        env_check_at = 0.0
         while True:
+            if time.monotonic() >= env_check_at:
+                env_check_at = time.monotonic() + ENV_RECHECK_S
+                await resume_environment_paused(store, cfg, echo)
             for name, (item, task) in list(running.items()):
                 if not task.done():
                     continue

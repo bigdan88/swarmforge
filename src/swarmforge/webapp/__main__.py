@@ -35,6 +35,8 @@ def main():
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")
     uvicorn = _interface_dependencies(parser)
+    from .frontend_build import ensure_current
+    ensure_current()  # pulled new code? rebuild the page before serving it, or say why not
     # Dependency checks are separate so an internal application import failure
     # remains visible instead of being mislabeled as a missing optional extra.
     from .app import create_app

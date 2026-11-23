@@ -216,7 +216,9 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
         if check is None:
             from ..settings import get_health_checks as check
         safe = lambda v: v if isinstance(v, (str, bool, int, float)) or v is None else str(v)
-        return {"checks": [{k: safe(v) for k, v in row.items() if k in ("name", "status", "message", "fix", "optional")} for row in check(config)][:30]}
+        from .frontend_build import health_row
+        rows = [*check(config), health_row()]  # the page itself may be older than its code
+        return {"checks": [{k: safe(v) for k, v in row.items() if k in ("name", "status", "message", "fix", "optional")} for row in rows][:30]}
 
     @app.get("/api/v1/settings/models")
     def settings_models(provider: str = Query(..., max_length=100)):

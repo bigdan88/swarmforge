@@ -273,7 +273,8 @@ def test_speed_benchmarks_and_health_views_are_read_only_and_bounded(ws, tmp_pat
         assert bench["suite"]["rows"][0]["delivery_pct"] == 100 and bench["suite"]["rows"][0]["team"] == "chinese"
         assert "incomplete" in bench["broken"]["error"]
         health = client.get("/api/v1/settings/health").json()["checks"]
-        assert health == [{"name": "Docker running", "status": "fail", "message": "not running", "fix": "start Docker"}]
+        assert health[0] == {"name": "Docker running", "status": "fail", "message": "not running", "fix": "start Docker"}
+        assert [h["name"] for h in health[1:]] == ["Web interface build"]  # unknown fields (the secret) never leak
 
 
 def test_fold_groups_by_persisted_lineage_never_by_title(ws, tmp_path):
