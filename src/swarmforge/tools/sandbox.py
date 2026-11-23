@@ -92,10 +92,12 @@ class ChatSandboxTools:
                 sandbox = ReadOnlyChatSandbox(self.sandbox_cfg)
         except SandboxError as e:
             raise SandboxToolError(str(e)) from e
-        timeout_s = max(1, min(DEFAULT_TIMEOUT_S, int(timeout_s)))
-        result = await sandbox.run(self.root, command, timeout_s=timeout_s, network="none")
+        effective_timeout = max(1, min(DEFAULT_TIMEOUT_S, int(timeout_s)))
+        result = await sandbox.run(
+            self.root, command, timeout_s=effective_timeout, network="none"
+        )
         status = (
-            f"[TIMED OUT after {timeout_s}s]"
+            f"[TIMED OUT after {effective_timeout}s]"
             if result.timed_out
             else f"[exit {result.exit_code}, {result.duration_s:.1f}s]"
         )

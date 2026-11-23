@@ -1,6 +1,7 @@
 """Tests for swarmforge.chat_quick quick-action helpers."""
 
 from swarmforge.chat_quick import (
+    URL_HINT_MARKER,
     detect_urls,
     expand_prompt,
     hint_for,
@@ -28,6 +29,10 @@ class TestDetectUrls:
     def test_case_insensitive_scheme(self):
         assert detect_urls("HTTPS://Example.COM/x") == ["HTTPS://Example.COM/x"]
 
+    def test_plain_text_has_no_urls(self):
+        assert detect_urls("plain text, no links") == []
+        assert detect_urls("visit example.com") == []
+
 
 class TestParseSlash:
     def test_repo(self):
@@ -46,10 +51,64 @@ class TestParseSlash:
         assert parse_slash("/repo") is None
         assert parse_slash("/repo ") is None
 
-    def test_not_a_command(self):
+    def test_code(self):
+        assert parse_slash("/code how does the parser work?") == (
+            "/code",
+            "how does the parser work?",
+        )
+
+    def test_issues(self):
+        assert parse_slash("/issues owner/repo") == ("/issues", "owner/repo")
+
+    def test_bare_slash(self):
+        assert parse_slash("/repo") is None
+        assert parse_slash("/code") is None
+
+    def test_not_a_slash_command(self):
         assert parse_slash("hello /repo x") is None
         assert parse_slash("/repositories owner/repo") is None
         assert parse_slash("/other thing") is None
+
+
+class TestExpandPrompt:
+    def test_url_gets_fetch_url_hint(self):
+        text = "what is https://example.com/doc about?"
+        out = expand_prompt(text)
+        assert out.startswith(text)
+        assert URL_HINT_MARKER in out
+        assert "fetch_url" in out
+
+    def test_expansion_is_idempotent(self):
+        once = expand_prompt("read https://example.com/a please")
+        assert expand_prompt(once) == once
+        assert once.count(URL_HINT_MARKER) == 1
+
+    def test_message_mentioning_fetch_url_still_gets_url_hint(self):
+        text = (
+            "Does fetch_url support POST? Here is the endpoint: https://example.com/api"
+        )
+        assert URL_HINT_MARKER in expand_prompt(text)
+
+    def test_repo_expands(self):
+        out = expand_prompt("/repo owner/repo")
+        assert "https://github.com/owner/repo" in out
+        assert "fetch_url" in out
+        assert "structured summary of the repository owner/repo" in out
+
+    def test_code_expands(self):
+        out = expand_prompt("/code the URL parser")
+        assert out.startswith('Explain the code relevant to "the URL parser":')
+        assert "fetch_url" in out
+
+    def test_issues_expands(self):
+        out = expand_prompt("/issues owner/repo")
+        assert "https://github.com/owner/repo/issues" in out
+        assert "open issues of owner/repo" in out
+
+    def test_url_in_repo_expansion_gets_hint_too(self):
+        out = expand_prompt("/repo https://github.com/owner/repo")
+        assert "fetch_url" in out
+        assert "https://github.com/owner/repo" in out
 
 
 class TestExpandRepo:
@@ -107,9 +166,17 @@ class TestExpandUrls:
         assert "https://example.com/3" not in hint
         assert "https://example.com/4" not in hint
 
+    def test_mentioning_fetch_url_still_gets_hint(self):
+        text = (
+            "Does fetch_url support POST? Here is the endpoint: https://example.com/api"
+        )
+        out = expand_prompt(text)
+        assert out.startswith(text)
+        assert "[chat quick-action] Detected link(s): https://example.com/api." in out
+
     def test_no_double_hint(self):
-        text = "use fetch_url on https://example.com/a"
-        assert expand_prompt(text) == text
+        once = expand_prompt("read https://example.com/a please")
+        assert expand_prompt(once) == once
 
     def test_idempotent(self):
         once = expand_prompt("read https://example.com/a please")

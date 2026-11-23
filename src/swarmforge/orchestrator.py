@@ -1076,6 +1076,7 @@ class Orchestrator:
             self.log("visual", f"golden comparison skipped: {e}"[:800], level="warn")
         self.log("visual", f"golden diff: {len(shots)} tab(s) checked, {len(golden_findings)} regression(s)")
         findings = golden_findings + visual.page_error_findings(shots)
+
         role = self.cfg.visual_role
         if role and role in self.cfg.roles and any(s["file"] for s in shots):
             from .llm import model_supports_vision

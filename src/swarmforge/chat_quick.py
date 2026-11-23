@@ -27,8 +27,9 @@ _ISSUES = (
     "the open issues of {slug}: number, title and a one-line summary for "
     "each."
 )
+URL_HINT_MARKER = "[chat quick-action] Detected link(s):"
 _URL_HINT = (
-    "\n\n[chat quick-action] Detected link(s): {urls}. Use the fetch_url "
+    f"\n\n{URL_HINT_MARKER} {{urls}}. Use the fetch_url "
     "tool on each URL and answer from the fetched Markdown, citing the URL."
 )
 
@@ -71,7 +72,7 @@ def _repo_slug(arg: str) -> str:
     candidate = candidate.strip("/")
     candidate = candidate.removesuffix(".git")
     parts = [p for p in candidate.split("/") if p]
-    if len(parts) >= 2 and all(parts):
+    if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
     return ""
 
@@ -101,7 +102,7 @@ def expand_prompt(text: str) -> str:
                 f"of {arg}: number, title and a one-line summary for each."
             )
     urls = detect_urls(text)
-    if urls and "fetch_url" not in text:
+    if urls and URL_HINT_MARKER not in text:
         return text + _URL_HINT.format(urls=", ".join(urls[:3]))
     return text
 

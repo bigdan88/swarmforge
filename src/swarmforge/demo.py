@@ -117,12 +117,16 @@ def _seed_chat(st: Store) -> None:
     try:
         from . import chatbot
         conv = chatbot.ensure_default_conversation(st)
-        chatbot.add_message(st, conv["id"], "user", "What files are in the repo?")
+        chatbot.add_message(
+            st, conv["id"], "user", "what does https://example.com/docs/quickstart say?"
+        )
         chatbot.add_message(
             st, conv["id"], "assistant",
-            "The repository contains the README and the `src/` source tree.",
-            tool_calls=[{"name": "list_files", "args": {"path": "."},
-                        "output": "README.md\nsrc/"}],
+            "It's a quickstart guide: install, configure and run your first task.",
+            tool_calls=[{"name": "fetch_url",
+                        "args": {"url": "https://example.com/docs/quickstart"},
+                        "ok": True,
+                        "preview": "# Quickstart\nInstall, configure, run."}],
         )
     except Exception:  # noqa: BLE001 - demo seeding must never fail the CLI
         pass

@@ -1,10 +1,31 @@
 """Page renderer with explicit dependencies supplied by the entrypoint."""
 
-def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat_conv_id, _chat_load, _chat_md, _chat_rail, _chat_save, _chat_save_attachments, _render_chat_attachments, cfg, components, dataclasses, json, render_message_actions, st, store, uuid):
+
+def render(
+    CHAT_AVATARS,
+    CHAT_SCROLL_JS,
+    QUICK_PROMPTS,
+    _chat_actions_key,
+    _chat_conv_id,
+    _chat_load,
+    _chat_md,
+    _chat_rail,
+    _chat_save,
+    _chat_save_attachments,
+    _render_chat_attachments,
+    cfg,
+    components,
+    dataclasses,
+    json,
+    render_message_actions,
+    st,
+    store,
+    uuid,
+):
     if cfg is None:
         st.error("Configuration not loaded; the chatbot needs a configured model role.")
         return
-    from swarmforge import chatbot, chat_quick
+    from swarmforge import chat_quick, chatbot
 
     def render_tools_used(used):
         if not used:
@@ -13,10 +34,15 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
             for tool in used:
                 output = str(tool.get("output") or "")
                 ok = tool.get("ok", not output.startswith("ERROR:"))
-                st.markdown(f"**{tool.get('name', '?')}** — " + ("✅ ok" if ok else "⚠️ error"))
-                st.code(json.dumps(tool.get("args") or {}, default=str), language="json")
+                st.markdown(
+                    f"**{tool.get('name', '?')}** — " + ("✅ ok" if ok else "⚠️ error")
+                )
+                st.code(
+                    json.dumps(tool.get("args") or {}, default=str), language="json"
+                )
                 if tool.get("preview") or output:
                     st.caption(tool.get("preview") or output[:160])
+
     page = st.container(key="chat_page")
     with page:
         # no page header: the sidebar already says where you are, and the transcript needs the height
@@ -53,7 +79,9 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
         c = convs.get(clicked["save"])
         if c:
             txt = st.session_state.get(f"chat_rename_{clicked['save']}") or ""
-            chatbot.rename_conversation(store, clicked["save"], txt.strip() or c["title"])
+            chatbot.rename_conversation(
+                store, clicked["save"], txt.strip() or c["title"]
+            )
         st.session_state.pop("chat_renaming", None)
         st.rerun()
     if clicked["del"]:
@@ -63,8 +91,11 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
             st.session_state.pop("chat_renaming", None)
         if active_id == del_id:
             rest = chatbot.list_conversations(store)
-            st.session_state.chat_conv_id = (rest[0]["id"] if rest
-                                             else chatbot.ensure_default_conversation(store)["id"])
+            st.session_state.chat_conv_id = (
+                rest[0]["id"]
+                if rest
+                else chatbot.ensure_default_conversation(store)["id"]
+            )
         st.rerun()
 
     # ------------------------------------------------ transcript (right)
@@ -72,12 +103,23 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
     needs = chatbot.failures_needing_attention(store)
     active_conv = chatbot.get_conversation(store, active_id) or {}
     with main, st.container(key="chat_main"):
-        with st.container(key="chat_topbar", horizontal=True, vertical_alignment="center"):
+        with st.container(
+            key="chat_topbar", horizontal=True, vertical_alignment="center"
+        ):
             st.markdown(active_conv.get("title") or "New chat", width="stretch")
-            tools_on = st.toggle("Tools", value=cfg.chat.tools_enabled, key="chat_tools_enabled",
-                                 help="Let the assistant call fetch_url / list_files while answering")
-            reset = st.button("Clear", icon=":material/restart_alt:", key="chat_reset", type="tertiary",
-                              help="Remove every message in this conversation")
+            tools_on = st.toggle(
+                "Tools",
+                value=cfg.chat.tools_enabled,
+                key="chat_tools_enabled",
+                help="Let the assistant call fetch_url / list_files while answering",
+            )
+            reset = st.button(
+                "Clear",
+                icon=":material/restart_alt:",
+                key="chat_reset",
+                type="tertiary",
+                help="Remove every message in this conversation",
+            )
         if reset:
             chatbot.clear_messages(store, active_id)
             store.kv_set(_chat_actions_key(active_id), None)
@@ -99,8 +141,10 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
                             if st.button(lab, key="chat_q_" + key):
                                 pending = prompt_text
                 if needs:
-                    st.info(f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
-                            "Press **Review my failed tasks**.")
+                    st.info(
+                        f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
+                        "Press **Review my failed tasks**."
+                    )
             for n, m in enumerate(history):
                 with st.chat_message(m["role"], avatar=CHAT_AVATARS.get(m["role"])):
                     if m["role"] == "assistant":
@@ -114,8 +158,14 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
                             if not isinstance(tc, dict):
                                 continue
                             a = tc.get("args") or {}
-                            arg = next((str(v) for v in a.values() if v not in (None, "")), "")[:80]
-                            st.caption(f"🔧 {tc.get('name')} · {arg}" if arg else f"🔧 {tc.get('name')}")
+                            arg = next(
+                                (str(v) for v in a.values() if v not in (None, "")), ""
+                            )[:80]
+                            st.caption(
+                                f"🔧 {tc.get('name')} · {arg}"
+                                if arg
+                                else f"🔧 {tc.get('name')}"
+                            )
                         st.markdown(_chat_md(m["content"]))
                         render_tools_used(calls or [])
                         render_message_actions(n, actions.get(n))
@@ -148,7 +198,10 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
             with st.popover("Shortcuts", icon=":material/keyboard_command_key:"):
                 st.caption("💡 Quick actions: " + " — or ".join(parts) + ".")
         typed = st.chat_input("Ask about runs, failures, or what to improve…")
-    components.html(CHAT_SCROLL_JS.replace("__N__", str(len(history)) + "-" + uuid.uuid4().hex[:6]), height=0)
+    components.html(
+        CHAT_SCROLL_JS.replace("__N__", str(len(history)) + "-" + uuid.uuid4().hex[:6]),
+        height=0,
+    )
     prompt = typed or pending
     if not prompt:
         return
@@ -166,7 +219,9 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
             if hint:
                 st.caption(hint)
             _render_chat_attachments(att_meta)
-        conv = st.session_state.setdefault("chat_conversation", "dash-" + uuid.uuid4().hex[:8])
+        conv = st.session_state.setdefault(
+            "chat_conversation", "dash-" + uuid.uuid4().hex[:8]
+        )
         kwargs = {"history": history[:-1], "conversation": conv}
         if att_paths:
             kwargs["attachments"] = att_paths
@@ -178,15 +233,20 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
 
             def _on_tool(name, args, output):
                 a = args or {}
-                arg = str(a.get("url") or a.get("path") or next(iter(a.values()), ""))[:80]
+                arg = str(a.get("url") or a.get("path") or next(iter(a.values()), ""))[
+                    :80
+                ]
                 tools_box.caption(f"🔧 {name} · {arg}" if arg else f"🔧 {name}")
                 calls.append({"name": name, "args": a, "output": output})
 
             try:
                 with st.spinner("Thinking…"):
                     ask_cfg = dataclasses.replace(
-                        cfg, chat=dataclasses.replace(cfg.chat, tools_enabled=tools_on))
-                    res = chatbot.ask(ask_cfg, store, question, on_tool=_on_tool, **kwargs)
+                        cfg, chat=dataclasses.replace(cfg.chat, tools_enabled=tools_on)
+                    )
+                    res = chatbot.ask(
+                        ask_cfg, store, question, on_tool=_on_tool, **kwargs
+                    )
             except chatbot.ChatError as e:
                 answer_slot.error(f"Chatbot: {e}")
                 _chat_save(actions, active_id)
@@ -197,14 +257,19 @@ def render(CHAT_AVATARS, CHAT_SCROLL_JS, QUICK_PROMPTS, _chat_actions_key, _chat
             if calls:
                 entry["tool_calls"] = calls
             history.append(entry)
-            chatbot.add_message(store, active_id, "assistant", res["answer"],
-                                tool_calls=calls or None)
-            if res.get("actions") and (res["actions"].get("tasks") or res["actions"].get("fixes")):
+            chatbot.add_message(
+                store, active_id, "assistant", res["answer"], tool_calls=calls or None
+            )
+            if res.get("actions") and (
+                res["actions"].get("tasks") or res["actions"].get("fixes")
+            ):
                 actions[len(history) - 1] = res["actions"]
             _chat_save(actions, active_id)
             answer_slot.markdown(_chat_md(res["answer"]))
             render_tools_used(calls)
-            st.caption(f"answered by **{res['role']}** · `{res['model']}` · "
-                       f"conversation {res.get('conversation', conv)} · "
-                       f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}")
+            st.caption(
+                f"answered by **{res['role']}** · `{res['model']}` · "
+                f"conversation {res.get('conversation', conv)} · "
+                f"cost ${res.get('usage', {}).get('cost_usd', 0):.4f}"
+            )
             render_message_actions(len(history) - 1, actions.get(len(history) - 1))
