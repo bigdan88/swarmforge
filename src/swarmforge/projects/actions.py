@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import json
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -12,6 +13,7 @@ from .spec import ProjectError, fixed
 
 class ActionKind(StrEnum):
     PLAN = "plan"
+    CONTINUE = "continue_plan"
     INSPECT = "inspect"
     INVESTIGATE = "investigate"
     REVIEW = "request_review"
@@ -104,6 +106,7 @@ class LeadAction:
     question: str | None = None
     proposal: str | None = None
     attempts: tuple[tuple[int, str], ...] = ()
+    task_id: int | None = None
 
     @classmethod
     def parse(cls, value: Any, default_evidence: str) -> LeadAction:
@@ -115,13 +118,15 @@ class LeadAction:
         except (ValueError, TypeError):
             raise ProjectError("Unknown lead action; arbitrary commands and permission changes are forbidden") from None
         common = {"action", "reason", "evidence", "living"}
-        extras = {ActionKind.PLAN: {"tasks"}, ActionKind.INSPECT: {"paths", "run_ids"},
+        extras = {ActionKind.PLAN: {"tasks"}, ActionKind.CONTINUE: {"task_id"}, ActionKind.INSPECT: {"paths", "run_ids"},
                   ActionKind.INVESTIGATE: {"task"}, ActionKind.REVIEW: {"task"},
                   ActionKind.BROWSER: {"checks"}, ActionKind.EVALUATE: {"tasks"},
                   ActionKind.PAUSE: {"question"}, ActionKind.QUESTION: {"question"},
                   ActionKind.ESCALATE: {"attempts", "proposal", "tasks"}}
-        if set(value) - common - extras[kind]:
-            raise ProjectError("Lead action contains fields outside its typed contract")
+        unexpected = set(value) - common - extras[kind]
+        if unexpected:
+            raise ProjectError("Lead action contains fields outside its typed contract: " + ", ".join(sorted(unexpected)) +
+                               ". Allowed fields for " + kind.value + ": " + ", ".join(sorted(common | extras[kind])))
         legacy = raw in ("plan", "checkpoint", "escalate") and "evidence" not in value
         evidence = strings(value.get("evidence", [default_evidence] if legacy else []), "Evidence references", 20)
         if not evidence:
@@ -130,12 +135,17 @@ class LeadAction:
         if living is not None:
             living = text(living, "Living specification", maximum=60000)
         tasks: tuple[TaskProposal, ...] = ()
+        task_id = value.get("task_id")
+        if kind == ActionKind.CONTINUE and (type(task_id) is not int or task_id <= 0):
+            raise ProjectError("continue_plan requires the integer task_id of the next queued task; it changes no task fields")
         if kind == ActionKind.PLAN:
             raw_tasks = value.get("tasks")
             if not isinstance(raw_tasks, list) or not 1 <= len(raw_tasks) <= 12:
                 raise ProjectError("Plan must contain 1–12 task proposals")
             tasks = tuple(TaskProposal.parse(t) for t in raw_tasks)
         elif kind in (ActionKind.INVESTIGATE, ActionKind.REVIEW):
+            if not isinstance(value.get("task"), dict):
+                raise ProjectError("task must be a complete task object, not a key string. Use continue_plan with task_id to run an existing queued task")
             tasks = (TaskProposal.parse(value.get("task")),)
             expected = "spike" if kind == ActionKind.INVESTIGATE else "build"
             if tasks[0].kind != expected or not tasks[0].ready:
@@ -165,7 +175,7 @@ class LeadAction:
                 raise ProjectError("Escalation rejected: try at least two distinct ladder steps")
         return cls(kind, text(value.get("reason"), "Decision reason"), evidence, living, tasks, paths, runs, checks,
                    question, text(value.get("proposal"), "Concrete proposal") if kind == ActionKind.ESCALATE else None,
-                   tuple(attempts))
+                   tuple(attempts), task_id)
 
     def legacy(self, spec: str) -> dict:
         action = "plan" if self.tasks else "checkpoint" if self.kind == ActionKind.EVALUATE else "escalate"
@@ -187,14 +197,48 @@ def validate_scope(action: LeadAction, project: dict, items: list[dict], evidenc
     if set(action.checks) - set(approved_checks):
         raise ProjectError("Browser checks must come from the approved current milestone")
     targets = {q["id"]: q for q in items}
+    if action.kind == ActionKind.CONTINUE:
+        queued = [q for q in items if q["status"] == "queued" and q["milestone"] == project["current_milestone"]]
+        target = targets.get(action.task_id)
+        if project.get("previous_spec"):
+            raise ProjectError("An amended specification must be replanned before continuing old tasks")
+        if not queued or target is None or target["id"] != queued[0]["id"] or target.get("run_id") or target.get("project_processed"):
+            raise ProjectError("continue_plan can select only the next undispatched queued task in the current milestone")
+        if target.get("project_id") != project["id"] or target.get("queue") != "project-" + project["id"]:
+            raise ProjectError("The queued task must belong to this project's own lane")
+        available = {q["project_key"] for q in items if q["milestone"] == project["current_milestone"] and
+                     (q.get("merged_sha") or q["status"] == "done" and q["mode"] == "single" and q["project_processed"])}
+        if set(json.loads(target.get("depends_on") or "[]")) - available:
+            raise ProjectError("The next queued task still has unfinished prerequisites")
     available = {q["project_key"] for q in items if q["milestone"] == project["current_milestone"] and
                  (q.get("merged_sha") or q["status"] == "done" and q["mode"] == "single" and q["project_processed"])}
     available -= {task.key for task in action.tasks}
+    planned = {task.key: task for task in action.tasks}
+    if len(planned) != len(action.tasks):
+        raise ProjectError("Task keys must be unique")
+    # Provisional work describes a future graph; it is never eligible for dispatch.
+    # Validate the whole graph without pretending those prerequisites are complete.
+    visiting, visited = set(), set()
+    def visit(key):
+        if key in visiting:
+            raise ProjectError("Task dependencies contain a cycle")
+        if key in visited:
+            return
+        visiting.add(key)
+        for dependency in planned[key].depends_on:
+            if dependency in planned:
+                visit(dependency)
+            elif dependency not in available:
+                raise ProjectError(f"Dependencies include an unknown or unfinished task: {dependency}")
+        visiting.remove(key)
+        visited.add(key)
+    for key in planned:
+        visit(key)
     seen: set[str] = set()
     for task in action.tasks:
         if task.key in seen:
             raise ProjectError("Task keys must be unique")
-        if set(task.depends_on) - available:
+        if task.ready and set(task.depends_on) - available:
             raise ProjectError("Dependencies must be completed evidence or earlier eligible tasks in this plan")
         for target in task.replaces:
             q = targets.get(target)
@@ -206,3 +250,32 @@ def validate_scope(action: LeadAction, project: dict, items: list[dict], evidenc
         seen.add(task.key)
         if task.ready:
             available.add(task.key)
+
+
+def existing_task_reference(value, project, items):
+    """Adapt the older reference-shaped investigation to an unchanged queued task.
+
+    Only known descriptive fields are accepted. A different allowance, deadline,
+    scope, permission or ambiguous target must go through normal model repair.
+    The original response remains in the decision journal.
+    """
+    if not isinstance(value, dict) or value.get("action") not in ("investigate", "request_review") or not isinstance(value.get("task"), str):
+        return value, None
+    allowed = {"action", "reason", "evidence", "living", "task", "hypothesis", "observable_result", "budget_usd", "max_runtime_s"}
+    if set(value) - allowed:
+        return value, None
+    key = value["task"].removeprefix("spike:")
+    matches = [q for q in items if q["status"] == "queued" and q["milestone"] == project["current_milestone"] and
+               q["project_key"].removeprefix("spike:") == key]
+    if len(matches) != 1:
+        return value, None
+    task = matches[0]
+    if (value["action"] == "investigate") != (task["mode"] == "single" and task["project_key"].startswith("spike:")):
+        return value, None
+    if value["action"] == "request_review" and task["mode"] not in ("swarm", "reviewed"):
+        return value, None
+    if any(field in value and (type(value[field]) not in (int, float) or value[field] != task.get(column))
+           for field, column in (("budget_usd", "budget"), ("max_runtime_s", "max_runtime_s"))):
+        return value, None
+    return {"action": "continue_plan", "reason": value.get("reason"), "evidence": value.get("evidence"),
+            "task_id": task["id"]}, f"Selected existing task #{task['id']} without changing its scope, allowance or the remaining plan."

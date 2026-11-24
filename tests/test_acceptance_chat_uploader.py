@@ -317,8 +317,8 @@ def test_ac4_no_upload_send_calls_ask_with_exactly_todays_arguments(tmp_path, mo
     assert len(calls) == 1
     kw = calls[0]["kw"]
     assert "attachments" not in kw
-    # exactly today's call shape: history + conversation (+ the live on_tool callback), nothing else
-    assert set(kw) == {"conversation", "on_tool"}
+    # exactly today's call shape: history + conversation (+ the live on_tool / on_text callbacks)
+    assert set(kw) == {"conversation", "on_tool", "on_text"}
     assert calls[0]["history"] == []
     # nothing image-like is rendered, and the answer still comes through
     assert not _thumbnail_images(at)
@@ -357,10 +357,14 @@ def test_ac5_ask_and_answer_gained_exactly_one_optional_keyword_only_param():
         assert params["attachments"].default is None
     assert set(inspect.signature(chatbot.ask).parameters) == {
         "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "attachments",
-        "on_tool"}
+        "on_tool", "on_text"}
     assert set(inspect.signature(chatbot.answer).parameters) == {
         "cfg", "store", "question", "history", "conversation", "transport", "max_runs", "budget",
-        "attachments", "on_tool", "question_saved"}
+        "attachments", "on_tool", "on_text", "question_saved", "request_id"}
+    # on_text streams the reply as it is written; like on_tool it is keyword-only and optional.
+    for fn in (chatbot.ask, chatbot.answer):
+        text = inspect.signature(fn).parameters["on_text"]
+        assert text.kind is inspect.Parameter.KEYWORD_ONLY and text.default is None
     # question_saved (web chat jobs store the question first) is keyword-only and off by default.
     saved = inspect.signature(chatbot.answer).parameters["question_saved"]
     assert saved.kind is inspect.Parameter.KEYWORD_ONLY and saved.default is False
@@ -372,7 +376,9 @@ def test_ac5_single_attachment_module_with_explicit_chat_page_consumer():
     touched = {"attachments.py", "chatbot.py", "dashboard.py", "dashboard_pages/chat.py",
                # React web chat: stages uploads through attachments.py and passes paths to chatbot.answer.
                "services/chat_requests.py", "services/dashboard.py", "webapp/app.py", "webapp/contracts.py",
-               "webapp/workspace.py", "webapp/demo.py"}
+               "webapp/workspace.py", "webapp/demo.py",
+               # reply files reuse the shared module's checks (imports from .attachments; no duplication)
+               "chat_files.py"}
     for f in sorted(pkg.rglob("*.py")):
         if f.name == "__init__.py" or f.relative_to(pkg).as_posix() in touched:
             continue

@@ -86,9 +86,9 @@ the optional-dependency message.
 | Queue | Start/resume worker, pause new starts, lane counts | Explicit spending authorization before starting; running work can finish when paused |
 | New task | Describe it or a GitHub issue URL (optional repository override); allowance, workflow, model team, repair cycles, time limit, auto-fix attempts; preserved draft | Always queued with publication approval ("Pre-approve" is not offered). Test command/sandbox image overrides, the sample-repository helper and immediate direct runs remain in the existing dashboard |
 | Projects | Lists, exact shared cost accounting; a project opens on a summary (plain-language status, last error with a suggested fix, milestone/tasks/spending, pending decision) with Overview, Milestones, Tasks, Conversation and Spec & history tabs (the last tab used is remembered per project; drafts open on Conversation) | Shows up to 100 connected tasks and 50 recent events |
-| Project planning | Structured draft editor and lead conversation before launch | Saving/replying does not launch; forms remain in the browser across navigation |
-| Project controls | Approve displayed spec, pause/cancel, checkpoint reply and manual-check confirmation, with page-level confirmations | Existing fixed-spec, repository ownership, merge, launch and spending barriers remain in application services. Post-launch fixed-spec amendment is not exposed |
-| Chat | Separate conversations (rename from the header; unnamed chats are titled after the first reply), retained messages, preserved drafts, background replies with live tool steps and elapsed time, visible failures with "put this message back", one pending reply per conversation, image (PNG/JPEG/GIF/WebP) and text attachments with thumbnails, Ctrl+Enter | Progress is polled each second, not token-streamed (the chat model call is not a streaming API). Suggested actions never execute automatically. SVG attachments are refused |
+| Project planning | New project opens a brief idea form; follow-up questions use fields or choices. Optional details, GitHub owner and proposed budget use editable defaults. A short exchange opens a drafted proposal for review, with an optional editor | Saving/replying does not launch; answers remain in the browser across navigation; stale question forms are refused |
+| Project controls | Approve displayed spec and start the queue worker, pause/cancel, checkpoint reply and manual-check confirmation, with page-level confirmations | Existing fixed-spec, repository ownership, merge, launch and spending barriers remain in application services. Paused projects offer a reviewed scope amendment; repository identity and completed milestones are protected |
+| Chat | Right-aligned user bubbles and left-aligned assistant replies; live model text, copy/download buttons on code blocks, copy reply and save Markdown, tables and inline images, generated-file download cards, retained task suggestions, attachments and separate conversations | Reply text uses provider streaming and reconnectable SSE; tool status is also polled. Suggestions still require reviewed launch. Uploaded SVG is refused; generated HTML/SVG is an inert download |
 | Pull requests | Open PRs per known repository (60-second cache, Refresh from GitHub), status, size, head commit, link to the run; merge (squash/merge/rebase, delete branch), Merge all ready, Update branch, all behind "I've reviewed these changes" | Each merge names the reviewed head commit and is refused if new commits arrived. Auto-merge settings and "update and restart SwarmForge" after merging its own repository remain in the existing dashboard |
 | Failures | Post-mortems with counts (fixed themselves / need you / not diagnosed), cause filter, why/fix/lesson/evidence, links to the run and its retry, authorized re-diagnosis | Bulk "diagnose all older failures" remains in the existing dashboard (one model call per run); the cause chart is shown as counts |
 | History | Finished work with the same detail/evidence views | None |
@@ -98,6 +98,70 @@ the optional-dependency message.
 | Settings | Health checks on demand, which API key variables are set (never values), per-role model/temperature/max steps with optional provider model list, limits; validated save with comment-preserving backup and stale-file protection; authorized model test | Saved values apply after restarting the web interface (the page says so). Sandbox image build (long Docker build) stays on the command line or existing dashboard. Secrets are never editable here |
 | Model teams | Named lineups and current roles | Team files are edited in `teams/` |
 | What's new | Packaged history grouped by day, search, category filter, New-to-you marks, Mark all as read (shared with the existing dashboard), links to pages; nav badges for unread highlights and failures needing you | None |
+
+## Task workspace on Work
+
+Expand a task on **Work** or **History** to open its task workspace. A compact header keeps the
+status, current run stage, repair cycle and pull-request link visible above seven tabs:
+
+- **Overview** shows finished bot assignments, bots, the current acceptance cycle and recorded
+  spend, followed by the current action, last result and next recorded action. Long text expands
+  on demand. Clicking a summary card opens its relevant tab.
+- **Sequence** groups implementation assignments by repair cycle and dependency level, including
+  parallel branches. Each card shows its bot/model, state and prerequisites; results, errors and
+  file hints expand separately. Filter by working, waiting, finished or needs attention.
+- **Bots** lists assigned and actually used role/model pairs, including fallbacks and escalations,
+  with recorded calls, known cost and assignment states. Current settings are not substituted for
+  the models that ran. A stopped run does not show assignments as actively working.
+- **Checks** keeps the latest acceptance results in the current cycle separate from earlier
+  results, and shows recorded test runs. Expand a check to inspect its evidence.
+- **Files** opens the existing retained-report and screenshot browser on demand.
+- **Activity** shows a compact newest-first event list with search, warnings/errors and stage
+  filters. Only 25 matches appear at a time; messages expand individually.
+- **Controls** keeps approvals, cancellation, authorized retries and archiving together with the
+  full allowance and model-usage breakdown. Pending approvals are highlighted above every tab.
+
+The selected tab is remembered per task and workspace. Tabs support arrow keys, Home and End;
+on phones they scroll horizontally. Evidence continues refreshing while a task is open.
+The stage strip marks observed stages and the current stage; it never invents a completion
+percentage from elapsed time or stage position. Finished assignments and passed acceptance
+checks are different measures, and a completed run can still await a pull-request merge.
+
+Execution details are a bounded read-only projection of task assignments, dependencies, state
+transitions and aggregated model calls. It exposes no configuration, raw prompts, worktree paths
+or provider credentials. Up to 200 recent assignments, 40 role/model/provider usage groups and
+100 stage transitions are previewed, with explicit truncation notices and whole-run counts.
+Missing or cyclic prerequisites are shown without an assumed order. Validation assignments
+remain separate from implementation dependency levels. Undispatched and older runs show honest
+empty states; browsing never starts a model, worker or task and does not migrate the database.
+
+The interactive demo includes a fabricated branching task plan, several bot roles and recorded
+sample usage so these views can be checked without spending AI credits.
+
+## Rich replies and streaming
+
+General and project conversations use the same message renderer. Code fences show a language header,
+**Copy code** and **Download**. Hover or focus a message to copy it or save it as Markdown; these controls
+stay visible on phones. Markdown tables and HTTPS images render inline, with no image referrer sent.
+Image attachments open at full size when clicked. User messages stay on the right in both themes.
+
+When asked for a file, chat can use `create_file` to attach text/code, valid raster images, PDF, ZIP or
+Office document bytes (maximum 10 MB each, eight files per reply). It cannot execute code or read an
+arbitrary local path. A configured chat-tool allowlist still applies. Without tools, a `file:filename.ext`
+text fence provides a copyable and downloadable text file. Completed text file fences are also retained
+as attachments. HTML/SVG/code downloads are served as inert attachments, never executed in the app.
+Artifacts are scoped to their conversation and message and survive a web-server restart.
+
+The provider's answer deltas are saved as a bounded partial reply and delivered through reconnectable
+server-sent events. Reading or reconnecting starts no model call. Navigation leaves the background
+reply running. A disconnected model stream is not retried after partial output; its text/files are
+retained with an interruption notice, and known or conservatively estimated costs remain accounted for.
+Project kickoff streams the human explanation while keeping the structured proposal behind its existing
+validation and human approval. Launch is disabled while a project reply is in progress.
+
+The demo uses simulated generation events and includes code, a downloadable CSV and a PNG preview;
+it never calls models or creates repositories. The previous Streamlit general chat also accepts live
+text callbacks; the shared rich message controls described above belong to the React dashboard.
 
 Chat replies run in the background as durable jobs (see docs/ARCHITECTURE.md, Background jobs) owned
 by the web process that started them. The question is stored in the same transaction that starts the
@@ -130,7 +194,7 @@ worker automatically after enqueue or project approval: use Work's queue control
 
 Project draft save and launch compare the spec the human reviewed against the current stored spec
 inside a write transaction. Stale editors/approvals are rejected. A project lead reply cannot overwrite
-a newer draft through this API. Post-launch fixed-spec edits are not exposed. At a checkpoint,
+a newer draft through this API. At a pause, Edit approved scope uses the existing human amendment service; approving a revision keeps the project paused until continued. At a checkpoint,
 confirm any checks marked “needs you” before continuing; corrections retain the current milestone.
 
 Draft text is stored in this browser. If another editor changes the project, reload/review the saved
@@ -200,7 +264,7 @@ Tests use disposable stores/files, fake model adapters and simulated worker star
 read-only behavior, public fields, pagination, origins/hosts, session/CSRF authorization, duplicates,
 uncertain outcomes, stale specs, project retry/accounting barriers and demo journeys without network
 or subprocesses. Frontend checks cover contracts, reconnect windows, accessible React navigation,
-spending-disabled forms, draft-only project creation and rendering every route without network calls.
+explicit allowance approvals, draft-only project creation and rendering every route without network calls.
 Server rendering is not browser evidence. Browser evidence for every page (desktop and 390px, light and
 dark) and the main journeys was captured with Playwright against `--demo` on November 22, 2026; the
 scripts and screenshots are under ignored `.swarmforge/ui-migration/screenshots/`. Rerun them after UI changes.

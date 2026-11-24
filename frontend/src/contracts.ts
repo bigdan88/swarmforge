@@ -37,6 +37,13 @@ export type RunEvent = {id:number; ts:number; level:string; kind:string; message
 export type Allowance = {attempt:number; budget_usd:number; spent_usd:number; reserved_usd:number; available_usd:number;
   deadline:number; last_progress_at:number; current_action:string|null; last_result:string|null;
   next_action:string|null; stop_reason:string|null};
+export type ExecutionTask = {task_key:string;cycle:number;kind:string;title:string|null;role:string|null;model:string|null;
+  state:string;depends_on:string[];dependencies_complete:boolean;expected_files:string[];started_at:number|null;ended_at:number|null;
+  attempts:number;summary:string|null;error:string|null;truncated:boolean};
+export type ExecutionBot = {role:string|null;provider:string|null;model:string|null;calls:number;tokens:number;
+  known_cost_usd:number;unavailable_calls:number;errors:number;first_call_at:number|null;last_call_at:number|null};
+export type Execution = {mode:string;repair_cycle:number;counts:Record<string,number>;tasks:ExecutionTask[];tasks_has_more:boolean;
+  bots:ExecutionBot[];bots_has_more:boolean;phases:{id:number;ts:number;state:string}[];phases_has_more:boolean};
 export type Evidence = {
   item_id:string; run_id:string|null;
   costs:{calls:number; reported_usd:number; estimated_usd:number; unavailable_calls:number}|null;
@@ -47,10 +54,30 @@ export type Evidence = {
     failed:number|null; errors:number|null; skipped:number|null; timed_out:boolean}[];
   tests_has_more:boolean;
   events:RunEvent[]; next_event_id:number; events_has_more:boolean;
+  execution?:Execution|null;
 };
 const finite = (v:unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const nullableNumber = (v:unknown) => v === null || finite(v);
 const fields = (v:Record<string,unknown>, keys:string[], check:(value:unknown)=>boolean) => keys.every(key=>check(v[key]));
+
+export function parseExecution(v:unknown):Execution {
+  const strings=(a:unknown,max:number)=>Array.isArray(a)&&a.length<=max&&a.every(text);
+  if(!object(v)||!text(v.mode)||!integer(v.repair_cycle)||!object(v.counts)||!Object.values(v.counts).every(n=>integer(n))||
+    !fields(v,['tasks_has_more','bots_has_more','phases_has_more'],n=>typeof n==='boolean')||
+    !Array.isArray(v.tasks)||v.tasks.length>200||!v.tasks.every(t=>object(t)&&
+      fields(t,['task_key','kind','state'],text)&&fields(t,['title','role','model','summary','error'],nullableText)&&
+      integer(t.cycle)&&integer(t.attempts)&&strings(t.depends_on,50)&&strings(t.expected_files,20)&&
+      fields(t,['started_at','ended_at'],nullableNumber)&&fields(t,['truncated','dependencies_complete'],n=>typeof n==='boolean'))||
+    !Array.isArray(v.bots)||v.bots.length>40||!v.bots.every(b=>object(b)&&fields(b,['role','provider','model'],nullableText)&&
+      fields(b,['calls','tokens','unavailable_calls','errors'],n=>integer(n))&&finite(b.known_cost_usd)&&b.known_cost_usd>=0&&
+      fields(b,['first_call_at','last_call_at'],nullableNumber))||
+    !Array.isArray(v.phases)||v.phases.length>100||!v.phases.every(p=>object(p)&&integer(p.id)&&finite(p.ts)&&text(p.state)))throw invalid();
+  const next=v as Execution;
+  if(new Set(next.tasks.map(t=>t.task_key)).size!==next.tasks.length||
+    Object.values(next.counts).reduce((a,b)=>a+b,0)<next.tasks.length||
+    next.phases.some((p,i)=>i>0&&p.id<=next.phases[i-1].id))throw invalid();
+  return next;
+}
 
 export function parseEvidence(value: unknown): Evidence {
   if (!object(value) || !text(value.item_id) || !nullableText(value.run_id) ||
@@ -69,6 +96,7 @@ export function parseEvidence(value: unknown): Evidence {
       !fields(value.allowance,['budget_usd','spent_usd','reserved_usd','available_usd','deadline','last_progress_at'],finite) ||
       !fields(value.allowance,['current_action','last_result','next_action','stop_reason'],nullableText))) throw invalid();
   const events = value.events as RunEvent[];
+  if(value.execution!==undefined&&value.execution!==null)parseExecution(value.execution);
   if (events.some((e,i)=>i>0 && e.id<=events[i-1].id) ||
       (events.length>0 && events.at(-1)!.id!==value.next_event_id) ||
       (value.events_has_more && events.length===0)) throw invalid();

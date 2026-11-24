@@ -83,6 +83,12 @@ roles:
 developer_roles: [developer_backend, developer_frontend]
 
 projects:
+  autonomous: true          # deliver a preview with a final review; total project cap is unchanged
+  auto_recovery_rounds: 2   # bounded extra recovery attempts, persisted across restarts
+  auto_retry_delay_s: 15
+  default_repo_owner: ""      # GitHub account/org for proposed new repositories; e.g. your-account
+  default_budget_usd: 30      # editable proposal default; never spending authorization
+  min_build_budget_usd: 2    # new build tasks; spikes may cost less, project/milestone caps still apply
   horizon: 3
   max_task_failures: 2
   escalate_budget_factor: 2.0

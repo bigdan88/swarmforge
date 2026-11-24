@@ -1,12 +1,11 @@
-import { WorkControls, QueueControls } from './Controls';
+import { QueueControls } from './Controls';
 import type { Session } from './api';
-import { ActionButton, type Navigate } from './ui';
+import type { Navigate } from './ui';
 import { useEffect, useRef, useState } from 'react';
-import { Evidence } from './Evidence';
+import { WorkDetails } from './WorkDetails';
 import { parsePage, parseWork, type Page, type Work } from './contracts';
 
 const label = (s:string) => s.replaceAll('_',' ').toLowerCase();
-const stamp = (t:number|null) => t !== null ? new Date(t*1000).toLocaleString() : 'Not recorded';
 export function WorkPage({session,navigate,view='work'}:{session:Session|null;navigate:Navigate;view?:string}){
   const initial = new URLSearchParams(location.search);
   const [search,setSearch]=useState(initial.get('search')||'');
@@ -53,14 +52,13 @@ export function WorkPage({session,navigate,view='work'}:{session:Session|null;na
       .catch(e=>{if(!controller.signal.aborted)setDetailError(e.message);});
     return()=>controller.abort();
   },[selected,updated]);
-  const pr=detail?.pr_url && /^https:\/\/github\.com\//i.test(detail.pr_url) ? detail.pr_url:null;
   const openRow=useRef<HTMLDivElement>(null);
   // Escape closes details from anywhere on the page, unless the user is typing in a field.
   useEffect(()=>{const close=(e:KeyboardEvent)=>{const t=e.target as HTMLElement|null;if(e.key==='Escape'&&selected&&!(t&&['INPUT','TEXTAREA','SELECT'].includes(t.tagName)))setSelected(null);};window.addEventListener('keydown',close);return()=>window.removeEventListener('keydown',close);},[selected]);
   // Bring an opened row (including a deep link) into view once its details load.
   useEffect(()=>{if(detail&&openRow.current)openRow.current.scrollIntoView({block:'nearest',behavior:'smooth'});},[detail?.id]);
   const inPage=!!selected&&!!page?.items.some(w=>w.id===selected);
-  const details=selected&&<section className="details" aria-label="Task details"><div className="detail-heading"><h2>Task details</h2><button onClick={()=>setSelected(null)}>Close details</button></div>{detailError?<p role="alert" className="error">{detailError}</p>:!detail?<p>Loading details…</p>:<><h3>{detail.title}</h3><p>{detail.reason||'No status explanation has been recorded.'}</p><dl><div><dt>Status</dt><dd>{label(detail.status)}</dd></div><div><dt>Stage</dt><dd>{detail.stage?label(detail.stage):'Not started'}</dd></div><div><dt>Created</dt><dd>{stamp(detail.created_at)}</dd></div><div><dt>Last updated</dt><dd>{stamp(detail.updated_at)}</dd></div><div><dt>Finished</dt><dd>{detail.finished_at?stamp(detail.finished_at):'Not finished'}</dd></div><div><dt>Run</dt><dd>{detail.run_id||'Not dispatched'}</dd></div></dl>{pr&&<a href={pr} target="_blank" rel="noreferrer">View pull request ↗</a>}<WorkControls key={selected} itemId={selected} session={session} onDone={()=>setUpdated(new Date())}/>{detail.run_id&&!['running','queued','tentative'].includes(detail.status)&&<div className="button-row"><ActionButton operation="set_archived" target={selected} args={{archived:!detail.archived}} disabled={!session?.actions_enabled} onDone={()=>{if(!detail.archived&&!showArchived)setSelected(null);setUpdated(new Date());}}>{detail.archived?'Unarchive':'Archive'}</ActionButton><span className="muted">{detail.archived?'Archived runs are hidden from Work; their history, report and transcripts stay.':'Hide this run from Work. Its history, report and transcripts stay.'}</span></div>}<Evidence key={selected+':'+detail.run_id} itemId={selected} runId={detail.run_id}/></>}</section>;
+  const details=selected&&<section className="details task-workspace" aria-label="Task details"><div className="detail-heading"><h2>Task workspace</h2><button onClick={()=>setSelected(null)}>Close details</button></div>{detailError?<p role="alert" className="error">{detailError}</p>:!detail?<p>Loading details.</p>:<WorkDetails key={selected+":"+detail.run_id} item={detail} session={session} onDone={()=>setUpdated(new Date())} onArchived={()=>{if(!detail.archived&&!showArchived)setSelected(null);setUpdated(new Date());}}/>}</section>;
   return <><header><div><div className="eyebrow">YOUR SWARM, AT A GLANCE</div><h1>{view==='prs'?'Pull requests':view==='failures'?'Failures':view==='history'?'History':'Work'}</h1><p>Follow what’s happening. Understand what comes next.</p></div><button className="primary" onClick={()=>navigate('new-task')}>New task</button></header>
       <QueueControls session={session}/><section className="stats" aria-label="Task summary">{[['running','In progress'],['queued','Ready to start'],['failed','Needs attention'],['done','Completed']].map(([key,name])=><div className="stat" key={key}><span>{name}</span><strong>{page?.counts[key]??'—'}</strong></div>)}</section>
       <section className="work-panel"><div className="toolbar"><h2>Task activity</h2><div className="filters"><label><span className="sr-only">Search work</span><input placeholder="Search tasks or repositories…" value={search} maxLength={200} onChange={e=>{setSearch(e.target.value);setOffset(0);}}/></label><label><span className="sr-only">Filter status</span><select value={status} onChange={e=>{setStatus(e.target.value);setOffset(0);}}><option value="">All statuses</option>{['running','queued','tentative','done','failed','cancelled','skipped'].map(s=><option key={s} value={s}>{label(s)}</option>)}</select></label><label className="check"><input type="checkbox" checked={everyAttempt} onChange={e=>{setEveryAttempt(e.target.checked);setOffset(0);}}/>Every attempt</label><label className="check"><input type="checkbox" checked={showArchived} onChange={e=>{setShowArchived(e.target.checked);setOffset(0);}}/>Show archived</label></div></div>

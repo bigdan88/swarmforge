@@ -1,10 +1,10 @@
 import {useEffect,useRef,useState,type FormEvent,type KeyboardEvent} from 'react';
 import {collection,elapsed,label,latestRequest,money,num,readLocal,record,rows,saveLocal,stamp,str,uploadAttachment,useAction,useDraft,useGet,type Row,type Session,type Staged} from './api';
 import {ActionButton,Feedback,Heading,Loading,Pager,type Navigate} from './ui';
-import {Markdown,Transcript,useFitToWindow} from './Messages';
+import {ChatMessage,Markdown,replyIsSaved,Transcript,useFitToWindow,useLiveReply} from './Messages';
 export function ChatPage({session,navigate,selected}:{session:Session|null;navigate:Navigate;selected:string}){
   const [offset,setOffset]=useState(0);const list=useGet(`/api/v1/conversations?offset=${offset}`,collection,6000,true);
-  return <><Heading title="Chat" description="Ask about the swarm, investigate work and keep each conversation separate."><ActionButton operation="create_conversation" disabled={!session?.actions_enabled} onDone={r=>{list.refresh();if(r.conversation_id)navigate('chat',r.conversation_id);}}>New conversation</ActionButton></Heading>
+  return <><Heading title="Chat" description="Discuss ideas, generate tasks, and review them before launching."><div className="button-row"><ActionButton operation="start_project" disabled={!session?.actions_enabled} onDone={r=>{if(r.project_id)navigate('projects',r.project_id);}}>Start a project</ActionButton><ActionButton operation="create_conversation" disabled={!session?.actions_enabled} onDone={r=>{list.refresh();if(r.conversation_id)navigate('chat',r.conversation_id);}}>New conversation</ActionButton></div></Heading>
     <div className="chat-layout"><section className="panel thread-list"><h2>Conversations</h2><Feedback error={list.error}/>{list.data?.items.map(c=><button className={`thread ${str(c.id)===selected?'selected':''}`} aria-current={str(c.id)===selected?'true':undefined} key={str(c.id)} onClick={()=>navigate('chat',str(c.id))}><strong>{str(c.title)||'New chat'}</strong><small>{stamp(c.updated_at||c.created_at)}</small></button>)}{list.data&&<Pager offset={offset} total={list.data.total} setOffset={setOffset}/>}</section>
       {selected?<Conversation key={selected} id={selected} session={session} onRenamed={list.refresh}/>:<section className="panel empty"><h2>A place to work things through</h2><p>Open a conversation or start a new one. Model calls happen only when you send an authorized message.</p></section>}
     </div></>;
@@ -15,7 +15,7 @@ function Attachments({conversation,items}:{conversation:string;items:Row[]}){
 }
 function ReplyStatus({request,now,onReuse}:{request:Row;now:number;onReuse:(text:string)=>void}){
   const status=str(request.status),steps=rows(request.steps);
-  if(status==='thinking')return <div className="reply-status" role="status" aria-live="polite"><strong>Responding… {elapsed(request.started_at,null,now)}</strong>{steps.length>0&&<ul>{steps.map((s,i)=><li key={i}>{s.ok===false?'Could not use':'Checked'} {label(s.tool)}</li>)}</ul>}{num(now-num(request.started_at))>45&&<p className="muted">This is taking longer than usual. You can leave; the reply is saved here when it arrives.</p>}</div>;
+  if(status==='thinking')return <div className="reply-status" role="status"><span>{str(request.partial_text)?'Generating':'Thinking'}… {elapsed(request.started_at,null,now)}</span>{steps.length>0&&<details><summary>{steps.length} tool {steps.length===1?'step':'steps'}</summary><ul>{steps.map((s,i)=><li key={i}>{s.ok===false?'Could not use':'Checked'} {label(s.tool)}</li>)}</ul></details>}{num(now-num(request.started_at))>45&&<p className="muted">You can leave this page. The reply will be saved here.</p>}</div>;
   if(status==='failed'||status==='interrupted')return <div className="reply-status error" role="alert"><strong>{status==='failed'?'The reply failed':'The reply was interrupted'}</strong><p>{str(request.error)||'No reason was recorded.'}</p><button onClick={()=>onReuse(str(request.question))}>Put this message back in the composer</button></div>;
   return null;
 }
@@ -41,7 +41,8 @@ function Conversation({id,session,onRenamed}:{id:string;session:Session|null;onR
   const fileInput=useRef<HTMLInputElement>(null);
   const panel=useFitToWindow<HTMLElement>(!!view.data);
   useEffect(()=>{saveLocal(stagedKey,JSON.stringify(staged));},[stagedKey,staged]);
-  const latest=view.data?latestRequest(view.data.requests):null;
+  const stream=useLiveReply(id,view.data?latestRequest(view.data.requests):null,view.refresh);
+  const latest=stream.request;
   const thinking=str(latest?.status)==='thinking';
   useEffect(()=>setFast(thinking),[thinking]);
   const wasThinking=useRef(false);
@@ -64,13 +65,45 @@ function Conversation({id,session,onRenamed}:{id:string;session:Session|null;onR
   if(!view.data)return <section className="panel"><Loading error={view.error}/></section>;
   const conversation=record(view.data.conversation),costs=record(view.data.costs);
   return <section className="panel conversation" ref={panel}><div className="detail-heading"><ConversationTitle id={id} title={str(conversation.title)} enabled={!!session?.actions_enabled} onRenamed={()=>{view.refresh();onRenamed();}}/><span className="muted">{money(costs.total)} recorded usage</span></div><Feedback error={view.error}/>
-    <Transcript count={rows(view.data.messages).length+(thinking?1:0)}>{rows(view.data.messages).map(m=><article className={`message ${str(m.role)}`} key={num(m.id)}><small>{label(m.role)} · {stamp(m.created_at)}</small>{str(m.role)==='assistant'?<Markdown text={str(m.content)}/>:<p>{str(m.content)}</p>}<Attachments conversation={id} items={rows(m.attachments)}/>{m.truncated===true&&<small>Long message shortened in this view.</small>}</article>)}{!rows(view.data.messages).length&&<p className="muted">No messages yet.</p>}
+    <Transcript count={rows(view.data.messages).length+(thinking?1:0)}>{rows(view.data.messages).map(m=><ChatMessage message={m} conversation={id} key={num(m.id)}><SuggestedTasks message={m} session={session} onDone={view.refresh}/><Attachments conversation={id} items={rows(m.attachments)}/></ChatMessage>)}{!rows(view.data.messages).length&&<p className="muted">No messages yet.</p>}
+      {str(latest?.partial_text)&&!replyIsSaved(rows(view.data.messages),latest)&&<ChatMessage message={{role:'assistant',content:latest?.partial_text}} streaming={thinking}/>}
+      {stream.reconnecting&&thinking&&<p className="muted" role="status">Reconnecting to the reply…</p>}
       {latest&&<ReplyStatus request={latest} now={now} onReuse={text=>setDraft({message:text})}/>}</Transcript>
     <form className="composer editor" onSubmit={submit}><fieldset disabled={action.pending||thinking||!session?.models_enabled}>
-      <label>Your message<textarea required rows={3} maxLength={16000} value={draft.message} onKeyDown={keys} onChange={e=>setDraft({message:e.target.value})} placeholder="What is blocking the current task?" aria-describedby="composer-help"/></label>
+      <label><span className="sr-only">Your message</span><textarea required rows={2} maxLength={16000} value={draft.message} onKeyDown={keys} onChange={e=>setDraft({message:e.target.value})} placeholder="Message SwarmForge…" aria-describedby="composer-help"/></label>
       <div className="composer-actions"><div className="attach-row"><input ref={fileInput} id={`attach-${id}`} className="sr-only" tabIndex={-1} aria-hidden="true" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.py,.js,.ts,.tsx,.json,.yaml,.yml,.toml,.csv,.log,.sql,.sh,.html,.css" onChange={e=>void attach(e.target.files)}/><label htmlFor={`attach-${id}`} className="button-like" tabIndex={0} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();fileInput.current?.click();}}}>Attach files</label>
         {staged.map(a=><span className="chip" key={a.id}>{a.name}<button type="button" aria-label={`Remove ${a.name}`} onClick={()=>setStaged(s=>s.filter(x=>x.id!==a.id))}>×</button></span>)}{uploading>0&&<span role="status">Uploading…</span>}</div><div className="send-row"><button className="primary" disabled={!draft.message.trim()||uploading>0} type="submit">{action.pending?'Sending…':thinking?'Waiting for reply…':'Send message'}</button></div></div>
       <Feedback error={uploadError}/></fieldset>
       <Feedback error={action.error}/><p className="muted composer-help" id="composer-help">Enter sends · Shift+Enter for a new line · images and text files up to 5 MB · drafts stay in this browser</p></form>
+  </section>;
+}
+
+export function SuggestedTasks({message,session,onDone}:{message:Row;session:Session|null;onDone:()=>void}){
+  return <>{rows(record(message.actions??{}).tasks).slice(0,8).map((task,index)=><SuggestedTask key={index} task={task} messageId={String(message.id)} index={index} launched={str(record(message.launched_tasks??{})[String(index)])} session={session} onDone={onDone}/>)}</>;
+}
+function SuggestedTask({task,messageId,index,launched,session,onDone}:{task:Row;messageId:string;index:number;launched:string;session:Session|null;onDone:()=>void}){
+  const [reviewing,setReviewing]=useState(false),[queued,setQueued]=useState('');
+  const [draft,setDraft]=useDraft(`sf-chat-task:${messageId}:${index}`,{title:str(task.title),body:str(task.description),repo:str(task.repo),budget:String(session?.settings.limits.budget_usd??5)});
+  const action=useAction(`chat-task:${messageId}:${index}`);
+  const field=(key:string,value:string)=>setDraft(old=>({...old,[key]:value}));
+  async function launch(e:FormEvent){
+    e.preventDefault();if(action.pending)return;
+    const result=await action.send('launch_chat_task',messageId,{...draft,budget:Number(draft.budget),index,spending_authorized:true});
+    if(result?.item_id){setQueued(result.item_id);onDone();}
+  }
+  const item=launched||queued;
+  return <section className="suggested-task"><h3>{str(task.title)}</h3>{str(task.why)&&<p className="muted">{str(task.why)}</p>}
+    {item?<p role="status">Task queued. <a href={`?page=work&item=${encodeURIComponent(item)}`}>Open task in Work</a></p>:<>
+      <Markdown text={str(task.description)}/><button type="button" disabled={!session?.models_enabled} onClick={()=>setReviewing(v=>!v)}>{reviewing?'Close task review':'Review and launch task'}</button>
+      {reviewing&&<form className="editor" onSubmit={launch}><fieldset disabled={action.pending||!session?.models_enabled}>
+        <label>Task title<input required maxLength={300} value={draft.title} onChange={e=>field('title',e.target.value)}/></label>
+        <label>Repository<input required value={draft.repo} onChange={e=>field('repo',e.target.value)} placeholder="owner/repository"/></label>
+        <label>Requirements and acceptance criteria<textarea required rows={6} maxLength={30000} value={draft.body} onChange={e=>field('body',e.target.value)}/></label>
+        <label>Task allowance (USD)<input required type="number" min="0.5" max="500" step="0.5" value={draft.budget} onChange={e=>field('budget',e.target.value)}/></label>
+        <p className="muted">Launching approves this task and its displayed allowance.</p>
+        <p className="muted">Launch adds this task to the normal queue and starts its worker. Publication still requires approval.</p>
+        <button className="primary" type="submit">{action.pending?'Launching…':'Approve & launch task'}</button>
+      </fieldset></form>}
+    </>}<Feedback error={action.error} message={action.message}/>
   </section>;
 }

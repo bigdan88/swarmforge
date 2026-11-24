@@ -5,12 +5,13 @@ import hashlib
 import json
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from .. import jobs
 from ..execution import transaction
 from .spec import ProjectError, fixed
+from .autonomy import milestone_limit
 
 if TYPE_CHECKING:
     from ..db import Store
@@ -28,9 +29,14 @@ def encoded(value: Any, limit: int = 64000) -> str:
     return raw
 
 
+def queue_manifest(rows):
+    fields = ("id", "status", "position", "body", "budget", "mode", "project_key", "depends_on", "project_processed", "merged_sha", "execution_id", "max_runtime_s")
+    return encoded([{key: row.get(key) for key in fields} for row in rows])
+
+
 def epoch(store: Store, project: dict) -> str:
     event = store._one("SELECT COALESCE(MAX(id),0) AS id FROM project_events WHERE project_id=? "
-                       "AND kind IN ('approval','merge','spike_finished','reply','spec_approved')", (project["id"],))
+                       "AND kind IN ('approval','merge','spike_finished','reply','spec_approved','automatic_recovery','verification_repair','milestone_progressed')", (project["id"],))
     last = store._one("SELECT COALESCE(MAX(id),0) AS id FROM queue_items WHERE project_id=? AND milestone=? "
                       "AND status IN ('done','failed')", (project["id"], project["current_milestone"]))
     source = [project["id"], fixed(project["spec"]), project["current_milestone"], event["id"], last["id"]]
@@ -49,14 +55,18 @@ def _on_lead_transition(db, job: dict, to_state: str, reason: str) -> None:
 
 
 def _fail_unfinished(db, project_id: str) -> bool:
-    unfinished = db.execute("SELECT id FROM project_decisions WHERE project_id=? AND status IN ('proposed','validated','executing')", (project_id,)).fetchall()
+    unfinished = db.execute("SELECT id,status FROM project_decisions WHERE project_id=? AND status IN ('proposed','validated','executing')", (project_id,)).fetchall()
     if not unfinished:
         return False
     db.execute("UPDATE project_decisions SET status='failed',finished_at=?,result=? WHERE project_id=? AND status IN ('proposed','validated','executing')",
                (time.time(), encoded({"error": LOST}), project_id))
-    db.execute("UPDATE projects SET status='waiting_for_you',last_error=? WHERE id=?", (LOST, project_id))
+    project = db.execute("SELECT status FROM projects WHERE id=?", (project_id,)).fetchone()
+    was_running = bool(project and project["status"] == "running")
+    if was_running:
+        db.execute("UPDATE projects SET status='waiting_for_you',last_error=? WHERE id=?", (LOST, project_id))
     db.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)",
-               (project_id, time.time(), "lead_recovery", encoded({"reason": LOST, "decision_ids": [r["id"] for r in unfinished]})))
+               (project_id, time.time(), "lead_recovery", encoded({"reason": LOST, "decision_ids": [r["id"] for r in unfinished],
+                  "safe_to_retry": was_running and all(r["status"] == "validated" for r in unfinished)})))
     return True
 
 
@@ -189,7 +199,7 @@ async def choose_action(cfg, store, project, repository, snapshot, items, contex
     """
     import asyncio
     from . import lead
-    from .actions import ActionKind, LeadAction, validate_scope
+    from .actions import ActionKind, LeadAction, existing_task_reference, validate_scope
     from .store import Projects
     ps = Projects(store)
     cycle = epoch(store, project)
@@ -204,24 +214,47 @@ async def choose_action(cfg, store, project, repository, snapshot, items, contex
         "timeout_s": cfg.projects.lead_timeout_s,
         "initial_cost": store.cost_summary("project:" + project["id"])["total"]}
     context["evidence_catalog"] = catalog
-    def queue_manifest(rows):
-        fields = ("id", "status", "position", "body", "budget", "mode", "project_key", "depends_on", "project_processed", "merged_sha", "execution_id")
-        return encoded([{key: row.get(key) for key in fields} for row in rows])
+    context["min_build_budget_usd"] = cfg.projects.min_build_budget_usd
+    context["autonomous"] = cfg.projects.autonomous
+    from .autonomy import instructions
+    context["automatic_recovery"] = instructions(store, project["id"])
     expected_queue = queue_manifest(items)
+    context["existing_ready_tasks"] = [{key: q.get(key) for key in ("id", "project_key", "title", "budget", "mode", "max_runtime_s")}
+                                       for q in items if q["status"] == "queued" and q["milestone"] == project["current_milestone"]]
+    context["action_examples"] = {
+        "continue_existing": {"action": "continue_plan", "reason": "The next accepted task remains appropriate", "evidence": ["repository:" + snapshot["sha"]],
+                              "task_id": context["existing_ready_tasks"][0]["id"] if context["existing_ready_tasks"] else "integer ID of the next queued task"},
+        "new_investigation": {"action": "investigate", "reason": "Resolve an in-scope uncertainty", "evidence": ["repository:" + snapshot["sha"]],
+                              "task": {"key": "probe", "title": "Investigate the uncertainty", "description": "State hypothesis and observable result here",
+                                       "acceptance_criteria": ["Retain concrete findings"], "files": ["docs/research.md"], "ready": True,
+                                       "kind": "spike", "budget_usd": min(2, project["budget_usd"] * .1), "depends_on": [], "max_runtime_s": min(cfg.limits.max_runtime_s, cfg.projects.investigation_timeout_s)}}}
     invalid = 0
     while True:
         used = store.cost_summary("project:" + project["id"])["total"] - policy["initial_cost"]
         ms = ps.milestones(project["id"])[project["current_milestone"]]
         available = min(policy["budget_usd"] - used, project["budget_usd"] - ps.spent(project["id"]),
-                        ms["estimate_usd"] * cfg.projects.escalate_budget_factor - ps.spent(project["id"], project["current_milestone"]))
+                        milestone_limit(cfg, project, ms) - ps.spent(project["id"], project["current_milestone"]))
         if available <= 0 or turn.begin(cycle, {**catalog, "_policy": policy}, policy["max_actions"]) is None:
-            pause("The project lead reached its decision allowance. Review the saved decisions before continuing.", {"epoch": cycle})
+            from .autonomy import schedule_repair
+            if schedule_repair(cfg, store, project, "planning", "Repair the invalid planning response using the saved exact errors and valid action examples. Choose a materially different approach if the same proposal failed repeatedly. Last rejection: " + str(context.get("correction_required") or "decision round exhausted")[:2500]):
+                return None
+            detail = context.get("correction_required")
+            message = (f"Automatic planning repair used its bounded decision allowance after {invalid} rejected responses. "
+                       f"Last rejection: {detail}. Use Retry planning to try again within the remaining project allowance."
+                       if detail else "The project lead reached its decision allowance. Review the saved decisions before continuing.")
+            pause(message, {"epoch": cycle, "rejections": invalid, "last_rejection": detail, "recovery_kind": "planning"})
             return None
         context["decision_budget_usd"] = available
         context["actions_remaining"] = policy["max_actions"] - store._one("SELECT COUNT(*) AS n FROM project_decisions WHERE project_id=? AND epoch=?", (project["id"], cycle))["n"]
         last_call = store._one("SELECT COALESCE(MAX(id),0) AS id FROM llm_calls WHERE run_id=?", ("project:" + project["id"],))["id"]
+        response_error = None
         try:
             result = await asyncio.wait_for(ask(cfg, store, project, lead.LEAD, context, transport), timeout=policy["timeout_s"])
+        except ProjectError as exc:
+            # Invalid JSON is a known, side-effect-free response failure. Its call
+            # was already charged by the model client; repair it inside this cap.
+            response_error = str(exc)
+            result = {"action": "invalid_response", "reason": "The lead response was not valid action JSON"}
         except BaseException as exc:
             # A provider may have accepted an interrupted request. Retain the reserved
             # decision allowance as an estimate rather than silently replenishing it.
@@ -251,10 +284,34 @@ async def choose_action(cfg, store, project, repository, snapshot, items, contex
             turn.mark("superseded", {"reason": "Human pause, spec revision or queue changes superseded this proposal"})
             return None
         try:
-            action = LeadAction.parse(result, "repository:" + snapshot["sha"])
+            if response_error:
+                raise ProjectError("The lead response could not be decoded as one JSON action: " + response_error)
+            candidate, normalization = existing_task_reference(result, project, items)
+            action = LeadAction.parse(candidate, "repository:" + snapshot["sha"])
+            adjusted = tuple(replace(task, budget_usd=max(task.budget_usd, cfg.projects.min_build_budget_usd))
+                             if task.kind == "build" else task for task in action.tasks)
+            if adjusted != action.tasks:
+                action = replace(action, tasks=adjusted)
+                normalization = (normalization + " " if normalization else "") + f"Applied the configured ${cfg.projects.min_build_budget_usd:g} minimum build-task allowance; project and milestone caps still apply."
+            ordered, remaining_tasks = [], list(action.tasks)
+            keys = {task.key for task in action.tasks}
+            while remaining_tasks:
+                eligible = [task for task in remaining_tasks if not (set(task.depends_on) & keys) - {t.key for t in ordered}]
+                if not eligible:
+                    break  # scope validation below reports cycles; nothing is silently dropped
+                task = next((t for t in eligible if t.ready), eligible[0])
+                ordered.append(task)
+                remaining_tasks.remove(task)
+            if not remaining_tasks and tuple(ordered) != action.tasks:
+                action = replace(action, tasks=tuple(ordered))
+                normalization = (normalization + " " if normalization else "") + "Ordered tasks after their prerequisites without changing scope or readiness."
             validate_scope(action, project, items, catalog, max_runtime_s=cfg.limits.max_runtime_s,
                            investigation_timeout_s=cfg.projects.investigation_timeout_s)
-            converted = action.legacy(project["spec"])
+            if action.kind == ActionKind.BROWSER and cfg.projects.autonomous and any(q.get("merged_sha") and q["milestone"] == project["current_milestone"] for q in items) and not any(c["status"] == "failed" for c in context["verification"]):
+                action = replace(action, kind=ActionKind.EVALUATE)
+                normalization = (normalization + " " if normalization else "") + "Kept unavailable browser observations unverified for the final preview review."
+            converted = ({"action": "continue_plan", "task_id": action.task_id, "queue_manifest": expected_queue, "normalization": normalization}
+                         if action.kind == ActionKind.CONTINUE else action.legacy(project["spec"]))
             spec = validate(project, converted, cfg.projects.horizon) if action.kind in (
                 ActionKind.PLAN, ActionKind.INVESTIGATE, ActionKind.REVIEW, ActionKind.EVALUATE, ActionKind.ESCALATE) else None
             if action.kind == ActionKind.EVALUATE and (not any(q.get("merged_sha") and q["milestone"] == project["current_milestone"] for q in items)
@@ -273,6 +330,10 @@ async def choose_action(cfg, store, project, repository, snapshot, items, contex
                 turn.mark("applied", {"evidence_ref": ref, "paths": list(action.paths), "run_ids": list(action.run_ids), "sha": snapshot["sha"], "findings": findings})
                 continue
             if action.kind in (ActionKind.PAUSE, ActionKind.QUESTION, ActionKind.BROWSER):
+                from .autonomy import schedule_repair
+                if schedule_repair(cfg, store, project, "clarification", "The owner wants a working preview with minimal interruption. Before asking, try an in-scope alternative, a reasonable reversible assumption, or fixtures for unavailable services/devices. Keep permissions, actual physical observations and unavailable credentials unverified. If none can advance the approved software scope, ask one concrete question explaining the attempted alternatives. Original question: " + (action.question or action.reason)[:2500]):
+                    turn.mark("superseded", {"reason": "Trying autonomous alternatives before interrupting the owner"})
+                    return None
                 if action.kind == ActionKind.BROWSER:
                     message = "Browser journey verification is required for: " + "; ".join(action.checks) + ". No browser journey runner is installed in this stage; verify these checks or resume with a correction."
                     status = "blocked"
@@ -281,13 +342,15 @@ async def choose_action(cfg, store, project, repository, snapshot, items, contex
                 pause(message, {"decision_id": turn.decision_id, "action": action.kind.value}, decision_status=status,
                       decision_result={"message": message, "evidence": list(action.evidence), "verification": "unverified" if action.kind == ActionKind.BROWSER else None})
                 return None
-            turn.mark("validated", {"evidence": list(action.evidence)})
+            if normalization:
+                ps.event(project["id"], "proposal_normalized", {"decision_id": turn.decision_id, "explanation": normalization})
+            turn.mark("validated", {"evidence": list(action.evidence), "normalization": normalization})
             return action, converted, spec
         except (ProjectError, TypeError, ValueError) as exc:
-            turn.mark("rejected", {"error": str(exc)})
-            ps.event(project["id"], "proposal_rejected", {"reason": str(exc), "decision_id": turn.decision_id})
+            turn.mark("rejected", {"error": str(exc), "recovery": "Automatic correction uses the remaining decision allowance"})
+            ps.event(project["id"], "proposal_rejected", {"reason": str(exc), "decision_id": turn.decision_id,
+                                                       "recovery": "Retrying automatically with the exact rejection and valid examples"})
             context["rejected_proposal"] = result
             context["correction_required"] = str(exc)
+            context["repair_instruction"] = "Correct the rejected response using action_examples. Do not ask the owner to fix JSON, dependencies or model formatting. Do not add fields, change scope or increase allowances. Use continue_plan for an unchanged next queued task."
             invalid += 1
-            if invalid >= 2:
-                raise ProjectError("Lead returned two invalid proposals. Retry after correcting the model configuration.") from exc

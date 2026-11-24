@@ -175,6 +175,7 @@ def test_interactive_demo_journeys_never_call_models_or_start_processes(tmp_path
     monkeypatch.setattr(httpx.AsyncClient, "send", no_network)
     monkeypatch.setattr("subprocess.Popen", no_process)
     cfg, store, actions = create_demo(tmp_path)
+    seeded_calls = store._one("SELECT COUNT(*) AS n FROM llm_calls")["n"]
     try:
         with TestClient(create_app(cfg.db_path, actions=actions, demo=True), base_url="http://127.0.0.1") as client:
             headers = authorize(client)
@@ -188,17 +189,24 @@ def test_interactive_demo_journeys_never_call_models_or_start_processes(tmp_path
             assert client.get("/api/v1/conversations/demo-chat").json()["requests"][0]["status"] == "thinking"
             assert wait_idle(store, "demo-chat")["status"] == "done"
             assert "Demo reply" in client.get("/api/v1/conversations/demo-chat").text
-            project = client.get("/api/v1/projects").json()["items"][0]
+            project = next(p for p in client.get("/api/v1/projects").json()["items"] if p["status"] == "drafting")
             pid = project["id"]
             before = client.get(f"/api/v1/projects/{pid}").json()
             headers["idempotency-key"] = "demo-project-chat-001"
             command = {"operation": "project_message", "target": pid, "args": {"message": "Refine the goals", "expected_spec": before["spec_sha"], "spending_authorized": True}}
             assert client.post("/api/v1/actions", json=command, headers=headers).json()["ok"]
             assert Projects(store).get(pid)["status"] == "drafting"
+            waiting = next(p for p in client.get("/api/v1/projects").json()["items"] if p["status"] == "waiting_for_you")
+            recovery = client.get(f"/api/v1/projects/{waiting['id']}").json()
+            headers["idempotency-key"] = "demo-recovery-retry-001"
+            retry = {"operation": "retry_project_lead", "target": waiting["id"], "args": {
+                "expected_spec": recovery["spec_sha"], "expected_decision": recovery["recovery"]["latest_decision_id"], "spending_authorized": True}}
+            assert client.post("/api/v1/actions", json=retry, headers=headers).json()["ok"]
+            assert Projects(store).get(waiting["id"])["status"] == "running"
             headers["idempotency-key"] = "demo-worker-start-001"
             assert client.post("/api/v1/actions", json={"operation": "start_queue", "args": {"spending_authorized": True}}, headers=headers).json()["ok"]
             assert store.kv_get("queue_worker_pid") is None
-            assert store._one("SELECT COUNT(*) AS n FROM llm_calls")["n"] == 0
+            assert store._one("SELECT COUNT(*) AS n FROM llm_calls")["n"] == seeded_calls  # fabricated usage stays unchanged
     finally:
         store.close()
 

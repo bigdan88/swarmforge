@@ -43,7 +43,8 @@ def ensure_tables(store: Store) -> None:
         before_message_id INTEGER NOT NULL DEFAULT 0, user_message_id INTEGER, attachments TEXT NOT NULL DEFAULT '[]')""")
     store._exec("CREATE INDEX IF NOT EXISTS chat_requests_conversation ON chat_requests(conversation_id, started_at)")
     columns = {r["name"] for r in store._all("PRAGMA table_info(chat_requests)")}
-    for name, kind in (("owner", "TEXT"), ("heartbeat", "REAL"), ("job_id", "TEXT")):
+    for name, kind in (("owner", "TEXT"), ("heartbeat", "REAL"), ("job_id", "TEXT"),
+                       ("partial_text", "TEXT NOT NULL DEFAULT ''"), ("assistant_message_id", "INTEGER")):
         if name not in columns:
             store._exec(f"ALTER TABLE chat_requests ADD COLUMN {name} {kind}")
     # One pending reply per conversation, enforced by the database across connections and processes.
@@ -68,6 +69,16 @@ def _on_transition(conn, job: dict, to_state: str, reason: str) -> None:
         error = (reason or "The reply failed")[:1000]
     elif status == "interrupted":
         error = INTERRUPTED
+    if status in ("failed", "interrupted"):
+        request = conn.execute("SELECT id,conversation_id,partial_text,assistant_message_id FROM chat_requests WHERE job_id=? AND status='thinking'", (job["id"],)).fetchone()
+        files_exist = bool(request and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_files'").fetchone()
+                           and conn.execute("SELECT 1 FROM chat_files WHERE reply_id=? AND message_id IS NULL LIMIT 1", (request["id"],)).fetchone())
+        if request and (request["partial_text"] or files_exist) and request["assistant_message_id"] is None:
+            cur = conn.execute("INSERT INTO chat_messages(conversation_id,role,content,created_at) VALUES (?,'assistant',?,?)",
+                               (request["conversation_id"], (request["partial_text"] or "Files created before the reply stopped.") + "\n\n*Reply interrupted before completion.*", time.time()))
+            conn.execute("UPDATE chat_requests SET assistant_message_id=? WHERE id=?", (cur.lastrowid, request["id"]))
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_files'").fetchone():
+                conn.execute("UPDATE chat_files SET message_id=? WHERE reply_id=? AND message_id IS NULL", (cur.lastrowid, request["id"]))
     conn.execute("UPDATE chat_requests SET status=?, error=?, finished_at=? WHERE job_id=? AND status='thinking'",
                  (status, error, time.time(), job["id"]))
 
@@ -177,12 +188,16 @@ def _saves_question(answer_fn: Callable) -> bool:
     return "question_saved" in inspect.signature(answer_fn).parameters
 
 
-def _call_answer(answer_fn: Callable, config, store, question, conversation, attachments, on_tool, saved: bool):
+def _call_answer(answer_fn: Callable, config, store, question, conversation, attachments, on_tool, saved: bool, on_text=None, request_id=None):
     params = inspect.signature(answer_fn).parameters
     accepts_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
     kwargs: dict[str, Any] = {"conversation": conversation}
     if accepts_any or "on_tool" in params:
         kwargs["on_tool"] = on_tool
+    if accepts_any or "on_text" in params:
+        kwargs["on_text"] = on_text
+    if accepts_any or "request_id" in params:
+        kwargs["request_id"] = request_id
     if saved:
         kwargs["question_saved"] = True
     if attachments:
@@ -193,7 +208,7 @@ def _call_answer(answer_fn: Callable, config, store, question, conversation, att
 
 
 def start_reply(store: Store, config, answer_fn: Callable, conversation: str, question: str,
-                attachment_ids: Any = None, *, background: bool = True) -> dict:
+                attachment_ids: Any = None, *, background: bool = True, save_question=None) -> dict:
     """Record a pending reply as a job owned by this process and run it; raises ChatBusy if a
     reply is already active here.
 
@@ -204,7 +219,7 @@ def start_reply(store: Store, config, answer_fn: Callable, conversation: str, qu
     request_id = uuid.uuid4().hex
     public = [{k: u[k] for k in ("id", "name", "kind", "size")} for u in uploads]
     release_interrupted(store, conversation)  # a dead owner's reply must not block the conversation forever
-    saved = _saves_question(answer_fn)
+    saved = _saves_question(answer_fn) if save_question is None else save_question
     busy = ChatBusy("A reply is still in progress in this conversation. Wait for it, or open another conversation.")
 
     def record(conn, job):
@@ -226,6 +241,18 @@ def start_reply(store: Store, config, answer_fn: Callable, conversation: str, qu
 
     steps: list[dict] = []
     lock = threading.Lock()
+    last_text_write = 0.0
+    pending_text = ""
+
+    def on_text(value, *, flush=False):
+        nonlocal last_text_write, pending_text
+        from ..streaming import public_text
+        with lock:
+            pending_text = public_text(str(value))[:128000]
+            now = time.monotonic()
+            if flush or now - last_text_write >= .06:
+                store._exec("UPDATE chat_requests SET partial_text=? WHERE id=? AND status='thinking'", (pending_text, request_id))
+                last_text_write = now
 
     def on_tool(name, args, output):
         with lock:
@@ -235,6 +262,10 @@ def start_reply(store: Store, config, answer_fn: Callable, conversation: str, qu
                 store._exec("UPDATE chat_requests SET steps=? WHERE id=?", (json.dumps(steps), request_id))
 
     def link_user_message(conn, _job):
+        row = conn.execute("SELECT c.id FROM chat_messages c JOIN chat_requests r ON r.id=? WHERE c.conversation_id=? "
+                           "AND c.id>r.before_message_id AND c.role='assistant' ORDER BY c.id DESC LIMIT 1", (request_id, conversation)).fetchone()
+        if row:
+            conn.execute("UPDATE chat_requests SET assistant_message_id=? WHERE id=?", (row[0], request_id))
         if saved:
             return
         # Adapters that store the question themselves: find the first new user message with this text.
@@ -247,11 +278,13 @@ def start_reply(store: Store, config, answer_fn: Callable, conversation: str, qu
     def run():
         with jobs.keep_alive(store, job["id"]):
             try:
-                _call_answer(answer_fn, config, store, question, conversation, [u["path"] for u in uploads], on_tool, saved)
+                _call_answer(answer_fn, config, store, question, conversation, [u["path"] for u in uploads], on_tool, saved, on_text, request_id)
             except Exception as exc:  # noqa: BLE001 - every failure must become visible to the user
+                on_text(pending_text, flush=True)
                 # If the job was recovered meanwhile, finish() changes nothing: that terminal state stands.
                 jobs.finish(store, job["id"], "failed", error=(str(exc) or type(exc).__name__)[:1000], also=link_user_message)
             else:
+                on_text(pending_text, flush=True)
                 jobs.finish(store, job["id"], "succeeded", also=link_user_message)
 
     if background:

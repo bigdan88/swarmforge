@@ -5,7 +5,7 @@ import asyncio
 import copy
 import json
 
-from swarmforge.projects import lead, service
+from swarmforge.projects import kickoff, lead, service
 from swarmforge.projects.store import Projects
 from swarmforge.dashboard_pages.project_activity import describe
 
@@ -46,7 +46,7 @@ def render(cfg, st, store):
     repo = own_repo() or "bigdan88/swarmforge"
     start, improve = st.columns(2)
     if start.button("Start a project", type="primary", icon=":material/add:"):
-        st.session_state.project_id = ps.create()["id"]
+        st.session_state.project_id = ps.create(kickoff_defaults=kickoff.defaults(cfg))["id"]
         st.rerun()
     if improve.button("Improve SwarmForge", icon=":material/build:",
                                help=f"Plan a multi-milestone improvement for {repo}."):
@@ -138,8 +138,27 @@ def render(cfg, st, store):
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
         if p["status"] == "drafting":
-            st.caption("Tell the kickoff chat your GitHub account and the name you want for a new repo. You can change the repository choice before launch.")
-            question = st.chat_input("Describe your app or answer the kickoff questions", key="project_kickoff_" + pid)
+            message_id, fields = kickoff.latest_questions(store, p, kickoff.defaults(cfg))
+            question = None
+            if fields:
+                with st.form(f"project_questions_{pid}_{message_id}"):
+                    answers = {}
+                    for field in fields:
+                        label = field["label"] + ("" if field.get("required") else " (optional)")
+                        if field["kind"] == "select":
+                            answers[field["id"]] = st.selectbox(label, ["", *field["options"]], help=field.get("help"))
+                        else:
+                            widget = st.text_input if field["kind"] == "text" else st.text_area
+                            answers[field["id"]] = widget(label, value=field.get("default", ""), placeholder=field.get("placeholder", ""), help=field.get("help"), max_chars=4000)
+                    st.caption("The lead proposes the milestones and allowance. Nothing launches until you approve.")
+                    submitted = st.form_submit_button("Draft my project", type="primary")
+                if submitted:
+                    try:
+                        question = kickoff.answer_message(store, p, {"expected_question": message_id, "answers": answers})
+                    except ValueError as exc:
+                        st.error(str(exc))
+            else:
+                question = st.chat_input("Refine the project proposal", key="project_kickoff_" + pid)
             if question:
                 try:
                     with st.spinner("Working on your project spec…"):

@@ -267,7 +267,7 @@ REPO_ISSUES_SCHEMA = {
 
 
 
-def build_chat_registry(cfg: Config) -> ToolRegistry:
+def build_chat_registry(cfg: Config, reply_files=None) -> ToolRegistry:
     """Tool registry for the chatbot: web fetch plus directory listing."""
 
     async def _fetch_url(
@@ -370,6 +370,8 @@ def build_chat_registry(cfg: Config) -> ToolRegistry:
             GREP_SCHEMA,
             tools.grep,
         )
+    if reply_files is not None:
+        reply_files.register(registry)
     registry.restrict(cfg.chatbot.tools)
     return registry
 
@@ -379,7 +381,7 @@ You are also the team lead who helps Dan improve SwarmForge itself (the platform
 back on track. Use <improvement_context> (features, modules, statistics, failures, lessons learned,
 work already queued or planned) as your evidence.
 
-When Dan asks what to improve, for ideas, or about failed tasks, answer in Markdown and then END your
+When Dan asks what to improve, for ideas, to generate or prepare tasks, or about failed tasks, answer in Markdown and then END your
 reply with exactly one fenced block of machine-readable actions:
 
 ```actions
@@ -394,6 +396,8 @@ Rules for tasks: 2-5 tasks, each small and independent (one pull request, about 
 and testable, never a duplicate of something already queued, in the backlog or recently done. Prefer
 changes that remove the causes of the failures and slowness you can see. Use the platform repository
 unless Dan asks about another project.
+If Dan requests one specific task, propose that one task. Suggestions do not launch work: the user
+reviews the task, repository and allowance and presses Launch task in the dashboard.
 Rules for fixes: only for runs in the failures list; 2-4 distinct options per run (e.g. more time,
 smaller scope, specific technical fix, continue from the code already written); set the numeric fields
 only when that option changes them; continue_code=true only if the run is marked resumable.
@@ -608,14 +612,15 @@ def _dict_attachments(attachments) -> bool:
     return bool(attachments) and isinstance(attachments[0], dict)
 
 
-async def _run_chat(cfg: Config, llm, role: str, messages: list[dict], on_tool=None) -> str:
+async def _run_chat(cfg: Config, llm, role: str, messages: list[dict], on_tool=None, *, on_text=None, reply_files=None) -> str:
     """One chat turn: the tool loop when chat tools are enabled, a plain
     llm.chat call otherwise (no tools in the request at all)."""
     if cfg.chat.tools_enabled:
-        return await chat_with_tools(llm, role, messages, build_chat_registry(cfg),
+        return await chat_with_tools(llm, role, messages, build_chat_registry(cfg, reply_files),
                                      max_rounds=cfg.chat.max_tool_rounds,
-                                     task_key="chatbot", on_tool=on_tool)
-    resp = await llm.chat(role, messages, task_key="chatbot")
+                                     task_key="chatbot", on_tool=on_tool, on_text=on_text)
+    from .streaming import text_callback
+    resp = await llm.chat(role, messages, task_key="chatbot", **({"on_delta": text_callback(on_text)} if on_text else {}))
     return resp.message.get("content") or ""
 
 
@@ -632,6 +637,8 @@ async def answer(
     attachments: list | None = None,
     on_tool=None,
     question_saved: bool = False,
+    on_text=None,
+    request_id=None,
 ) -> dict:
     """Ask the status chatbot a question; returns {answer, role, model, question}.
 
@@ -669,6 +676,9 @@ async def answer(
             "content": SYSTEM_PROMPT
             + "\n"
             + IMPROVE_PROMPT
+            + "\n\nUse fenced code blocks with a language for code. For requested downloads use create_file when available. "
+              "Otherwise use a fenced block whose info is file:filename.ext for a downloadable text file. "
+              "Use Markdown images ![description](URL) to show available images. Never claim a file or image was created unless you actually provided it."
             + "\n\n<status>\n"
             + status_snapshot(store, max_runs)
             + "\n</status>\n\n<improvement_context>\n"
@@ -728,11 +738,19 @@ async def answer(
                 summary = await compact_conversation(store, conversation, msgs, context, summarize)
                 if summary:
                     messages.insert(1, summary_message(summary))
-            text = await _run_chat(cfg, llm, role, messages, capture_tool)
+            from .chat_files import ReplyFiles
+            reply_files = ReplyFiles(cfg, store, conversation, request_id)
+            options = {"reply_files": reply_files}
+            if on_text:
+                options["on_text"] = on_text
+            text = await _run_chat(cfg, llm, role, messages, capture_tool, **options)
         except (LLMError, BudgetExceeded, ConfigError, httpx.HTTPError) as e:
             raise ChatError(str(e)) from e
         text, actions = parse_actions(text, store)
-        store.conversation_append(conversation, "assistant", text)
+        reply_files.from_fences(text)
+        with store.transaction():
+            mid = store.conversation_append(conversation, "assistant", text, actions=actions)
+            reply_files.attach(mid)
         if needs_title(store, conversation):
             async def name_it(title_messages):
                 return (await llm.chat(role, title_messages, task_key="chat-title")).message.get("content") or ""
@@ -788,6 +806,7 @@ def ask(
     max_runs: int = 12,
     attachments: list | None = None,
     on_tool=None,
+    on_text=None,
 ) -> dict:
     """Synchronous wrapper around answer() for CLI and Streamlit callers."""
     return asyncio.run(
@@ -801,6 +820,7 @@ def ask(
             max_runs=max_runs,
             attachments=attachments,
             on_tool=on_tool,
+            on_text=on_text,
         )
     )
 

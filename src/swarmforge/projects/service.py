@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import lead
+from .autonomy import milestone_limit
 from .repository import Repository
 from .spec import ProjectError, fixed, replace_living, validate
 from .store import Projects
@@ -92,22 +93,39 @@ def _amend(store, ps, pid, definition, render):
     store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, time.time(), "spec_approved", json.dumps({"before": p["spec"], "after": render(d, living)})))
 
 
-def resume(store, pid, reply="continue", *, confirm_manual=False):
+def resume(store, pid, reply="continue", *, confirm_manual=False, expected_spec=None, expected_recovery=None):
     ps = Projects(store)
     if not reply.strip():
         raise ProjectError("Add a reply or correction")
     from ..runqueue import set_lane_paused
     with store.transaction():
         p = ps.get(pid)
+        if expected_spec is not None:
+            import hashlib
+            if expected_spec != hashlib.sha256(p["spec"].encode()).hexdigest():
+                raise ProjectError("The approved spec changed. Reload before continuing.")
         if p["status"] not in ("at_checkpoint", "waiting_for_you"):
             raise ProjectError("Project is not waiting for a reply")
+        if expected_recovery is not None or p["status"] == "waiting_for_you":
+            from .recovery import recovery_state
+            recovery = recovery_state(store, p)
+            if expected_recovery is not None and expected_recovery != recovery["decision_token"]:
+                raise ProjectError("This decision changed. Reload and review the current stop before continuing.")
+            task = recovery["decision"].get("task")
+            if task and task.get("stop_kind") == "allowance_exhausted" and store.kv_get("project_recovery:" + pid) != task.get("execution_id"):
+                raise ProjectError("This task needs a bounded allowance extension before replanning. Use the project's recovery controls to approve the additional amount and time window.")
         status, index = "running", p["current_milestone"]
         now = time.time()
         if p["status"] == "at_checkpoint" and reply.strip().lower() in ("continue", "approved", "looks good"):
             milestones = ps.milestones(pid)
             report = json.loads(milestones[index]["report"])
-            if any(c["status"] == "needs you" for c in report["checks"]) and not confirm_manual:
+            outstanding = report["checks"] + [check for milestone in report.get("pending_milestones", []) for check in milestone.get("checks", [])]
+            if any(c["status"] != "passed" for c in outstanding) and not confirm_manual:
                 raise ProjectError("Confirm the checks marked needs you before continuing")
+            if any(c["status"] == "failed" for c in outstanding):
+                raise ProjectError("Failed milestone checks require repairs before acceptance")
+            if report.get("final_review"):
+                store.conn.execute("UPDATE milestones SET status='done',finished_at=? WHERE project_id=? AND status='verification_pending'", (now, pid))
             store.conn.execute("UPDATE milestones SET status='done',finished_at=? WHERE project_id=? AND idx=?", (now, pid, index))
             if index + 1 == len(milestones):
                 status = "done"
@@ -120,6 +138,76 @@ def resume(store, pid, reply="continue", *, confirm_manual=False):
         store.conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, p["conversation_id"]))
         store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, now, "completed" if status == "done" else "reply", json.dumps({"reply": reply, "confirmed_manual": confirm_manual})))
         set_lane_paused(store, lane(pid), False)  # the lane reopens with the reply, not in a later commit
+        store.kv_set("project_auto_context:" + pid, None)
+
+
+def extend_task_allowance(cfg, store, pid, *, expected_spec, expected_recovery, extra_budget, hours):
+    """Explicit, bounded recovery approval. Keep the original lineage, costs and evidence."""
+    import hashlib
+    import math
+    from .recovery import recovery_state
+    from .decisions import lead_active
+    ps = Projects(store)
+    if type(extra_budget) not in (int, float) or not math.isfinite(extra_budget) or not .5 <= extra_budget <= 500:
+        raise ProjectError("Choose an additional task allowance between $0.50 and $500")
+    if type(hours) not in (int, float) or not math.isfinite(hours) or not .05 <= hours <= 72:
+        raise ProjectError("Choose a recovery time window between 0.05 and 72 hours")
+    with store.transaction():
+        p = ps.get(pid)
+        recovery = recovery_state(store, p)
+        if expected_spec != hashlib.sha256(p["spec"].encode()).hexdigest() or expected_recovery != recovery["decision_token"]:
+            raise ProjectError("This decision changed. Reload before extending its allowance.")
+        if not recovery["can_extend_task"] or lead_active(store.conn, pid):
+            raise ProjectError("This stop cannot use an allowance extension. Inspect its existing recovery path.")
+        task = recovery["decision"]["task"]
+        allowance = store._one("SELECT * FROM execution_allowances WHERE id=?", (task["execution_id"],))
+        if store._one("SELECT id FROM execution_calls WHERE execution_id=? AND status='reserved' LIMIT 1", (allowance["id"],)):
+            raise ProjectError("Resolve the outstanding model request before extending its allowance")
+        ms = ps.milestones(pid)[p["current_milestone"]]
+        remaining = min(p["budget_usd"] - ps.spent(pid), milestone_limit(cfg, p, ms) - ps.spent(pid, p["current_milestone"]))
+        unspent = max(0, allowance["budget_usd"] - allowance["spent_usd"])
+        if unspent + extra_budget > remaining:
+            raise ProjectError(f"This extension exceeds the remaining project or milestone allowance (${max(0, remaining):.2f}). Revise the specification or choose a smaller extension.")
+        before = {k: allowance[k] for k in ("budget_usd", "spent_usd", "deadline")}
+        deadline = time.time() + hours * 3600
+        store.conn.execute("UPDATE execution_allowances SET budget_usd=budget_usd+?,deadline=MAX(deadline,?) WHERE id=?",
+                           (extra_budget, deadline, allowance["id"]))
+        # Carry the approved lineage through the next lead turn, even though the
+        # exhausted attempt is already processed and has no ready replacement.
+        store.kv_set("project_recovery:" + pid, allowance["id"])
+        store.conn.execute("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
+        reply = ("Replan and repair the stopped task within the approved scope and extended shared allowance. "
+                 "Inspect retained code and test evidence. Keep the same task lineage. "
+                 "Separate report instructions and unavailable human/browser checks from machine-testable build acceptance criteria; "
+                 "do not retry an unchanged plan that already failed twice. Ask me only for facts or permissions you cannot resolve.")
+        resume(store, pid, reply, expected_spec=expected_spec)
+        ps.event(pid, "task_allowance_extended", {"task_id": task["id"], "execution_id": allowance["id"], "before": before,
+                                                  "additional_usd": extra_budget, "window_hours": hours, "deadline": max(allowance["deadline"], deadline)})
+
+
+def retry_planning(store, pid, *, expected_spec, expected_decision, correction=""):
+    """A human-requested new planning turn; never replay an uncertain repository write."""
+    from .recovery import recovery_state
+    from .decisions import lead_active
+    from ..runqueue import set_lane_paused
+    import hashlib
+    ps = Projects(store)
+    with store.transaction():
+        project = ps.get(pid)
+        recovery = recovery_state(store, project)
+        if expected_spec != hashlib.sha256(project["spec"].encode()).hexdigest() or expected_decision != recovery["latest_decision_id"]:
+            raise ProjectError("The project or lead decision changed. Reload before retrying.")
+        if not recovery["can_retry"] or lead_active(store.conn, pid):
+            raise ProjectError("This stop needs its existing decision or recovery path; an uncertain action cannot be retried as a planning error")
+        if store._one("SELECT id FROM queue_items WHERE project_id=? AND status='running'", (pid,)):
+            raise ProjectError("Wait for running work before retrying planning")
+        reply = "Retry automatic planning within the approved specification and remaining allowance. Repair response formatting internally; continue an eligible existing task instead of recreating it."
+        if correction.strip():
+            reply += "\nOwner's clarification: " + correction.strip()
+        # The ordinary reply creates a new bounded decision epoch; all previous
+        # calls remain charged to the same project and milestone.
+        resume(store, pid, reply, expected_spec=expected_spec)
+        ps.event(pid, "planning_retry", {"decision_id": expected_decision, "correction": correction.strip(), "reason": project["last_error"]})
 
 
 def github_repo_name(repo):
@@ -138,6 +226,9 @@ def can_start(store, item):
     ps = Projects(store)
     p = ps.get(item["project_id"])
     if p["status"] != "running" or not p["observed_sha"] or item["milestone"] != p["current_milestone"]:
+        return False
+    from .autonomy import ready
+    if not ready(store, p["id"]):
         return False
     from .decisions import lead_active
     with store._lock:
@@ -226,7 +317,7 @@ def verify_checks(store, p):
     return checks
 
 
-def checkpoint(store, p, reason):
+def checkpoint(store, p, reason, *, config=None):
     ps = Projects(store)
     items = ps.items(p["id"])
     checks = verify_checks(store, p)
@@ -243,11 +334,35 @@ def checkpoint(store, p, reason):
               "estimate_usd": ms["estimate_usd"], "elapsed_hours": (time.time() - (ms["started_at"] or time.time())) / 3600,
               "estimate_hours": ms["estimate_hours"], "plan_changes": p["spec"].split("## Living", 1)[-1],
               "next_milestone": (p["definition"]["milestones"][p["current_milestone"] + 1] if p["current_milestone"] + 1 < len(p["definition"]["milestones"]) else "Project complete after your confirmation")}
-    store._exec("UPDATE milestones SET status='checkpoint',report=?,spent_usd=? WHERE project_id=? AND idx=?",
-                (json.dumps(report), report["spent_usd"], p["id"], p["current_milestone"]))
-    ps.update(p["id"], status="at_checkpoint")
-    ps.event(p["id"], "checkpoint", report)
-    store.conversation_append(p["conversation_id"], "assistant", "Milestone checkpoint\n\n" + reason + "\n\n" + "\n".join(f"- {c['status']}: {c['text']}" for c in checks) + "\n\nReview the report and reply continue, or describe a correction.")
+    with store.transaction():
+        current = ps.get(p["id"])
+        if current["status"] != "running" or current["spec"] != p["spec"] or current["current_milestone"] != p["current_milestone"]:
+            return
+        store._exec("UPDATE milestones SET status='checkpoint',report=?,spent_usd=? WHERE project_id=? AND idx=?",
+                    (json.dumps(report), report["spent_usd"], p["id"], p["current_milestone"]))
+        ps.update(p["id"], status="at_checkpoint")
+        ps.event(p["id"], "checkpoint", report)
+    from .autonomy import review_checkpoint
+    if review_checkpoint(config, store, ps.get(p["id"])):
+        return
+    # An explicitly unconstrained project can advance on real evidence. Missing
+    # observations still pause; no agent is allowed to confirm them for the owner.
+    automatic = bool(checks) and all(c["status"] == "passed" for c in checks) and p["definition"].get("ask_before", "").strip().lower() == "none"
+    if automatic:
+        index = p["current_milestone"]
+        final = index + 1 == len(p["definition"]["milestones"])
+        with store.transaction():
+            current = ps.get(p["id"])
+            if current["status"] != "at_checkpoint" or current["spec"] != p["spec"] or current["current_milestone"] != index:
+                return
+            store.conn.execute("UPDATE milestones SET status='done',finished_at=? WHERE project_id=? AND idx=?", (time.time(), p["id"], index))
+            if not final:
+                store.conn.execute("UPDATE milestones SET status='current',started_at=? WHERE project_id=? AND idx=?", (time.time(), p["id"], index + 1))
+            ps.update(p["id"], status="done" if final else "running", current_milestone=index if final else index + 1, observed_sha=None, last_error=None)
+            ps.event(p["id"], "milestone_auto_accepted", {"milestone": index, "reason": "Every approved check has passing recorded evidence; no additional approval was requested in the specification."})
+        store.conversation_append(p["conversation_id"], "assistant", "Milestone verified automatically\n\n" + reason + "\n\nEvery approved check has passing recorded evidence. " + ("Project complete." if final else "Continuing to the next milestone within the approved allowance."))
+    else:
+        store.conversation_append(p["conversation_id"], "assistant", "Milestone checkpoint\n\n" + reason + "\n\n" + "\n".join(f"- {c['status']}: {c['text']}" for c in checks) + "\n\nReview the report, request automatic verification, or accept after verifying the listed checks.")
 
 
 async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None):
@@ -260,11 +375,21 @@ async def advance(cfg, store, pid, *, repository=None, ask=None, transport=None)
         with turn.keep_alive():
             return await _advance(cfg, store, pid, repository=repository, ask=ask, transport=transport, turn=turn)
     except BaseException as exc:
+        phase = store._one("SELECT status FROM project_decisions WHERE id=?", (turn.decision_id,)) if turn.decision_id else None
         failed = f"{type(exc).__name__}: {exc}"
         turn.mark("failed", {"error": f"{type(exc).__name__}: {exc}"})
         ps = Projects(store)
         current = ps.get(pid)
         if current["status"] == "running":
+            from .autonomy import schedule_repair
+            from httpx import HTTPStatusError, TransportError
+            safe_interruption = isinstance(exc, (asyncio.CancelledError, TimeoutError)) and (not phase or phase["status"] != "executing")
+            transient_request = (isinstance(exc, TransportError) or isinstance(exc, HTTPStatusError) and exc.response.status_code in (429, 500, 502, 503, 504)) and (not phase or phase["status"] != "executing")
+            stale_snapshot = isinstance(exc, ProjectError) and "Main changed while planning" in str(exc)
+            if (safe_interruption or transient_request or stale_snapshot) and schedule_repair(cfg, store, current, "planning", "The planning turn was interrupted before any repository write. Inspect the latest repository and continue from saved evidence."):
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return
             stop(ps, current, f"Project lead stopped: {type(exc).__name__}: {exc}. Review the saved decision before resuming.",
                  {"decision_id": turn.decision_id, "error": str(exc)})
         raise
@@ -277,6 +402,9 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
     ps = Projects(store)
     p = ps.get(pid)
     if p["status"] != "running":
+        return
+    from .autonomy import ready
+    if not ready(store, pid):
         return
     activity_key = f"project_activity:{pid}"
     for q in store.queue_items(include_finished=False):
@@ -294,6 +422,9 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
         progress = False
         recovery_lineages = {q["execution_id"] for q in items
                              if q["status"] in ("queued", "tentative") and q.get("execution_id")}
+        approved_recovery = store.kv_get("project_recovery:" + pid)
+        if approved_recovery:
+            recovery_lineages.add(approved_recovery)
         for q in items:
             if q["project_processed"] or q["status"] not in ("done", "failed", "cancelled"):
                 continue
@@ -314,7 +445,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                             title, body = am.fix_task(title=q["title"], body=q["body"], url=run["pr_url"], reason=reason, findings=[])
                             budget = min(q["budget"] or cfg.limits.budget_usd, p["budget_usd"] - ps.spent(pid))
                             ms = ps.milestones(pid)[p["current_milestone"]]
-                            if budget <= 0 or ps.spent(pid, p["current_milestone"]) + budget > ms["estimate_usd"] * cfg.projects.escalate_budget_factor:
+                            if budget <= 0 or ps.spent(pid, p["current_milestone"]) + budget > milestone_limit(cfg, p, ms):
                                 stop(ps, p, "The held PR needs a fix-up, but its budget needs review first.", {"pr": run["pr_url"], "reason": reason})
                                 return
                             with store.transaction():
@@ -333,6 +464,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                     return
                 store.queue_update(q["id"], project_processed=1, merged_sha=sha)
                 ps.event(pid, "merge" if sha else "spike_finished", {"task": q["id"], "sha": sha})
+                store.kv_set("project_auto_context:" + pid, None)
                 progress = True
             else:
                 store.queue_update(q["id"], project_processed=1)
@@ -343,16 +475,27 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                     allowance = execution_snapshot(store, run["id"])
                     exhausted_recovery = run["stop_kind"] in ("stalled", "lost_worker") and allowance and allowance["recoveries"] >= allowance["max_recoveries"]
                     if run["stop_kind"] in ("cancelled", "allowance_exhausted", "external_uncertain") or exhausted_recovery:
-                        stop(ps, p, "Task execution stopped: review its retained evidence and allowance before continuing.",
+                        from .autonomy import recover_allowance
+                        if recover_allowance(cfg, store, p, q, run):
+                            return
+                        stop(ps, p, f"Task stopped: {q['title']}. {run.get('state_reason') or run['stop_kind']}. Review its recovery options.",
                              {"task": q["project_key"], "run_id": run["id"], "stop_kind": run["stop_kind"], "reason": run.get("state_reason")})
                         return
                 failures = sum(x["project_key"] == q["project_key"] and (x["status"] == "failed" or (x["status"] == "cancelled" and bool(x.get("run_id")))) for x in ps.items(pid))
                 if failures >= cfg.projects.escalate_failures:
+                    from .autonomy import schedule_repair
+                    if schedule_repair(cfg, store, p, "task:" + q["project_key"], "Repeated task failure: revise or split this work using its retained code and test failures. Do not repeat the unchanged attempt."):
+                        if run and run.get("execution_id"):
+                            store.kv_set("project_recovery:" + pid, run["execution_id"])
+                        return
                     stop(ps, p, "The same problem has failed three times. Propose a correction before resuming.", {"task": q["project_key"], "failures": failures})
                     return
                 if failures < cfg.projects.max_task_failures:
+                    from ..postmortem import resumable
+                    seed = run["id"] if run and resumable(store, run["id"]) else q.get("seed_run_id")
                     store._exec("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
-                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + str(q.get("note")), p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=q.get("seed_run_id"), execution_id=(run or {}).get("execution_id"))
+                    diagnosis = str((run or {}).get("state_reason") or q.get("note") or "Inspect the retained run evidence")
+                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + diagnosis, p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=seed, execution_id=(run or {}).get("execution_id"), retry_of=(run or {}).get("id"), max_runtime_s=q.get("max_runtime_s"), max_cycles=q.get("max_cycles"), team=q.get("team"), depends_on=q.get("depends_on") or "[]")
                     from ..runqueue import set_lane_paused
                     set_lane_paused(store, lane(pid), False)
                     return
@@ -366,12 +509,21 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
         if recovery_lineage:
             allowance = store._one("SELECT deadline,budget_usd,spent_usd FROM execution_allowances WHERE id=?", (recovery_lineage,))
             if allowance and (time.time() >= allowance["deadline"] or allowance["spent_usd"] >= allowance["budget_usd"]):
+                from .autonomy import recover_lineage
+                if recover_lineage(cfg, store, p, recovery_lineage):
+                    return
                 stop(ps, p, "The task's shared allowance is exhausted. Review its scope and retained evidence before replanning.",
                      {"execution_id": recovery_lineage})
                 return
         ms = ps.milestones(pid)[p["current_milestone"]]
         mspent = ps.spent(pid, p["current_milestone"])
-        if spent >= p["budget_usd"] or mspent >= ms["estimate_usd"] * cfg.projects.escalate_budget_factor:
+        if cfg.projects.autonomous and mspent >= ms["estimate_usd"] * cfg.projects.escalate_budget_factor and spent < p["budget_usd"]:
+            notice = f"project_estimate_reallocated:{pid}:{p['current_milestone']}:{ms['estimate_usd']}"
+            if not store.kv_get(notice):
+                store.kv_set(notice, "1")
+                ps.event(pid, "budget_reallocated", {"milestone": p["current_milestone"], "estimate_usd": ms["estimate_usd"],
+                                                     "milestone_spent_usd": mspent, "project_remaining_usd": p["budget_usd"] - spent})
+        if spent >= p["budget_usd"] or mspent >= milestone_limit(cfg, p, ms):
             stop(ps, p, "Budget checkpoint: review spend and choose a revised plan before continuing.", {"spent_usd": spent, "milestone_spent_usd": mspent})
             return
         store.kv_set(activity_key, "Preparing the GitHub repository")
@@ -410,6 +562,30 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
         if selected is None:
             return
         action, result, proposal = selected
+        if action.kind == ActionKind.CONTINUE:
+            from .actions import validate_scope
+            from .decisions import queue_manifest
+            from ..runqueue import set_lane_paused
+            with store.transaction():
+                current = ps.get(pid)
+                rows = ps.items(pid)
+                if current["status"] != "running" or current["spec"] != p["spec"] or queue_manifest(rows) != result["queue_manifest"]:
+                    return
+                validate_scope(action, current, rows, context["evidence_catalog"], max_runtime_s=cfg.limits.max_runtime_s,
+                               investigation_timeout_s=cfg.projects.investigation_timeout_s)
+                target = next(q for q in rows if q["id"] == action.task_id)
+                reservation = target["budget"] or cfg.limits.budget_usd
+                if ps.spent(pid) + reservation > p["budget_usd"] or ps.spent(pid, p["current_milestone"]) + reservation > milestone_limit(cfg, p, ms):
+                    stop(ps, current, "The next existing task needs a budget review before continuing.", {"task_id": target["id"]})
+                    return
+                ps.update(pid, observed_sha=snapshot["sha"], last_error=None)
+                ps.event(pid, "plan_continued", {"task_id": target["id"], "task": target["project_key"], "reason": action.reason,
+                                               "explanation": result.get("normalization") or "Continuing the existing accepted task; scope, allowance and later tasks are unchanged."})
+                turn.mark("applied", {"result": "Continued the accepted horizon without replacing tasks", "task_id": target["id"],
+                                      "normalization": result.get("normalization")}, connection=store.conn)
+                set_lane_paused(store, lane(pid), False)
+                store.kv_set("project_auto_context:" + pid, None)
+            return
         from ..execution import ensure_allowance
         for task in action.tasks:
             for target_id in task.replaces:
@@ -435,7 +611,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
             return  # A pause, cancellation or human spec revision supersedes an in-flight proposal.
         spent = ps.spent(pid)
         mspent = ps.spent(pid, p["current_milestone"])
-        if spent >= p["budget_usd"] or mspent >= ms["estimate_usd"] * cfg.projects.escalate_budget_factor:
+        if spent >= p["budget_usd"] or mspent >= milestone_limit(cfg, p, ms):
             stop(ps, p, "Lead planning reached the budget checkpoint. Review its spend before scheduling more work.", {"spent_usd": spent})
             return
         pending = {q["project_key"]: q for q in ps.items(pid) if q["status"] in ("queued", "tentative")}
@@ -457,9 +633,11 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
         turn.mark("executing", {"repository_sha": snapshot["sha"]})
         await asyncio.to_thread(repo.write_spec, p, proposal, snapshot)
         snapshot = await asyncio.to_thread(repo.snapshot)
-        if ps.get(pid)["status"] != "running":
-            return
-        ps.update(pid, spec=proposal, observed_sha=snapshot["sha"], last_error=None, previous_spec=None)
+        with store.transaction():
+            latest = ps.get(pid)
+            if latest["status"] != "running" or latest["spec"] != p["spec"]:
+                return
+            ps.update(pid, spec=proposal, observed_sha=snapshot["sha"], last_error=None, previous_spec=None)
         p = ps.get(pid)
         if result["action"] == "escalate":
             stop(ps, p, result["proposal"], result, turn=turn, decision_status="applied",
@@ -468,17 +646,20 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
         if result["action"] == "checkpoint":
             if not any(q["merged_sha"] and q["milestone"] == p["current_milestone"] for q in ps.items(pid)):
                 raise ProjectError("A milestone cannot finish without merged work")
-            checkpoint(store, p, result["reason"])
-            turn.mark("applied", {"result": "Milestone checks evaluated; human checkpoint retained"})
+            checkpoint(store, p, result["reason"], config=cfg)
+            turn.mark("applied", {"result": "Milestone checks evaluated", "status": ps.get(pid)["status"]})
             return
         ready = [t for t in result["tasks"] if t.get("ready")]
         next_budget = ready[0]["budget_usd"]
-        if spent + next_budget > p["budget_usd"] or mspent + next_budget > ms["estimate_usd"] * cfg.projects.escalate_budget_factor:
+        if spent + next_budget > p["budget_usd"] or mspent + next_budget > milestone_limit(cfg, p, ms):
             stop(ps, p, "The next task would exceed the approved project or milestone budget. Review its scope or budget.", {"next_task_budget": next_budget, "spent": spent})
             return
         # Retain completed/failed history; replace only the pending horizon, atomically.
         from ..runqueue import set_lane_paused
         with store.transaction():
+            latest = ps.get(pid)
+            if latest["status"] != "running" or latest["spec"] != proposal:
+                return
             store.conn.execute("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
             pos = store.conn.execute("SELECT COALESCE(MAX(position),0) FROM queue_items").fetchone()[0]
             for i, t in enumerate(result["tasks"]):
@@ -488,14 +669,28 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                 store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts,execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                    (pos + i + 1, t["title"], body, p["repo"], time.time(), status, lane(pid), 0, "yes", pid, p["current_milestone"], key, t["budget_usd"], "single" if t["kind"] == "spike" else "reviewed" if action.kind == ActionKind.REVIEW else "swarm", 0, recovery_lineage))
                 qid = store.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                if recovery_lineage and t.get("ready") and t["kind"] == "build":
+                    from ..postmortem import resumable
+                    candidates = store._all("SELECT q.run_id FROM queue_items q JOIN runs r ON r.id=q.run_id WHERE q.project_id=? "
+                                            "AND q.milestone=? AND q.project_key=? AND r.execution_id=? AND q.status='failed' ORDER BY q.id DESC",
+                                            (pid, p["current_milestone"], key, recovery_lineage))
+                    seed = next((old["run_id"] for old in candidates if resumable(store, old["run_id"])), None)
+                    if seed:
+                        store.conn.execute("UPDATE queue_items SET seed_run_id=?,retry_of=? WHERE id=?", (seed, seed, qid))
                 runtime = t.get("max_runtime_s") or (min(cfg.projects.investigation_timeout_s, cfg.limits.max_runtime_s) if t["kind"] == "spike" else cfg.limits.max_runtime_s)
                 store.conn.execute("UPDATE queue_items SET depends_on=?,project_action=?,max_runtime_s=? WHERE id=?",
                                    (json.dumps(t.get("depends_on", [])), action.kind.value, runtime, qid))
             store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, time.time(), "replan", json.dumps({"sha": snapshot["sha"], "reason": result["reason"], "tasks": result["tasks"], "changed_keys": changed})))
             turn.mark("applied", {"result": "Scheduled approved tasks in the existing project lane", "task_keys": [t["key"] for t in result["tasks"]]}, connection=store.conn)
             set_lane_paused(store, lane(pid), False)
+            store.kv_set("project_recovery:" + pid, None)
+            store.kv_set("project_auto_context:" + pid, None)
     finally:
-        store.kv_set(activity_key, None)
+        from .autonomy import instructions
+        recovery = instructions(store, pid) if cfg.projects.autonomous else {}
+        descriptions = {"planning": "Repairing the project plan", "task_repair": "Replanning failed work", "milestone_verification": "Checking missing milestone evidence", "environment": "Waiting to recheck the worker environment", "clarification": "Trying an alternative before asking you"}
+        activity = "Recovering automatically: " + descriptions.get(recovery.get("problem"), "trying a revised approach") if recovery and ps.get(pid)["status"] == "running" else None
+        store.kv_set(activity_key, activity)
         if own:
             repo.close()
 
@@ -521,10 +716,14 @@ async def tick(cfg, store, **kw):
     slots = asyncio.Semaphore(max(1, cfg.limits.max_parallel_queues))
 
     async def one(p):
-        if p["status"] != "running":
-            return
         try:
             async with slots:
+                from .autonomy import remember_policy, recover_waiting, recover_environment
+                remember_policy(cfg, store, p["id"])
+                if p["status"] != "running":
+                    if not recover_waiting(cfg, store, p):
+                        return
+                recover_environment(cfg, store, Projects(store).get(p["id"]))
                 await advance(cfg, store, p["id"], **kw)
         except Exception as e:  # One project must never stop the worker or another lane.
             ps = Projects(store)

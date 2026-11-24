@@ -31,10 +31,12 @@ test('the React shell exposes core journeys through accessible links',()=>{
   assert.ok(!html.includes('<iframe'));
 });
 
-test('new task starts with spending disabled and a requirements form',()=>{
+test('new task explains that its single explicit submission approves the displayed allowance',()=>{
   const html=renderToStaticMarkup(createElement(NewTask,{session,navigate(){}}));
   assert.match(html,/Requirements and acceptance criteria/);
-  assert.match(html,/disabled=""[^>]*>Add to queue/);
+  assert.match(html,/Approve allowance &amp; add to queue/);
+  assert.ok(!html.includes('type="checkbox"'));
+  assert.match(html,/Adding this task approves its displayed allowance/);
   assert.match(html,/publishing still asks for your approval/i);
 });
 
@@ -46,11 +48,78 @@ test('project planning saves a draft and offers no implicit launch',()=>{
   assert.ok(!html.includes('Approve displayed spec and launch'));
 });
 
+test('new projects begin with a conversation instead of a requirements form',async()=>{
+  const {ProjectsPage}=await import(pathToFileURL(join(output,'Projects.js')));
+  const html=renderToStaticMarkup(createElement(ProjectsPage,{session,selected:'',navigate(){}}));
+  assert.match(html,/Start with a conversation/);
+  assert.match(html,/>New project</);
+  assert.ok(!html.includes('Milestone 3'));
+  assert.ok(!html.includes('Total API allowance'));
+  assert.ok(!html.includes('Approve and launch'));
+});
+
+test('removed plans and cancelled attempts do not masquerade as failed builds or active work',async()=>{
+  const {projectTaskCounts}=await import(pathToFileURL(join(output,'Projects.js')));
+  assert.deepEqual(projectTaskCounts([{status:'done'},{status:'cancelled'},{status:'cancelled',run_id:'old'},
+    {status:'queued'},{status:'tentative'},{status:'failed'},{status:'skipped'}]),{done:1,failed:1,active:2});
+});
+
+test('kickoff questions render as a form with optional answers and visible proposal defaults',async()=>{
+  const {ProjectQuestions}=await import(pathToFileURL(join(output,'Projects.js')));
+  const question={id:10,actions:{project_questions:[
+    {id:'goal',label:'What would you like to build?',kind:'textarea',required:true},
+    {id:'sharing',label:'Who can see a garden?',kind:'select',required:false,options:['Only me','Invited gardeners']},
+    {id:'users',label:'Who is it for?',kind:'text',required:false}],kickoff_defaults:{repo_owner:'bigdan88',budget_usd:30}}};
+  const html=renderToStaticMarkup(createElement(ProjectQuestions,{id:'p1',session,spec:'abc',question,onDone(){}}));
+  assert.match(html,/<form/);assert.match(html,/<textarea required=""/);
+  assert.match(html,/<select/);assert.match(html,/<input maxLength="4000"/);
+  assert.match(html,/Only me/);assert.match(html,/Let the lead decide/);assert.match(html,/Optional/);
+  assert.match(html,/bigdan88\/project-name/);assert.match(html,/\$30\.00/);
+  assert.match(html,/Draft my project/);assert.match(html,/Nothing launches until you approve/);
+  assert.ok(!html.includes('ask_before'));assert.ok(!html.includes('Approve and launch'));
+});
+
+test('chat renders retained suggestions with review controls and remembers launched tasks',async()=>{
+  const {SuggestedTasks,ChatPage}=await import(pathToFileURL(join(output,'Chat.js')));
+  const message={id:42,actions:{tasks:[{title:'Export inventory',description:'Acceptance: CSV matches the list',repo:'owner/app'}]}};
+  const html=renderToStaticMarkup(createElement(SuggestedTasks,{message,session,onDone(){}}));
+  assert.match(html,/Export inventory/);assert.match(html,/Review and launch task/);
+  assert.ok(!html.includes('>Launch task<'),'a suggestion must be reviewed before launch');
+  const launched=renderToStaticMarkup(createElement(SuggestedTasks,{message:{...message,launched_tasks:{'0':'task-1'}},session,onDone(){}}));
+  assert.match(launched,/Task queued/);assert.match(launched,/page=work&amp;item=task-1/);
+  assert.ok(!launched.includes('Review and launch task'));
+  const page=renderToStaticMarkup(createElement(ChatPage,{session,selected:'',navigate(){}}));
+  assert.match(page,/Start a project/);
+});
+
 test('workspace responses reject incompatible settings and list payloads',()=>{
   assert.equal(parseSession(session).models_enabled,true);
   assert.throws(()=>parseSession({...session,settings:{...session.settings,roles:[{role:'planner'}]}}),/incompatible/);
   assert.throws(()=>collection({items:[null],total:1}),/incompatible/);
   assert.throws(()=>collection({items:[],total:-1}),/incompatible/);
+});
+
+test('milestone decision names unverified checks and distinguishes repair from explicit acceptance',async()=>{
+  const {ProjectDecision}=await import(pathToFileURL(join(output,'ProjectDecision.js')));
+  const html=renderToStaticMarkup(createElement(ProjectDecision,{id:'p1',session,spec:'abc',project:{budget_usd:50,spent_usd:1},nextMilestone:'Ingest',onDone(){},onAmend(){},navigate(){},
+    recovery:{decision_token:'current',can_amend:true,decision:{kind:'checkpoint',title:'Review milestone 1',summary:'This is a checkpoint, not a task crash.',lead_summary:'Docs merged; owner hardware is unavailable.',
+      checks:[{text:'A real recording plays correctly',status:'needs you',explanation:'No automated evidence is linked.'}]}}}));
+  assert.match(html,/A real recording plays correctly/);
+  assert.match(html,/Verify &amp; fix automatically/);assert.match(html,/I verified these checks — accept milestone/);
+  assert.match(html,/you personally verified the 1 unverified check/);assert.match(html,/Ingest/);
+  assert.match(html,/keeps this milestone open/);assert.ok(!html.includes('type="checkbox"'));
+  assert.ok(!html.includes('>Submit checkpoint reply<'));
+});
+
+test('task recovery shows retained test progress and a precise bounded extension approval',async()=>{
+  const {ProjectDecision}=await import(pathToFileURL(join(output,'ProjectDecision.js')));
+  const html=renderToStaticMarkup(createElement(ProjectDecision,{id:'p1',session,spec:'abc',project:{budget_usd:20,spent_usd:7},nextMilestone:'',onDone(){},onAmend(){},navigate(){},
+    recovery:{decision_token:'current',can_extend_task:true,decision:{kind:'task',title:'The task reached its spending or time limit',passed_checks:9,task:{id:95,title:'Polish CSS'},allowance:{budget_usd:1,spent_usd:.73},
+      checks:[{text:'Browser observation',status:'unverified',explanation:'no tests mapped'}]}}}));
+  assert.match(html,/9 acceptance checks passed/);assert.match(html,/Polish CSS/);assert.match(html,/Browser observation/);
+  assert.match(html,/Approve \$1.00 more &amp; repair automatically/);assert.match(html,/project cap stays \$20.00/);
+  assert.match(html,/Existing costs and evidence stay recorded/);assert.ok(!html.includes('type="checkbox"'));
+  assert.ok(!html.includes('Send correction &amp; continue'));
 });
 
 test('each workspace route renders without a DOM or automatic network/model calls',async()=>{
@@ -76,16 +145,111 @@ test('chat reply status helpers report the newest request and readable elapsed t
   assert.equal(elapsed(200,null,100),'0s');
 });
 
+test('a stale Python server explains how to recover an unsupported action',async()=>{
+  const api=await import(pathToFileURL(join(output,'api.js')));
+  api.bindWorkspace({...session,workspace_id:'ws-test',instance_id:'i1'});
+  globalThis.fetch=async url=>url==='/api/v1/session'?{ok:true,status:200,json:async()=>({...session,workspace_id:'ws-test'})}:{ok:false,status:422,json:async()=>({detail:[{type:'literal_error',loc:['body','operation']}]})};
+  try{await assert.rejects(api.performAction('start_project','',{},'unsupported-0000001'),/Restart the Python dashboard server/);}
+  finally{globalThis.fetch=()=>{throw new Error('Rendering must not call a model or service');};}
+});
+
 test('chat markdown renders structure but never raw HTML or script links',async()=>{
   const {Markdown}=await import(pathToFileURL(join(output,'Messages.js')));
   const html=renderToStaticMarkup(createElement(Markdown,{text:'**Bold** and `code`\n\n- one\n- two\n\n1. first\n\n```\nx<y\n```\n<img src=x onerror=alert(1)> [ok](https://example.com) [bad](javascript:alert(1))'}));
   assert.match(html,/<strong>Bold<\/strong>/);assert.match(html,/<code>code<\/code>/);
   assert.match(html,/<ul><li>one<\/li><li>two<\/li><\/ul>/);assert.match(html,/<ol><li>first<\/li><\/ol>/);
-  assert.match(html,/<pre class="md-code"><code>x&lt;y<\/code><\/pre>/);
+  assert.match(html,/<pre class="md-code"><code[^>]*>x&lt;y<\/code><\/pre>/);
   assert.ok(!html.includes('<img'),'raw HTML must be escaped');assert.match(html,/&lt;img/);
   assert.match(html,/href="https:\/\/example.com"/);assert.ok(!html.includes('javascript:alert(1)"'),'script links must not become hrefs');
 });
 
+test('chat messages expose copyable code, files, tables, images and user alignment',async()=>{
+  const {ChatMessage,Markdown,MessageFiles,safeLink,downloadName}=await import(pathToFileURL(join(output,'Messages.js')));
+  const code=renderToStaticMarkup(createElement(Markdown,{text:'```python\nprint("hello")\n```\n\n```file:notes.csv\nitem,count\nbeans,3\n```\n\n| Item | Count |\n| --- | --- |\n| Beans | 3 |\n\n![Preview](https://example.com/preview.png)'}));
+  assert.match(code,/Copy code/);assert.match(code,/data-language="python"/);assert.match(code,/Download file/);assert.match(code,/notes.csv/);
+  assert.match(code,/<table>/);assert.match(code,/<img[^>]*src="https:\/\/example.com\/preview.png"/);
+  assert.match(code,/referrerPolicy="no-referrer"/);
+  const user=renderToStaticMarkup(createElement(ChatMessage,{message:{role:'user',content:'My request'}}));
+  assert.match(user,/class="message user"/);assert.match(user,/Your message/);assert.match(user,/Copy message/);
+  const assistant=renderToStaticMarkup(createElement(ChatMessage,{message:{role:'assistant',content:'Reply'}}));
+  assert.match(assistant,/class="message assistant"/);assert.match(assistant,/Save as Markdown/);
+  const files=renderToStaticMarkup(createElement(MessageFiles,{conversation:'c1',items:[{id:'a'.repeat(32),name:'result.png',kind:'image',size:2048}]}));
+  assert.match(files,/files\/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);assert.match(files,/inline=true/);assert.match(files,/Download/);
+  assert.equal(safeLink('javascript:alert(1)'), '');assert.equal(safeLink('data:text/html;base64,AA',true),'');
+  assert.equal(safeLink('http://localhost/private.png',true),'');assert.equal(downloadName('../../result.py'),'result.py');
+  const partial=renderToStaticMarkup(createElement(Markdown,{text:'```file:notes.txt\nStill writing'}));
+  assert.ok(!partial.includes('Download file'));assert.match(partial,/Writing file/);
+});
+
+test('copy actions write the exact source text and report unavailable clipboard access',async()=>{
+  const {copyText}=await import(pathToFileURL(join(output,'Messages.js')));
+  const old=Object.getOwnPropertyDescriptor(globalThis,'navigator'),copied=[];
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{clipboard:{writeText:async text=>copied.push(text)}}});
+  try{await copyText('print("hello")\n');assert.deepEqual(copied,['print("hello")\n']);Object.defineProperty(globalThis,'navigator',{configurable:true,value:{}});await assert.rejects(copyText('x'),/Clipboard access is unavailable/);}
+  finally{if(old)Object.defineProperty(globalThis,'navigator',old);else delete globalThis.navigator;}
+});
+
+
+test('work details use accessible tabs and keep controls outside the initial overview',async()=>{
+  const {WorkDetails}=await import(pathToFileURL(join(output,'WorkDetails.js')));
+  const item={id:'task-1',title:'Build a dashboard',repo:'example/app',status:'running',stage:'TESTING',run_id:'r1',
+    reason:'Checking the result',created_at:100,updated_at:120,finished_at:null,pr_url:null};
+  const html=renderToStaticMarkup(createElement(WorkDetails,{item,session,onDone(){},onArchived(){}}));
+  assert.equal((html.match(/role="tab"/g)||[]).length,7);
+  for(const tab of ['Overview','Sequence','Bots','Checks','Files','Activity','Controls'])assert.ok(html.includes(tab),tab);
+  assert.equal((html.match(/aria-selected="true"/g)||[]).length,1);
+  assert.match(html,/role="tabpanel"[^>]*hidden=""/);
+  assert.match(html,/Happening now/);assert.match(html,/Up next/);
+  assert.ok(!html.includes('Recent events'),'the event wall does not render by default');
+  assert.ok(!html.includes('Read retained report'),'files are loaded only on their tab');
+});
+
+test('work overview, sequence and bots use recorded results without implying finished acceptance',async()=>{
+  const {WorkOverview,SequencePanel,BotsPanel}=await import(pathToFileURL(join(output,'WorkDetails.js')));
+  const item={id:'task-1',title:'Build',status:'failed',stage:'FAILED',run_id:'r1',reason:'Layout failed'};
+  const makeTask=(key,state,deps=[])=>({task_key:key,cycle:0,kind:'implement',title:key,state,role:'developer',model:'recorded-model',
+    depends_on:deps,dependencies_complete:true,expected_files:[],started_at:null,ended_at:null,attempts:1,summary:null,error:null,truncated:false});
+  const execution={mode:'swarm',repair_cycle:0,counts:{INTEGRATED:1,BLOCKED:1},tasks:[makeTask('T1','INTEGRATED'),makeTask('T2','BLOCKED',['T1'])],bots:[],phases:[]};
+  const snapshot={execution,allowance:null,costs:null,checks:[{id:1,cycle:0,criterion_id:'C1',status:'failed'}]};
+  const overview=renderToStaticMarkup(createElement(WorkOverview,{item,snapshot,events:[],onTab(){}}));
+  assert.match(overview,/1 \/ 2/);assert.match(overview,/0 \/ 1/);assert.match(overview,/Review the stopping reason/);
+  const sequence=renderToStaticMarkup(createElement(SequencePanel,{item,execution}));
+  assert.match(sequence,/Dependency level 2/);assert.match(sequence,/After/);assert.match(sequence,/Blocked/);assert.match(sequence,/recorded-model/);
+  const bots=renderToStaticMarkup(createElement(BotsPanel,{item,execution}));
+  assert.match(bots,/recorded-model/);assert.ok(!bots.includes('result-tag active'),'a stopped run never shows a bot as working');
+});
+
+test('planning recovery explains rejection and offers an optional clarification without manual-check claims',async()=>{
+  const {ProjectRecovery}=await import(pathToFileURL(join(output,'ProjectRecovery.js')));
+  const props={id:'p1',project:{budget_usd:50,spent_usd:.51},spec:'reviewed',session,onDone(){},onAmend(){},
+    recovery:{can_retry:true,can_amend:true,latest_decision_id:12,attempts:3,rejections:[{id:12,action:'investigate',
+      explanation:'The response used fields in the wrong part of an action.',error:'Unexpected hypothesis',reason:'Research the recorder'}]}};
+  const html=renderToStaticMarkup(createElement(ProjectRecovery,props));
+  assert.match(html,/Retry planning automatically/);assert.match(html,/\$49\.49/);assert.match(html,/Optional clarification/);
+  assert.match(html,/Planning issues/);assert.match(html,/Unexpected hypothesis/);assert.match(html,/Edit approved scope/);
+  assert.ok(!html.includes('I verified any checks'));
+  const uncertain=renderToStaticMarkup(createElement(ProjectRecovery,{...props,recovery:{can_retry:false,rejections:[]}}));
+  assert.ok(!uncertain.includes('Retry planning automatically'));
+});
+
+test('approved scope editor preserves repository and milestone count and requires explicit revised approval',()=>{
+  const initial={name:'Inventory',repo:'owner/inventory',budget_usd:30,repository_kind:'existing',
+    milestones:[0,1,2].map(i=>({name:`M${i}`,goal:'Build',checks:['A','B'],estimate_usd:10,estimate_hours:1}))};
+  const html=renderToStaticMarkup(createElement(ProjectForm,{session,initial,projectId:'amend1',expectedSpec:'reviewed',amending:true,completedMilestones:1,onSaved(){}}));
+  assert.match(html,/Revise the approved specification/);assert.ok(!html.includes('type="checkbox"'));assert.match(html,/Approve revised specification/);
+  assert.match(html,/>Approve revised specification<\/button>/);assert.match(html,/readOnly=""/i);
+  assert.match(html,/<fieldset[^>]*class="milestone-editor"[^>]*disabled=""/);
+  assert.match(html,/The project stays paused|the project stays paused/);assert.ok(!html.includes('Saving creates a draft'));
+});
+
+test('resolved planning failures are history and do not appear to be an active approval request',async()=>{
+  const {ProjectRecovery}=await import(pathToFileURL(join(output,'ProjectRecovery.js')));
+  const html=renderToStaticMarkup(createElement(ProjectRecovery,{id:'p1',project:{budget_usd:20},spec:'abc',session,onDone(){},onAmend(){},
+    recovery:{can_retry:false,attempts:1,rejections:[{id:1,action:'plan',ts:1795381315,resolved:true,resolved_by:2,explanation:'Provisional task ordering was corrected.'}]}}));
+  assert.match(html,/Recovery history/);assert.match(html,/Corrected automatically/);assert.match(html,/corrected by decision #2/);
+  assert.match(html,/do not mean the project is currently blocked/);assert.match(html,/SwarmForge&#x27;s plan validator/);
+  assert.ok(!html.includes('attempts in the current planning round'));assert.ok(!html.includes('Retry planning automatically'));
+});
 
 test('drafts are stored per workspace and a stale tab cannot act on a replacement workspace',async()=>{
   const api=await import(pathToFileURL(join(output,'api.js')));

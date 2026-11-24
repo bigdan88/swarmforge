@@ -231,12 +231,13 @@ class LLMClient:
         self._transport = transport
 
     async def chat(self, role: str, messages: list[dict], *, tools: list[dict] | None = None,
-                   task_key: str | None = None, tool_choice: Any = None) -> ChatResult:
+                   task_key: str | None = None, tool_choice: Any = None, on_delta=None) -> ChatResult:
         from .db import outside_transaction
         from .execution import SharedBudget
         outside_transaction("A model call")
         if not isinstance(self.budget, SharedBudget):
-            return await self._chat(role, messages, tools=tools, task_key=task_key, tool_choice=tool_choice)
+            return await self._chat(role, messages, tools=tools, task_key=task_key, tool_choice=tool_choice,
+                                    **({"on_delta": on_delta} if on_delta else {}))
         rc = self.config.role(role)
         pc = self.config.providers[rc.provider]
         models = {rc.model, *rc.fallback_models, self.model_overrides.get(task_key or "", rc.model)}
@@ -255,7 +256,8 @@ class LLMClient:
                 await asyncio.sleep(0.05)
         try:
             result = await self._chat(role, messages, tools=tools, task_key=task_key,
-                                      tool_choice=tool_choice, reservation=call_id)
+                                      tool_choice=tool_choice, reservation=call_id,
+                                      **({"on_delta": on_delta} if on_delta else {}))
         except NothingBilled:
             # No model produced a completion (never sent, busy or unavailable): release at $0.
             self.budget.settle(call_id, 0.0)
@@ -269,7 +271,7 @@ class LLMClient:
 
     async def _chat(self, role: str, messages: list[dict], *, tools: list[dict] | None = None,
                    reservation: str | None = None,
-                   task_key: str | None = None, tool_choice: Any = None) -> ChatResult:
+                   task_key: str | None = None, tool_choice: Any = None, on_delta=None) -> ChatResult:
         """Call the role's model. Busy/overloaded responses (429/503/529…) are retried patiently
         for up to `limits.busy_wait_s` per model; then the role's `fallback_models` are tried in
         order. Every attempt that fails is recorded; the successful call records the model used.
@@ -293,13 +295,15 @@ class LLMClient:
                 self._event(f"{role}: {models[idx - 1]} unavailable; falling back to {model}", task_key, role)
             try:
                 self.budget.check()
-                return await self._chat_model(role, rc, pc, key, model, messages, tools, tool_choice, task_key, reservation)
+                return await self._chat_model(role, rc, pc, key, model, messages, tools, tool_choice, task_key, reservation,
+                                              **({"on_delta": on_delta} if on_delta else {}))
             except _ModelUnavailable as e:
                 errors.append(f"{model}: {e}")
                 continue
         raise NothingBilled(f"{role} call failed on every configured model: " + " | ".join(errors))
 
-    async def _chat_model(self, role, rc, pc, key, model, messages, tools, tool_choice, task_key, reservation=None) -> ChatResult:
+    async def _chat_model(self, role, rc, pc, key, model, messages, tools, tool_choice, task_key, reservation=None, on_delta=None) -> ChatResult:
+        from .streaming import StreamInterrupted, completion_request
         vision = model_supports_vision(model, self.config.vision_models)
         msgs, stripped = normalize_messages(messages, vision)
         if stripped:
@@ -334,7 +338,21 @@ class LLMClient:
             while True:
                 self.budget.check()
                 try:
-                    r = await client.post(url, headers=headers, json=body)
+                    r = await completion_request(client, url, headers, body, on_delta)
+                except StreamInterrupted as exc:
+                    prices = await self.prices.get(pc, rc, model)
+                    raw_usage = exc.data.get("usage")
+                    if not raw_usage and prices:
+                        # A lost stream may still be billed. Keep a conservative estimate,
+                        # including the model's maximum output, rather than refunding the call.
+                        raw_usage = {"prompt_tokens": len(json.dumps([msgs, tools]).encode("utf-8")),
+                                     "completion_tokens": rc.max_output_tokens}
+                    usage = parse_usage(raw_usage, prices)
+                    self.budget.add(usage)
+                    self._record(role, model, pc, task_key, started, usage, "error", str(exc),
+                                 reservation=reservation if usage.cost_usd is not None else None, force=True)
+                    # Never retry or switch models after a stream may have generated billed output.
+                    raise LLMError(str(exc)) from exc
                 except (httpx.TimeoutException, httpx.TransportError) as e:
                     last_err = f"{type(e).__name__}: {e}"
                     if reservation and not isinstance(e, _NOT_SENT):
@@ -405,10 +423,10 @@ class LLMClient:
             except Exception:
                 pass
 
-    def _record(self, role, model, pc, task_key, started, usage: Usage, status, error, reservation=None):
+    def _record(self, role, model, pc, task_key, started, usage: Usage, status, error, reservation=None, force=False):
         if not self.store or not self.run_id:
             return
-        if status != "ok" and not self.record_errors:
+        if status != "ok" and not self.record_errors and not force:
             # Failed calls are still visible as events, but don't count toward
             # cost summaries (used by per-conversation chat attribution).
             self._event(f"llm call failed ({status}): {error}", task_key, role, level="error")
@@ -417,7 +435,7 @@ class LLMClient:
             started_at=started, ended_at=time.time(), prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens, total_tokens=usage.total_tokens,
             cached_tokens=usage.cached_tokens, cost_usd=usage.cost_usd,
-            cost_source=usage.cost_source if status == "ok" else "unavailable",
+            cost_source=usage.cost_source if usage.cost_usd is not None else "unavailable",
             status=status, error=error,
         )
         if reservation:

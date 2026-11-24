@@ -305,6 +305,7 @@ class Store:
         ("queue_items", "heal_attempts", "INTEGER"),
         ("runs", "archived", "INTEGER NOT NULL DEFAULT 0"),
         ("chat_messages", "tool_calls", "TEXT"),
+        ("chat_messages", "actions", "TEXT"),
         ("queue_items", "team", "TEXT"),
         ("projects", "team", "TEXT"),
     ]
@@ -743,9 +744,12 @@ class Store:
             self._exec("DELETE FROM chat_messages WHERE conversation_id = ?", (conv_id,))
             self._exec("DELETE FROM conversations WHERE id = ?", (conv_id,))
 
-    def conversation_append(self, conv_id: str, role: str, content: str) -> int:
+    def conversation_append(self, conv_id: str, role: str, content: str, *, actions: dict | None = None) -> int:
         with self.transaction():
-            return self._conversation_append(conv_id, role, content)
+            message_id = self._conversation_append(conv_id, role, content)
+            if actions is not None:
+                self._exec("UPDATE chat_messages SET actions=? WHERE id=?", (json.dumps(actions), message_id))
+            return message_id
 
     def _conversation_append(self, conv_id: str, role: str, content: str) -> int:
         self.conversation_create(conv_id)
