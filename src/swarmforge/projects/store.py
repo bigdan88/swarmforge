@@ -25,19 +25,28 @@ class Projects:
     def create(self, name="New project", *, repo="", greeting=None):
         pid = uuid.uuid4().hex[:12]
         cid = "project-" + pid
-        self.store.conversation_create(cid, name)
-        self.store._exec("INSERT INTO projects (id,name,repo,conversation_id,budget_usd,created_at,spec,definition) VALUES (?,?,?,?,?,?,?,?)",
-                         (pid, name, repo, cid, 0, time.time(), "", "{}"))
-        self.store.conversation_append(cid, "assistant", greeting or "Who is this app for, and what are the 3–5 things they must be able to do? We will turn those into milestones, then agree on scope, constraints, budget and done-when checks before launch.")
+        with self.store.transaction():  # project, its conversation and the greeting exist together or not at all
+            self.store.conversation_create(cid, name)
+            self.store._exec("INSERT INTO projects (id,name,repo,conversation_id,budget_usd,created_at,spec,definition) VALUES (?,?,?,?,?,?,?,?)",
+                             (pid, name, repo, cid, 0, time.time(), "", "{}"))
+            self._greet(cid, greeting)
         return self.get(pid)
 
-    def draft(self, pid, definition):
-        p = self.get(pid)
-        if p["status"] != "drafting":
-            raise ProjectError("Only a draft can be edited before launch")
+    def _greet(self, cid, greeting):
+        self.store.conversation_append(cid, "assistant", greeting or "Who is this app for, and what are the 3–5 things they must be able to do? We will turn those into milestones, then agree on scope, constraints, budget and done-when checks before launch.")
+
+    def draft(self, pid, definition, *, expected_spec=None):
         d = validate(definition)
-        self.store._exec("UPDATE projects SET name=?,repo=?,budget_usd=?,spec=?,definition=? WHERE id=? AND status='drafting'",
-                         (d["name"], d["repo"].lower(), d["budget_usd"], render(d), json.dumps(d), pid))
+        with self.store.transaction():
+            p = self.get(pid)
+            if p["status"] != "drafting":
+                raise ProjectError("Only a draft can be edited before launch")
+            if expected_spec is not None:
+                import hashlib
+                if expected_spec != hashlib.sha256(p["spec"].encode()).hexdigest():
+                    raise ProjectError("The spec changed. Reload and review before saving.")
+            self.store.conn.execute("UPDATE projects SET name=?,repo=?,budget_usd=?,spec=?,definition=? WHERE id=? AND status='drafting'",
+                                    (d["name"], d["repo"].lower(), d["budget_usd"], render(d), json.dumps(d), pid))
 
     def items(self, pid):
         return self.store._all("SELECT * FROM queue_items WHERE project_id=? ORDER BY position", (pid,))
@@ -50,6 +59,13 @@ class Projects:
 
     def events(self, pid):
         return self.store._all("SELECT * FROM project_events WHERE project_id=? ORDER BY id", (pid,))
+
+    def decisions(self, pid, limit=30):
+        rows = self.store._all("SELECT * FROM project_decisions WHERE project_id=? ORDER BY id DESC LIMIT ?", (pid, min(100, max(1, limit))))
+        for row in rows:
+            for key in ("proposal", "evidence", "result"):
+                row[key] = json.loads(row[key]) if row[key] else None
+        return rows
 
     def update(self, pid, **kw):
         allowed = {"status", "spec", "observed_sha", "current_milestone", "last_error", "approved_at", "previous_spec"}
@@ -67,6 +83,12 @@ class Projects:
             while r and r.get("heal_of") and r["heal_of"] not in run_ids:
                 run_ids.add(r["heal_of"])
                 r = self.store.get_run(r["heal_of"])
+        # Lost-worker continuations and held-PR replacements share a durable task
+        # allowance even when the queue row now points only at the newest attempt.
+        for rid in list(run_ids):
+            run = self.store.get_run(rid)
+            if run and run.get("execution_id"):
+                run_ids.update(r["id"] for r in self.store._all("SELECT id FROM runs WHERE execution_id=?", (run["execution_id"],)))
         if milestone is None:
             lead = self.store.cost_summary("project:" + pid)["total"]
         else:

@@ -1,5 +1,7 @@
 .env
 swarmforge.yaml
+swarmforge.yaml.bak
+swarmforge.yaml.before-*
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -8,6 +10,9 @@ __pycache__/
 build/
 dist/
 .swarmforge/
+.sfstage/
+frontend/node_modules/
+src/swarmforge/resources/web/
 knowledge/
 _to_delete/
 *.tar.gz

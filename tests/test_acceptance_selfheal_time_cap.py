@@ -27,6 +27,7 @@ from swarmforge.db import Store
 from swarmforge.postmortem import escalate, heal
 
 from .conftest import ROOT, base_raw
+from .test_selfheal_time import _deadline_extended
 
 
 def _failed_run(
@@ -80,8 +81,9 @@ async def test_ac1_heal_blocks_when_chain_elapsed_leaves_under_600s(cfg):
 async def test_ac2_escalate_time_cap_clamps_roles_and_model_unavailable_path(cfg):
     cfg.limits.max_runtime_s = 3600
     base_role_timeout = cfg.roles["planner"].timeout_s  # 900 by default
-    # escalated (no cap): 3600 * 1.5 = 5400; role 900 * 1.5 = 1350
-    assert escalate(cfg, 1).limits.max_runtime_s == 5400
+    # no cap: the run keeps the task's original 3600 s (retries share its deadline, docs/EXECUTION.md);
+    # role timeouts still escalate: 900 * 1.5 = 1350
+    assert escalate(cfg, 1).limits.max_runtime_s == 3600
     assert escalate(cfg, 1).roles["planner"].timeout_s == int(base_role_timeout * 1.5)
     # with time_cap below the escalated values, both are clamped below them
     c = escalate(cfg, 1, time_cap=1000)
@@ -147,6 +149,7 @@ async def test_ac4_clamp_visible_in_echo_line_and_selfheal_event(cfg):
     _failed_run(
         store, "r-a4", started_s_ago=10100, ended_s_ago=100
     )  # elapsed 10000 -> 800 left
+    _deadline_extended(store, cfg, "r-a4")
 
     async def launch(c, seed, ctx, heal_of, attempt):
         store.create_run(

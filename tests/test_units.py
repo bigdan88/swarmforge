@@ -374,7 +374,7 @@ def test_postmortem_classify_parse_and_escalate(cfg):
     cfg.limits.max_runtime_s, cfg.limits.budget_usd, cfg.limits.max_repair_cycles = 3600, 4.0, 2
     steps = cfg.roles["planner"].max_steps
     e2 = escalate(cfg, 2, budget_cap=7.0)
-    assert e2.limits.max_runtime_s == int(3600 * 2.25) and e2.limits.budget_usd == 7.0
+    assert e2.limits.max_runtime_s == 3600 and e2.limits.budget_usd == 4.0
     assert e2.limits.max_repair_cycles == 4 and e2.roles["planner"].max_steps == int(steps * 2.25)
     assert cfg.limits.max_repair_cycles == 2  # original untouched
 

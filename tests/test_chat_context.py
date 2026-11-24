@@ -11,6 +11,12 @@ from swarmforge.db import Store
 from .conftest import FakeProvider
 
 
+def _replies(fake):
+    """Model requests that produce chat replies (conversation-title requests left out)."""
+    from swarmforge.chatbot import TITLE_PROMPT
+    return [r for r in fake.requests if r["messages"][0]["content"] != TITLE_PROMPT]
+
+
 @pytest.fixture
 def st_(cfg):
     return Store(cfg.db_path)
@@ -32,23 +38,23 @@ def test_two_conversations_have_disjoint_contexts(cfg, st_):
     chatbot.ask(cfg, st_, "what about bravo?", conversation="B", transport=fake.transport)
     chatbot.ask(cfg, st_, "and alpha again?", conversation="A", transport=fake.transport)
 
-    a = _thread_messages(fake.requests[2])
-    b = _thread_messages(fake.requests[1])
+    a = _thread_messages(_replies(fake)[2])
+    b = _thread_messages(_replies(fake)[1])
     assert [m["content"] for m in a] == ["what about alpha?", "ok", "and alpha again?"]
     assert [m["content"] for m in b] == ["what about bravo?"]
     # no leak across threads
     assert all("bravo" not in m["content"] for m in a)
     assert all("alpha" not in m["content"] for m in b)
     # the snapshot system prompt is always present
-    assert fake.requests[2]["messages"][0]["role"] == "system"
-    assert "<status>" in fake.requests[2]["messages"][0]["content"]
+    assert _replies(fake)[2]["messages"][0]["role"] == "system"
+    assert "<status>" in _replies(fake)[2]["messages"][0]["content"]
 
 
 def test_history_argument_is_ignored_when_conversation_given(cfg, st_):
     fake = _fake()
     chatbot.ask(cfg, st_, "question one", history=[{"role": "user", "content": "stale history"}],
                 conversation="C", transport=fake.transport)
-    thread = _thread_messages(fake.requests[0])
+    thread = _thread_messages(_replies(fake)[0])
     assert [m["content"] for m in thread] == ["question one"]
 
 
@@ -107,12 +113,12 @@ def test_long_thread_truncated_in_request(cfg, st_):
         st_.conversation_append("L", "assistant", f"seed answer {i}")
     fake = _fake()
     chatbot.ask(cfg, st_, "the newest question", conversation="L", transport=fake.transport)
-    msgs = fake.requests[0]["messages"]
-    thread = _thread_messages(fake.requests[0])
+    msgs = _replies(fake)[-1]["messages"]  # the first request summarizes the 3 older messages
+    thread = _thread_messages(_replies(fake)[-1])
     # 6 seeds + the new question = 7 stored messages -> exactly the newest 4 are sent
     assert [m["content"] for m in thread] == [
         "seed answer 1", "seed question 2", "seed answer 2", "the newest question"]
-    assert len(msgs) == len(thread) + 1  # + system snapshot
+    assert len(msgs) == len(thread) + 2  # + system snapshot + summary of the older messages
 
 
 # ------------------------------------------------------ cost attribution (AC3)

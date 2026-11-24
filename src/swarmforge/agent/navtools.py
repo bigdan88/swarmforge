@@ -189,6 +189,38 @@ def _outline_py(tree: ast.Module, lines: list[str]) -> None:
                     lines.append(f"  {prefix} {sub.name}({_format_args(sub)}) [L{sub.lineno}]")
 
 
+# Line-based outlines for languages without a parser here: good enough to show an agent where the
+# definitions are (and on which line) without reading the whole file.
+_JS = [re.compile(p) for p in (
+    r"^\s*(export\s+)?(default\s+)?(async\s+)?function\*?\s+[\w$]+",
+    r"^\s*(export\s+)?(default\s+)?(abstract\s+)?class\s+[\w$]+",
+    r"^\s*(export\s+)?(declare\s+)?(interface|type|enum|namespace)\s+[\w$]+",
+    r"^(export\s+)?(const|let|var)\s+[\w$]+\s*(:[^=]+)?=\s*(async\s*)?(\(|function\b|[\w$]+\s*=>|<)",
+    r"^\s{2,}(?:(?:public|private|protected|static|readonly|async|override|get|set)\s+)*[\w$#]+\s*(<[^>]*>)?\([^)]*\)\s*(:\s*[^{;]+)?\{\s*$",
+)]
+_JVM = [re.compile(p) for p in (
+    r"^\s*(?:(?:public|private|protected|internal|abstract|final|sealed|static|data|open|partial)\s+)*"
+    r"(class|interface|enum|record|object|struct|trait)\s+\w+",
+    r"^\s*(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|async|suspend|open|inline)\s+)+"
+    r"[\w<>\[\],.? ]*\b\w+\s*\([^;]*$",
+    r"^\s*(?:(?:public|private|protected|internal|override|suspend|open|inline)\s+)*fun\s+",
+)]
+_OUTLINE_PATTERNS = {
+    **dict.fromkeys((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte"), _JS),
+    ".go": [re.compile(r"^func\s"), re.compile(r"^type\s+\w+")],
+    ".rs": [re.compile(r"^\s*(pub(\([^)]*\))?\s+)?(async\s+|unsafe\s+|const\s+)*(fn|struct|enum|trait|mod|type)\s+\w+"),
+            re.compile(r"^\s*impl\b")],
+    **dict.fromkeys((".java", ".kt", ".kts", ".cs", ".scala"), _JVM),
+    ".rb": [re.compile(r"^\s*(def|class|module)\s+\S+")],
+    ".php": [re.compile(r"^\s*((public|private|protected|static|abstract|final)\s+)*function\s+\w+"),
+             re.compile(r"^\s*(abstract\s+|final\s+)?(class|interface|trait|enum)\s+\w+")],
+    ".swift": [re.compile(r"^\s*((public|private|internal|fileprivate|open|static|final|override|mutating)\s+)*"
+                          r"(func|class|struct|enum|protocol|extension)\s+\w+")],
+    ".sh": [re.compile(r"^\s*(function\s+\w+|\w+\s*\(\)\s*\{)")],
+}
+_OUTLINE_SKIP = re.compile(r"^\s*(//|\*|/\*|#(?!\[)|(if|for|while|switch|catch|return|else|do|try)\b)")
+
+
 async def outline(ctx: ToolContext, path: str) -> str:
     p = ctx.resolve(path, must_exist=True)
     if p.is_dir():
@@ -226,6 +258,15 @@ async def outline(ctx: ToolContext, path: str) -> str:
                 keys.append(m.group(1))
         return _cap(f"{rel} (top-level keys):\n" + ("\n".join(f"  {k}" for k in keys)
                                                     or "  (none found)"))
+    pats = _OUTLINE_PATTERNS.get(suffix)
+    if pats:
+        found = []
+        for i, ln in enumerate(text.splitlines(), 1):
+            if len(ln) > 400 or not ln.strip() or _OUTLINE_SKIP.match(ln):
+                continue
+            if any(p.match(ln) for p in pats):
+                found.append(f"  L{i}: {ln.rstrip().rstrip('{').rstrip()[:160]}")
+        return _cap(f"{rel}:\n" + "\n".join(found) if found else f"{rel}: (no definitions found)")
     head = "\n".join(text.splitlines()[:40])
     return _cap(f"{rel}: no outline for this file type; first 40 lines:\n{head}")
 

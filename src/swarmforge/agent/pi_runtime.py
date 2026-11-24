@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..llm import BudgetExceeded, LLMClient, LLMError
+from ..execution import ExecutionStopped, refresh_changed_files
 from ..sandbox import DEPS_DIR, DockerSandbox, LocalSandbox, _kill_tree, _scrubbed_env
 from .runtime import AgentResult
 from .tools import ToolContext
@@ -40,16 +41,7 @@ SF_TOOLS = ("start_process", "read_process_output", "stop_process", "browse", "c
 
 def _refresh_changed_files(ctx) -> None:
     """Pi edits files itself, so tell check_code/format_code what has changed so far (git status)."""
-    import subprocess
-    try:
-        p = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=str(ctx.workspace),
-                           capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return
-    for ln in p.stdout.splitlines():
-        path = ln[3:].split(" -> ")[-1].strip().strip('"')
-        if path and not path.startswith(".swarmforge/") and (ctx.workspace / path).is_file():
-            ctx.files_written.add(path)
+    refresh_changed_files(ctx)
 
 
 def install_sf(workspace: Path) -> Path:
@@ -82,6 +74,7 @@ class _Agent:
     error: str | None = None
     seen_tool_ids: set = field(default_factory=set)
     ctx: Any = None                     # ToolContext for `sf` tool calls (None: tools not offered)
+    progress_ctx: Any = None            # retained evidence without granting sf tool access
     sf_calls: list = field(default_factory=list)   # [(tool, seconds, ok)]
 
 
@@ -92,6 +85,7 @@ class ModelRelay:
         self.llm, self.host, self.port = llm, host, port
         self.agents: dict[str, _Agent] = {}
         self._server: asyncio.base_events.Server | None = None
+        self._handlers: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         if self._server is None:
@@ -103,11 +97,16 @@ class ModelRelay:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        pending = [task for task in self._handlers if task is not asyncio.current_task()]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     def register(self, role: str, task_key: str, *, max_steps: int, should_cancel=None,
-                 transcript: Path | None = None, on_event=None, ctx=None) -> str:
+                 transcript: Path | None = None, on_event=None, ctx=None, progress_ctx=None) -> str:
         token = "sf-" + uuid.uuid4().hex
-        self.agents[token] = _Agent(role, task_key, max_steps, should_cancel, transcript, on_event, ctx=ctx)
+        self.agents[token] = _Agent(role, task_key, max_steps, should_cancel, transcript, on_event,
+                                    ctx=ctx, progress_ctx=progress_ctx)
         return token
 
     def unregister(self, token: str) -> _Agent | None:
@@ -115,6 +114,9 @@ class ModelRelay:
 
     # ------------------------------------------------------------- http
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task:
+            self._handlers.add(task)
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=60)
             lines = head.decode("latin-1").split("\r\n")
@@ -148,6 +150,8 @@ class ModelRelay:
             except Exception:  # noqa: BLE001
                 pass
         finally:
+            if task:
+                self._handlers.discard(task)
             try:
                 writer.close()
             except Exception:  # noqa: BLE001
@@ -220,6 +224,9 @@ class ModelRelay:
 
     async def _complete(self, agent: _Agent, req: dict) -> dict:
         messages = req.get("messages") or []
+        evidence_ctx = agent.progress_ctx or agent.ctx
+        if evidence_ctx is not None and any(m.get("role") == "tool" and m.get("tool_call_id") not in agent.seen_tool_ids for m in messages):
+            await asyncio.to_thread(_refresh_changed_files, evidence_ctx)
         self._log_tool_results(agent, messages)
         if agent.should_cancel and agent.should_cancel():
             return self._stop(agent, "cancelled", "The run was cancelled. Stop now.")
@@ -235,6 +242,9 @@ class ModelRelay:
         except BudgetExceeded as e:
             agent.error = str(e)
             return self._stop(agent, "budget", "The run's budget is exhausted. Stop now.")
+        except ExecutionStopped as e:
+            agent.error = str(e)
+            return self._stop(agent, "cancelled", str(e))
         except LLMError as e:
             agent.error = str(e)
             return self._stop(agent, "error", f"The model provider failed: {e}. Stop now.")
@@ -252,7 +262,7 @@ class ModelRelay:
         return _response(msg, "tool_calls" if msg.get("tool_calls") else (res.finish_reason or "stop"), u)
 
     def _log_tool_results(self, agent: _Agent, messages: list[dict]) -> None:
-        names = {tc.get("id"): (tc.get("function") or {}).get("name") for m in messages
+        names = {tc.get("id"): (tc.get("function") or {}) for m in messages
                  if m.get("role") == "assistant" for tc in (m.get("tool_calls") or [])}
         for m in messages:
             if m.get("role") == "tool" and m.get("tool_call_id") not in agent.seen_tool_ids:
@@ -260,10 +270,13 @@ class ModelRelay:
                 content = m.get("content")
                 if isinstance(content, list):
                     content = "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
-                self._tx(agent, {"type": "tool", "name": m.get("name") or names.get(m.get("tool_call_id")) or "tool",
-                                 "output": str(content)[:8000]})
+                call = names.get(m.get("tool_call_id")) or {}
+                self._tx(agent, {"type": "tool", "name": m.get("name") or call.get("name") or "tool",
+                                 "args": call.get("arguments", {}), "output": str(content)[:8000]})
 
     def _tx(self, agent: _Agent, obj: dict) -> None:
+        if obj.get("type") == "tool" and agent.on_event:
+            agent.on_event("tool_result", str(obj.get("name", "tool")), obj)
         if agent.transcript:
             with agent.transcript.open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"ts": time.time(), **obj}, ensure_ascii=False, default=str) + "\n")
@@ -288,11 +301,17 @@ def models_json(base_url: str, model_id: str, max_tokens: int) -> dict:
                     "contextWindow": 200000, "maxTokens": max_tokens}]}}}
 
 
-def pi_argv(command: str, model_id: str, thinking: str | None, system: str, prompt: str,
-            extra: list[str] | None = None) -> list[str]:
+def pi_argv_head(command: str, model_id: str, thinking: str | None, extra: list[str] | None = None) -> list[str]:
+    """Pi's command line without the two prompts (those can be far too long for a command line)."""
     argv = [command, "--mode", "json", *SAFE_FLAGS, "--provider", "swarmforge", "--model", model_id]
     if thinking:
         argv += ["--thinking", thinking]
+    return argv + list(extra or [])
+
+
+def pi_argv(command: str, model_id: str, thinking: str | None, system: str, prompt: str,
+            extra: list[str] | None = None) -> list[str]:
+    argv = pi_argv_head(command, model_id, thinking)
     return argv + ["--append-system-prompt", system, *(extra or []), "--", prompt]
 
 
@@ -335,7 +354,8 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
     from .devtools import DockerSession, LocalSession, open_session
     start = time.time()
     token = relay.register(role, task_key, max_steps=max_steps, should_cancel=should_cancel,
-                           transcript=transcript, on_event=on_event, ctx=ctx if sf_tools else None)
+                           transcript=transcript, on_event=on_event, ctx=ctx if sf_tools else None,
+                           progress_ctx=ctx)
     model_id = f"swarmforge-{role}"
     if transcript:
         transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -358,12 +378,20 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
             if setup.exit_code != 0:
                 raise RuntimeError(f"could not prepare Pi in the sandbox: {setup.output[-400:]}")
             rel = f"/workspace/{PI_DIR}/{token}"
-            argv = pi_argv(command, model_id, thinking, system, prompt, extra_args)
+            # The two prompts travel as files and are read inside the container. `docker exec` is started
+            # on the host, and Windows refuses any command line over 32,767 characters with
+            # "WinError 206: The filename or extension is too long" - a long task brief hit that limit.
+            (pidir / f"{token}.system").write_text(system, encoding="utf-8", newline="\n")
+            (pidir / f"{token}.prompt").write_text(prompt, encoding="utf-8", newline="\n")
+            argv = pi_argv_head(command, model_id, thinking, extra_args)
             # files written from Windows may lack the exec bit inside the Linux container: set it here
             script = ('chmod +x /workspace/' + SF_BIN + '/sf 2>/dev/null; export PATH="/workspace/' + SF_BIN
-                      + ':$PATH"; exec timeout -k 10 "$SF_T" "$@" > "$SF_OUT" 2> "$SF_ERR"')
+                      + ':$PATH"; SF_S="$(cat "$SF_SYS")"; SF_P="$(cat "$SF_PROMPT")"; '
+                      'exec timeout -k 10 "$SF_T" "$@" --append-system-prompt "$SF_S" -- "$SF_P" '
+                      '> "$SF_OUT" 2> "$SF_ERR"')
             run = await session.exec_argv(["sh", "-c", script, "sh", *argv], timeout_s=timeout_s + 60, env={
                 "SF_T": str(int(timeout_s)), "SF_OUT": rel + ".jsonl", "SF_ERR": rel + ".err",
+                "SF_SYS": rel + ".system", "SF_PROMPT": rel + ".prompt",
                 "SF_RELAY_TOKEN": token, "HOME": home, "PI_OFFLINE": "1",
                 "SF_TOOLS_URL": f"http://host.docker.internal:{relay.port}"})
             timed_out = run.exit_code == 124 or run.timed_out
@@ -422,6 +450,8 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
             else:
                 result.status, result.value = "completed", value
                 relay._tx(agent, {"type": "terminal", "tool": terminal.name, "value": value})
+    except ExecutionStopped:
+        raise
     except Exception as e:  # noqa: BLE001
         result.status, result.error = "error", f"Pi harness: {type(e).__name__}: {e}"
     finally:
@@ -459,6 +489,10 @@ async def _run_local(argv: list[str], cwd: Path, env: dict, out_file: Path, err_
             except asyncio.TimeoutError:
                 pass
             return True
+        except asyncio.CancelledError:
+            _kill_tree(proc)
+            await proc.wait()
+            raise
 
 
 def resolve_local_command(command: str) -> str:

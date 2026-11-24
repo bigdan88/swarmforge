@@ -24,6 +24,7 @@ def resolve_variant(cfg: Config, store) -> tuple[Config, str | None]:
 def effective_config(cfg: Config) -> dict:
     # Do not serialize providers, headers, environment, extra_body, agent_env or command strings.
     return {
+        "team": cfg.team,
         "active_variant": cfg.active_variant,
         "variant_applied": cfg.variant_applied,
         "roles": {name: {"provider": role.provider, "model": role.model,

@@ -29,4 +29,5 @@ async def test_worker_closes_runs_it_left_behind(cfg, tmp_path):
     assert st.queue_item(item)["status"] == "queued"           # back in line; the dead run is closed
     assert st.queue_item(item)["run_id"] is None
     run = st.get_run("r1")
-    assert run["state"] == "FAILED" and "queue worker stopped" in run["state_reason"]
+    assert run["state"] == "FAILED" and run["stop_kind"] == "lost_worker"
+    assert st.queue_item(item)["execution_id"] == "r1"

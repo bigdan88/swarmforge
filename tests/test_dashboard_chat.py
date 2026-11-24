@@ -36,7 +36,8 @@ def test_chat_page_renders(tmp_path, monkeypatch):
     assert not at.exception, [e.value for e in at.exception]
     assert any(b.key == "nav_chat" for b in at.button)
     _open_chat(at)
-    assert any("Chat: improve SwarmForge and fix failed tasks" in h.value for h in at.header)
+    assert not at.header  # no page header: the transcript gets the height
+    assert any(b.key == "chat_new" for b in at.button) and any(b.key == "chat_project" for b in at.button)
     assert len(at.chat_input) == 1
     assert any(b.key == "chat_reset" for b in at.button)
 

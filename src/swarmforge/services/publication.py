@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from .. import prompts
 from ..config import Config
 from ..db import Store
-from ..github import GitHubClient, GitHubError, Issue
+from ..execution import external_once
+from ..github import GitHubClient, GitHubError, Issue, pr_number_from_url
 from ..llm import LLMClient, LLMError
 from ..report import build_pr_body
 from ..workspace import GitError, GitWorkspace
@@ -74,7 +77,9 @@ class PublicationService:
             if d.merge:
                 if pr.state == "dirty" or pr.mergeable is False:
                     pr = await self._resolve_pr_conflict(gh, repo, pr)
-                info["sha"] = await asyncio.to_thread(am.apply, gh, pr, amc.method)
+                info["sha"] = await external_once(self.store, self.run_id, f"merge:{repo}:{number}",
+                                                  lambda: asyncio.to_thread(am.apply, gh, pr, amc.method),
+                                                  intent={"head_sha": pr.head_sha}, cfg=self.cfg)
                 self.store.record_intervention(self.run_id, am.MERGED, json.dumps(info))
                 self.store.update_run(self.run_id, state_reason=f"draft PR created: {url} · auto-merged")
                 self.log("merge", f"auto-merged {url}: {d.reason}")
@@ -109,8 +114,9 @@ class PublicationService:
         if not old or old == url or "/pull/" not in old:
             return
         try:
-            await asyncio.to_thread(am.close_pr, gh, repo, int(old.rstrip("/").split("/")[-1]),
-                                    f"Superseded by {url} (SwarmForge fix-up).")
+            await external_once(self.store, self.run_id, f"close:{old}",
+                                lambda: asyncio.to_thread(am.close_pr, gh, repo, int(old.rstrip("/").split("/")[-1]),
+                                                          f"Superseded by {url} (SwarmForge fix-up)."), cfg=self.cfg)
             self.store.record_intervention(self.run_id, am.CLOSED, json.dumps({"url": old, "replaced_by": url}))
             self.log("merge", f"closed {old}: replaced by {url}")
         except (GitHubError, ValueError) as e:
@@ -126,6 +132,8 @@ class PublicationService:
             args = dict(title=self.issue.title, body=self.issue.body, repo=info["repo"], url=info["url"],
                         reason=info.get("reason", ""), findings=[f for f in open_findings if f["severity"] != "info"])
             try:
+                if (self.store.get_run(self.run_id) or {}).get("execution_id"):
+                    raise ValueError("Shared task allowance: schedule the replacement in the queue after this attempt releases it")
                 info["fix_run"] = am.start_fix(self.cfg, self.run_id, **args)       # starts right away
                 self.store.record_intervention(self.run_id, am.FIXING, json.dumps(info))
                 self.log("merge", f"not merged ({info.get('reason')}); started fix-up run {info['fix_run']} that "
@@ -145,6 +153,71 @@ class PublicationService:
         self.store.record_intervention(self.run_id, am.HELD, json.dumps(info))
         self.log("merge", f"waiting for you to merge {info['url']}: {info.get('reason')}", level="warn")
 
+
+    async def _attach_evidence(self, gh: GitHubClient, owner: str, name: str, url: str,
+                               original_body: str | None = None) -> None:
+        """Upload the run's dashboard screenshots as PR assets and append them to the draft PR body.
+        Best effort: any problem is logged as a warning and never affects the PR itself."""
+        run = self.store.get_run(self.run_id) or {}
+        branch = run.get("integration_branch") or getattr(self.ws, "integration_branch", None)
+        if not branch:
+            self.log("evidence", "screenshot upload skipped: no integration branch", level="warn")
+            return
+        try:
+            from .. import evidence
+        except Exception as e:  # noqa: BLE001 - evidence support is optional
+            self.log("evidence", f"screenshot upload skipped: {type(e).__name__}: {e}", level="warn")
+            return
+        try:
+            shots = evidence.read_manifest(Path(run.get("run_dir") or ""))
+            if not shots:
+                return
+            if not gh.token:
+                self.log("evidence", "screenshot upload skipped: no GitHub token", level="warn")
+                return
+            number = pr_number_from_url(url)
+            if number is None:
+                self.log("evidence", f"cannot parse a PR number from {url}; skipping screenshots",
+                         level="warn")
+                return
+            lines = []
+            for s in shots:
+                p = Path(s["file"])
+                if not p.is_absolute():
+                    p = Path(run.get("run_dir") or ".") / p
+                if not p.is_file():
+                    continue
+                try:
+                    asset = await asyncio.to_thread(gh.upload_pr_asset, owner, name, branch, p)
+                except Exception as e:  # noqa: BLE001 - one bad asset must not drop the rest
+                    self.log("evidence", f"could not upload {p.name}: {type(e).__name__}: {e}",
+                             level="warn")
+                    continue
+                if not asset:
+                    self.log("evidence", f"upload of {p.name} returned no URL; skipping it", level="warn")
+                    continue
+                lines.append(f"![{s['tab']} — {s['theme']}]({asset})")
+            if not lines:
+                return
+            section = "## 📸 Visual evidence\n\n" + "\n".join(lines)
+            # Patch the PR's *live* body so manual edits made after the PR was
+            # created are preserved; only fall back to a rebuilt body when the
+            # live one cannot be fetched.
+            current = None
+            getter = getattr(gh, "get_pr_body", None)
+            if getter is not None:
+                try:
+                    current = await asyncio.to_thread(getter, owner, name, number)
+                except Exception as e:  # noqa: BLE001 - fall back to the original body
+                    self.log("evidence", f"could not fetch the PR body: {type(e).__name__}: {e}",
+                             level="warn")
+            if not current:
+                current = original_body or build_pr_body(self.store, self.run_id)
+            body = current.rstrip() + "\n\n" + section
+            await asyncio.to_thread(gh.update_pr_body, owner, name, number, body)
+            self.log("evidence", f"attached {len(lines)} dashboard screenshot(s) to {url}")
+        except Exception as e:  # noqa: BLE001 - never let evidence problems break publication
+            self.log("evidence", f"screenshot upload skipped: {type(e).__name__}: {e}", level="warn")
 
     async def publish(self, gh: GitHubClient, owner: str, name: str) -> str | None:
         issue, ws = self.issue, self.ws
@@ -168,13 +241,19 @@ class PublicationService:
                                            f"{'approved' if approved else 'declined'}: {q}")
             if not approved:
                 return None
-        await asyncio.to_thread(self.push, ws.repo, owner, name, ws.integration_branch,
-                                gh.token, ws.base_branch, self.cfg.github.branch_prefix)
+        from ..reconcile import local_head
+        head = local_head(ws.repo, ws.integration_branch)
+        await external_once(self.store, self.run_id, f"push:{full}:{ws.integration_branch}",
+                            lambda: asyncio.to_thread(self.push, ws.repo, owner, name, ws.integration_branch,
+                                                      gh.token, ws.base_branch, self.cfg.github.branch_prefix),
+                            intent={"sha": head}, cfg=self.cfg)
         self.log("pr", f"pushed {ws.integration_branch} to {full}")
         body = build_pr_body(self.store, self.run_id)
         title = f"[SwarmForge] {issue.title}" + (f" (#{issue.number})" if issue.number else "")
-        url = await asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
-                                      ws.base_branch, title, body)
+        url = await external_once(self.store, self.run_id, f"pr:{full}:{ws.integration_branch}",
+                                  lambda: asyncio.to_thread(gh.create_draft_pr, owner, name, ws.integration_branch,
+                                                            ws.base_branch, title, body), cfg=self.cfg)
+        await self._attach_evidence(gh, owner, name, url, original_body=body)
         self.store.update_run(self.run_id, pr_url=url)
         self.log("pr", f"draft pull request: {url}")
         return url

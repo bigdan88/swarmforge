@@ -58,12 +58,21 @@ def _orch(cfg, st, run_id):
     return o
 
 
+def _with_execution(o, cfg, st):
+    """Attach and acquire the shared allowance exactly as Orchestrator.run() does before it waits
+    for the repository; the wait loop checks it so the wall-clock allowance includes queueing."""
+    from swarmforge.execution import Execution, ensure_allowance
+    o.execution = Execution(st, o.run_id, ensure_allowance(st, o.run_id, cfg, None, None))
+    o.execution.acquire(None)
+    return o
+
+
 async def test_run_waits_for_earlier_run_on_same_repo(cfg, tmp_path):
     st = _store(tmp_path)
     st.create_run("first", repo="bigdan88/swarmforge", state="TASK_EXECUTION", pid=os.getpid())
     time.sleep(0.01)
     st.create_run("second", pid=os.getpid())
-    o = _orch(cfg, st, "second")
+    o = _with_execution(_orch(cfg, st, "second"), cfg, st)
     waiter = asyncio.ensure_future(o._wait_for_repo("https://github.com/bigdan88/swarmforge.git", None))
     await asyncio.sleep(0.3)
     assert not waiter.done()

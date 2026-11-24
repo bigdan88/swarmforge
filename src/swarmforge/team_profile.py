@@ -39,5 +39,7 @@ def apply_team_profile(raw: dict, source_path: Path | None) -> dict:
                 raise ConfigError(f"team profile role {name}.{field} has the wrong type")
             if field == "fallback_models" and not all(isinstance(m, str) for m in value):
                 raise ConfigError(f"team profile role {name}.fallback_models must contain model names")
+        if "model" in values and "fallback_models" not in values:
+            values = {**values, "fallback_models": []}   # backups come from the profile's own team only
         result["roles"][name] = {**result["roles"][name], **values}
     return result

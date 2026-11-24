@@ -45,25 +45,20 @@ def render(
 
     page = st.container(key="chat_page")
     with page:
-        st.header("Chat: improve SwarmForge and fix failed tasks")
-        st.caption(
-            "Ask about runs, failures and what to improve. Suggestions come with buttons to launch tasks "
-            'or pick how a failed task should be fixed. CLI: `swarmforge ask "…"`.'
-        )
-        if st.button("Start a project", icon=":material/flag:"):
-            from swarmforge.projects.store import Projects
-
-            st.session_state.project_id = Projects(store).create()["id"]
-            st.session_state.goto = "Projects"
-            st.rerun()
+        # no page header: the sidebar already says where you are, and the transcript needs the height
         active_id = _chat_conv_id()
-        rail, main = page.columns([1, 3.2], gap="large")
+        rail, main = page.columns([1, 3.2], gap="medium")
 
     # ------------------------------------------------ conversation rail (left)
     with rail:
         clicked = _chat_rail(active_id, chatbot)
 
     # rail clicks are handled before the transcript renders; each one reruns
+    if clicked.get("project"):
+        from swarmforge.projects.store import Projects
+        st.session_state.project_id = Projects(store).create()["id"]
+        st.session_state.goto = "Projects"
+        st.rerun()
     if clicked["new"]:
         conv = chatbot.create_conversation(store, "New chat")
         st.session_state.chat_conv_id = conv["id"]
@@ -133,16 +128,18 @@ def render(
             st.session_state.pop("chat_done", None)
             st.session_state["chat_conversation"] = "dash-" + uuid.uuid4().hex[:8]
             _chat_save(actions, active_id)
-        scroll = st.container(
-            key="chat_scroll", height=520
-        )  # the transcript scrolls on its own
+        pending = None
+        scroll = st.container(key="chat_scroll", height=520)   # scrolls on its own; CSS stretches it to fill
         with scroll:
             if not history:
                 with st.container(key="chat_empty"):
                     st.markdown("### What should we look at?")
-                    st.markdown(
-                        "Runs and their statuses, failed tasks, cost and speed, or what to build next."
-                    )
+                    st.markdown("Runs and their statuses, failed tasks, cost and speed, or what to build next.")
+                    with st.container(key="chat_chips", horizontal=True, horizontal_alignment="center", gap="small"):
+                        for key, (label, prompt_text) in zip(("improve", "failures", "slow"), QUICK_PROMPTS.items()):
+                            lab = label + (f" ({len(needs)})" if key == "failures" and needs else "")
+                            if st.button(lab, key="chat_q_" + key):
+                                pending = prompt_text
                 if needs:
                     st.info(
                         f"🩺 {len(needs)} failed task(s) are waiting for your decision. "
@@ -175,45 +172,31 @@ def render(
                     else:
                         st.write(m["content"])
                     _render_chat_attachments(m.get("attachments"))
-            live = (
-                st.container()
-            )  # the new exchange renders here, at the bottom of the transcript
-        pending = None
-        with st.container(
-            key="chat_chips",
-            horizontal=True,
-            horizontal_alignment="center" if not history else "left",
-            gap="small",
-        ):
-            for key, (label, prompt_text) in zip(
-                ("improve", "failures", "slow"), QUICK_PROMPTS.items()
-            ):
-                lab = label + (
-                    f" ({len(needs)})" if key == "failures" and needs else ""
-                )
-                if st.button(lab, key="chat_q_" + key):
-                    pending = prompt_text
-        enabled = cfg.chatbot.tools
-        parts = []
-        if tools_on and (enabled is None or "fetch_url" in enabled):
-            parts.append(
-                "paste a URL and the assistant fetches it with the fetch_url tool"
-            )
-        parts.append("use /repo <owner/name>, /code <topic>, /issues <owner/name>")
-        st.caption("💡 Quick actions: " + " — or ".join(parts) + ".")
-        try:
-            from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
-
-            uploaded = st.file_uploader(
-                "Attach images or files",
-                label_visibility="collapsed",
-                type=sorted(TEXT_EXTENSIONS | IMAGE_EXTENSIONS),
-                accept_multiple_files=True,
-                key="chat_files",
-                help="Images and text/code files are attached to your next question.",
-            )
-        except Exception:  # noqa: BLE001 - an upload widget problem must not break the page
+            live = st.container()  # the new exchange renders here, at the bottom of the transcript
+        with st.container(key="chat_tools", horizontal=True, vertical_alignment="center", gap="small"):
             uploaded = None
+            with st.popover("Attach", icon=":material/attach_file:", help="Attach images or files to your next question"):
+                try:
+                    from swarmforge.attachments import IMAGE_EXTENSIONS, TEXT_EXTENSIONS
+                    uploaded = st.file_uploader(
+                        "Attach images or files",
+                        label_visibility="collapsed",
+                        type=sorted(TEXT_EXTENSIONS | IMAGE_EXTENSIONS),
+                        accept_multiple_files=True,
+                        key="chat_files",
+                        help="Images and text/code files are attached to your next question.",
+                    )
+                except Exception:
+                    uploaded = None
+            if uploaded:
+                st.caption(f"{len(uploaded)} file(s) attached to your next question")
+            enabled = cfg.chatbot.tools
+            parts = []
+            if tools_on and (enabled is None or "fetch_url" in enabled):
+                parts.append("paste a URL and the assistant fetches it with the fetch_url tool")
+            parts.append("use /repo <owner/name>, /code <topic>, /issues <owner/name>")
+            with st.popover("Shortcuts", icon=":material/keyboard_command_key:"):
+                st.caption("💡 Quick actions: " + " — or ".join(parts) + ".")
         typed = st.chat_input("Ask about runs, failures, or what to improve…")
     components.html(
         CHAT_SCROLL_JS.replace("__N__", str(len(history)) + "-" + uuid.uuid4().hex[:6]),

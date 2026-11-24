@@ -21,6 +21,7 @@ from typing import Callable
 import yaml
 
 from . import prompts
+from . import evidence
 from .agent.runtime import AgentResult, AgentSpec, run_agent
 from .agent.navtools import NAV_READONLY, NAV_TOOLS
 from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext, ToolError
@@ -57,6 +58,12 @@ def is_test_path(p: str) -> bool:
             or name.endswith("_test.py") or name == "conftest.py")
 
 
+# Stops whose cause a planner diagnosis can usefully explain, using only the remaining shared task
+# allowance. Cancellations, exhausted allowances, invalid lineage, concurrent or uncertain external
+# attempts keep the rule-based diagnosis and spend nothing more.
+MODEL_DIAGNOSABLE_STOPS = (None, "task_failure", "stalled")
+
+
 class Orchestrator:
     def __init__(self, config: Config, store: Store, *, mode: str = "swarm",
                  single_role: str | None = None,
@@ -68,8 +75,9 @@ class Orchestrator:
                  sandbox_image: str | None = None,
                  seed_run_id: str | None = None,
                  heal_of: str | None = None, heal_attempt: int | None = None,
-                 heal_context: str | None = None):
-        assert mode in ("swarm", "single", "reviewed")
+                 heal_context: str | None = None, execution_id: str | None = None,
+                 retry_of: str | None = None):
+        assert mode in ("swarm", "single", "reviewed", "auto")
         from .effective_config import resolve_variant
         self.cfg, self._variant_note = resolve_variant(config, store)
         self.store = store
@@ -78,6 +86,8 @@ class Orchestrator:
         self._repo_poll_s = 15.0   # how often a waiting run re-checks whether its repository is free
         self.seed_run_id = seed_run_id
         self.heal_of, self.heal_attempt, self.heal_context = heal_of, heal_attempt, heal_context
+        self.execution_id = execution_id
+        self.retry_of = retry_of
         self.mode = mode
         self.single_role = single_role or config.developer_roles[0]
         self.approve = approve
@@ -86,12 +96,61 @@ class Orchestrator:
         self._llm_transport = llm_transport
         self._integration_lock = asyncio.Lock()
         self._conflicts_used = 0
+        self._evidence_done = False
+        self._evidence_shots: list[dict] = []
         self.run_id: str | None = None
 
     # ================================================================ logging
+    async def _seed_from_previous(self, seed: dict) -> str | None:
+        """Start from the previous attempt's code: its local clone if it is still there, else its branch
+        on GitHub if it was pushed, else the current base. Its diagnosis is part of the task either way,
+        so a missing clone never blocks the retry (that used to need a manual "Start again")."""
+        branch = seed.get("integration_branch")
+        fresh = f"Starting fresh from {self.ws.base_branch} @ {self.ws.base_sha[:8]}; the previous attempt's diagnosis is still part of the task"
+        if not branch:
+            self.log("repo", f"the previous attempt {seed['id']} made no branch (it stopped before writing code). {fresh}.", level="warn")
+            return None
+        seed_repo = Path(seed.get("run_dir") or "") / "repo"
+        source, config, where = seed_repo, None, "its workspace"
+        if not seed_repo.is_dir():
+            if await asyncio.to_thread(self.ws.remote_has_branch, branch, self._git_auth):
+                source, config, where = "origin", self._git_auth, "its pushed branch on GitHub"
+                self.log("repo", f"the previous attempt's workspace was cleaned up; continuing from {where} ({branch})")
+            else:
+                self.log("repo", f"the previous attempt's workspace no longer exists and {branch} was never pushed. {fresh}.",
+                         level="warn")
+                return None
+        try:
+            return await asyncio.to_thread(self.ws.seed_from, source, branch, config)
+        except StaleSeed as e:
+            # the base branch moved and the old work conflicts with it
+            self.log("repo", f"cannot reuse the previous attempt's code: {e}. {fresh}.", level="warn")
+        except GitError as e:
+            self.log("repo", f"cannot reuse the previous attempt's code from {where}: {str(e)[:300]}. {fresh}.", level="warn")
+        await asyncio.to_thread(self.ws.reset_to_base)
+        return None
+
+    async def _reconcile_earlier_attempts(self) -> None:
+        """An earlier attempt may have left a push/PR/merge with an unknown outcome: ask GitHub first,
+        so a retry continues from what really happened instead of stopping (or repeating it)."""
+        from .reconcile import reconcile_execution
+        try:
+            lines = await reconcile_execution(self.store, self.cfg, self.execution_id)
+        except Exception as exc:  # noqa: BLE001 - an unreachable GitHub leaves the record open; acquire() then stops safely
+            self.log("reconcile", f"could not check earlier external actions: {type(exc).__name__}: {exc}", level="warn")
+            return
+        for line in lines:
+            self.log("reconcile", f"{line['operation']}: {line['outcome']} — {line['note']}",
+                     level="info" if line["outcome"] in ("done", "not_done") else "warn")
+
     def log(self, kind: str, msg: str, *, level: str = "info", task_key: str | None = None,
             role: str | None = None, data=None) -> None:
         self.store.event(self.run_id, kind, msg, level=level, task_key=task_key, role=role, data=data)
+        execution = getattr(self, "execution", None)
+        if execution and kind == "integrate" and level == "info":
+            execution.observe("integration", {"result": msg}, meaningful=True,
+                              next_action="Run verification and independent review", summary=msg)
+            execution.checkpoint("integrated", {"run_id": self.run_id, "result": msg})
         if self.echo:
             who = f"[{task_key}/{role}] " if task_key and role else (f"[{task_key}] " if task_key else "")
             self.echo(f"{datetime.now():%H:%M:%S} {level.upper():5} {kind:8} {who}{msg}")
@@ -111,12 +170,23 @@ class Orchestrator:
         self.store.create_run(
             self.run_id, mode=self.mode, issue_url=issue_url or issue_file, run_dir=str(self.run_dir),
             seed_run_id=self.seed_run_id, heal_of=self.heal_of, heal_attempt=self.heal_attempt,
+            retry_of=self.retry_of,
             budget_usd=self.cfg.limits.budget_usd, pid=os.getpid(), variant_id=self.cfg.active_variant,
             max_runtime_s=int(self.cfg.limits.max_runtime_s),
             max_repair_cycles=int(self.cfg.limits.max_repair_cycles),
             config_json=json.dumps(_config_snapshot(self.cfg)))
         self.sm = StateMachine(self.store, self.run_id)
-        self.budget = Budget(self.cfg.limits.budget_usd)
+        from .execution import Execution, ExecutionStopped, SharedBudget, ensure_allowance
+        try:
+            self.execution_id = ensure_allowance(self.store, self.run_id, self.cfg,
+                                                 self.heal_of or self.retry_of or self.seed_run_id, self.execution_id)
+        except ValueError as exc:
+            self.store.update_run(self.run_id, stop_kind="lineage_invalid")
+            self._abort(RunState.FAILED, str(exc))
+            write_report(self.store, self.run_id, self.run_dir)
+            return self.run_id
+        self.execution = Execution(self.store, self.run_id, self.execution_id)
+        self.budget = SharedBudget(self.execution)
         self.llm = LLMClient(self.cfg, self.store, self.run_id, self.budget, transport=self._llm_transport)
         self.sandbox = self._sandbox_override or make_sandbox(self.cfg.sandbox, run_label=self.run_id)
         self.ws: GitWorkspace | None = None
@@ -135,10 +205,15 @@ class Orchestrator:
                         f"sandbox: {self.sandbox.describe()})")
         self._started = time.monotonic()
         self._timed_out = False
+        self._execution_stop = None
+        acquired = False
         self._issue_file_hint = issue_file
         self._repo_arg, self._issue_url_arg = repo, issue_url
         self._git_auth: list[str] = []
         try:
+            await self._reconcile_earlier_attempts()
+            self.execution.acquire(self.heal_of or self.retry_of or self.seed_run_id)
+            acquired = True
             if self._same_repo_mode() == "serial":
                 await self._wait_for_repo(repo, issue_url)
             self._started = time.monotonic()
@@ -147,16 +222,26 @@ class Orchestrator:
             try:
                 await pipeline
             except asyncio.CancelledError:
+                if self._execution_stop:
+                    raise self._execution_stop from None
                 if not self._timed_out:
                     raise
                 raise asyncio.TimeoutError from None
             finally:
                 watchdog.cancel()
+                await asyncio.gather(watchdog, return_exceptions=True)
         except asyncio.TimeoutError:
+            self.store.update_run(self.run_id, stop_kind="allowance_exhausted")
             self._abort(RunState.FAILED, f"maximum runtime of {int(self.cfg.limits.max_runtime_s)}s exceeded")
+        except ExecutionStopped as e:
+            self.store.update_run(self.run_id, stop_kind=e.kind)
+            self._abort(RunState.CANCELLED if e.kind == "cancelled" else RunState.FAILED, str(e))
         except RunAborted as e:
+            if e.state == RunState.BUDGET_EXCEEDED:
+                self.store.update_run(self.run_id, stop_kind="allowance_exhausted")
             self._abort(e.state, e.reason)
         except BudgetExceeded as e:
+            self.store.update_run(self.run_id, stop_kind="allowance_exhausted")
             self._abort(RunState.BUDGET_EXCEEDED, str(e))
         except (asyncio.CancelledError, KeyboardInterrupt):
             self.store.record_intervention(self.run_id, "cancel", "run interrupted by user (Ctrl+C)")
@@ -166,6 +251,7 @@ class Orchestrator:
                      data={"traceback": traceback.format_exc()})
             self._abort(RunState.FAILED, f"unexpected error: {type(e).__name__}: {e}")
         finally:
+            await self._cancel_early_tester()
             try:
                 await self.sandbox.kill_all()
             except Exception:
@@ -173,11 +259,13 @@ class Orchestrator:
             if getattr(self, "_relay", None) is not None:
                 await self._relay.stop()
                 self._relay = None
-            if self.cfg.knowledge.enabled and self.issue is not None:
+            if acquired and not self.sm.state in (RunState.CANCELLED, RunState.BUDGET_EXCEEDED) and self.cfg.knowledge.enabled and self.issue is not None:
                 try:
-                    await asyncio.wait_for(self._capture_knowledge(), timeout=900)
+                    self.execution.check()
+                    await asyncio.wait_for(self._capture_knowledge(), timeout=max(.01, min(900, self.execution.row()["deadline"] - time.time())))
                 except Exception as e:  # knowledge capture must never change the run outcome
                     self.log("knowledge", f"knowledge capture failed: {type(e).__name__}: {e}", level="warn")
+            await self._collect_evidence()  # no-op when already collected on the COMPLETED path
             try:
                 path = write_report(self.store, self.run_id, self.run_dir)
                 self.log("report", f"execution report written to {path}")
@@ -195,7 +283,9 @@ class Orchestrator:
                 try:
                     from .postmortem import diagnose
                     await asyncio.wait_for(diagnose(self.cfg, self.store, self.run_id,
-                                                    transport=self._llm_transport), timeout=600)
+                                                    transport=self._llm_transport, budget=self.budget,
+                                                    allow_model=acquired and (self.store.get_run(self.run_id) or {}).get("stop_kind") in MODEL_DIAGNOSABLE_STOPS),
+                                           timeout=max(.01, min(600, self.execution.row()["deadline"] - time.time())))
                 except Exception as e:  # the post-mortem must never change the run outcome
                     self.log("postmortem", f"post-mortem failed: {type(e).__name__}: {e}", level="warn")
             try:
@@ -203,6 +293,8 @@ class Orchestrator:
                 self.log("report", f"summary written to {path}")
             except Exception as e:
                 self.log("error", f"failed to write summary: {e}", level="warn")
+            row = self.store.get_run(self.run_id)
+            self.execution.finish(row.get("stop_kind") or {"COMPLETED": "completed", "CANCELLED": "cancelled"}.get(row["state"], "task_failure"), row.get("state_reason") or "")
         return self.run_id
 
     def _apply_live_settings(self) -> None:
@@ -213,7 +305,7 @@ class Orchestrator:
             return
         lim = self.cfg.limits
         b = row.get("budget_usd")
-        if b is not None and abs(float(b) - self.budget.limit) > 1e-9:
+        if b is not None and not hasattr(self.budget, "execution") and abs(float(b) - self.budget.limit) > 1e-9:
             self.log("settings", f"budget changed to ${float(b):.2f}")
             self.budget.limit = float(b)
             lim.budget_usd = float(b)
@@ -228,19 +320,39 @@ class Orchestrator:
 
     async def _watchdog(self, pipeline: asyncio.Future, every_s: float = 5.0) -> None:
         """Enforces the (live-adjustable) time limit; replaces a fixed asyncio.wait_for."""
+        if getattr(self, "execution", None) is None:
+            # A programming error, not a timeout or task failure: run() acquires the shared task
+            # allowance before any work starts, and the watchdog enforces its deadline.
+            raise RuntimeError("watchdog started before the shared task allowance was acquired")
         while not pipeline.done():
             self._apply_live_settings()
+            try:
+                self.execution.poll()
+            except (Exception,) as e:
+                from .execution import ExecutionStopped
+                if isinstance(e, (ExecutionStopped, BudgetExceeded)):
+                    self._execution_stop = e
+                    pipeline.cancel()
+                    return
+                self._execution_stop = ExecutionStopped("task_failure", f"Progress watchdog failed: {e}")
+                pipeline.cancel()
+                return
             if time.monotonic() - self._started > self.cfg.limits.max_runtime_s:
                 self._timed_out = True
                 pipeline.cancel()
                 return
-            await asyncio.sleep(min(every_s, max(0.05, self.cfg.limits.max_runtime_s)))
+            await asyncio.sleep(max(.01, min(every_s, self.cfg.limits.max_runtime_s,
+                                            self.cfg.limits.no_progress_s,
+                                            self.execution.row()["deadline"] - time.time())))
 
     def _abort(self, state: RunState, reason: str) -> None:
         if self.sm.terminal:
             return
         if state == RunState.CANCELLED and self._should_cancel():
             reason = reason or "cancelled"
+        row = self.store.get_run(self.run_id)
+        if row and not row.get("stop_kind"):
+            self.store.update_run(self.run_id, stop_kind={RunState.CANCELLED: "cancelled", RunState.BUDGET_EXCEEDED: "allowance_exhausted"}.get(state, "task_failure"))
         self.log("run", f"stopping: {state.value} - {reason}", level="warn")
         self.sm.transition(state, reason)
 
@@ -327,20 +439,9 @@ class Orchestrator:
             raise RunAborted(RunState.BLOCKED, f"could not clone {source}: {_redact(str(e), token)}")
         if self.seed_run_id:
             seed = self.store.get_run(self.seed_run_id)
-            seed_repo = Path(seed["run_dir"] or "") / "repo"
-            if not seed["integration_branch"] or not seed_repo.is_dir():
-                raise RunAborted(RunState.BLOCKED, f"cannot continue from {self.seed_run_id}: its workspace "
-                                                   "(clone) no longer exists; use Start again instead")
-            try:
-                sha = await asyncio.to_thread(self.ws.seed_from, seed_repo, seed["integration_branch"])
-            except StaleSeed as e:
-                # the base branch moved and the old work conflicts with it: start fresh from the
-                # current base (the previous attempt's diagnosis is still part of the task)
-                sha = None
-                self.log("repo", f"cannot reuse the previous attempt's code: {e}. Starting fresh from "
-                                 f"{self.ws.base_branch} @ {self.ws.base_sha[:8]}", level="warn")
-            except GitError as e:
-                raise RunAborted(RunState.BLOCKED, f"cannot continue from {self.seed_run_id}: {e}")
+            if not seed:
+                raise RunAborted(RunState.BLOCKED, f"cannot continue: run {self.seed_run_id} not found")
+            sha = await self._seed_from_previous(seed)
             if sha and self.ws.seed_updated:
                 self.log("repo", f"{self.ws.base_branch} moved on since the previous attempt; merged it "
                                  f"into {seed['integration_branch']} cleanly ({sha[:8]})", level="warn")
@@ -359,6 +460,8 @@ class Orchestrator:
                          f"integration branch {self.ws.integration_branch})")
         repo_summary = await self._inspect_repo()
         self._retrieve_knowledge()
+        if self.mode == "auto":
+            await self._route(repo_summary)
 
         # -------------------------------------------------- planning
         self.sm.transition(RunState.PLANNING)
@@ -379,7 +482,15 @@ class Orchestrator:
             self._check_cancel()
             # -------------------------------------------- execution
             self.sm.transition(RunState.TASK_EXECUTION)
-            sched = await self._run_tasks(tasks, cycle, done_ids)
+            if (cycle == 0 and self.cfg.limits.tester_with_developers and self.mode == "swarm"
+                    and plan.acceptance_criteria):
+                self.log("test", "tester starts now, alongside the developers (limits.tester_with_developers)")
+                self._early_tester = asyncio.ensure_future(self._run_tester(0, early=True))
+            try:
+                sched = await self._run_tasks(tasks, cycle, done_ids)
+            except BaseException:
+                await self._cancel_early_tester()
+                raise
             done_ids.update(sched.succeeded)
             failed_tasks = sched.failed + sched.blocked
             self._check_cancel()
@@ -391,16 +502,20 @@ class Orchestrator:
             self.log("integrate", f"integration branch now changes {len(changed)} file(s) vs base",
                      data={"diff_stat": stat})
             if not changed:
+                await self._cancel_early_tester()
                 raise RunAborted(RunState.FAILED, "no code changes were produced by any task")
 
-            # -------------------------------------------- testing
+            # -------------------------------------------- testing + review
             self.sm.transition(RunState.TESTING)
-            evidence, tester_report = await self._testing(cycle)
-
-            # -------------------------------------------- review
-            self.sm.transition(RunState.CODE_REVIEW)
-            self._visual_findings = await self._visual_review(cycle)
-            review = await self._review(cycle, evidence)
+            if self.cfg.limits.parallel_review and self.mode != "single":
+                # the reviewer reads the diff while the full suite runs; the gate below still needs both
+                evidence, tester_report, review = await self._test_and_review(cycle)
+                self.sm.transition(RunState.CODE_REVIEW)
+            else:
+                evidence, tester_report = await self._testing(cycle)
+                self.sm.transition(RunState.CODE_REVIEW)
+                self._visual_findings = await self._visual_review(cycle)
+                review = await self._review(cycle, evidence)
 
             problems = self._gate(cycle, evidence, tester_report, review, failed_tasks)
             if not problems:
@@ -435,7 +550,8 @@ class Orchestrator:
                 self.log("plan", f"cycle {cycle}: {len(repair_tasks)} mandatory repair task(s) "
                          "created from reviewer findings",
                          data=[asdict(t) for t in repair_tasks])
-            fix_plan = await self._make_fix_plan(cycle, problems, done_ids)
+            fix_plan = (self._direct_fix_plan(cycle, problems, repair_tasks)
+                        or await self._make_fix_plan(cycle, problems, done_ids))
             self.sm.transition(RunState.TASK_VALIDATION)
             self._register_tasks(fix_plan.tasks, cycle=cycle, kind="fix")
             self.log("plan", f"repair cycle {cycle}: {len(fix_plan.tasks)} corrective task(s)",
@@ -552,6 +668,68 @@ class Orchestrator:
             self.log("plan", f"planning attempt {attempt} failed: {res.error}", level="warn")
         raise RunAborted(RunState.FAILED, f"planner could not produce a valid plan: {last_err}")
 
+    async def _route(self, repo_summary: str) -> None:
+        """mode=auto: one cheap model call decides whether the task needs the whole team.
+
+        Falls back to the one-developer workflow whenever the answer is missing or unusable, because
+        that is the cheaper mistake: a too-small workflow costs a repair cycle, a too-big one costs
+        the planning, hand-offs and merges of a full swarm run."""
+        choice, reason = "reviewed", "no usable routing answer; using the one-developer workflow"
+        user = (f"## Task\n{self.issue.title}\n{(self.issue.body or '')[:4000]}\n\n"
+                f"## Repository\n{(repo_summary or '')[:3000]}")
+        try:
+            res = await self.llm.chat("planner", [{"role": "system", "content": prompts.ROUTER_SYSTEM},
+                                                  {"role": "user", "content": user}], task_key="routing")
+            m = re.search(r"\{.*\}", res.content or "", re.S)
+            d = json.loads(m.group(0)) if m else {}
+            if isinstance(d, dict) and d.get("mode") in ("reviewed", "swarm"):
+                choice, reason = d["mode"], str(d.get("reason") or "")[:300]
+        except (LLMError, json.JSONDecodeError) as e:
+            self.log("routing", f"routing call failed ({e}); using the one-developer workflow", level="warn")
+        self.mode = choice
+        self.store.update_run(self.run_id, mode=choice)
+        self.log("routing", f"auto workflow -> {choice}: {reason}", data={"mode": choice, "reason": reason})
+
+    def _direct_fix_plan(self, cycle: int, problems: list[dict], repair_tasks: list[Task]) -> Plan | None:
+        """limits.direct_repairs: a small repair goes straight to a developer, skipping the fix planner.
+
+        Reviewer findings already became mandatory repair tasks; what is left (failing tests, unmet
+        criteria, tester defects, visual findings) becomes ONE task that runs after those. Returns None
+        when the planner should decide: too many problems, a task that never completed, or a blocking
+        finding that got no repair task."""
+        lim = self.cfg.limits
+        if not lim.direct_repairs:
+            return None
+        review = [p for p in problems if p.get("kind") == "review"]
+        rest = [p for p in problems if p.get("kind") != "review"]
+        if len(repair_tasks) < len(review):
+            rest = list(problems)
+        if len(rest) > max(0, lim.direct_repair_max_problems) or any(p.get("kind") == "task" for p in rest):
+            return None
+        if not rest:
+            self.log("plan", f"repair cycle {cycle}: the reviewer's findings already have repair tasks; "
+                             "no planner call needed (limits.direct_repairs)")
+            return Plan(summary=f"Direct repair, cycle {cycle}: reviewer findings only.", tasks=[])
+        used = {t["task_key"] for t in self.store.tasks(self.run_id)} | {t.id for t in repair_tasks}
+        tid, n = f"D{cycle}", 1
+        while tid in used:
+            n += 1
+            tid = f"D{cycle}x{n}"
+        detail = "\n\n".join(f"### Problem {i + 1} ({p.get('kind')})\n{p.get('detail') or p.get('summary')}"
+                             for i, p in enumerate(rest))
+        role = self.single_role if self.mode in ("single", "reviewed") else self.cfg.developer_roles[0]
+        task = Task(
+            id=tid, title=f"Fix {len(rest)} blocking problem(s) found by tests and review", role=role,
+            description=("The integrated result did not pass the delivery gate. Fix exactly the problems "
+                         "below and nothing else. For each one: reproduce it first (run the failing test "
+                         "or follow the reproduction), fix the cause in the implementation rather than "
+                         "weakening the test, then re-run the relevant tests.\n\n" + detail),
+            depends_on=[t.id for t in repair_tasks],
+            acceptance_criteria=[str(p.get("summary") or "")[:300] for p in rest])
+        self.log("plan", f"repair cycle {cycle}: {len(rest)} problem(s) sent straight to {role} as {tid}; "
+                         "no planner call (limits.direct_repairs)")
+        return Plan(summary=f"Direct repair, cycle {cycle}: {len(rest)} problem(s) to {role}.", tasks=[task])
+
     async def _make_fix_plan(self, cycle: int, problems: list[dict], done_ids: set[str]) -> Plan:
         all_ids = {t["task_key"] for t in self.store.tasks(self.run_id)}
         prob_text = "\n\n".join(f"### Problem {i + 1} ({p['kind']})\n{p['detail']}" for i, p in enumerate(problems))
@@ -656,6 +834,7 @@ class Orchestrator:
         attempts = 1 + max(0, self.cfg.limits.task_retries)
         for attempt in range(1, attempts + 1):
             self.store.upsert_task(self.run_id, task.id, attempts=attempt)
+            self._maybe_escalate(task, cycle, attempt)
             ctx = ToolContext(workspace=path, sandbox=self.sandbox, installer=self._tool_installer(),
                               command_timeout_s=self.cfg.sandbox.command_timeout_s,
                               artifacts_dir=self.artifacts / f"task-{task.id}",
@@ -684,6 +863,20 @@ class Orchestrator:
         if ok:
             await asyncio.to_thread(self.ws.remove_worktree, path)
         return ok
+
+    def _maybe_escalate(self, task: Task, cycle: int, attempt: int) -> None:
+        """Start cheap, pay for strength only when needed: a retried task, or any task in a repair
+        cycle, runs on the role's `escalation_model` (when one is configured)."""
+        rc = self.cfg.roles[task.role]
+        strong = getattr(rc, "escalation_model", None)
+        overrides = getattr(self.llm, "model_overrides", None)
+        if not strong or strong == rc.model or overrides is None or (attempt <= 1 and cycle < 1):
+            return
+        if overrides.get(task.id) != strong:
+            overrides[task.id] = strong
+            self.store.upsert_task(self.run_id, task.id, model=strong)
+            why = f"attempt {attempt}" if attempt > 1 else f"repair cycle {cycle}"
+            self.log("task", f"escalating from {rc.model} to {strong} ({why})", task_key=task.id, role=task.role)
 
     async def _integrate(self, task: Task, branch: str) -> bool:
         async with self._integration_lock:
@@ -738,7 +931,51 @@ class Orchestrator:
                             TEST_REPORT_JSON_SCHEMA, lambda a: validate_test_report(a.get("report", a), ids))
 
     async def _testing(self, cycle: int) -> tuple[TestEvidence, dict | None]:
+        tester_report = await self._tester_phase(cycle)
+        return await self._test_run_phase(cycle, tester_report), tester_report
+
+    async def _test_and_review(self, cycle: int) -> tuple[TestEvidence, dict | None, dict | None]:
+        """limits.parallel_review: once the acceptance tests are merged, the deterministic test run and the
+        independent review no longer depend on each other, so they overlap instead of queueing."""
+        tester_report = await self._tester_phase(cycle)
+        self.log("review", "reviewing the diff while the full test suite runs (limits.parallel_review)")
+
+        async def reviewing():
+            self._visual_findings = await self._visual_review(cycle)
+            return await self._review(cycle, None)
+
+        review_task = asyncio.ensure_future(reviewing())
+        try:
+            evidence = await self._test_run_phase(cycle, tester_report)
+        except BaseException:
+            review_task.cancel()
+            await asyncio.gather(review_task, return_exceptions=True)
+            raise
+        return evidence, tester_report, await review_task
+
+    async def _cancel_early_tester(self) -> None:
+        early = getattr(self, "_early_tester", None)
+        self._early_tester = None
+        if early is not None and not early.done():
+            early.cancel()
+            await asyncio.gather(early, return_exceptions=True)
+
+    async def _tester_phase(self, cycle: int) -> dict | None:
         tester_report = None
+        early = getattr(self, "_early_tester", None)
+        if cycle == 0 and early is not None:
+            self._early_tester = None
+            try:
+                tester_report = await early
+            except RunAborted:
+                raise
+            except Exception as e:  # noqa: BLE001 - the normal tester below is the fallback
+                self.log("test", f"early tester failed ({type(e).__name__}: {e})", level="warn")
+            if tester_report:
+                self._first_tester_report = tester_report
+                return tester_report
+            self.log("test", "the early tester produced no report; running the tester on the integrated code",
+                     level="warn")
         if self.mode != "single":
             if cycle == 0 or getattr(self.cfg.limits, "tester_every_cycle", False) \
                     or getattr(self, "_first_tester_report", None) is None:
@@ -751,6 +988,9 @@ class Orchestrator:
                 self.log("test", "repair cycle: re-running the existing tests without the tester agent "
                                  "(limits.tester_every_cycle: true brings it back)")
                 tester_report = {**self._first_tester_report, "defects": []}
+        return tester_report
+
+    async def _test_run_phase(self, cycle: int, tester_report: dict | None) -> TestEvidence:
         await self._ensure_deps(self.ws.repo, "repo")
         ev = await run_tests(self.sandbox, self.ws.repo, self.cfg.project.test_command, self.artifacts,
                              f"cycle{cycle}", self.cfg.sandbox.command_timeout_s)
@@ -772,10 +1012,10 @@ class Orchestrator:
                 self.store.record_finding(self.run_id, cycle=cycle, source="tester", severity=d["severity"],
                                           file=d.get("file"), line=None, title=d["title"],
                                           description=d["description"], recommendation=d["reproduction"])
-        return ev, tester_report
+        return ev
 
-    async def _run_tester(self, cycle: int) -> dict | None:
-        key = f"tester-c{cycle}"
+    async def _run_tester(self, cycle: int, early: bool = False) -> dict | None:
+        key = f"tester-c{cycle}" + ("-early" if early else "")
         path, branch = await asyncio.to_thread(self.ws.create_worktree, key)
         await self._ensure_deps(path, key)
         crit = "\n".join(f"- {c.id}: {c.text}" for c in self.plan.acceptance_criteria)
@@ -786,6 +1026,7 @@ class Orchestrator:
             self._test_hint(),
             "This is a re-test after corrective work; update existing acceptance tests if needed."
             if cycle else "",
+            prompts.EARLY_TESTER_NOTE if early else "",
         ])
         ctx = ToolContext(workspace=path, sandbox=self.sandbox, installer=self._tool_installer(), command_timeout_s=self.cfg.sandbox.command_timeout_s,
                           artifacts_dir=self.artifacts / key, test_command=self.cfg.project.test_command,
@@ -824,6 +1065,18 @@ class Orchestrator:
                                    errors=ev.errors, skipped=ev.skipped, duration_s=ev.duration_s,
                                    log_path=ev.log_path, junit_path=ev.junit_path,
                                    timed_out=int(ev.timed_out))
+        execution = getattr(self, "execution", None)
+        if execution:
+            evidence = {"command": ev.command, "exit_code": ev.exit_code, "passed": ev.passed,
+                        "failed": ev.failed, "errors": ev.errors, "cases": ev.cases,
+                        "timed_out": ev.timed_out}
+            execution.observe("verification", evidence, meaningful=True,
+                              next_action="Review results and repair remaining failures",
+                              summary=f"Verification finished: {ev.passed} passed, {ev.failed} failed, {ev.errors} errors"
+                                      + (" (timed out)" if ev.timed_out else ""))
+            if ev.exit_code or ev.failed or ev.errors or ev.timed_out:
+                execution.observe("failure", evidence)
+            execution.checkpoint("verification", {**evidence, "log_path": ev.log_path})
 
     # ================================================================== review
     async def _visual_review(self, cycle: int) -> list[dict]:
@@ -889,7 +1142,7 @@ class Orchestrator:
                  level="warn" if counts["critical"] else "info")
         return findings
 
-    async def _review(self, cycle: int, ev: TestEvidence) -> dict | None:
+    async def _review(self, cycle: int, ev: TestEvidence | None) -> dict | None:
         if self.mode == "single":
             self.log("review", "single-agent baseline: independent review skipped by design")
             return None
@@ -899,7 +1152,10 @@ class Orchestrator:
             prompts.render_issue(self.issue.title, self.issue.body),
             f"Plan summary: {self.plan.summary}",
             "Acceptance criteria:\n" + crit,
-            f"Deterministic test result (executed by the orchestrator): {ev.short()}",
+            (f"Deterministic test result (executed by the orchestrator): {ev.short()}" if ev is not None else
+             "The orchestrator is running the full test suite right now and gates delivery on its result "
+             "separately, so you do not have the result: review the code on its merits and do not assume "
+             "the tests pass."),
             f"<diff base='{self.ws.base_branch}'>\n{diff}\n</diff>",
             self.knowledge_review_block,
             ("Repair review: prioritize the corrective diff and unresolved prior findings. Verify each fix, "
@@ -943,8 +1199,45 @@ class Orchestrator:
                            task_rows=self.store.tasks(self.run_id), scope=self._repair_scope(),
                            visual_findings=getattr(self, "_visual_findings", []), policy=self.cfg.review)
 
+    # =========================================================== visual evidence
+    async def _collect_evidence(self) -> None:
+        """Capture dashboard screenshots for UI-touching plans at run end.
+
+        Idempotent and failure-proof: the done-flag is set BEFORE any capture attempt
+        (never retry, even after a failure — this runs from both the COMPLETED path and
+        the FAILED/finally path) and every exception is swallowed with a warn event so
+        evidence problems can never change the run outcome.
+        """
+        if self._evidence_done:
+            return
+        self._evidence_done = True
+        try:
+            if self.ws is None:
+                self.log("evidence", "no workspace; skipping screenshots", level="warn")
+                return
+            if getattr(self, "plan", None):
+                files = evidence.plan_file_set(self.plan.tasks)
+            else:
+                changed = self.ws.changed_files
+                files = changed() if callable(changed) else changed
+            if not evidence.touches_ui(files):
+                self.log("evidence", "plan touches only non-UI modules; skipping dashboard screenshots")
+                return
+            tabs = evidence.tabs_for(files, failed=self.sm.state is not RunState.APPROVED)
+            out = Path(self.run_dir) / "evidence"
+            repo_dir = getattr(self.ws, "integration", None) or self.ws.repo
+            shots = await asyncio.wait_for(
+                asyncio.to_thread(evidence.collect, str(repo_dir), out, tabs=tabs),
+                timeout=evidence.MAX_CAPTURE_S)
+            self._evidence_shots = shots
+            self.log("evidence", f'captured {len(shots)} screenshot(s) for tabs '
+                                 f'{sorted({s["tab"] for s in shots})}', data=shots)
+        except Exception as e:  # evidence must never change the run outcome
+            self.log("evidence", f"evidence collection skipped: {type(e).__name__}: {e}", level="warn")
+
     # ================================================================ delivery
     async def _deliver(self) -> None:
+        await self._collect_evidence()  # manifest must exist before the PR is published
         issue = self.issue
         if self.mode == "single":
             self.sm.transition(RunState.COMPLETED, "single-agent run finished (no independent review, so no PR is created)")
@@ -953,7 +1246,13 @@ class Orchestrator:
         name = issue.repo or (self.ref.name if getattr(self, "ref", None) else None)
         if not owner:
             from .services.delivery import deliver_local
-            outcome = await deliver_local(self.ws, self.source)
+            from .execution import external_once
+            from .services.delivery import DeliveryOutcome
+            async def deliver():
+                from dataclasses import asdict
+                return asdict(await deliver_local(self.ws, self.source))
+            result = await external_once(self.store, self.run_id, f"local:{self.ws.integration_branch}", deliver)
+            outcome = DeliveryOutcome(**result)
             self.log("pr", outcome.warning or outcome.reason, level="warn" if outcome.warning else "info")
             self.sm.transition(RunState.COMPLETED, outcome.reason)
             return
@@ -1098,8 +1397,8 @@ class Orchestrator:
                 timeout_s=self.cfg.sandbox.install_timeout_s, cache_dir=self.cfg.workdir / "pipcache",
                 install_command=getattr(self, "install_command", None))
             if status == "none":
-                return ("No dependency files found. Declare packages in requirements.txt (one per line) "
-                        "or in pyproject.toml [project].dependencies, then call this again.")
+                return ("No dependency files found. Declare packages in requirements.txt, "
+                        "pyproject.toml [project].dependencies, or package.json, then call this again.")
             if status == "current":
                 return f"Dependencies from {', '.join(plan.sources)} are already installed and unchanged."
             out = res.summary(4000) if res else ""
@@ -1256,13 +1555,14 @@ class Orchestrator:
             ids = ", ".join(b["id"] for b in blockers)
             if ids != announced:
                 self.log("queue", f"waiting: run(s) {ids} are already working on this repository; this run "
-                                  "starts when they finish (the time limit starts then)")
+                                  "starts when they finish (the shared wall-clock allowance includes this wait)")
                 self.store.update_run(self.run_id, state_reason=f"waiting for the repository: run(s) {ids} "
                                                                 "are working on it")
                 announced = ids
             if self._should_cancel():
                 raise RunAborted(RunState.CANCELLED, "cancelled while waiting for the repository")
-            await asyncio.sleep(self._repo_poll_s)
+            self.execution.check()
+            await asyncio.sleep(max(.01, min(self._repo_poll_s, self.execution.row()["deadline"] - time.time())))
             waited += self._repo_poll_s
         if announced:
             self.store.update_run(self.run_id, state_reason=None)
@@ -1511,6 +1811,15 @@ class Orchestrator:
             self.store.record_intervention(self.run_id, "cancel", "cancel requested via CLI")
             raise RunAborted(RunState.CANCELLED, "cancel requested")
 
+    def _agent_event(self, kind, msg, data, key, role, ctx):
+        if kind == "tool_result":
+            from .execution import observe_tool
+            if getattr(self, "execution", None):
+                observe_tool(self.execution, ctx, data or {})
+            # Retain output in the transcript; progress telemetry contains hashes only.
+            return
+        self.log("agent", msg, task_key=key, role=role, data=data)
+
     async def _agent(self, role: str, key: str, system: str, user: str, tools: list[str],
                      terminal: TerminalTool, ctx: ToolContext, transcript_suffix: str = "") -> AgentResult:
         rc = self.cfg.roles[role]
@@ -1526,7 +1835,7 @@ class Orchestrator:
             terminal=terminal, ctx=ctx, max_steps=rc.max_steps, timeout_s=rc.timeout_s,
             transcript_path=self.run_dir / "transcripts" / f"{name}.jsonl",
             should_cancel=self._should_cancel,
-            on_event=lambda kind, msg, data: self.log("agent", msg, task_key=key, role=role, data=data))
+            on_event=lambda kind, msg, data: self._agent_event(kind, msg, data, key, role, ctx))
         self.log("agent", f"start ({rc.model}{', Pi harness' if use_pi else ''})", task_key=key, role=role)
         try:
             from .agent.harness import FunctionHarness

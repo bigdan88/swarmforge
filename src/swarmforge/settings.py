@@ -381,13 +381,13 @@ def save_config_with_backup(path, raw: dict) -> Path:
 # ==================================================================== UI ===
 import os  # noqa: E402
 
-import streamlit as st  # noqa: E402
-
 
 def render(cfg) -> None:
     """Render the Settings & health page (called by dashboard.page_settings).
 
-    Every helper is looked up as a module global at call time so tests can monkeypatch it."""
+    Every helper is looked up as a module global at call time so tests can monkeypatch it.
+    Streamlit is imported here so the helpers above stay usable without it (React dashboard)."""
+    import streamlit as st
     flash = st.session_state.pop("set_saved", None)
     if flash:
         st.success(flash)

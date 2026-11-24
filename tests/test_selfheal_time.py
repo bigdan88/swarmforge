@@ -10,6 +10,14 @@ from swarmforge.postmortem import escalate, heal
 from .conftest import ROOT, base_raw
 
 
+def _deadline_extended(store, cfg, run_id):
+    """Retries share the task's persisted deadline; these scenarios assume the person extended it,
+    so only the chain time cap is in play."""
+    from swarmforge.execution import ensure_allowance
+    ensure_allowance(store, run_id, cfg, None)
+    store._exec("UPDATE execution_allowances SET deadline=? WHERE id=?", (time.time() + 100000, run_id))
+
+
 async def test_escalate_time_cap_clamps_runtime_and_role_timeouts(cfg):
     cfg.limits.max_runtime_s = 3600
     c = escalate(cfg, 2, time_cap=1800)
@@ -23,7 +31,8 @@ async def test_escalate_time_cap_clamps_runtime_and_role_timeouts(cfg):
         ).limits.max_runtime_s
         == 1800
     )
-    assert escalate(cfg, 2).limits.max_runtime_s == 8100
+    # retries share the task's original deadline (docs/EXECUTION.md): no extra time per attempt
+    assert escalate(cfg, 2).limits.max_runtime_s == 3600
 
 
 async def test_escalate_model_unavailable_clamps_role_timeouts(cfg):
@@ -107,6 +116,7 @@ async def test_heal_time_cap_default_is_3x_runtime(cfg):
     )
     store.update_run("r-ok", created_at=now - 10100, finished_at=now - 100)
     store.failure_save("r-ok", category="time_limit", retry=1, root_cause="x", fix="y")
+    _deadline_extended(store, cfg, "r-ok")
     seen = []
 
     async def launch(c, seed, ctx, heal_of, attempt):
@@ -123,7 +133,7 @@ async def test_heal_time_cap_default_is_3x_runtime(cfg):
     assert len(seen) == 1
     assert (
         seen[0].limits.max_runtime_s == 800
-    )  # escalated 5400 clamped to the 800 s left
+    )  # the original 3600 s clamped to the 800 s left
     events = [e for e in store.events("r-ok") if e["kind"] == "selfheal"]
     assert events and "clamped" in events[0]["message"]
 
@@ -158,6 +168,7 @@ async def test_heal_echo_reports_time_cap_clamp(cfg):
     store.failure_save(
         "r-echo", category="time_limit", retry=1, root_cause="x", fix="y"
     )
+    _deadline_extended(store, cfg, "r-echo")
 
     async def launch(c, seed, ctx, heal_of, attempt):
         store.create_run(
@@ -249,6 +260,7 @@ async def test_heal_model_unavailable_attempt_clamps_role_timeouts(cfg):
     store.failure_save(
         "r-mu", category="model_unavailable", retry=1, root_cause="x", fix="y"
     )
+    _deadline_extended(store, cfg, "r-mu")
     seen = []
 
     async def launch(c, seed, ctx, heal_of, attempt):
@@ -266,7 +278,7 @@ async def test_heal_model_unavailable_attempt_clamps_role_timeouts(cfg):
     c = seen[0]
     assert (
         c.limits.max_runtime_s == 800
-    )  # escalated 5400 clamped to the time left in the chain
+    )  # the original 3600 s clamped to the time left in the chain
     # model_unavailable does not scale roles, but 800 < the base 900 so the clamp must apply
     assert all(r.timeout_s <= 800 for r in c.roles.values())
     assert c.roles["planner"].timeout_s == 800

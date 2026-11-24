@@ -1,0 +1,27 @@
+description: Anthropic Claude (served by DeepInfra). Highest expected quality, roughly 5-10x the cost.
+roles:
+  planner:
+    model: anthropic/claude-sonnet-5-5
+    fallback_models: [anthropic/claude-sonnet-5]
+  developer_backend:
+    model: anthropic/claude-sonnet-5-5
+    fallback_models: [anthropic/claude-sonnet-5]
+  developer_frontend:
+    model: anthropic/claude-sonnet-5-5
+    fallback_models: [anthropic/claude-sonnet-5]
+  reviewer:                 # must differ from the developer models, fallbacks included
+    model: anthropic/claude-opus-5-5
+    fallback_models: [anthropic/claude-opus-5]
+  tester:
+    model: anthropic/claude-haiku-4-5
+    fallback_models: [anthropic/claude-sonnet-5]
+  librarian:
+    model: anthropic/claude-haiku-4-5
+    fallback_models: [anthropic/claude-sonnet-5]
+  designer:
+    model: anthropic/claude-sonnet-5-5
+    fallback_models: [anthropic/claude-opus-5-5]
+  lead:
+    model: anthropic/claude-sonnet-5-5
+    fallback_models: [anthropic/claude-opus-5-5]
+vision_models: [anthropic/claude-]

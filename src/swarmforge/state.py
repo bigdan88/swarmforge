@@ -254,6 +254,9 @@ class StateMachine:
 
             fields["finished_at"] = time.time()
         self.store.update_run(self.run_id, **fields)
+        self.store._exec("UPDATE execution_attempts SET current_action=?,next_action=? WHERE run_id=?",
+                         (new.value.replace("_", " ").title(),
+                          "Review retained results and stopping reason" if new in TERMINAL else None, self.run_id))
         self.store.event(
             self.run_id,
             "state",

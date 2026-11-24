@@ -17,10 +17,15 @@ from .variants import _fresh_repo, load_suite
 from .workspace import git
 
 
+def _group(r: dict) -> str:
+    """Summary key: the mode, or "team / mode" when teams are compared."""
+    return f"{r['team']} / {r['mode']}" if r.get("team") else r["mode"]
+
+
 def summarize(rows: list[dict]) -> dict:
     groups = {}
-    for mode in sorted({r["mode"] for r in rows}):
-        selected = [r for r in rows if r["mode"] == mode]
+    for mode in sorted({_group(r) for r in rows}):
+        selected = [r for r in rows if _group(r) == mode]
         successful = [r for r in selected if r["final_state"] == "COMPLETED"
                       and r["hidden_acceptance"].get("total", 0) > 0
                       and r["hidden_acceptance"].get("passed") == r["hidden_acceptance"].get("total")]
@@ -40,7 +45,10 @@ def summarize(rows: list[dict]) -> dict:
 
 async def run_suite(cfg, store, suite_path, *, runs=3, modes=("single", "swarm"), budget=20.,
                     label="comparison", knowledge=False, same_repo="coordinate", limit=None,
-                    echo=print, orchestrator_factory=None) -> dict:
+                    echo=print, orchestrator_factory=None, teams=None) -> dict:
+    """Compare modes (and, with `teams`, model teams) on pinned cases. Without teams `budget` caps the
+    whole comparison; with teams it caps each team separately, and a team that runs out stops while
+    the others carry on."""
     from .orchestrator import Orchestrator
     if runs < 1 or not modes or any(m not in {"single", "reviewed", "swarm"} for m in modes):
         raise ValueError("positive repeats and valid comparison modes are required")
@@ -54,15 +62,24 @@ async def run_suite(cfg, store, suite_path, *, runs=3, modes=("single", "swarm")
     safe_label = re.sub(r"[^a-zA-Z0-9_-]", "_", label)[:60] or "comparison"
     root = cfg.workdir / "evaluations" / f"{safe_label}-{time.time_ns()}"
     root.mkdir(parents=True)
-    c = copy.deepcopy(cfg)
-    c.github.create_pr = False
-    c.auto_merge.enabled = False
-    c.self_heal.enabled = False
-    c.self_heal.diagnose = False  # no separately budgeted diagnostic model calls in comparisons
-    c.limits.same_repo = same_repo
-    c.limits.one_run_per_repo = same_repo != "parallel"
-    c.project.reuse_baseline = False  # each repeat includes the same baseline work
-    c.knowledge.enabled = knowledge
+    from .teams import apply_team
+    team_names = list(dict.fromkeys(teams or []))
+
+    def prepare(base):
+        c = copy.deepcopy(base)
+        c.github.create_pr = False
+        c.auto_merge.enabled = False
+        c.self_heal.enabled = False
+        c.self_heal.diagnose = False  # no separately budgeted diagnostic model calls in comparisons
+        c.limits.same_repo = same_repo
+        c.limits.one_run_per_repo = same_repo != "parallel"
+        c.project.reuse_baseline = False  # each repeat includes the same baseline work
+        c.knowledge.enabled = knowledge
+        return c
+
+    # Resolve every team before spending anything: a typo or an incomplete team fails up front.
+    configs = {t: prepare(apply_team(cfg, t)) for t in team_names} or {None: prepare(cfg)}
+    c = next(iter(configs.values()))
     if knowledge:
         vault = root / "knowledge-source"
         if cfg.vault_path.exists():
@@ -70,7 +87,9 @@ async def run_suite(cfg, store, suite_path, *, runs=3, modes=("single", "swarm")
         else:
             vault.mkdir()
     report = {"suite": suite, "budget_usd": budget, "config": effective_config(c),
-              "knowledge": knowledge, "requested_runs": runs * len(cases) * len(modes),
+              "teams": team_names, "budget_per_team": bool(team_names),
+              "team_configs": {t: effective_config(tc) for t, tc in configs.items() if t},
+              "knowledge": knowledge, "requested_runs": runs * len(cases) * len(modes) * len(configs),
               "rows": [], "pins": {}, "input_digests": {}, "summary": {}, "status": "running"}
     path = root / "results.json"
     report["report_path"] = str(path)
@@ -84,6 +103,8 @@ async def run_suite(cfg, store, suite_path, *, runs=3, modes=("single", "swarm")
 
     save()
     spent = 0.
+    spent_by = {t: 0. for t in configs}
+    exhausted: set = set()
     try:
         for case in cases:
             inputs = root / "inputs" / case["name"]
@@ -104,38 +125,56 @@ async def run_suite(cfg, store, suite_path, *, runs=3, modes=("single", "swarm")
                 pinned = frozen.repo
             report["pins"][case["name"]] = git(pinned, "rev-parse", "HEAD").strip()
             for repeat in range(runs):
-                # Alternate order so provider load does not always favor the same mode.
-                for mode in (list(modes) if repeat % 2 == 0 else list(reversed(modes))):
-                    remaining = budget - spent
-                    if remaining < .05:
-                        report["status"] = "budget_exhausted"
+                # Alternate order so provider load does not always favor the same mode or team.
+                order = list(configs) if repeat % 2 == 0 else list(reversed(configs))
+                for team in order:
+                    c = configs[team]
+                    for mode in (list(modes) if repeat % 2 == 0 else list(reversed(modes))):
+                        if team in exhausted:
+                            break
+                        remaining = (budget - spent_by[team]) if team_names else (budget - spent)
+                        if remaining < .05:
+                            exhausted.add(team)
+                            if not team_names or len(exhausted) == len(configs):
+                                report["status"] = "budget_exhausted"
+                                save()
+                                return report
+                            echo(f"team {team}: its ${budget:.2f} budget is used up; it stops, the others continue")
+                            report.setdefault("teams_out_of_budget", []).append(team)
+                            save()
+                            break
+                        c.limits.budget_usd = min(cfg.limits.budget_usd, remaining)
+                        if knowledge:
+                            run_vault = root / f"knowledge-{len(report['rows'])}"
+                            shutil.copytree(vault, run_vault)
+                            c.knowledge.resolved_vault = run_vault
+                        who = f"{team} " if team else ""
+                        echo(f"{case['name']} repeat {repeat + 1}/{runs}: {who}{mode}; ${remaining:.2f} remaining")
+                        orch = factory(c, store, mode=mode, single_role=c.developer_roles[0],
+                                       approve=lambda _: False, echo=None)
+                        rid = await orch.execute(issue_file=str(issue_path), repo=str(pinned))
+                        row = metrics(store, rid)
+                        row.update(case=case["name"], repeat=repeat + 1,
+                                   base_commit=report["pins"][case["name"]])
+                        if team:
+                            row["team"] = team
+                        row["hidden_acceptance"] = await evaluate_hidden(c, store.get_run(rid), hidden_path, mode)
+                        cost = store.cost_summary(rid)["total"]
+                        spent += cost
+                        spent_by[team] += cost
+                        report["rows"].append(row)
+                        report["spent_usd"] = round(spent, 4)
+                        if team_names:
+                            report["spent_by_team"] = {t: round(v, 4) for t, v in spent_by.items()}
                         save()
-                        return report
-                    c.limits.budget_usd = min(cfg.limits.budget_usd, remaining)
-                    if knowledge:
-                        run_vault = root / f"knowledge-{len(report['rows'])}"
-                        shutil.copytree(vault, run_vault)
-                        c.knowledge.resolved_vault = run_vault
-                    echo(f"{case['name']} repeat {repeat + 1}/{runs}: {mode}; ${remaining:.2f} remaining")
-                    orch = factory(c, store, mode=mode, single_role=cfg.developer_roles[0],
-                                   approve=lambda _: False, echo=None)
-                    rid = await orch.execute(issue_file=str(issue_path), repo=str(pinned))
-                    row = metrics(store, rid)
-                    row.update(case=case["name"], repeat=repeat + 1,
-                               base_commit=report["pins"][case["name"]])
-                    row["hidden_acceptance"] = await evaluate_hidden(c, store.get_run(rid), hidden_path, mode)
-                    spent += store.cost_summary(rid)["total"]
-                    report["rows"].append(row)
-                    report["spent_usd"] = round(spent, 4)
-                    save()
-                    if row["final_state"] == "CANCELLED":
-                        report["status"] = "cancelled"
-                        save()
-                        return report
-                    if row["calls_without_cost"]:
-                        report["status"] = "unpriced_calls_hold"
-                        save()
-                        return report  # cannot enforce a dollar cap without prices
+                        if row["final_state"] == "CANCELLED":
+                            report["status"] = "cancelled"
+                            save()
+                            return report
+                        if row["calls_without_cost"]:
+                            report["status"] = "unpriced_calls_hold"
+                            save()
+                            return report  # cannot enforce a dollar cap without prices
         report["status"] = "completed"
         save()
         store.record_benchmark(label, str(suite_path), report["rows"])

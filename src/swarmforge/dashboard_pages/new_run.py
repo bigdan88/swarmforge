@@ -39,8 +39,10 @@ def render(Path, _hrs, cfg, dataclasses, heal_input, pd, re, repo_picker, select
                                         "acceptance criteria; the planner turns this into a task graph.")
         repo = repo_picker("Repository", "nr_repo")
 
+    from swarmforge.dashboard_pages.team_ui import team_config, team_picker
     c1, c2, c3, c4, c5 = st.columns(5)
-    mode = c1.selectbox("Team", ["swarm", "reviewed", "single"], format_func=lambda m: {
+    mode = c1.selectbox("Workflow", ["swarm", "reviewed", "single", "auto"], format_func=lambda m: {
+        "auto": "Auto (pick by task size)",
         "swarm": "Swarm (5 roles)", "reviewed": "One developer + test/review",
         "single": "Single agent (baseline)"}[m])
     budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(cfg.limits.budget_usd), 0.5, key="nr_budget")
@@ -50,7 +52,12 @@ def render(Path, _hrs, cfg, dataclasses, heal_input, pd, re, repo_picker, select
                                  "(limits.max_runtime_s).")
     approval = c5.selectbox("Before pushing to GitHub", ["dashboard", "yes"], format_func=lambda a: {
         "dashboard": "Ask me here", "yes": "Pre-approve"}[a])
-    heal = heal_input(st.columns(5)[0], "nr_heal")
+    h1, h2, _ = st.columns([1, 1, 3])
+    heal = heal_input(h1, "nr_heal")
+    team = team_picker(cfg, h2, "nr_team")
+    run_cfg, team_error = team_config(cfg, team)
+    if team_error:
+        st.error(f"Model team: {team_error}")
 
     with st.expander("Advanced: test command and sandbox image"):
         st.caption("Leave blank to use the repository's `swarmforge.project.yml` (if it has one), "
@@ -62,17 +69,20 @@ def render(Path, _hrs, cfg, dataclasses, heal_input, pd, re, repo_picker, select
     from swarmforge.effective_config import effective_config, policy_summary, resolve_variant
     with st.expander("Run policy"):
         preview_cfg = dataclasses.replace(
-            cfg, limits=dataclasses.replace(cfg.limits, budget_usd=budget,
+            run_cfg, limits=dataclasses.replace(cfg.limits, budget_usd=budget,
                                            max_repair_cycles=int(cycles), max_runtime_s=int(hours * 3600)),
             sandbox=dataclasses.replace(cfg.sandbox, image=(image or "").strip() or cfg.sandbox.image))
         preview_cfg, _ = resolve_variant(preview_cfg, store)
         st.caption(policy_summary(preview_cfg))
         st.json({"mode": mode, **effective_config(preview_cfg)}, expanded=False)
     with st.expander("Team roster for this run"):
-        roster = [{"role": r, "model": cfg.roles[r].model} for r in
-                  ["planner", *cfg.developer_roles, "tester", "reviewer", cfg.librarian_role] if r in cfg.roles]
+        roster = [{"role": r, "model": run_cfg.roles[r].model,
+                   "fallbacks": ", ".join(run_cfg.roles[r].fallback_models) or "-"} for r in
+                  ["planner", *run_cfg.developer_roles, "tester", "reviewer", run_cfg.librarian_role,
+                   run_cfg.visual_role, "lead"] if r in run_cfg.roles]
         st.dataframe(pd.DataFrame(roster).drop_duplicates(), hide_index=True, width="stretch")
-        st.caption("Change models in swarmforge.yaml (then restart the dashboard).")
+        st.caption("Pick another lineup with **Model team**; edit or add teams in `teams/` next to "
+                   "swarmforge.yaml.")
 
     if vault and (body or title):
         found = vault.search(f"{title or ''}\n{body or ''}", k=cfg.knowledge.max_notes_in_prompt)
@@ -99,6 +109,8 @@ def render(Path, _hrs, cfg, dataclasses, heal_input, pd, re, repo_picker, select
                 url = url.strip()
             elif not (title or "").strip() or not (body or "").strip():
                 raise ValueError("give the run a title and a description")
+            if team_error:
+                raise ValueError(f"fix the model team first: {team_error}")
             from swarmforge.preflight import environment_problems
             with st.spinner("Checking Docker, keys and the repository…"):
                 problems = environment_problems(cfg, (image or "").strip() or None)
@@ -117,7 +129,7 @@ def render(Path, _hrs, cfg, dataclasses, heal_input, pd, re, repo_picker, select
                                     mode=mode, budget=budget, max_cycles=int(cycles), approval=approval,
                                     test_command=(test_cmd or "").strip() or None,
                                     sandbox_image=(image or "").strip() or None, base=base,
-                                    max_runtime_s=int(hours * 3600), heal_attempts=heal)
+                                    max_runtime_s=int(hours * 3600), heal_attempts=heal, team=team)
         except (ValueError, RepoError) as e:
             st.error(str(e))
             return

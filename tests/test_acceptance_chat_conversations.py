@@ -22,6 +22,12 @@ from .conftest import FakeProvider, base_raw
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _replies(fake):
+    """Model requests that produce chat replies (conversation-title requests left out)."""
+    from swarmforge.chatbot import TITLE_PROMPT
+    return [r for r in fake.requests if r["messages"][0]["content"] != TITLE_PROMPT]
+
+
 @pytest.fixture
 def store(cfg):
     s = Store(cfg.db_path)
@@ -31,6 +37,14 @@ def store(cfg):
 
 def _fake(reply: str = "ok"):
     return FakeProvider({"qwen-fake": lambda b: {"content": reply}})
+
+
+def _answer(fake):
+    """The reply request. When older messages fall out of the window, a compaction summary request
+    (and only that) comes first."""
+    from swarmforge.compaction import CONVERSATION_PROMPT
+    assert all(r["messages"][0]["content"] == CONVERSATION_PROMPT for r in _replies(fake)[:-1])
+    return _replies(fake)[-1]
 
 
 def _thread(request_body):
@@ -48,11 +62,11 @@ def test_ac1_two_conversations_produce_disjoint_contexts(cfg, store):
     # second turn on B: must see B's history only, never A's
     chatbot.ask(cfg, store, "bravo follow-up", conversation="B", transport=fake.transport)
 
-    assert [m["content"] for m in _thread(fake.requests[2])] == [
+    assert [m["content"] for m in _thread(_replies(fake)[2])] == [
         "alpha question", "ok", "alpha follow-up"]
-    assert [m["content"] for m in _thread(fake.requests[3])] == [
+    assert [m["content"] for m in _thread(_replies(fake)[3])] == [
         "bravo question", "ok", "bravo follow-up"]
-    for body in (fake.requests[2], fake.requests[3]):
+    for body in (_replies(fake)[2], _replies(fake)[3]):
         contents = " ".join(m["content"] for m in _thread(body))
         if "alpha" in contents:
             assert "bravo" not in contents
@@ -70,9 +84,9 @@ def test_ac1_switching_threads_does_not_leak_history(cfg, store):
     for i in range(3):
         chatbot.ask(cfg, store, f"secret thread one {i}", conversation="one", transport=fake.transport)
     chatbot.ask(cfg, store, "first question in thread two", conversation="two", transport=fake.transport)
-    last = _thread(fake.requests[-1])
+    last = _thread(_replies(fake)[-1])
     assert [m["content"] for m in last] == ["first question in thread two"]
-    assert all("thread one" not in m["content"] for m in fake.requests[-1]["messages"])
+    assert all("thread one" not in m["content"] for m in _replies(fake)[-1]["messages"])
     # thread "one" itself is intact and still isolated
     assert len(store.conversation_messages("one")) == 6
     assert store.conversation_messages("two")[0]["content"] == "first question in thread two"
@@ -82,9 +96,9 @@ def test_ac1_answer_async_is_also_scoped_by_conversation(cfg, store):
     fake = _fake()
     asyncio.run(chatbot.answer(cfg, store, "q for X", conversation="X", transport=fake.transport))
     asyncio.run(chatbot.answer(cfg, store, "q for Y", conversation="Y", transport=fake.transport))
-    assert [m["content"] for m in _thread(fake.requests[1])] == ["q for Y"]
-    assert fake.requests[0]["messages"][0]["role"] == "system"
-    assert "<status>" in fake.requests[0]["messages"][0]["content"]
+    assert [m["content"] for m in _thread(_replies(fake)[1])] == ["q for Y"]
+    assert _replies(fake)[0]["messages"][0]["role"] == "system"
+    assert "<status>" in _replies(fake)[0]["messages"][0]["content"]
 
 
 def test_ac1_conversation_wins_over_history_argument(cfg, store):
@@ -94,7 +108,7 @@ def test_ac1_conversation_wins_over_history_argument(cfg, store):
                 history=[{"role": "user", "content": "foreign thread"},
                          {"role": "assistant", "content": "foreign answer"}],
                 transport=fake.transport)
-    assert [m["content"] for m in _thread(fake.requests[0])] == ["real question"]
+    assert [m["content"] for m in _thread(_replies(fake)[0])] == ["real question"]
 
 
 # ========================================================= AC2: truncation rule
@@ -141,7 +155,7 @@ def test_ac2_window_is_the_configured_value(cfg, store):
     fake = _fake()
     chatbot.ask(cfg, store, "newest", conversation="W", transport=fake.transport)
     # 8 stored + this question = 9 rows, newest 4 go to the model
-    assert [m["content"] for m in _thread(fake.requests[0])] == ["a2", "u3", "a3", "newest"]
+    assert [m["content"] for m in _thread(_answer(fake))] == ["a2", "u3", "a3", "newest"]
 
 
 def test_ac2_token_budget_applied_end_to_end(cfg, store):
@@ -154,7 +168,7 @@ def test_ac2_token_budget_applied_end_to_end(cfg, store):
     store.conversation_append("T", "assistant", "a1")
     fake = _fake()
     chatbot.ask(cfg, store, "q2", conversation="T", transport=fake.transport)
-    thread = _thread(fake.requests[0])
+    thread = _thread(_answer(fake))
     contents = [m["content"] for m in thread]
     assert big not in contents                      # oldest over-budget message dropped
     assert contents == ["a1", "q2"] or contents[-1] == "q2"
@@ -170,6 +184,7 @@ def test_ac2_truncation_is_deterministic(cfg, store):
 
 # ==================================================== AC3: cost attribution
 def test_ac3_usage_recorded_under_chat_conversation_run_id(cfg, store):
+    store.conversation_create("paid", "Costs")  # already named, so no title call is made
     fake = _fake()
     res = chatbot.ask(cfg, store, "how much?", conversation="paid", transport=fake.transport)
     rows = store.llm_calls("chat:paid")
@@ -184,6 +199,8 @@ def test_ac3_usage_recorded_under_chat_conversation_run_id(cfg, store):
 
 
 def test_ac3_cost_is_per_conversation_and_accumulates(cfg, store):
+    store.conversation_create("A", "Alpha")  # already named, so only reply calls are charged
+    store.conversation_create("B", "Bravo")
     fake = _fake()
     chatbot.ask(cfg, store, "a1", conversation="A", transport=fake.transport)
     chatbot.ask(cfg, store, "a2", conversation="A", transport=fake.transport)
@@ -284,8 +301,8 @@ def test_ac5_config_without_chat_section_still_loads(tmp_path, monkeypatch):
     for i in range(20):
         st_.conversation_append("wide", "user", f"m{i}")
     chatbot.ask(cfg, st_, "last", conversation="wide", transport=fake.transport)
-    assert len(_thread(fake.requests[-1])) == 12
-    assert _thread(fake.requests[-1])[-1]["content"] == "last"
+    assert len(_thread(_replies(fake)[-1])) == 12
+    assert _thread(_replies(fake)[-1])[-1]["content"] == "last"
 
 
 def test_ac5_example_yaml_documents_the_chat_section():
@@ -306,7 +323,7 @@ def test_ac6_ask_without_conversation_is_unchanged(cfg, store):
     chatbot.ask(cfg, store, "next", history=[{"role": "user", "content": "h1"},
                                              {"role": "assistant", "content": "h2"}],
                 transport=fake.transport)
-    assert [m["content"] for m in _thread(fake.requests[1])] == ["h1", "h2", "next"]
+    assert [m["content"] for m in _thread(_replies(fake)[1])] == ["h1", "h2", "next"]
     # nothing persisted, no cost attributed
     assert store.conversations_list() == []
     assert store.cost_summary("chat:cli")["total"] == 0
