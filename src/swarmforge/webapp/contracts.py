@@ -86,6 +86,56 @@ class RecordedTest(PublicResponse):
     timed_out: bool
 
 
+class ExecutionTask(PublicResponse):
+    task_key: str
+    cycle: int
+    kind: str
+    title: str | None
+    role: str | None
+    model: str | None
+    state: str
+    depends_on: list[str] = Field(max_length=50)
+    dependencies_complete: bool
+    expected_files: list[str] = Field(max_length=20)
+    started_at: float | None
+    ended_at: float | None
+    attempts: int
+    summary: str | None
+    error: str | None
+    truncated: bool
+
+
+class ExecutionBot(PublicResponse):
+    role: str | None
+    provider: str | None
+    model: str | None
+    calls: int
+    tokens: int
+    known_cost_usd: float
+    unavailable_calls: int
+    errors: int
+    first_call_at: float | None
+    last_call_at: float | None
+
+
+class ExecutionPhase(PublicResponse):
+    id: int
+    ts: float
+    state: str
+
+
+class WorkExecution(PublicResponse):
+    mode: str
+    repair_cycle: int
+    counts: dict[str, int]
+    tasks: list[ExecutionTask] = Field(max_length=200)
+    tasks_has_more: bool
+    bots: list[ExecutionBot] = Field(max_length=40)
+    bots_has_more: bool
+    phases: list[ExecutionPhase] = Field(max_length=100)
+    phases_has_more: bool
+
+
 class WorkEvidence(PublicResponse):
     item_id: str
     run_id: str | None
@@ -98,6 +148,7 @@ class WorkEvidence(PublicResponse):
     events: list[RecordedEvent] = Field(max_length=100)
     next_event_id: int
     events_has_more: bool
+    execution: WorkExecution | None = None
 
 
 class Screenshot(PublicResponse):
@@ -126,7 +177,7 @@ class RetainedReport(PublicResponse):
 
 class ActionCommand(PublicResponse):
     operation: Literal["cancel_work", "retry_work", "decide_approval", "queue_task", "start_queue", "pause_queue",
-                       "create_project", "save_project", "launch_project", "pause_project", "cancel_project", "resume_project",
+                       "start_project", "create_project", "save_project", "amend_project", "retry_project_lead", "extend_project_task", "launch_project", "pause_project", "cancel_project", "resume_project", "launch_chat_task",
                        "create_conversation", "rename_conversation", "send_message", "project_message",
                        "create_note", "save_note", "delete_note", "diagnose_failure", "merge_pr", "update_pr",
                        "mark_features_read", "set_archived", "save_settings", "test_models"]
@@ -145,6 +196,7 @@ class ActionResult(PublicResponse):
     item_id: str | None = None
     project_id: str | None = None
     conversation_id: str | None = None
+    draft_ready: bool | None = None
     note_id: str | None = None
     details: list[dict[str, str | bool | float | None]] | None = Field(default=None, max_length=50)
 
@@ -184,6 +236,9 @@ class Message(PublicResponse):
     created_at: float
     truncated: bool
     attachments: list[Attachment] = Field(default_factory=list, max_length=6)
+    actions: dict = Field(default_factory=dict)
+    launched_tasks: dict[str, str] = Field(default_factory=dict)
+    files: list[dict] = Field(default_factory=list, max_length=8)
 
 
 class ChatStep(PublicResponse):
@@ -201,6 +256,8 @@ class ChatRequest(PublicResponse):
     started_at: float
     finished_at: float | None
     attachments: list[Attachment] = Field(max_length=6)
+    partial_text: str = ""
+    assistant_message_id: int | None = None
 
 
 class ProjectMilestone(PublicResponse):
@@ -231,6 +288,8 @@ class ProjectDetail(PublicResponse):
     tasks: list[WorkItem] = Field(max_length=100)
     events: list[ProjectEvent] = Field(max_length=50)
     messages: list[Message] = Field(max_length=100)
+    requests: list[ChatRequest] = Field(default_factory=list, max_length=5)
+    recovery: dict = Field(default_factory=dict)
 
 
 class ConversationSummary(PublicResponse):
@@ -273,10 +332,19 @@ class Lane(PublicResponse):
     count: int
 
 
+class ProjectBlocker(PublicResponse):
+    id: str
+    name: str
+    status: str
+    reason: str | None = None
+
+
 class QueueSnapshot(PublicResponse):
     paused: bool
     worker_running: bool
     lanes: list[Lane] = Field(max_length=100)
+    queued_count: int = 0
+    blocked_projects: list[ProjectBlocker] = Field(default_factory=list, max_length=20)
 
 
 class NoteSummary(PublicResponse):

@@ -71,3 +71,55 @@ def test_web_build_check_detects_stale_and_current(tmp_path, monkeypatch):
     assert fb.status()[0] == "stale" and fb.health_row()["status"] == "fail"
     monkeypatch.setattr(fb, "_npm", lambda: None)
     assert fb.ensure_current(echo=lambda m: None) == "stale"  # says so instead of serving silently
+
+
+def test_resuming_a_live_worker_clears_the_pause_without_starting_another(cfg, store, monkeypatch):
+    store.kv_set(runqueue.PAUSED_KEY, "1")
+    monkeypatch.setattr(runqueue, "worker_pid", lambda s: 1234)
+    assert runqueue.start_worker(cfg, store) == 1234
+    assert store.kv_get(runqueue.PAUSED_KEY) == "0"
+    store.kv_set(runqueue.PAUSED_KEY, "1")
+    assert runqueue.start_worker(cfg, store, keep_pause=True) == 1234
+    assert store.kv_get(runqueue.PAUSED_KEY) == "1"
+
+
+async def test_preflight_retry_has_no_missing_checkout_seed_and_keeps_its_allowance(cfg, store, monkeypatch):
+    from swarmforge import orchestrator, postmortem
+    from swarmforge.execution import ensure_allowance
+
+    store.create_run("old-preflight", state="BLOCKED", run_dir=str(cfg.workdir / "missing"))
+    store.event("old-preflight", "environment", "Docker is not responding", level="error")
+    eid = ensure_allowance(store, "old-preflight", cfg)
+    before = store._one("SELECT budget_usd,deadline FROM execution_allowances WHERE id=?", (eid,))
+    item = store.queue_add("Retry preflight", "body", "owner/app", seed_run_id="old-preflight", execution_id=eid)
+    seen = []
+
+    class FakeOrchestrator:
+        def __init__(self, config, s, **kwargs):
+            seen.append(kwargs.get("seed_run_id"))
+            self.execution_id = kwargs["execution_id"]
+
+        async def execute(self, **kwargs):
+            rid = kwargs["run_id"]
+            store.create_run(rid, state="BLOCKED", run_dir=str(cfg.workdir / rid), execution_id=self.execution_id)
+            store.event(rid, "environment", "Docker is still unavailable", level="error")
+            return rid
+
+    async def no_heal(config, s, rid, *args, **kwargs):
+        return rid
+
+    monkeypatch.setattr(orchestrator, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(postmortem, "heal", no_heal)
+    await runqueue.run_item(cfg, store, store.queue_item(item), echo=None)
+    assert seen == [None]
+    assert store.queue_item(item)["status"] == "queued"
+    assert store.queue_item(item)["seed_run_id"] is None
+    assert store.queue_item(item)["execution_id"] == eid
+    assert store._one("SELECT budget_usd,deadline FROM execution_allowances WHERE id=?", (eid,)) == before
+
+
+def test_a_checkout_with_work_remains_available_as_a_seed(cfg, store):
+    directory = cfg.workdir / "retained"
+    (directory / "repo").mkdir(parents=True)
+    assert runqueue.continuation_available({"run_dir": str(directory), "integration_branch": "swarmforge/task-retained"})
+    assert not runqueue.continuation_available({"run_dir": str(directory), "integration_branch": None})

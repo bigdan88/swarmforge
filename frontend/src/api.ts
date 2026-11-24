@@ -16,7 +16,7 @@ function checkWorkspace(session:Row){
   if(bound&&session.workspace_id!==bound.workspace){if(typeof window!=='undefined')window.dispatchEvent(new Event(WORKSPACE_CHANGED));throw new Error('This page shows a different workspace than the one now running here. Reload the page to continue.');}
 }
 export type Settings={configured:boolean;team:string|null;roles:{role:string;model:string;fallbacks:string[]}[];limits:Record<string,number>;teams:{name:string;description:string;models:Record<string,string>}[]};
-export type Result={ok:boolean;message:string;item_id?:string|null;project_id?:string|null;conversation_id?:string|null};
+export type Result={ok:boolean;message:string;item_id?:string|null;project_id?:string|null;conversation_id?:string|null;draft_ready?:boolean|null};
 export const isRow=(value:unknown):value is Row=>!!value&&typeof value==='object'&&!Array.isArray(value);
 export const str=(value:unknown)=>typeof value==='string'?value:'';
 export const num=(value:unknown)=>typeof value==='number'&&Number.isFinite(value)?value:0;
@@ -74,7 +74,10 @@ export async function performAction(operation:string,target:string,args:Row,key:
   const response=await fetch('/api/v1/actions',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':session.csrf_token,'Idempotency-Key':key,'X-SwarmForge-Workspace':bound?.workspace??str(session.workspace_id)},body:JSON.stringify({operation,target,args})});
   const value=record(await response.json());
   if(value.code==='workspace_changed')window.dispatchEvent(new Event(WORKSPACE_CHANGED));
-  if(!response.ok)throw new Error(typeof value.detail==='string'?value.detail:'The request was rejected. Review the form and try again.');
+  if(!response.ok){
+    const unsupported=response.status===422&&rows(value.detail).some(e=>e.type==='literal_error'&&Array.isArray(e.loc)&&e.loc.includes('operation'));
+    throw new Error(unsupported?'This server does not support this action yet. Restart the Python dashboard server, then reload this page.':typeof value.detail==='string'?value.detail:'The request was rejected. Review the form and try again.');
+  }
   if(typeof value.ok!=='boolean'||typeof value.message!=='string')throw new Error('The action response was incompatible. Inspect current state before retrying.');
   return value as Result;
 }

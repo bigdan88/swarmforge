@@ -245,7 +245,8 @@ def render(
                         cfg, chat=dataclasses.replace(cfg.chat, tools_enabled=tools_on)
                     )
                     res = chatbot.ask(
-                        ask_cfg, store, question, on_tool=_on_tool, **kwargs
+                        ask_cfg, store, question, on_tool=_on_tool,
+                        on_text=lambda text: answer_slot.markdown(_chat_md(text)), **kwargs
                     )
             except chatbot.ChatError as e:
                 answer_slot.error(f"Chatbot: {e}")

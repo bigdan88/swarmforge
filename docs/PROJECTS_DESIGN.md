@@ -2,6 +2,15 @@
 
 Nov 2, 2026 · @Dan
 
+## Unattended delivery update (November 23, 2026)
+
+The owner can now select `projects.autonomous: true`: approve launch once, let the swarm repair and
+build a preview within the total project cap, then refine it at the final review. Routine milestone
+replies in the original design below apply to manual mode. Unattended mode tries bounded verification,
+keeps unavailable observations explicitly pending, and continues later software milestones without
+marking those observations passed. The recovery policy, limits and final review behavior are documented
+in [Projects](PROJECTS.md#unattended-preview-delivery).
+
 ## Summary and goals
 
 SwarmForge should build a whole app from one approved spec by planning in rolling waves: fixed milestones, a short detailed horizon, and a replan after every merged task. Today a big request becomes \~20 sequential tasks planned up front, and tasks 4–20 are built on what the planner assumed tasks 1–3 would produce. This feature adds a **Project**: a kickoff chat that writes a spec, one human approval to launch, a "lead" step that replans from the real code after each merge, and a human checkpoint at the end of each milestone.
@@ -48,15 +57,21 @@ The human makes decisions at two points only: approving the spec at launch, and 
 
 The highlighted boxes are the human's; the loop on the right runs unattended until the milestone's checks pass.
 
-**The kickoff chat** is an interview, not a form. The chatbot should:
+**The kickoff chat** is a short interview with form-based answers (updated November 23, 2026). The lead should:
 
 1. Ask who the app is for and the 3–5 things those users must be able to do; these become the milestones.
-2. Ask what is explicitly out of scope.
-3. Ask for hard constraints: stack, hosting, new or existing repository, budget, deadline.
+2. Accept exclusions and hard constraints when the user supplies them; propose reasonable defaults otherwise.
+3. Use the configured GitHub owner and proposed budget, and suggest a repository name. Show all of these for review before launch.
 4. Turn each milestone's goal into checkable done-when statements, pushing back on vague ones.
-5. Ask where the swarm may choose freely and where it must ask.
+5. Default latitude to implementation choices within scope, with approval for scope changes, paid services, credentials and public deployment.
 6. Propose the milestone split itself and let the human edit it, then estimate cost and time per milestone.
 7. Show the finished spec as a rendered page with one **Approve and launch** button. Nothing touches any repository before that press.
+
+Clarifying questions appear as a bounded set of labelled fields or choices, with optional answers
+clearly marked. Ask at most one product-focused follow-up round, then prepare the draft. Missing
+optional model fields are normalized by application code before strict spec validation. One internal
+repair is allowed for malformed output; repeated prose questions produce a labelled starter proposal
+for review instead of an endless interview. The approval-time validator and fixed-spec guard remain strict.
 
 ## The project spec
 

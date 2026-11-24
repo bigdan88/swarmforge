@@ -418,7 +418,7 @@ def test_new_dashboard_pages_and_spec_preview(tmp_path, monkeypatch):
     s = Store(cfg.db_path)
     ps = Projects(s)
     p, = ps.list()
-    assert s.conversation_messages(p["conversation_id"])[0]["content"].startswith("Who is this app for")
+    assert s.conversation_messages(p["conversation_id"])[0]["content"].startswith("Tell me what you want to build")
     ps.draft(p["id"], definition())
     s.close()
     at.run()

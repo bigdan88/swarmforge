@@ -102,6 +102,7 @@ async def chat_with_tools(
     task_key: str = "chatbot",
     on_tool: Callable[[str, dict, str], Any] | None = None,
     trace: list | None = None,
+    on_text=None,
 ) -> str:
     """Run a tool-calling conversation loop and return the final text answer.
 
@@ -113,7 +114,9 @@ async def chat_with_tools(
         raise ValueError("max_rounds must be >= 1")
     work = list(messages)
     for _ in range(max_rounds):
-        resp = await llm.chat(role, work, tools=registry.schemas(), task_key=task_key)
+        from .streaming import text_callback
+        options = {"on_delta": text_callback(on_text)} if on_text else {}
+        resp = await llm.chat(role, work, tools=registry.schemas(), task_key=task_key, **options)
         work.append(
             {
                 "role": "assistant",
@@ -155,5 +158,6 @@ async def chat_with_tools(
             "content": "No more tool calls are available. Answer now with what you have.",
         }
     )
-    resp = await llm.chat(role, work, task_key=task_key)
+    from .streaming import text_callback
+    resp = await llm.chat(role, work, task_key=task_key, **({"on_delta": text_callback(on_text)} if on_text else {}))
     return resp.message.get("content") or ""

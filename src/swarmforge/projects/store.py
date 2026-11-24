@@ -22,18 +22,20 @@ class Projects:
     def list(self):
         return [self.get(p["id"]) for p in self.store._all("SELECT id FROM projects ORDER BY created_at DESC")]
 
-    def create(self, name="New project", *, repo="", greeting=None):
+    def create(self, name="New project", *, repo="", greeting=None, kickoff_defaults=None):
         pid = uuid.uuid4().hex[:12]
         cid = "project-" + pid
         with self.store.transaction():  # project, its conversation and the greeting exist together or not at all
             self.store.conversation_create(cid, name)
             self.store._exec("INSERT INTO projects (id,name,repo,conversation_id,budget_usd,created_at,spec,definition) VALUES (?,?,?,?,?,?,?,?)",
                              (pid, name, repo, cid, 0, time.time(), "", "{}"))
-            self._greet(cid, greeting)
+            self._greet(cid, greeting, kickoff_defaults)
         return self.get(pid)
 
-    def _greet(self, cid, greeting):
-        self.store.conversation_append(cid, "assistant", greeting or "Who is this app for, and what are the 3–5 things they must be able to do? We will turn those into milestones, then agree on scope, constraints, budget and done-when checks before launch.")
+    def _greet(self, cid, greeting, choices=None):
+        from .kickoff import initial_questions
+        self.store.conversation_append(cid, "assistant", greeting or "Tell me what you want to build. I will propose the scope, milestones and budget for you to review. Fill in as much as you know; I can suggest the rest.",
+                                       actions={"project_questions": initial_questions(choices or {}), "kickoff_defaults": choices or {}})
 
     def draft(self, pid, definition, *, expected_spec=None):
         d = validate(definition)

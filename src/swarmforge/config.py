@@ -133,11 +133,28 @@ class ProjectsConfig:
     lead_timeout_s: int = 300         # each short decision call; inspection is separately bounded
     lead_budget_usd: float = 0.5      # all decision calls in one epoch, also capped by project/milestone
     investigation_timeout_s: int = 900
+    default_repo_owner: str = ""
+    default_budget_usd: float = 30.0  # proposed at kickoff; spending still needs launch approval
+    min_build_budget_usd: float = 0.0  # optional floor for newly planned build tasks; project caps still apply
+    autonomous: bool = False  # owner-selected unattended operation within the approved project cap
+    auto_recovery_rounds: int = 2  # persisted recovery cap per problem between real progress/owner replies
+    auto_retry_delay_s: float = 15.0
 
     def __post_init__(self):
+        import re
+        if not isinstance(self.default_repo_owner, str) or (self.default_repo_owner and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", self.default_repo_owner)):
+            raise ConfigError("projects.default_repo_owner must be a GitHub account or organization name")
+        if type(self.default_budget_usd) not in (int, float) or not .5 <= self.default_budget_usd <= 10000:
+            raise ConfigError("projects.default_budget_usd must be between 0.50 and 10000")
         if not 1 <= self.horizon <= 3 or self.max_task_failures < 1 or self.escalate_failures < 2 or self.escalate_budget_factor < 1:
             raise ConfigError("projects: invalid horizon, failure thresholds or budget factor")
         import math
+        if type(self.autonomous) is not bool or type(self.auto_recovery_rounds) is not int or not 0 <= self.auto_recovery_rounds <= 3:
+            raise ConfigError("projects.autonomous must be boolean and auto_recovery_rounds between 0 and 3")
+        if type(self.auto_retry_delay_s) not in (int, float) or not math.isfinite(self.auto_retry_delay_s) or not 0 <= self.auto_retry_delay_s <= 300:
+            raise ConfigError("projects.auto_retry_delay_s must be between 0 and 300")
+        if type(self.min_build_budget_usd) not in (int, float) or not math.isfinite(self.min_build_budget_usd) or not 0 <= self.min_build_budget_usd <= 500:
+            raise ConfigError("projects.min_build_budget_usd must be between 0 and 500")
         if type(self.max_lead_actions) is not int or not 1 <= self.max_lead_actions <= 6:
             raise ConfigError("projects.max_lead_actions must be between 1 and 6")
         if not all(math.isfinite(v) and v > 0 for v in (self.lead_timeout_s, self.lead_budget_usd, self.investigation_timeout_s)):

@@ -172,9 +172,10 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         c.auto_merge.repos = [p["repo"]]
         c.self_heal.enabled = False
         c.github.create_pr = not str(item.get("project_key") or "").startswith("spike:")
+        from .projects.autonomy import milestone_limit
         ms = ps.milestones(p["id"])[p["current_milestone"]]
         remaining = min(p["budget_usd"] - ps.spent(p["id"]),
-                        ms["estimate_usd"] * cfg.projects.escalate_budget_factor - ps.spent(p["id"], p["current_milestone"]))
+                        milestone_limit(cfg, p, ms) - ps.spent(p["id"], p["current_milestone"]))
         requested = min(float(item["budget"] or c.limits.budget_usd), c.limits.budget_usd)
         if item.get("execution_id"):
             allowance = store._one("SELECT budget_usd-spent_usd AS remaining FROM execution_allowances WHERE id=?", (item["execution_id"],))
@@ -222,7 +223,14 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         else:
             orch.approve = dashboard_approver(store, lambda: orch.run_id, cc.approval.timeout_s)
         return orch
-    await make(c, item.get("seed_run_id")).execute(**src, base_branch=base, run_id=run_id)
+    seed = item.get("seed_run_id")
+    if seed:
+        previous = store.get_run(seed)
+        # Older workers seeded every environment failure, even a preflight stop
+        # before a checkout existed. Keep its allowance, but start from the repo.
+        if environment_blocked(store, previous) and not continuation_available(previous):
+            seed = None
+    await make(c, seed).execute(**src, base_branch=base, run_id=run_id)
     store.queue_update(item["id"], execution_id=store.get_run(run_id).get("execution_id"))
 
     async def launch(cc, seed, ctx, heal_of, attempt):
@@ -238,9 +246,9 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         # this one in line and pause its queue until the problem is fixed (Resume starts it again).
         name = lane(item)
         with store.transaction():  # the item goes back in line exactly when its lane pauses
-            set_lane_paused(store, name, True)
+            set_lane_paused(store, name, True, reason="environment")
             store.queue_update(item["id"], status="queued", run_id=None, started_at=None,
-                               seed_run_id=run_id,
+                               seed_run_id=run_id if continuation_available(run) else seed,
                                note=f"{ENV_PAUSE_NOTE}: {(run['state_reason'] or '')[:300]}")
         if echo:
             echo(f"queue '{name}' paused: environment problem ({(run['state_reason'] or '')[:200]}). "
@@ -268,6 +276,12 @@ def _hook(name: str, *args, echo=None) -> None:
 
 
 ENV_PAUSE_NOTE = "paused, not failed: environment problem"
+
+
+def continuation_available(run: dict | None) -> bool:
+    """A preflight failure has no code to continue; allowance identity is separate."""
+    return bool(run and run.get("integration_branch") and run.get("run_dir")
+                and (Path(run["run_dir"]) / "repo").is_dir())
 
 
 def environment_blocked(store: Store, run: dict | None) -> bool:
@@ -353,8 +367,9 @@ def lane_paused(store: Store, name: str) -> bool:
     return store.kv_get(LANE_PAUSED.format(name)) == "1"
 
 
-def set_lane_paused(store: Store, name: str, paused: bool) -> None:
+def set_lane_paused(store: Store, name: str, paused: bool, *, reason: str | None = None) -> None:
     store.kv_set(LANE_PAUSED.format(name), "1" if paused else None)
+    store.kv_set("queue_pause_reason:" + name, reason if paused else None)
 
 
 def resume_all(store: Store) -> None:
@@ -470,12 +485,13 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                 if echo:
                     echo(f"queue[{name}]: #{item['id']} -> {result['status']}")
                 if result["status"] != "done" and (store.kv_get(POLICY_KEY) or "stop") == "stop":
-                    set_lane_paused(store, name, True)
+                    pause_reason = "environment" if result["status"] == "queued" and str(result.get("note") or "").startswith(ENV_PAUSE_NOTE) else "failure"
+                    set_lane_paused(store, name, True, reason=pause_reason)
                     if echo:
                         echo(f"queue[{name}] paused because #{item['id']} did not complete (policy: stop on failure)")
             paused = store.kv_get(PAUSED_KEY) == "1"
             restart = store.kv_get(RESTART_KEY) == "1"      # new code was installed: finish, then restart
-            if restart and not running:
+            if restart and not running and (project_task is None or project_task.done()):
                 store.kv_set(RESTART_KEY, None)
                 store.kv_set(WORKER_KEY, None)
                 if echo:
@@ -493,7 +509,7 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                 # starting another refresh immediately would reclaim its project fence.
                 project_poll = max(project_poll, time.monotonic() + poll_s)
             if can_start and project_task is None and time.monotonic() >= project_poll:
-                project_task = asyncio.create_task(projects.tick(cfg, store, transport=llm_transport))
+                project_task = asyncio.create_task(projects.tick(fresh_config(cfg, echo), store, transport=llm_transport))
                 project_poll = time.monotonic() + 10
             startable = []
             if can_start:
@@ -518,6 +534,9 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                 if restart:
                     if project_task is not None:
                         await asyncio.sleep(poll_s)
+                    continue
+                if not paused and (max_items is None or started < max_items) and project_task is not None and not project_task.done():
+                    await asyncio.sleep(poll_s)  # let automatic recovery reopen a waiting project before deciding the worker is idle
                     continue
                 if paused and echo:
                     echo("queue paused")
@@ -545,11 +564,11 @@ def start_worker(cfg: Config, store: Store, keep_pause: bool = False) -> int | N
     """Start the background worker process (no-op if one is running). Returns its pid."""
     import subprocess
     import sys
+    if not keep_pause:
+        store.kv_set(PAUSED_KEY, "0")
     pid = worker_pid(store)
     if pid:
         return pid
-    if not keep_pause:
-        store.kv_set(PAUSED_KEY, "0")
     logs = cfg.workdir / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     log = open(logs / "queue-worker.log", "a", encoding="utf-8")

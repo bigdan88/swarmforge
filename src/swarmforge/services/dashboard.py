@@ -120,6 +120,28 @@ class DashboardActions:
         from .runs import request_cancel
         store = self.store
         ps = Projects(store)
+        if operation == "launch_chat_task":
+            if not self.config or args.get("spending_authorized") is not True:
+                raise ValueError("Review the task and authorize its allowance before launching")
+            index = args.get("index")
+            if not target.isdigit() or type(index) is not int or not 0 <= index < 8:
+                raise ValueError("Choose a suggested task")
+            with store.transaction():
+                message = store._one("SELECT role,conversation_id,actions FROM chat_messages WHERE id=?", (int(target),))
+                if not message or message["role"] != "assistant" or message["conversation_id"].startswith("project-"):
+                    raise ValueError("Choose a task from a general conversation")
+                tasks = json.loads(message["actions"] or "{}").get("tasks", [])
+                if index >= len(tasks):
+                    raise ValueError("This suggestion is no longer available")
+                marker = f"chat-task:{int(target)}:{index}"
+                existing = store.kv_get(marker)
+                if existing:
+                    result = {"item_id": existing, "message": "This suggestion is already in the queue."}
+                else:
+                    # The ordinary task path validates edited requirements, repository and limits.
+                    result = self._apply("queue_task", "", args)
+                    store.kv_set(marker, result["item_id"])
+            return {**result, "message": result["message"] + (self._start_authorized_worker() if not existing else "")}
         if operation == "cancel_work":
             if target.startswith("task-") and target[5:].isdigit():
                 item = store.queue_item(int(target[5:]))
@@ -242,12 +264,23 @@ class DashboardActions:
             if not self.config or not self.config.source_path or args.get("spending_authorized") is not True:
                 raise ValueError("A configured worker and explicit authorization are required")
             from ..runqueue import start_worker
+            ready = store._one("SELECT COUNT(*) AS n FROM queue_items WHERE status IN ('queued','running')")["n"]
+            projects_running = store._one("SELECT COUNT(*) AS n FROM projects WHERE status='running'")["n"]
+            if not ready and not projects_running:
+                waiting = store._one("SELECT name FROM projects WHERE status IN ('waiting_for_you','at_checkpoint','paused') ORDER BY created_at DESC LIMIT 1")
+                if waiting:
+                    raise ValueError(f"No work is ready. Open Projects and review {waiting['name']}: it needs your decision before the queue can continue.")
+                raise ValueError("No work is ready. Add a task or approve a project before starting the queue. Tentative tasks wait for the project lead.")
             (self.worker_start or start_worker)(self.config, store)
             return {"message": "Queue worker start requested"}
         if operation == "pause_queue":
             from ..runqueue import PAUSED_KEY
             store.kv_set(PAUSED_KEY, "1")
             return {"message": "Queue paused; running work can finish"}
+        if operation == "start_project":
+            from ..projects.kickoff import defaults
+            p = ps.create(kickoff_defaults=defaults(self.config) if self.config else {})
+            return {"project_id": p["id"], "message": "Project conversation started. Tell the lead what you want to build; nothing has launched."}
         if operation == "create_project":
             definition = validate(args.get("definition"))
             from ..projects.spec import render
@@ -261,6 +294,38 @@ class DashboardActions:
                 raise ValueError("The spec changed. Reload and review before saving.")
             ps.draft(target, validate(args.get("definition")), expected_spec=args.get("expected_spec"))
             return {"project_id": target, "message": "Draft saved. Nothing has launched."}
+        if operation == "amend_project":
+            if args.get("spending_authorized") is not True:
+                raise ValueError("Approve the revised specification and allowance before saving")
+            with store.transaction():
+                project = ps.get(target)
+                if args.get("expected_spec") != hashlib.sha256(project["spec"].encode()).hexdigest():
+                    raise ValueError("The approved spec changed. Reload before amending it.")
+                service.amend(store, target, validate(args.get("definition")))
+            return {"project_id": target, "message": "Revised specification approved. The project stays paused until you continue."}
+        if operation == "extend_project_task":
+            if self.config is None or args.get("spending_authorized") is not True:
+                raise ValueError("Approve the displayed additional task allowance before continuing")
+            from ..runqueue import RESTART_KEY, worker_pid
+            with store.transaction():
+                service.extend_task_allowance(self.config, store, target, expected_spec=args.get("expected_spec"),
+                                              expected_recovery=args.get("expected_recovery"), extra_budget=args.get("extra_budget"), hours=args.get("hours"))
+                if self.worker_start is None and worker_pid(store):
+                    store.kv_set(RESTART_KEY, "1")
+            return {"project_id": target, "message": "Recovery allowance approved. The lead will revise the plan and attempt repairs." + self._start_authorized_worker()}
+        if operation == "retry_project_lead":
+            if self.config is None or args.get("spending_authorized") is not True:
+                raise ValueError("Retry planning within the approved scope and remaining allowance")
+            correction = args.get("correction", "")
+            if not isinstance(correction, str) or len(correction) > 16000:
+                raise ValueError("Keep the optional clarification within 16000 characters")
+            from ..runqueue import RESTART_KEY, worker_pid
+            with store.transaction():
+                service.retry_planning(store, target, expected_spec=args.get("expected_spec"), expected_decision=args.get("expected_decision"), correction=correction)
+                if self.worker_start is None and worker_pid(store):
+                    # Finish in-flight work, then load the repaired planner.
+                    store.kv_set(RESTART_KEY, "1")
+            return {"project_id": target, "message": "Automatic planning retry requested." + self._start_authorized_worker()}
         if operation in ("launch_project", "resume_project", "pause_project", "cancel_project"):
             if operation in ("launch_project", "resume_project") and args.get("spending_authorized") is not True:
                 raise ValueError("Explicit project authorization is required")
@@ -270,14 +335,25 @@ class DashboardActions:
                 project = ps.get(target)
                 if len(project["spec"]) > 256000 or len(json.dumps(project["definition"])) > 64000:
                     raise ValueError("This specification exceeds the web review limit; review and approve it in the existing dashboard")
-                service.approve(store, target, expected_spec=args.get("expected_spec", ""))
+                with store.transaction():
+                    if store._one("SELECT id FROM chat_requests WHERE conversation_id=? AND status='thinking'", (project["conversation_id"],)):
+                        raise ValueError("Wait for the lead's reply, then review the current proposal before launching")
+                    service.approve(store, target, expected_spec=args.get("expected_spec", ""))
             elif operation == "resume_project":
-                service.resume(store, target, text(args, "reply", 16000, "continue"), confirm_manual=args.get("confirm_manual") is True)
+                from ..runqueue import RESTART_KEY, worker_pid
+                with store.transaction():
+                    service.resume(store, target, text(args, "reply", 16000, "continue"), confirm_manual=args.get("confirm_manual") is True,
+                                   expected_spec=args.get("expected_spec"), expected_recovery=args.get("expected_recovery"))
+                    if self.worker_start is None and worker_pid(store):
+                        store.kv_set(RESTART_KEY, "1")  # load updated verification/recovery code after in-flight work finishes
             elif operation == "pause_project":
                 service.pause(store, target)
             else:
                 service.cancel(store, target)
-            return {"project_id": target, "message": "Project action recorded; existing launch, merge and spending rules apply"}
+            message = "Project action recorded; existing launch, merge and spending rules apply"
+            if operation in ("launch_project", "resume_project") and ps.get(target)["status"] == "running":
+                message += self._start_authorized_worker()
+            return {"project_id": target, "message": message}
         if operation == "create_conversation":
             cid = uuid.uuid4().hex
             store.conversation_create(cid, text(args, "title", 200, "New chat"))
@@ -296,10 +372,29 @@ class DashboardActions:
             expected = args.get("expected_spec")
             if p["status"] != "drafting" or expected != hashlib.sha256(p["spec"].encode()).hexdigest():
                 raise ValueError("Reload the current draft before continuing its interview")
-            question = text(args, "message", 16000)
+            if "answers" in args:
+                from ..projects.kickoff import answer_message, defaults
+                question = answer_message(store, p, args, defaults(self.config))
+            else:
+                question = text(args, "message", 16000)
             from ..projects.lead import interview
+            if self.chat_background:
+                import inspect
+                from .chat_requests import start_reply
+                interview_fn = self.project_interview or interview
+                params = inspect.signature(interview_fn).parameters
+                async def project_answer(config, store, question, *, conversation, on_text=None, question_saved=False):
+                    options: dict[str, Any] = {"expected_spec": expected}
+                    if "on_text" in params:
+                        options["on_text"] = on_text
+                    if "question_saved" in params:
+                        options["question_saved"] = question_saved
+                    return await interview_fn(config, store, target, question, **options)
+                start_reply(store, self.config, project_answer, p["conversation_id"], question,
+                            save_question="question_saved" in params)
+                return {"project_id": target, "draft_ready": False, "message": "Your reply is saved. The lead's response appears as it arrives."}
             asyncio.run((self.project_interview or interview)(self.config, store, target, question, expected_spec=expected))
-            return {"project_id": target, "message": "Project reply recorded. Review any updated spec before launch."}
+            return {"project_id": target, "draft_ready": bool(ps.get(target)["definition"]), "message": "Project reply recorded. Review any updated spec before launch."}
         if operation == "send_message":
             if not self.config or not store.conversation_get(target) or target.startswith("project-"):
                 raise ValueError("Choose a general conversation with model configuration loaded")
@@ -362,6 +457,17 @@ class DashboardActions:
                 raise ValueError("No diagnosis was produced; the run's retained evidence may be missing")
             return {"message": "Diagnosis recorded"}
         raise ValueError("Unknown action")
+
+    def _start_authorized_worker(self) -> str:
+        """A reviewed launch must run, while a startup failure must not lose its queued work."""
+        if not self.config or (not self.config.source_path and self.worker_start is None):
+            return ". Start queue from Work with a saved configuration to begin."
+        from ..runqueue import start_worker
+        try:
+            (self.worker_start or start_worker)(self.config, self.store)
+        except (OSError, RuntimeError, ValueError):
+            return ". Work is saved, but the worker could not start. Open Work and choose Start queue."
+        return ". Queue worker start requested."
 
     def _save_settings(self, args):
         """Validated role/limit edits written with a backup, exactly as the Streamlit Settings page does."""

@@ -50,7 +50,7 @@ class WorkspaceReader(WorkReader):
             total = conn.execute("SELECT COUNT(*) FROM projects" + where, (search,)).fetchone()[0]
             return {"items": items, "total": total, "limit": limit, "offset": offset}
 
-    def project(self, pid):
+    def project(self, pid, *, kickoff_defaults=None):
         with self.connection() as conn:
             conn.execute("BEGIN")
             row = conn.execute("SELECT " + self.project_fields + ",spec,definition FROM projects WHERE id=?", (pid,)).fetchone()
@@ -60,17 +60,53 @@ class WorkspaceReader(WorkReader):
             item["spent_usd"] = Projects(ReadStore(conn)).spent(pid)
             spec = item.pop("spec")
             definition = item.pop("definition")
+            messages = self._messages(conn, item["conversation_id"])
+            requests = self._chat_requests(conn, item["conversation_id"], messages)
+            draft = json.loads(definition) if len(definition) <= 64000 else {}
+            if item["status"] == "drafting" and not draft:
+                from ..projects.kickoff import recovery_questions
+                last = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+                if last is not None and "project_questions" not in last.get("actions", {}):
+                    # Present old stalled interviews as a form too, without changing history on GET.
+                    choices = kickoff_defaults or {}
+                    has_brief = bool(conn.execute("SELECT 1 FROM chat_messages WHERE conversation_id=? AND role='user' LIMIT 1", (item["conversation_id"],)).fetchone())
+                    last["actions"] = {**last.get("actions", {}), "project_questions": recovery_questions(has_brief, choices), "kickoff_defaults": choices}
+            from ..projects.recovery import recovery_state
+            recovery = recovery_state(ReadStore(conn), {**item, "spec": spec})
             return {"project": item, "spec": spec[:256000], "spec_sha": hashlib.sha256(spec.encode()).hexdigest(),
-                    "definition": json.loads(definition) if len(definition) <= 64000 else {},
+                    "definition": draft,
                     "truncated": len(spec) > 256000 or len(definition) > 64000,
                     "milestones": [dict(r) for r in conn.execute("SELECT idx,name,status,estimate_usd,spent_usd,started_at,finished_at,substr(report,1,16000) AS report FROM milestones WHERE project_id=? ORDER BY idx LIMIT 6", (pid,))],
                     "tasks": [dict(r) for r in conn.execute(self.queue_projection + " WHERE q.project_id=? ORDER BY q.position LIMIT 100", (pid,))],
                     "events": [dict(r) for r in conn.execute("SELECT id,ts,kind,substr(detail,1,12000) AS detail FROM project_events WHERE project_id=? ORDER BY id DESC LIMIT 50", (pid,))],
-                    "messages": self._messages(conn, item["conversation_id"])}
+                    "messages": messages, "requests": requests, "recovery": recovery}
 
     @staticmethod
     def _messages(conn, cid):
         rows = [dict(r) for r in conn.execute("SELECT id,role,substr(content,1,32000) AS content,created_at,length(content)>32000 AS truncated FROM chat_messages WHERE conversation_id=? ORDER BY id DESC LIMIT 100", (cid,))]
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_files'").fetchone():
+            from ..chat_files import metadata
+            files = {}
+            for item in conn.execute("SELECT id,message_id,name,kind,size,media_type FROM chat_files WHERE conversation_id=? AND message_id IN (SELECT id FROM chat_messages WHERE conversation_id=? ORDER BY id DESC LIMIT 100) ORDER BY created_at", (cid, cid)):
+                files.setdefault(item["message_id"], []).append(metadata(dict(item)))
+            for row in rows:
+                row["files"] = files.get(row["id"], [])[:8]
+        # Older read-only workspaces may predate stored suggestions. Never migrate on a GET.
+        if "actions" in {r[1] for r in conn.execute("PRAGMA table_info(chat_messages)")}:
+            actions = {r[0]: r[1] for r in conn.execute("SELECT id,substr(actions,1,100000) FROM chat_messages WHERE conversation_id=? ORDER BY id DESC LIMIT 100", (cid,))}
+            markers = [f"chat-task:{row['id']}:{index}" for row in rows for index in range(8)]
+            launched = dict(conn.execute("SELECT key,value FROM kv WHERE key IN (" + ",".join("?" for _ in markers) + ")", markers)) if markers else {}
+            for row in rows:
+                try:
+                    value = json.loads(actions.get(row["id"]) or "{}")
+                    row["actions"] = value if isinstance(value, dict) else {}
+                except ValueError:
+                    row["actions"] = {}
+                row["launched_tasks"] = {}
+                for index in range(8):
+                    item = launched.get(f"chat-task:{row['id']}:{index}")
+                    if item:
+                        row["launched_tasks"][str(index)] = item
         return list(reversed(rows))
 
     def conversations(self, *, limit=25, offset=0):
@@ -92,7 +128,9 @@ class WorkspaceReader(WorkReader):
         """Recent background replies (status, tool steps, failures) and attachments on their messages."""
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_requests'").fetchone():
             return []
-        rows = [dict(r) for r in conn.execute("SELECT id,status,substr(question,1,2000) AS question,steps,substr(error,1,1000) AS error,started_at,finished_at,user_message_id,attachments "
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(chat_requests)")}
+        extra = "partial_text,assistant_message_id," if "partial_text" in columns else "'' AS partial_text,NULL AS assistant_message_id,"
+        rows = [dict(r) for r in conn.execute("SELECT " + extra + "id,status,substr(question,1,2000) AS question,steps,substr(error,1,1000) AS error,started_at,finished_at,user_message_id,attachments "
                                               "FROM chat_requests WHERE conversation_id=? ORDER BY started_at DESC LIMIT 5", (cid,))]
         by_message = {}
         for r in rows:
@@ -114,6 +152,22 @@ class WorkspaceReader(WorkReader):
         for m in messages:
             m["attachments"] = by_message.get(m["id"], [])
         return rows
+
+    def chat_file(self, cid, file_id):
+        with self.connection() as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_files'").fetchone():
+                return None
+            row = conn.execute("SELECT f.* FROM chat_files f JOIN chat_messages m ON m.id=f.message_id AND m.conversation_id=f.conversation_id WHERE f.id=? AND f.conversation_id=?", (file_id, cid)).fetchone()
+            return dict(row) if row else None
+
+    def reply(self, cid, request_id):
+        with self.connection() as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_requests'").fetchone():
+                return None
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(chat_requests)")}
+            extra = "partial_text,assistant_message_id," if "partial_text" in columns else "'' AS partial_text,NULL AS assistant_message_id,"
+            row = conn.execute("SELECT " + extra + "id,status,error FROM chat_requests WHERE id=? AND conversation_id=?", (request_id, cid)).fetchone()
+            return dict(row) if row else None
 
     def chat_upload(self, cid, upload_id):
         """Path of an image attached to a message in this conversation, or None."""
@@ -150,6 +204,8 @@ class WorkspaceReader(WorkReader):
             except ValueError:
                 running = False
             return {"paused": bool(row and row[0] == "1"), "worker_running": running,
+                    "queued_count": conn.execute("SELECT COUNT(*) FROM queue_items WHERE status='queued'").fetchone()[0],
+                    "blocked_projects": [dict(r) for r in conn.execute("SELECT id,name,status,substr(last_error,1,1000) AS reason FROM projects WHERE status IN ('waiting_for_you','at_checkpoint','paused') ORDER BY created_at DESC LIMIT 20")],
                     "lanes": [dict(r) for r in conn.execute("SELECT COALESCE(queue,'main') AS name,status,COUNT(*) AS count FROM queue_items WHERE status IN ('queued','running','tentative') GROUP BY name,status LIMIT 100")]}
 
     def outcomes(self):

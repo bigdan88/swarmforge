@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 import re
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -176,7 +177,7 @@ class WorkReader:
             run_id = item["run_id"]
             result = {"item_id": item_id, "run_id": run_id, "costs": None, "allowance": None,
                       "checks": [], "checks_has_more": False, "tests": [], "tests_has_more": False,
-                      "events": [], "next_event_id": after, "events_has_more": False}
+                      "events": [], "next_event_id": after, "events_has_more": False, "execution": None}
             if run_id is None:
                 return result
             result["costs"] = dict(conn.execute("""
@@ -187,6 +188,7 @@ class WorkReader:
                     cost_source NOT IN ('provider_reported','estimated') THEN 1 ELSE 0 END),0) AS unavailable_calls
                 FROM llm_calls WHERE run_id=?""", (run_id,)).fetchone())
             result["allowance"] = self._allowance(conn, run_id)
+            result["execution"] = self._execution(conn, run_id)
             checks = [dict(r) for r in conn.execute("""
                 SELECT id,cycle,substr(criterion_id,1,200) AS criterion_id,substr(text,1,4000) AS text,
                        substr(status,1,100) AS status,substr(evidence,1,4000) AS evidence,
@@ -207,6 +209,76 @@ class WorkReader:
             if result["events"]:
                 result["next_event_id"] = result["events"][-1]["id"]
             return result
+
+    @staticmethod
+    def _execution(conn, run_id):
+        """Public task graph and observed model usage, never configuration or prompts.
+
+        Aggregate counts cover the whole run even when the bounded task preview is full.
+        Phase history is independent of the recent-event cursor so reconnects cannot
+        make an earlier stage look as though it never happened.
+        """
+        run = conn.execute("SELECT mode,repair_cycle FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:  # Legacy queue rows can reference a run whose record is unavailable.
+            return None
+        counts = {r[0]: r[1] for r in conn.execute(
+            "SELECT state,COUNT(*) FROM tasks WHERE run_id=? GROUP BY state", (run_id,))}
+        tasks = [dict(r) for r in conn.execute("""
+            SELECT substr(task_key,1,200) AS task_key,cycle,kind,substr(title,1,300) AS title,substr(role,1,100) AS role,
+                   substr(model,1,200) AS model,state,substr(depends_on,1,65537) AS depends_on,
+                   substr(expected_files,1,65537) AS expected_files,
+                   started_at,ended_at,attempts,substr(summary,1,1200) AS summary,substr(error,1,1200) AS error,
+                   COALESCE(length(summary)>1200 OR length(error)>1200 OR length(title)>300,0) AS truncated
+            FROM tasks WHERE run_id=? ORDER BY cycle DESC,id DESC LIMIT 201""", (run_id,))]
+        has_more = len(tasks) > 200
+        tasks = list(reversed(tasks[:200]))
+        for task in tasks:
+            for field, limit, width in (("depends_on", 50, 200), ("expected_files", 20, 240)):
+                raw = task[field]
+                try:
+                    values = json.loads(raw or "[]") if len(raw or "") <= 65536 else None
+                except (ValueError, TypeError, RecursionError):
+                    values = None
+                valid = isinstance(values, list) and all(isinstance(v, str) for v in values)
+                clipped = not valid or len(values) > limit or any(len(v) > width for v in values)
+                task[field] = [v[:width] for v in values[:limit]] if valid else []
+                task["truncated"] = bool(task["truncated"] or clipped)
+                if field == "depends_on":
+                    task["dependencies_complete"] = not clipped
+            task["attempts"] = task["attempts"] or 0
+        bots = [dict(r) for r in conn.execute("""
+            SELECT substr(role,1,100) AS role,substr(provider,1,100) AS provider,substr(model,1,200) AS model,
+                   COUNT(*) AS calls,COALESCE(SUM(total_tokens),0) AS tokens,
+                   COALESCE(SUM(CASE WHEN cost_source IN ('provider_reported','estimated') THEN cost_usd END),0) AS known_cost_usd,
+                   SUM(CASE WHEN cost_usd IS NULL OR cost_source IS NULL OR
+                       cost_source NOT IN ('provider_reported','estimated') THEN 1 ELSE 0 END) AS unavailable_calls,
+                   SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,
+                   MIN(started_at) AS first_call_at,MAX(ended_at) AS last_call_at
+            FROM llm_calls WHERE run_id=? GROUP BY role,provider,model
+            ORDER BY calls DESC,role,model,provider LIMIT 41""", (run_id,))]
+        history = [dict(r) for r in conn.execute("""
+            SELECT id,ts,substr(message,1,1000) AS message,substr(data,1,16000) AS data
+            FROM events WHERE run_id=? AND kind='state' ORDER BY id DESC LIMIT 101""", (run_id,))]
+        phases = []
+        for event in reversed(history[:100]):
+            try:
+                data = json.loads(event["data"] or "{}")
+            except (ValueError, TypeError, RecursionError):
+                data = {}
+            state = data.get("to") if isinstance(data, dict) else None
+            if not isinstance(state, str):
+                match = re.search(r"->\s*([A-Z_]+)", event["message"] or "")
+                state = match[1] if match else None
+            known_states = {"ISSUE_RECEIVED", "REPOSITORY_INSPECTION", "PLANNING", "TASK_VALIDATION",
+                            "TASK_EXECUTION", "INTEGRATION", "TESTING", "CODE_REVIEW", "FIX_REQUIRED",
+                            "APPROVED", "PULL_REQUEST_CREATION", "COMPLETED", "FAILED", "BLOCKED",
+                            "CANCELLED", "BUDGET_EXCEEDED"}
+            if state in known_states:
+                phases.append({"id": event["id"], "ts": event["ts"], "state": state[:100]})
+        return {"mode": run["mode"], "repair_cycle": run["repair_cycle"] or 0,
+                "counts": counts, "tasks": tasks, "tasks_has_more": has_more,
+                "bots": bots[:40], "bots_has_more": len(bots) > 40,
+                "phases": phases, "phases_has_more": len(history) > 100}
 
     @staticmethod
     def _allowance(conn, run_id):

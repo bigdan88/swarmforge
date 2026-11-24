@@ -1,6 +1,7 @@
 """React chat: background replies with progress, visible failures, one pending reply, attachments."""
 import asyncio
 import base64
+import json
 import threading
 
 import pytest
@@ -12,6 +13,65 @@ from swarmforge.db import Store
 from swarmforge.services.chat_requests import ChatBusy, release_interrupted, stage_upload, start_reply, wait_idle
 from swarmforge.services.dashboard import DashboardActions
 from swarmforge.webapp.app import create_app
+
+
+def test_generated_tasks_survive_reload_and_launch_once_through_normal_queue(chat, tmp_path, monkeypatch):
+    from swarmforge import chatbot
+    cfg, store = chat
+    calls, starts = [], []
+
+    async def fake_model(*args, **kwargs):
+        calls.append(True)
+        return 'Here is a task.\n```actions\n' + json.dumps({"tasks": [{
+            "title": "Export inventory", "description": "Add CSV export.\nAcceptance: exported rows match the list.",
+            "repo": "owner/app", "why": "Requested in this chat"}]}) + '\n```'
+
+    monkeypatch.setattr(chatbot, "_run_chat", fake_model)
+    actions = DashboardActions(store, cfg, chat_background=False, worker_start=lambda *_: starts.append(True))
+    with TestClient(create_app(cfg.db_path, tmp_path, actions=actions), base_url="http://127.0.0.1") as client:
+        sent = client.post("/api/v1/actions", json={"operation": "send_message", "target": "c1", "args": {"message": "Generate a task"}},
+                           headers=authorize(client)).json()
+        assert sent["ok"] and len(calls) == 1
+        message = client.get("/api/v1/conversations/c1").json()["messages"][-1]
+        assert message["content"] == "Here is a task."
+        assert message["actions"]["tasks"][0]["title"] == "Export inventory"
+        assert message["launched_tasks"] == {} and not store.queue_items() and not starts
+        args = {"index": 0, "title": "Export inventory", "body": "Reviewed CSV acceptance criteria", "repo": "owner/app", "budget": 2}
+
+        def launch(key, **changes):
+            return client.post("/api/v1/actions", json={"operation": "launch_chat_task", "target": str(message["id"]), "args": {**args, **changes}},
+                               headers=authorize(client, key)).json()
+
+        assert not launch("chat-launch-noauth01")["ok"]
+        assert not launch("chat-launch-badindex", index=5, spending_authorized=True)["ok"]
+        assert not launch("chat-launch-badlimit", budget=1000, spending_authorized=True)["ok"]
+        assert not store.queue_items() and not starts
+        result = launch("chat-launch-reviewed", spending_authorized=True)
+        assert result["ok"] and result["item_id"]
+        assert launch("chat-launch-reviewed", spending_authorized=True) == result
+        assert launch("chat-launch-new-key1", spending_authorized=True)["item_id"] == result["item_id"]
+        assert len(store.queue_items()) == 1
+        item = store.queue_items()[0]
+        assert item["approval"] == "dashboard" and item["budget"] == 2
+        assert item["body"] == args["body"] and item["max_runtime_s"] == cfg.limits.max_runtime_s
+        assert starts
+        reloaded = client.get("/api/v1/conversations/c1").json()["messages"][-1]
+        assert reloaded["launched_tasks"] == {"0": result["item_id"]}
+        assert reloaded["actions"] == message["actions"]
+        assert store._one("SELECT COUNT(*) AS n FROM llm_calls")["n"] == 0
+
+
+def test_worker_start_failure_keeps_reviewed_task_and_prevents_duplicate_launch(chat):
+    cfg, store = chat
+    mid = store.conversation_append("c1", "assistant", "Proposal", actions={"tasks": [{"title": "One task"}]})
+    def broken(*_):
+        raise OSError("Cannot start process")
+    actions = DashboardActions(store, cfg, worker_start=broken)
+    args = {"index": 0, "title": "One task", "body": "Acceptance", "repo": "owner/app", "budget": 2, "spending_authorized": True}
+    result = actions.execute("chat-worker-failed01", "launch_chat_task", str(mid), args)
+    assert result["ok"] and "worker could not start" in result["message"]
+    assert actions.execute("chat-worker-retry001", "launch_chat_task", str(mid), args)["item_id"] == result["item_id"]
+    assert len(store.queue_items()) == 1
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 

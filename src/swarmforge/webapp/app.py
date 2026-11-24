@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -72,7 +72,7 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self'; img-src 'self' data: https:; frame-ancestors 'none'"
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
@@ -130,13 +130,49 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
             raise HTTPException(404, "Attachment unavailable")
         return Response(path.read_bytes(), media_type=media, headers={"Content-Disposition": 'inline; filename="attachment"'})
 
+    @app.get("/api/v1/conversations/{cid}/files/{file_id}")
+    def chat_file(cid: str, file_id: str, inline: bool = False):
+        from ..chat_files import MAX_FILE_BYTES, root
+        row = workspace.chat_file(cid, file_id) if len(file_id) == 32 else None
+        if row is None or config is None:
+            raise HTTPException(404, "File unavailable")
+        path = Path(row["path"]).resolve()
+        if root(config) not in path.parents or not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+            raise HTTPException(404, "File unavailable")
+        if inline and row["kind"] == "image":
+            return Response(path.read_bytes(), media_type=row["media_type"])
+        return FileResponse(path, filename=row["name"], media_type=row["media_type"], content_disposition_type="attachment")
+
+    @app.get("/api/v1/conversations/{cid}/replies/{request_id}/events")
+    def reply_events(cid: str, request_id: str):
+        import json
+        import time
+        if workspace.reply(cid, request_id) is None:
+            raise HTTPException(404, "Reply unavailable")
+        def events():
+            previous = None
+            deadline = time.monotonic() + 55
+            while time.monotonic() < deadline:
+                row = workspace.reply(cid, request_id)
+                if row is None:
+                    return
+                payload = json.dumps(row, ensure_ascii=True)
+                if payload != previous:
+                    yield "data: " + payload + "\n\n"
+                    previous = payload
+                if row["status"] != "thinking":
+                    return
+                time.sleep(.08)
+        return StreamingResponse(events(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
     @app.get("/api/v1/projects", response_model=ProjectPage)
     def projects(limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0, le=100000), search: str = Query("", max_length=200)):
         return workspace.projects(limit=limit, offset=offset, search=search)
 
     @app.get("/api/v1/projects/{pid}", response_model=ProjectDetail)
     def project(pid: str):
-        row = workspace.project(pid)
+        from ..projects.kickoff import defaults
+        row = workspace.project(pid, kickoff_defaults=defaults(config) if config else {})
         if row is None:
             raise HTTPException(404, "Project not found")
         return row

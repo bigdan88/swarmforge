@@ -11,6 +11,7 @@ and milestone merge barriers remain in force. No repository work starts during k
 | --- | --- |
 | `inspect` | Read up to eight repository-relative files at the observed commit and up to four supplied project run IDs; retain bounded excerpts, hashes, test summaries and findings. No commands or writes. |
 | `plan` | Create, split, revise, assign or reorder the unfinished horizon through the existing project queue. At most three ready tasks, or the configured smaller horizon. |
+| `continue_plan` | Select the next undispatched queued task by integer `task_id` when the accepted horizon remains appropriate. Keeps task bodies, allowances, dependencies and all later tasks unchanged; rechecks ownership, merge/prerequisite evidence and project/milestone reservation limits. |
 | `investigate` | Queue one ready spike with a hypothesis and observable result. Uses the existing single-agent workflow, has a small spending/time allowance and creates no PR. |
 | `request_review` | Queue one task using the existing reviewed workflow: independent review, tests and any permitted in-scope corrections, with normal publication controls. This is not a read-only certification of old evidence. |
 | `request_browser_verification` | Record which exact approved milestone checks need browser verification. Stage 2 has no journey runner, so the request is explicitly **blocked/unverified** and asks for a concrete human check or correction. Stage 3 supplies executable browser journeys. |
@@ -66,7 +67,14 @@ An epoch advances on actual project outcomes or human approval/replies, not on h
 model message, a Living edit or a worker restart. The initial epoch policy and spending baseline
 are persisted. A repeated successful inspection is rejected; saved inspection evidence can feed a
 subsequent action without reading it again. Reaching the action/spending cap pauses with evidence.
-Two consecutive invalid proposals stop the turn. Timeouts cancel the awaited model work. Unknown
+Invalid JSON and rejected proposals receive the exact error and valid action examples, then retry
+automatically through the remaining persisted action/spending allowance. There is no separate
+two-response cutoff. Structured proposals and exact decoding/validation errors remain in the journal. An unambiguous
+legacy `investigate`/`request_review` reference to an existing queued task can become `continue_plan`
+only when its known descriptive fields cannot change the task, allowance, runtime or permissions.
+Different caps and unknown fields still require model repair. Human questions are a last resort in
+the lead instructions, after available evidence, inspection, investigation or in-scope alternatives.
+Timeouts cancel the awaited model work. Unknown
 request spending is retained conservatively rather than replenished. Provider-reported costs can
 still cross a nominal limit by the final in-flight response, as with existing accounting.
 
@@ -80,6 +88,15 @@ Find decision events in **Projects → Plan**, alongside the existing task histo
 records use `swarmforge project status PROJECT_ID`; its JSON includes `lead_decisions`. History is
 bounded when read; inspection excerpts and evidence catalogs are capped. No extra model calls run
 on dashboard refreshes.
+
+The React project view explains recent rejections and offers **Retry planning automatically** for
+known planning-format/decision-cap stops. An optional clarification can steer the next turn. The
+retry compares the reviewed spec and decision ID, retains all charged costs/history, opens a new
+bounded reply epoch and resumes only the approved project. It cannot replay an uncertain write,
+confirm a manual milestone check or amend scope. An existing worker finishes its in-flight work
+and reloads before the retry so it uses the repaired planner. **Edit approved scope** uses the existing
+human amendment service, preserves repository identity and completed milestones, requires explicit
+approval of the edited specification/allowance, and leaves the project paused until continued.
 
 Opening an existing database adds the journal/job tables (lead turns are `project_lead` jobs; a claim row left by an older version is still honoured until its process exits) and nullable queue `depends_on` and
 `project_action` fields. Existing tasks have no additional dependencies and retain their existing
@@ -110,3 +127,12 @@ Stage 3's isolated browser journey runner and retained evidence using existing t
 infrastructure. Preserve AGENTS.md, Fixed bytes, launch approval, merge barriers, evidence, ownership
 and task/project allowances. Use fake/local fixtures and temporary state; no paid builds, real
 repositories, production credentials, live project changes or deployments as validation.
+
+## Unattended recovery
+
+With `projects.autonomous: true`, deterministic ordering repair and valid tentative dependency graphs
+avoid unnecessary planning rejections. Ready tasks retain strict dispatch and merge barriers. Bounded
+additional planning rounds and in-scope alternatives run before requesting owner clarification, all
+charged to the same project. Safe interruptions can recover without an owner reply; uncertain repository
+writes remain held. Unavailable browser observations may enter milestone verification and the final
+preview checklist, never a fabricated pass. See [the delivery policy](PROJECTS.md#unattended-preview-delivery).

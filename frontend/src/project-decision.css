@@ -1,0 +1,8 @@
+.project-decision{margin-top:1.2rem;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:12px;padding:1.3rem;background:var(--panel)}
+.decision-heading h3{margin:.6rem 0}.decision-heading>.badge{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em}
+.decision-prose{white-space:pre-line;max-height:18rem;overflow:auto;line-height:1.6}
+.decision-checks{margin:1.2rem 0}.decision-checks article{border:1px solid var(--line);padding:.9rem 1rem;border-radius:9px;margin:.5rem 0}
+.decision-checks article>p{margin:.6rem 0;line-height:1.5}.decision-checks small{display:block;line-height:1.5}
+.decision-checks .passed{color:#359c7c}.decision-option{border-top:1px solid var(--line);margin:1.2rem 0;padding-top:.4rem}
+.project-decision form{border-top:1px solid var(--line);margin:1.2rem 0;padding-top:1rem}.project-decision>button.link-button{margin-top:.75rem}
+.project-decision input{max-width:18rem}.project-decision button{white-space:normal;text-align:left}.project-decision .form-grid{max-width:42rem}
