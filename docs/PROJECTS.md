@@ -106,9 +106,15 @@ allowances or restart cancelled, active or uncertain work. Old decision tokens a
 Launch, amendments, task launches, retries and queue start use explicit action buttons with nearby
 allowance explanations instead of a second authorization checkbox.
 
-`projects.min_build_budget_usd` sets an optional minimum for newly planned build tasks. The example
-configuration uses $2; research spikes may remain cheaper. Application code applies this configured
+`projects.min_build_budget_usd` sets a minimum for newly planned build tasks: $2 by default (one
+full team attempt costs about $0.70-1.10, so less cannot finish even once); 0 turns it off. Research
+spikes may remain cheaper. Application code applies this configured
 floor even if the lead proposes less, and records the adjustment alongside the original proposal.
+A task's acceptance criteria are sorted when it is planned (`criteria.py`): what a test can prove
+stays a gate; what only a person can check (a browser, a phone, the live site, "looks good", what the
+report says) is listed under "For a person to check after merge" and never fails the task. When a
+run's only remaining problems are criteria no test proves (tests pass, review is clean), it stops
+without spending repair cycles, and it is re-planned instead of retried unchanged.
 In manual mode, existing shared task allowances require an explicit recovery extension. Unattended
 mode may reallocate approved project funds under the bounded policy below. The total project cap
 continues to apply.

@@ -294,6 +294,7 @@ def test_project_cli_parser():
 
 
 async def test_held_fixup_stays_in_project_and_blocks_later_work(state, cfg):
+    cfg.projects.min_build_budget_usd = 0  # keeps the task's own $1 allowance (floor tested elsewhere)
     from swarmforge import automerge as am
     s, ps, pid = state
     service.approve(s, pid)

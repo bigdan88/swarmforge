@@ -35,6 +35,7 @@ CATEGORIES = {
     "repository": "Repository problem",
     "stale_base": "Base branch moved since the previous attempt",
     "planning": "Planner could not make a valid plan",
+    "unprovable_criteria": "Work is fine, but some criteria have no test that can prove them",
     "tests_failing": "Tests kept failing",
     "review_rejected": "Reviewer kept rejecting the work",
     "agent_failure": "Coding agents could not finish their tasks",
@@ -98,6 +99,8 @@ def classify(run: dict, events: list[dict], tasks: list[dict], tests: list[dict]
         return "environment"
     if re.search(r"docker|sandbox image|environment variable|api key", reason):
         return "environment"
+    if reason.startswith("criteria not provable"):
+        return "unprovable_criteria"
     if "repair limit" in reason or "fix_required" in reason:
         real = [t for t in tests if t["label"] != "baseline"]
         if real and (real[-1]["exit_code"] != 0 or real[-1]["failed"] or real[-1]["errors"]):
@@ -183,6 +186,9 @@ def rules_diagnosis(category: str, run: dict) -> Diagnosis:
         "stale_base": ("New commits landed on the base branch after the previous attempt. Continue merges "
                        "them into the old work automatically; if that conflicts, start again from scratch."),
         "planning": "Make the task description more concrete (interfaces, files, acceptance criteria).",
+        "unprovable_criteria": ("Do not retry the same plan: it would fail the same way. Re-plan the task: rewrite each "
+                                "unproved criterion as something a test can check (for example 'only README.md changes' "
+                                "becomes the task's expected files plus a test), or move it to the checks for a person."),
         "tests_failing": "Start by running the failing tests and fixing their root cause before anything else.",
         "review_rejected": "Address every unresolved review finding explicitly and verify each with a test.",
         "agent_failure": "Inspect the failed tasks' errors; give smaller, more specific tasks.",
@@ -207,7 +213,8 @@ def parse_diagnosis(text: str, fallback: Diagnosis) -> Diagnosis | None:
     cat = d.get("category") if d.get("category") in CATEGORIES else fallback.category
     retry = d.get("retry")
     retry = bool(retry) if isinstance(retry, bool) else fallback.retry
-    if fallback.category in ("environment", "repository", "cancelled", "allowance_exhausted", "external_uncertain"):
+    if fallback.category in ("environment", "repository", "cancelled", "allowance_exhausted", "external_uncertain",
+                             "unprovable_criteria"):
         retry = False  # a new attempt can't fix these; never loop on them
     return Diagnosis(category=cat, root_cause=str(d["root_cause"])[:2000], fix=str(d.get("fix") or fallback.fix)[:3000],
                      retry=retry, lesson=str(d.get("lesson") or "")[:500])

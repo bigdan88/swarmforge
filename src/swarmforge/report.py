@@ -197,9 +197,14 @@ def build_report(store, run_id: str) -> str:
     lim = []
     if run["state"] != "COMPLETED":
         lim.append(f"The run did not complete successfully (state {run['state']}): {run['state_reason']}")
-    unv = [a for a in acc if a["status"] != "satisfied" and a["cycle"] == max((x["cycle"] for x in acc), default=0)]
+    last = max((x["cycle"] for x in acc), default=0)
+    unv = [a for a in acc if a["status"] not in ("satisfied", "needs_you") and a["cycle"] == last]
     for a in unv:
         lim.append(f"Acceptance criterion {a['criterion_id']} is {a['status']}: {a['evidence']}")
+    person = [a for a in acc if a["status"] == "needs_you" and a["cycle"] == last]
+    if person:
+        lim.append("For you to check (only a person can; these did not block delivery): "
+                   + "; ".join(f"{a['criterion_id']} {a['text']}" for a in person))
     open_nb = [f for f in findings if not blocks(f, run) and f["severity"] != "info"
                and f["cycle"] == run["repair_cycle"]]
     if open_nb:
@@ -403,8 +408,12 @@ def build_summary(store, run_id: str, *, lessons: bool = True) -> str:
         lc = max(a["cycle"] for a in acc)
         cur = [a for a in acc if a["cycle"] == lc]
         ok = sum(1 for a in cur if a["status"] == "satisfied")
-        L.append(f"- **Acceptance criteria:** {ok}/{len(cur)} satisfied")
-        L += [f"  - {a['criterion_id']} {a['status']}: {a['text'][:120]}" for a in cur if a["status"] != "satisfied"]
+        person = [a for a in cur if a["status"] == "needs_you"]
+        gated = len(cur) - len(person)
+        L.append(f"- **Acceptance criteria:** {ok}/{gated} satisfied"
+                 + (f"; {len(person)} for you to check (only a person can; not blocking)" if person else ""))
+        L += [f"  - {a['criterion_id']} {'for you to check' if a['status'] == 'needs_you' else a['status']}: {a['text'][:120]}"
+              for a in cur if a["status"] != "satisfied"]
     cur_f = [f for f in findings if f["cycle"] == run["repair_cycle"] and f["source"] == "reviewer"]
     if cur_f or run["repair_cycle"]:
         blocking = sum(1 for f in cur_f if blocks(f, run))

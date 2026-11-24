@@ -528,6 +528,16 @@ class Orchestrator:
             for p in problems:
                 self.log("gate", p["summary"], level="warn")
             max_cycles = self.cfg.limits.max_repair_cycles if self.mode != "single" else 0
+            if all(p["kind"] == "acceptance_unverified" for p in problems) and not self.cfg.limits.tester_every_cycle:
+                # Nothing is broken: tests pass and review is clean, but some criteria have no test that
+                # proves them. A repair cycle re-runs the same tests (the tester does not run again), so
+                # it cannot change that; stop now and let the task be re-planned instead of retried.
+                raise RunAborted(RunState.FAILED,
+                                 "criteria not provable: no test proves "
+                                 + ", ".join(p["summary"].split()[2] for p in problems)
+                                 + " (tests pass and review found no blocking problems). Re-plan: rewrite them as "
+                                   "checks a test can prove, or as checks for a person. "
+                                 + "; ".join(p["detail"].splitlines()[0] for p in problems)[:600])
             if cycle >= max_cycles:
                 raise RunAborted(RunState.FAILED,
                                  f"repair limit reached ({max_cycles} cycle(s)); "
@@ -999,10 +1009,16 @@ class Orchestrator:
                  level="info" if ev.ok else "warn", data={"log": ev.log_path})
         if self.plan.acceptance_criteria:
             mapping = (tester_report or {}).get("criteria_tests", {})
-            results = evaluate_criteria(mapping, [(c.id, c.text) for c in self.plan.acceptance_criteria], ev)
+            from .criteria import mark_person_checks
+            results = mark_person_checks(
+                evaluate_criteria(mapping, [(c.id, c.text) for c in self.plan.acceptance_criteria], ev))
             for r in results:
                 self.store.record_acceptance(self.run_id, cycle=cycle, **r)
-            summary = {s: sum(1 for r in results if r["status"] == s) for s in ("satisfied", "failed", "unverified")}
+            summary = {s: sum(1 for r in results if r["status"] == s) for s in ("satisfied", "failed", "unverified", "needs_you")}
+            person = [r for r in results if r["status"] == "needs_you"]
+            if person:
+                self.log("test", f"{len(person)} criterion/criteria only a person can check (not blocking): "
+                                 + "; ".join(f"{r['criterion_id']}: {r['text'][:120]}" for r in person))
             self.log("test", f"acceptance criteria: {summary}", data=results)
             self._criteria_results = results
         else:

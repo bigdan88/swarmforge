@@ -664,7 +664,12 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
             pos = store.conn.execute("SELECT COALESCE(MAX(position),0) FROM queue_items").fetchone()[0]
             for i, t in enumerate(result["tasks"]):
                 key = ("spike:" if t["kind"] == "spike" else "") + t["key"].removeprefix("spike:")
-                body = t["description"] + "\n\nAcceptance criteria:\n" + "\n".join(t.get("acceptance_criteria", [])) + "\nLikely files: " + ", ".join(t.get("files", [])) + "\n\nApproved project spec (fixed part must be unchanged):\n" + proposal
+                from ..criteria import split as split_criteria
+                gated, person = split_criteria(t.get("acceptance_criteria", []))
+                body = (t["description"] + "\n\nAcceptance criteria:\n" + "\n".join(gated)
+                        + ("\n\nFor a person to check after merge (not acceptance criteria; never block this run):\n"
+                           + "\n".join(person) if person else "")
+                        + "\nLikely files: " + ", ".join(t.get("files", [])) + "\n\nApproved project spec (fixed part must be unchanged):\n" + proposal)
                 status = "queued" if t.get("ready") else "tentative"
                 store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts,execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                    (pos + i + 1, t["title"], body, p["repo"], time.time(), status, lane(pid), 0, "yes", pid, p["current_milestone"], key, t["budget_usd"], "single" if t["kind"] == "spike" else "reviewed" if action.kind == ActionKind.REVIEW else "swarm", 0, recovery_lineage))

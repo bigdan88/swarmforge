@@ -59,7 +59,7 @@ def test_unexecuted_mapping_is_not_satisfied():
     args = dict(criteria=results, tester_report=None, review=None, failed_tasks=[], task_rows=[],
                 scope=set(), visual_findings=[])
     assert not assess_gate(ev, policy=ReviewConfig(), **args)
-    assert assess_gate(ev, policy=ReviewConfig(require_verified_criteria=True), **args)[0]['kind'] == 'acceptance'
+    assert assess_gate(ev, policy=ReviewConfig(require_verified_criteria=True), **args)[0]['kind'] == 'acceptance_unverified'
     ev.junit_found = False
     assert assess_gate(ev, policy=ReviewConfig(require_junit=True), **{**args, 'criteria': []})[0]['kind'] == 'tests'
 

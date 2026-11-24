@@ -99,6 +99,7 @@ def test_invalid_planning_cannot_create_unlimited_new_rounds_even_after_worker_r
 
 def test_allowance_recovery_doubles_once_per_failed_attempt_and_keeps_the_lineage(unattended, cfg):
     store, ps, pid = unattended
+    cfg.projects.min_build_budget_usd = 0  # this test is about the doubling, not the $2 floor
     task_id, eid = stopped_task(store, ps, pid, cfg)
     assert autonomy.recover_waiting(cfg, store, ps.get(pid))
     row = store._one("SELECT * FROM execution_allowances WHERE id=?", (eid,))
@@ -133,6 +134,7 @@ def test_automatic_allowance_recovery_cannot_bypass_actual_blockers(unattended, 
 
 def test_auto_recovery_is_bounded_across_distinct_failed_attempts(unattended, cfg):
     store, ps, pid = unattended
+    cfg.projects.min_build_budget_usd = 0  # this test is about the doubling, not the $2 floor
     task_id, eid = stopped_task(store, ps, pid, cfg)
     for attempt in range(3):
         if attempt:

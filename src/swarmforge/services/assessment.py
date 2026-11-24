@@ -31,8 +31,14 @@ def assess_gate(ev: TestEvidence, *, criteria: list[dict], tester_report: dict |
         problems.append({"kind": "tests", "summary": f"test suite not passing: {ev.short()}",
                          "detail": ev.failure_report()})
     for r in criteria:
-        if r["status"] == "failed" or (policy.require_verified_criteria and r["status"] != "satisfied"):
+        # "needs_you" criteria (browser, device, live site, judgement) are checks for a person: shown
+        # with the result, never a reason to fail the run (see criteria.py).
+        if r["status"] == "failed":
             problems.append({"kind": "acceptance", "summary": f"acceptance criterion {r['criterion_id']} failing",
+                             "detail": f"{r['criterion_id']}: {r['text']}\nEvidence: {r['evidence']}"})
+        elif policy.require_verified_criteria and r["status"] == "unverified":
+            problems.append({"kind": "acceptance_unverified",
+                             "summary": f"acceptance criterion {r['criterion_id']} not proved by any test",
                              "detail": f"{r['criterion_id']}: {r['text']}\nEvidence: {r['evidence']}"})
     blocking = set(policy.blocking_severities)
     if review:

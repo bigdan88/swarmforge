@@ -49,6 +49,9 @@ Planning guidelines:
   2-3 smaller sub-tasks with sequential depends_on edges. The orchestrator deterministically
   auto-splits any task that violates these limits into sub-tasks named <id>-1, <id>-2, ....
 - List issue-level acceptance criteria (ids AC1, AC2, ...) that cover everything the issue requests.
+  Each must be something a test or command in the sandbox can prove. Do not list things only a person
+  can check (looking at it in a browser, a phone, the live site, "looks good", what the report says):
+  those are reported to the person automatically and never count as acceptance criteria.
 When finished exploring, call `submit_plan` with the plan. If it is rejected, fix the listed problems.
 """
 

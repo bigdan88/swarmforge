@@ -82,7 +82,10 @@ any non-terminal state → FAILED | BLOCKED | CANCELLED | BUDGET_EXCEEDED
   passed test and no failures/errors. `review.require_junit` holds delivery without JUnit;
   `review.require_verified_criteria` also holds unverified criteria. Both are enabled in the example
   and local configuration; compatibility defaults in the Python config classes are false. Missing
-  or skipped test mappings remain unverified even if other mapped tests pass.
+  or skipped test mappings remain unverified even if other mapped tests pass. Criteria only a person
+  can check (browser, device, live site, judgement) are recorded as `needs_you` and listed for the
+  person instead; they never block (`criteria.py`). If only unproved criteria remain, the run stops
+  without repair cycles (they cannot help) so the task is re-planned.
   Review blocking severities are configurable, and reviewer findings are filtered to repair scope.
 * **PULL_REQUEST_CREATION**: only after approval, only for GitHub issues, only with push access,
   and (by default) only after a human answers "yes". Delivery creates a draft PR. Optional

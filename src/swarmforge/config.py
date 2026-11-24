@@ -135,7 +135,7 @@ class ProjectsConfig:
     investigation_timeout_s: int = 900
     default_repo_owner: str = ""
     default_budget_usd: float = 30.0  # proposed at kickoff; spending still needs launch approval
-    min_build_budget_usd: float = 0.0  # optional floor for newly planned build tasks; project caps still apply
+    min_build_budget_usd: float = 2.0  # floor for newly planned build tasks (one full team attempt costs ~$0.7-1.1); 0 = off; project caps still apply
     autonomous: bool = False  # owner-selected unattended operation within the approved project cap
     auto_recovery_rounds: int = 2  # persisted recovery cap per problem between real progress/owner replies
     auto_retry_delay_s: float = 15.0
