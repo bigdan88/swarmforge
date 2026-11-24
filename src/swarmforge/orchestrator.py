@@ -98,6 +98,35 @@ class Orchestrator:
         self.run_id: str | None = None
 
     # ================================================================ logging
+    async def _seed_from_previous(self, seed: dict) -> str | None:
+        """Start from the previous attempt's code: its local clone if it is still there, else its branch
+        on GitHub if it was pushed, else the current base. Its diagnosis is part of the task either way,
+        so a missing clone never blocks the retry (that used to need a manual "Start again")."""
+        branch = seed.get("integration_branch")
+        fresh = f"Starting fresh from {self.ws.base_branch} @ {self.ws.base_sha[:8]}; the previous attempt's diagnosis is still part of the task"
+        if not branch:
+            self.log("repo", f"the previous attempt {seed['id']} made no branch (it stopped before writing code). {fresh}.", level="warn")
+            return None
+        seed_repo = Path(seed.get("run_dir") or "") / "repo"
+        source, config, where = seed_repo, None, "its workspace"
+        if not seed_repo.is_dir():
+            if await asyncio.to_thread(self.ws.remote_has_branch, branch, self._git_auth):
+                source, config, where = "origin", self._git_auth, "its pushed branch on GitHub"
+                self.log("repo", f"the previous attempt's workspace was cleaned up; continuing from {where} ({branch})")
+            else:
+                self.log("repo", f"the previous attempt's workspace no longer exists and {branch} was never pushed. {fresh}.",
+                         level="warn")
+                return None
+        try:
+            return await asyncio.to_thread(self.ws.seed_from, source, branch, config)
+        except StaleSeed as e:
+            # the base branch moved and the old work conflicts with it
+            self.log("repo", f"cannot reuse the previous attempt's code: {e}. {fresh}.", level="warn")
+        except GitError as e:
+            self.log("repo", f"cannot reuse the previous attempt's code from {where}: {str(e)[:300]}. {fresh}.", level="warn")
+        await asyncio.to_thread(self.ws.reset_to_base)
+        return None
+
     async def _reconcile_earlier_attempts(self) -> None:
         """An earlier attempt may have left a push/PR/merge with an unknown outcome: ask GitHub first,
         so a retry continues from what really happened instead of stopping (or repeating it)."""
@@ -406,20 +435,9 @@ class Orchestrator:
             raise RunAborted(RunState.BLOCKED, f"could not clone {source}: {_redact(str(e), token)}")
         if self.seed_run_id:
             seed = self.store.get_run(self.seed_run_id)
-            seed_repo = Path(seed["run_dir"] or "") / "repo"
-            if not seed["integration_branch"] or not seed_repo.is_dir():
-                raise RunAborted(RunState.BLOCKED, f"cannot continue from {self.seed_run_id}: its workspace "
-                                                   "(clone) no longer exists; use Start again instead")
-            try:
-                sha = await asyncio.to_thread(self.ws.seed_from, seed_repo, seed["integration_branch"])
-            except StaleSeed as e:
-                # the base branch moved and the old work conflicts with it: start fresh from the
-                # current base (the previous attempt's diagnosis is still part of the task)
-                sha = None
-                self.log("repo", f"cannot reuse the previous attempt's code: {e}. Starting fresh from "
-                                 f"{self.ws.base_branch} @ {self.ws.base_sha[:8]}", level="warn")
-            except GitError as e:
-                raise RunAborted(RunState.BLOCKED, f"cannot continue from {self.seed_run_id}: {e}")
+            if not seed:
+                raise RunAborted(RunState.BLOCKED, f"cannot continue: run {self.seed_run_id} not found")
+            sha = await self._seed_from_previous(seed)
             if sha and self.ws.seed_updated:
                 self.log("repo", f"{self.ws.base_branch} moved on since the previous attempt; merged it "
                                  f"into {seed['integration_branch']} cleanly ({sha[:8]})", level="warn")

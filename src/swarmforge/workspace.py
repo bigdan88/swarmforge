@@ -140,11 +140,12 @@ class GitWorkspace:
         git(self.repo, "checkout", "-q", "-b", self.integration_branch)
         self.worktrees_dir.mkdir(exist_ok=True)
 
-    def seed_from(self, other_repo: Path, branch: str) -> str:
+    def seed_from(self, other_repo: Path | str, branch: str, git_config: list[str] | None = None) -> str:
         """Start the integration branch from another run's result (same repository).
+        `other_repo` is that run's clone, or "origin" when only its pushed branch is left.
         The base branch/sha stay the original ones, so diffs, reviews and PRs cover all the work."""
         with self._lock:
-            git(self.repo, "fetch", "--quiet", str(other_repo), f"+refs/heads/{branch}:refs/remotes/seed/{branch}")
+            git(self.repo, *(git_config or []), "fetch", "--quiet", str(other_repo), f"+refs/heads/{branch}:refs/remotes/seed/{branch}")
             seed_sha = git(self.repo, "rev-parse", f"refs/remotes/seed/{branch}").strip()
             self.seed_updated = False
             git(self.repo, "reset", "--quiet", "--hard", seed_sha)
@@ -167,6 +168,16 @@ class GitWorkspace:
                     conflicts)
             self.seed_updated = True
             return self.head(self.repo)
+
+    def reset_to_base(self) -> None:
+        """Back to the base commit (after a previous attempt's code could not be reused)."""
+        with self._lock:
+            git_rc(self.repo, "merge", "--abort")
+            git(self.repo, "reset", "--quiet", "--hard", self.base_sha)
+
+    def remote_has_branch(self, branch: str, git_config: list[str] | None = None) -> bool:
+        rc, out = git_rc(self.repo, *(git_config or []), "ls-remote", "--heads", "origin", branch)
+        return rc == 0 and bool(out.strip())
 
     def fetch_base(self, git_config: list[str] | None = None) -> str:
         """Fetch the latest base branch from the source repository; returns its sha."""

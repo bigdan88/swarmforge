@@ -367,14 +367,37 @@ async def test_continue_from_stopped_run(cfg, sample_repo):
     assert any("starting from the previous attempt's result" in e["message"] for e in store.events(second))
 
 
-async def test_continue_from_missing_workspace_is_blocked(cfg, sample_repo):
+async def test_continue_from_a_missing_workspace_uses_the_pushed_branch_or_starts_fresh(cfg, sample_repo):
+    """A cleaned-up workspace no longer blocks the retry (it used to need a manual "Start again")."""
+    cfg.limits.max_runtime_s = 1200
     cfg.limits.max_repair_cycles = 0
     store, first, _ = await _run(cfg, sample_repo)
-    shutil.rmtree(cfg.workdir / "runs" / first / "repo")
+    r1 = store.get_run(first)
+    repo1 = cfg.workdir / "runs" / first / "repo"
+    t1_commit = subprocess.run(["git", "log", "--format=%H", "--grep", "^T1:", r1["integration_branch"]],
+                               cwd=repo1, capture_output=True, text=True).stdout.split()[0]
+    # never pushed and the clone is gone: start fresh from the base, with the diagnosis in the task
+    shutil.rmtree(repo1, ignore_errors=True)
     orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport, seed_run_id=first)
     second = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
-    r2 = store.get_run(second)
-    assert r2["state"] == "BLOCKED" and "Start again" in r2["state_reason"]
+    assert store.get_run(second)["state"] != "BLOCKED", store.get_run(second)["state_reason"]
+    assert any("was never pushed. Starting fresh" in e["message"] for e in store.events(second))
+
+    # pushed to the source repository (GitHub, in real use): continue from that branch
+    store, third, _ = await _run(cfg, sample_repo)
+    r3 = store.get_run(third)
+    repo3 = cfg.workdir / "runs" / third / "repo"
+    t1_commit = subprocess.run(["git", "log", "--format=%H", "--grep", "^T1:", r3["integration_branch"]],
+                               cwd=repo3, capture_output=True, text=True).stdout.split()[0]
+    subprocess.run(["git", "push", "--quiet", str(sample_repo), r3["integration_branch"]], cwd=repo3, check=True)
+    shutil.rmtree(repo3, ignore_errors=True)
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport, seed_run_id=third)
+    fourth = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+    r4 = store.get_run(fourth)
+    assert r4["state"] != "BLOCKED", r4["state_reason"]
+    assert any("continuing from its pushed branch" in e["message"] for e in store.events(fourth))
+    assert subprocess.run(["git", "merge-base", "--is-ancestor", t1_commit, r4["integration_branch"]],
+                          cwd=cfg.workdir / "runs" / fourth / "repo").returncode == 0
 
 
 async def test_live_settings_and_runtime_watchdog(cfg):
