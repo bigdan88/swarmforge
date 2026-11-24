@@ -22,7 +22,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
               test_command: str | None = None, sandbox_image: str | None = None,
               base: str | None = None, issue_file: str | None = None,
               max_runtime_s: int | None = None, seed_run_id: str | None = None,
-              heal_attempts: int | None = None) -> tuple[str, Path]:
+              heal_attempts: int | None = None, team: str | None = None,
+              retry_of: str | None = None) -> tuple[str, Path]:
     if not issue_url and not issue_file and not (issue_title and issue_body):
         raise ValueError("give a GitHub issue URL, or a title and description")
     if not issue_url and not repo and not issue_file:
@@ -32,8 +33,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
     run_id = new_run_id()
     logs = cfg.workdir / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    args = [sys.executable, "-m", "swarmforge.cli", "-c", str(cfg.source_path), "run",
-            "--run-id", run_id, "--approval", approval]
+    args = [sys.executable, "-m", "swarmforge.cli", "-c", str(cfg.source_path),
+            *(["--team", team] if team else []), "run", "--run-id", run_id, "--approval", approval]
     if issue_url:
         args.append(issue_url.strip())
     elif issue_file:
@@ -50,8 +51,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args.append("--single")
         if single_role:
             args += ["--role", single_role]
-    elif mode == "reviewed":
-        args += ["--mode", "reviewed"]
+    elif mode in ("reviewed", "auto"):
+        args += ["--mode", mode]
     elif mode != "swarm":
         raise ValueError(f"unknown run mode: {mode}")
     if budget is not None:
@@ -64,6 +65,8 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args += ["--max-runtime-hours", f"{max_runtime_s / 3600:.4g}"]
     if seed_run_id:
         args += ["--continue-from", seed_run_id]
+    if retry_of:
+        args += ["--retry-of", retry_of]
     if heal_attempts is not None:
         args += ["--heal-attempts", str(int(heal_attempts))]
     if test_command:

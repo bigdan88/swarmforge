@@ -129,6 +129,12 @@ class DockerSandbox(Sandbox):
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
             return CommandResult(command, proc.returncode, _truncate(out.decode(errors="replace")),
                                  time.time() - start)
+        except asyncio.CancelledError:
+            await _run_quiet([self.cfg.docker_binary, "kill", name])
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
         except asyncio.TimeoutError:
             await _run_quiet([self.cfg.docker_binary, "kill", name])
             try:
@@ -205,6 +211,10 @@ class LocalSandbox(Sandbox):
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
             return CommandResult(command, proc.returncode, _truncate(out.decode(errors="replace")),
                                  time.time() - start)
+        except asyncio.CancelledError:
+            _kill_tree(proc)
+            await proc.wait()
+            raise
         except asyncio.TimeoutError:
             _kill_tree(proc)
             try:

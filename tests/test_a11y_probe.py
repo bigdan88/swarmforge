@@ -1,5 +1,6 @@
-"""Accessibility probe tests: browse_raw's a11y passthrough, the sandbox probe script contract,
-and the Chat page's accessible names. Offline except for the optional real-browser probe test."""
+"""Accessibility probe tests: visual._browse_probe's a11y passthrough, the sandbox probe script
+contract, and the Chat page's accessible names. Offline except for the optional real-browser probe
+test."""
 
 import importlib.util
 import json
@@ -15,6 +16,7 @@ import pytest
 
 pytest.importorskip("streamlit")
 
+from swarmforge import visual
 from swarmforge.agent import devtools
 from swarmforge.sandbox import CommandResult
 
@@ -63,12 +65,12 @@ def ctx(tmp_path):
 async def _captured_args(ctx, monkeypatch, payload, **kwargs):
     sess = _FakeSession(payload)
     monkeypatch.setattr(devtools, "open_session", lambda _ctx: sess)
-    data = await devtools.browse_raw(ctx, "http://localhost:8501/", **kwargs)
-    assert sess.env is not None, "browse_raw must pass SF_BROWSE_ARGS to the probe"
+    data = await visual._browse_probe(ctx, "http://localhost:8501/", **kwargs)
+    assert sess.env is not None, "_browse_probe must pass SF_BROWSE_ARGS to the probe"
     return json.loads(sess.env["SF_BROWSE_ARGS"]), data
 
 
-async def test_browse_raw_sends_a11y_flag_only_when_requested(ctx, monkeypatch):
+async def test_browse_probe_sends_a11y_flag_only_when_requested(ctx, monkeypatch):
     payload = {
         "url": "http://localhost:8501/",
         "status": 200,
@@ -84,16 +86,25 @@ async def test_browse_raw_sends_a11y_flag_only_when_requested(ctx, monkeypatch):
             }
         ],
     }
-    args, data = await _captured_args(ctx, monkeypatch, payload, a11y=True)
+    args, data = await _captured_args(
+        ctx,
+        monkeypatch,
+        payload,
+        a11y=True,
+        color_scheme="light",
+        viewport={"width": 390, "height": 844},
+    )
     assert args["a11y"] is True
-    # the raw passthrough returns the probe's a11y snapshot and contrast pairs untouched
+    assert args["color_scheme"] == "light"
+    assert args["viewport"] == {"width": 390, "height": 844}
+    # the passthrough returns the probe's a11y snapshot and contrast pairs untouched
     assert data["a11y"] == payload["a11y"]
     assert data["contrast"] == payload["contrast"]
 
     args, data = await _captured_args(
         ctx, monkeypatch, {**payload, "a11y": None, "contrast": []}
     )
-    assert args["a11y"] is False  # opt-in: off unless requested
+    assert "a11y" not in args  # opt-in: the flag is absent unless requested
     assert data["a11y"] is None and data["contrast"] == []
 
 
@@ -313,7 +324,9 @@ def test_nameless_icon_button_is_flagged_major(tmp_path, monkeypatch):
     edit_key = next(
         (b.key for b in at.button if (b.key or "").startswith("chat_edit_")), None
     )
-    assert edit_key is not None, "expected a chat_edit_ button (requires a seeded conversation)"
+    assert edit_key is not None, (
+        "expected a chat_edit_ button (requires a seeded conversation)"
+    )
     snapshot = _chat_snapshot_from(at, strip_help_keys={edit_key})
     assert any(c["role"] == "button" and not c["name"] for c in snapshot["children"])
 

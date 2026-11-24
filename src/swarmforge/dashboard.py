@@ -89,6 +89,8 @@ CHAT_CSS = """<style>
 [data-testid="stChatMessageContent"] { border-radius: 18px; padding: 0.15rem 0.1rem; max-width: 100%; line-height: 1.7; font-size: 1rem; }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"], [data-testid="stChatMessage"]:has([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) [data-testid="stChatMessageContent"] { padding: 0.65rem 1.1rem; max-width: 78%; flex: 0 1 auto; border-bottom-right-radius: 6px; }
 :where([data-testid="stChatMessageContent"][aria-label="Chat message from user"]) { background-color: rgba(128, 128, 128, 0.12); }
+/* your own messages sit flush right (Streamlit's auto margins would otherwise centre the bubble) */
+[data-testid="stChatMessage"] [data-testid="stChatMessageContent"][aria-label="Chat message from user"] { margin: 0 0 0 auto !important; }
 [data-testid="stChatMessageAvatarCustom"] { opacity: 0.75; margin-top: 0.2rem; background: transparent; border: 0; }
 [data-testid="stChatMessageContent"] h1, [data-testid="stChatMessageContent"] h2, [data-testid="stChatMessageContent"] h3, [data-testid="stChatMessageContent"] h4 { font-family: Georgia, "Times New Roman", serif; font-weight: 600; letter-spacing: 0.01em; line-height: 1.35; padding: 0.9rem 0 0.35rem 0; }
 [data-testid="stChatMessageContent"] h1 { font-size: 1.45rem; }
@@ -100,8 +102,8 @@ CHAT_CSS = """<style>
 [data-testid="stChatMessageContent"] code { font-size: 0.85em; border-radius: 4px; padding: 0.05em 0.3em; }
 
 /* ---- page frame */
-.st-key-chat_page h2 { font-size: 1.45rem; font-weight: 600; padding-bottom: 0.1rem; }
-.st-key-chat_main { max-width: 860px; margin: 0 auto; }
+/* the pane fills the space beside the rail; --sf-chat-measure only stops lines getting absurdly long */
+.st-key-chat_main { --sf-chat-measure: 72rem; width: 100%; max-width: var(--sf-chat-measure); margin: 0 auto; }
 .st-key-chat_topbar { border-bottom: 1px solid rgba(128, 128, 128, 0.2); padding-bottom: 0.4rem; margin-bottom: 0.4rem; }
 .st-key-chat_topbar [data-testid="stMarkdown"] p { font-family: Georgia, "Times New Roman", serif; font-size: 1.1rem; font-weight: 600; margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .st-key-chat_empty { padding: 3.5rem 0 1.5rem 0; }
@@ -118,23 +120,38 @@ CHAT_CSS = """<style>
 .st-key-chat_chips button:hover { background: rgba(128, 128, 128, 0.1); }
 .st-key-chat_chips button p { font-size: 0.88rem; }
 
-/* ---- transcript scrolls by itself (fills the window), so the page, the rail and the composer stay put */
-[data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) { padding-top: 2.75rem; padding-bottom: 0.75rem; }
+/* ---- app-style layout: the page is exactly one window tall. Every ancestor of the transcript is a
+   flex item that takes the leftover height, so the transcript fills whatever the top bar and the composer
+   leave over. Pure CSS: no script measures or sets heights. */
 [data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) [data-testid="stElementContainer"]:has(> iframe.stIFrame) { position: absolute; height: 0; overflow: hidden; margin: 0; }
-/* compact composer: a small "Upload" button instead of a big drop zone */
-.st-key-chat_files [data-testid="stFileUploaderDropzone"] { padding: 0; background: transparent; border: 0; }
-.st-key-chat_files [data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
+[data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) { max-width: none; padding: 1rem 1.5rem 0.75rem 1.5rem; }
+[data-testid="stColumn"]:has(.st-key-chat_rail) { flex: 0 0 17rem !important; min-width: 0; }
+.st-key-chat_scroll { border: 0 !important; overflow-y: auto; overscroll-behavior: contain; }
+.st-key-chat_rail { overflow-y: auto; flex-wrap: nowrap; }
+@media (min-width: 641px) {
+  [data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) { display: flex; flex-direction: column; box-sizing: border-box; height: 100vh; height: 100dvh; }
+  [data-testid="stMainBlockContainer"]:has(.st-key-chat_scroll) :has(.st-key-chat_scroll) { flex: 1 1 0 !important; min-height: 0 !important; min-width: 0; }
+  [data-testid="stColumn"]:has(.st-key-chat_scroll) { display: flex; flex-direction: column; }
+  .st-key-chat_scroll { flex: 1 1 0 !important; height: auto !important; min-height: 0 !important; }
+  .st-key-chat_rail { max-height: calc(100vh - 2.75rem); max-height: calc(100dvh - 2.75rem); }
+}
+@media (max-width: 640px) {  /* phone: columns stack, so the transcript gets a fixed share of the screen */
+  .st-key-chat_scroll { height: 60vh !important; height: 60dvh !important; }
+  .st-key-chat_rail { max-height: 14rem; }
+}
+/* compact composer: attach / shortcuts sit in one slim row above the input */
+.st-key-chat_tools { min-height: 0; }
+.st-key-chat_tools [data-testid="stPopover"] button { min-height: 1.9rem; padding: 0.1rem 0.6rem; border: 0; background: transparent; opacity: 0.75; }
+.st-key-chat_tools [data-testid="stPopover"] button:hover { opacity: 1; background: rgba(128, 128, 128, 0.1); }
+.st-key-chat_tools [data-testid="stPopover"] button p { font-size: 0.85rem; }
+.st-key-chat_tools [data-testid="stCaptionContainer"] { margin: 0; }
 .st-key-chat_chips { gap: 0.4rem; }
 .st-key-chat_chips button { min-height: 1.9rem !important; padding: 0.15rem 0.75rem !important; }
-div[data-testid="stLayoutWrapper"]:has(> .st-key-chat_scroll) { flex: 0 0 auto !important; height: auto !important; }
-.st-key-chat_scroll { flex: 0 0 auto !important; height: var(--sf-chat-h, calc(100vh - 25rem)) !important; min-height: 10rem; overflow-y: auto;
-                      border: 0 !important; overscroll-behavior: contain; }
-.st-key-chat_rail { position: sticky; top: 3.75rem; max-height: calc(100vh - 9rem); overflow-y: auto; flex-wrap: nowrap; }
 
 /* ---- conversation rail */
 .st-key-chat_rail { background: rgba(128, 128, 128, 0.06); border-radius: 14px; padding: 0.75rem 0.55rem; gap: 0.15rem; }
-.st-key-chat_rail .st-key-chat_new button { justify-content: flex-start; border-radius: 10px; font-weight: 500; }
-.st-key-chat_rail .st-key-chat_new button > div { justify-content: flex-start; }
+.st-key-chat_rail .st-key-chat_new button, .st-key-chat_rail .st-key-chat_project button { justify-content: flex-start; border-radius: 10px; font-weight: 500; }
+.st-key-chat_rail .st-key-chat_new button > div, .st-key-chat_rail .st-key-chat_project button > div { justify-content: flex-start; }
 .st-key-chat_rail .sf-rail-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; padding: 0.85rem 0 0 0.6rem; height: 2.1rem; line-height: 1; }
 .st-key-chat_rail [class*="st-key-chat_row_"] { border-radius: 9px; padding: 0 0.15rem 0 0; flex-wrap: nowrap; min-height: 2.25rem; }
 .st-key-chat_rail [class*="st-key-chat_row_"]:hover { background: rgba(128, 128, 128, 0.1); }
@@ -176,21 +193,6 @@ CHAT_SCROLL_JS = """<script>
     const el = d.querySelector('.st-key-chat_scroll');
     if (!el) return;
     if (el !== st.el) { st.el = el; st.stick = true; el.addEventListener('scroll', onScroll, {passive: true}); }
-    // size the transcript so the page itself never scrolls: rail and composer stay in place
-    const main = d.querySelector('[data-testid="stMain"]');
-    const rail = d.querySelector('.st-key-chat_rail');
-    if (rail && main) {  // the conversation list scrolls inside its own panel
-      const h = Math.max(200, Math.floor(main.getBoundingClientRect().bottom - rail.getBoundingClientRect().top - 28));
-      if (Math.abs(h - rail.getBoundingClientRect().height) > 2 || rail.style.maxHeight !== h + 'px') {
-        rail.style.setProperty('max-height', h + 'px', 'important');
-      }
-    }
-    const col = d.querySelector('.st-key-chat_main');
-    if (main && col) {  // fill the window down to the composer; the page itself never scrolls
-      const r = el.getBoundingClientRect(), below = col.getBoundingClientRect().bottom - r.bottom;
-      const want = Math.max(160, Math.floor(main.getBoundingClientRect().bottom - r.top - below - 24));
-      if (Math.abs(want - r.height) > 2) el.style.setProperty('height', want + 'px', 'important');
-    }
     if (st.stick && el.scrollHeight - el.scrollTop - el.clientHeight > 2) el.scrollTop = el.scrollHeight;
   }, 200);
   pin();
@@ -648,6 +650,9 @@ def run_resumable(run_id: str) -> bool:
 def _requeue_next(item: dict, kw: dict) -> tuple[int, bool]:
     """Re-add a queue item at the front of the waiting line (never twice)."""
     from swarmforge.runqueue import requeue
+    if item.get("run_id"):
+        from swarmforge.execution import approve_retry
+        approve_retry(store, cfg, item["run_id"], budget=kw.get("budget"), runtime_s=kw.get("max_runtime_s"))
     return requeue(store, item, **kw)
 
 
@@ -688,11 +693,14 @@ def restart_panel(run: dict) -> None:
 
         def launch(seed):
             try:
+                from swarmforge.execution import approve_retry
+                approve_retry(store, cfg, run["id"], budget=budget, runtime_s=int(hours * 3600))
                 rid, _ = start_run(cfg, repo=None if is_url else (run["repo"] or None),
                                    issue_url=issue_src if is_url else None,
                                    issue_file=None if is_url else issue_src,
                                    mode=run["mode"], budget=budget, max_cycles=int(cycles),
                                    max_runtime_s=int(hours * 3600), seed_run_id=seed,
+                                   retry_of=run["id"],
                                    base=run["base_branch"] if not seed else run["base_branch"])
                 select_item(f"r:{rid}")
                 st.session_state.flash = f"Started run {rid}."
@@ -848,6 +856,12 @@ def run_detail(run_id, header=True):
         st.error("The process running this run has exited without finishing (crash, reboot or killed). "
                  "See the Console tab for its output.")
     _explain_card(run, events, run_id)  # plain-language outcome + next steps, above the metrics
+    from swarmforge.execution import progress_text
+    progress = progress_text(store, run_id)
+    if progress:
+        with st.container(border=True):
+            st.markdown("**Task allowance and progress**")
+            st.caption(progress)
     c = st.columns([2.2, 1, 1, 1, 1.2, 1, 1.2])
     c[0].metric("State", run["state"].replace("_", " ").title())
     c[1].metric("Elapsed", fmt_dur(elapsed))
@@ -923,12 +937,12 @@ def run_detail(run_id, header=True):
                         st.markdown("Waits for: " + ", ".join(t["depends_on"]))
                 with b:
                     st.markdown("**Reported back**")
-                    st.write(t["summary"] or t["error"] or "_(still working)_")
+                    st.write(t["summary"] or t["error"] or ("_(run ended)_" if run["finished_at"] else "_(still working)_"))
                     st.caption(f"attempts {t['attempts']} · duration "
-                               f"{fmt_dur((t['ended_at'] or time.time()) - t['started_at']) if t['started_at'] else '-'}")
+                               f"{fmt_dur((t['ended_at'] or run['finished_at'] or time.time()) - t['started_at']) if t['started_at'] else '-'}")
 
     with tabs[1]:
-        running = [t for t in tasks if t["state"] == "RUNNING"]
+        running = [t for t in tasks if t["state"] == "RUNNING" and not run["finished_at"]]
         last_agent = {}
         for e in events:
             if e["kind"] == "agent" and e["task_key"]:
@@ -945,7 +959,7 @@ def run_detail(run_id, header=True):
             other = [e for e in events if e["kind"] == "agent"][-1:]
             st.caption("No coding task running." + (f" Last agent activity: {other[0]['message'][:150]}" if other else ""))
         rows = [{"task": f"{t['task_key']} ({t['role']})", "start": datetime.fromtimestamp(t["started_at"]),
-                 "end": datetime.fromtimestamp(t["ended_at"] or time.time()), "model": short_model(t["model"]),
+                 "end": datetime.fromtimestamp(t["ended_at"] or run["finished_at"] or time.time()), "model": short_model(t["model"]),
                  "state": t["state"]} for t in tasks if t["started_at"]]
         if rows:
             st.markdown("#### Timeline (overlapping bars = agents working in parallel)")
@@ -1338,11 +1352,23 @@ def _short_result(text: str) -> str:
     return t[:120]
 
 
+def _recovery_pr(item: dict | None) -> str | None:
+    if item and item.get("project_id") and item["status"] in ("failed", "cancelled"):
+        match = re.search(r"(?:Recovered in|Superseded by) verified recovery PR (https://github\.com/[\w.-]+/[\w.-]+/pull/\d+)", item.get("note") or "")
+        if match:
+            return match[1]
+    return None
+
+
 def _cells(w: dict, costs: dict[str, float]) -> dict:
     r, i = w["run"], w["item"]
     now = ""
     pr = re.search(r"/pull/(\d+)", (r.get("pr_url") or r.get("state_reason") or "")) if r else None
-    if pr and w["group"] == "done":
+    recovery = _recovery_pr(i)
+    if recovery:
+        label = "Superseded by" if i["status"] == "cancelled" else "Recovered in"
+        now = f"{label} PR #{recovery.rsplit('/', 1)[-1]}"
+    elif pr and w["group"] == "done":
         now = f"PR #{pr.group(1)}" + (f" · {w['merge']}" if w.get("merge") else "")
     elif w["group"] == "active" and r and (r["state_reason"] or "").startswith("waiting for the repository"):
         now = r["state_reason"][:120]
@@ -1656,8 +1682,8 @@ def waiting_editor(i: dict) -> None:
         body = st.text_area("Description and acceptance criteria", i["body"], height=240, key=f"qe_d_{i['id']}")
         repo = repo_picker("Repository", f"qe_r_{i['id']}", value=i["repo"])
         c1, c2, c3, c4, c5 = st.columns(5)
-        mode = c1.selectbox("Team", ["swarm", "reviewed", "single"], index=["swarm", "reviewed", "single"].index(i["mode"] or "swarm"),
-                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent"}.get)
+        mode = c1.selectbox("Team", ["swarm", "reviewed", "single", "auto"], index=["swarm", "reviewed", "single", "auto"].index(i["mode"] or "swarm"),
+                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent", "auto": "Auto (pick by task size)"}.get)
         budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(i["budget"] or cfg.limits.budget_usd), 0.5,
                                  key=f"qe_b_{i['id']}")
         cycles = c3.number_input("Max repair cycles", 0, 10, int(i["max_cycles"] if i["max_cycles"] is not None
@@ -1687,19 +1713,28 @@ def waiting_editor(i: dict) -> None:
 def live_settings(run: dict) -> None:
     """Change limits of a run that is going right now; the run picks them up within a few seconds."""
     rid = run["id"]
+    from swarmforge.execution import snapshot
+    allowance = snapshot(store, rid)
     lim = json.loads(run["config_json"] or "{}").get("limits", {})
     cur_t = run.get("max_runtime_s") or lim.get("max_runtime_s") or cfg.limits.max_runtime_s
     cur_c = run.get("max_repair_cycles")
     if cur_c is None:
         cur_c = lim.get("max_repair_cycles", cfg.limits.max_repair_cycles)
     elapsed = time.time() - run["created_at"]
+    current_budget = float(run["budget_usd"] or cfg.limits.budget_usd)
+    spent = store.cost_summary(rid)["total"]
+    if allowance:
+        elapsed = allowance["elapsed_s"]
+        cur_t = allowance["deadline"] - allowance["created_at"]
+        current_budget = allowance["budget_usd"]
+        spent = allowance["spent_usd"]
     with st.form(f"live_{rid}", border=True):
-        st.markdown("**⚙️ Settings for this run** — applied within a few seconds, no restart needed")
+        st.markdown("**⚙️ Settings for this task allowance** — totals across every attempt")
         c1, c2, c3 = st.columns(3)
-        budget = c1.number_input("Budget (USD)", 0.1, 1000.0, float(run["budget_usd"] or cfg.limits.budget_usd),
-                                 0.5, key=f"ls_b_{rid}", help=f"Spent so far: ${store.cost_summary(rid)['total']:.3f}")
+        budget = c1.number_input("Budget (USD)", 0.1, 1000.0, float(current_budget),
+                                 0.5, key=f"ls_b_{rid}", help=f"Spent across all attempts: ${spent:.3f}")
         hours = c2.number_input("Time limit (hours)", 0.05, 72.0, _hrs(cur_t), 0.5, key=f"ls_h_{rid}",
-                                help=f"Running for {fmt_dur(elapsed)} so far. The run stops when it reaches this.")
+                                help=f"Task elapsed: {fmt_dur(elapsed)}. Includes waits, pauses and earlier attempts.")
         cycles = c3.number_input("Max repair cycles", 0, 10, int(cur_c), key=f"ls_c_{rid}",
                                  help=f"Currently in repair cycle {run['repair_cycle']}.")
         if st.form_submit_button("Apply", type="primary"):
@@ -1707,6 +1742,12 @@ def live_settings(run: dict) -> None:
                 st.error(f"The run has already been going for {fmt_dur(elapsed)}; pick a longer time limit "
                          "(or use Cancel below).")
             else:
+                from swarmforge.execution import revise_allowance
+                try:
+                    revise_allowance(store, rid, float(budget), int(hours * 3600))
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
                 store.update_run(rid, budget_usd=float(budget), max_runtime_s=int(hours * 3600),
                                  max_repair_cycles=int(cycles))
                 store.record_intervention(rid, "settings", f"budget ${budget:.2f}, time limit {hours:g} h, "
@@ -1802,6 +1843,8 @@ def item_detail(w: dict, every) -> None:
     st.caption(" · ".join(bits))
     if blocker := w.get("waiting_on"):
         st.info(f"Waiting for task #{blocker['id']} to leave this queue slot. {blocker['title']}")
+    if recovery := _recovery_pr(i):
+        st.link_button("View merged recovery PR", recovery)
     if i and i["status"] != "queued":
         extra = []
         if i["base_branch"]:
@@ -2193,9 +2236,11 @@ def _chat_md(text: str) -> str:
 
 def _chat_rail(active_id: str, chatbot) -> dict:
     """Claude-style conversation list. Returns which rail control (if any) was clicked this pass."""
-    clicked = dict.fromkeys(("new", "sel", "edit", "del", "save", "cancel"))
+    clicked = dict.fromkeys(("new", "project", "sel", "edit", "del", "save", "cancel"))
     with st.container(key="chat_rail"):
         clicked["new"] = st.button("New chat", icon=":material/add:", key="chat_new", width="stretch")
+        clicked["project"] = st.button("Start a project", icon=":material/flag:", key="chat_project",
+                                       width="stretch", help="Agree goals in a kickoff chat, then launch")
         st.markdown('<div class="sf-rail-label">Recents</div>', unsafe_allow_html=True)
         renaming = st.session_state.get("chat_renaming")
         for c in chatbot.list_conversations(store):
@@ -2239,8 +2284,8 @@ def queue_forms() -> None:
 
     def common(prefix):
         c1, c2, c3, c5, c4 = st.columns(5)
-        mode = c1.selectbox("Team", ["swarm", "reviewed", "single"], key=f"{prefix}_mode",
-                            format_func=lambda m: {"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent"}[m])
+        mode = c1.selectbox("Workflow", ["swarm", "reviewed", "single", "auto"], key=f"{prefix}_mode",
+                            format_func=lambda m: {"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent", "auto": "Auto (pick by task size)"}[m])
         budget = c2.number_input("Budget per task (USD)", 0.5, 500.0, 5.0, 0.5, key=f"{prefix}_budget")
         cycles = c3.number_input("Max repair cycles", 0, 10, 2, key=f"{prefix}_cycles")
         hours = c5.number_input("Time limit per task (h)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s),
@@ -2248,12 +2293,14 @@ def queue_forms() -> None:
         approval = c4.selectbox("GitHub pushes", ["yes", "dashboard"], key=f"{prefix}_appr",
                                 format_func=lambda a: {"yes": "Draft PRs without asking",
                                                        "dashboard": "Ask me each time"}[a])
-        h1, h2 = st.columns([1, 4])
+        h1, h3, h2 = st.columns([1, 1, 3])
         heal = heal_input(h1, f"{prefix}_heal")
+        from swarmforge.dashboard_pages.team_ui import team_picker
+        team = team_picker(cfg, h3, f"{prefix}_team")
         chain = h2.checkbox("Chain: start from the previous task's result on this repository", value=True,
                             key=f"{prefix}_chain")
         lane = queue_picker(st, f"{prefix}_queue")
-        return mode, budget, cycles, approval, chain, int(hours * 3600), heal, lane
+        return mode, budget, cycles, approval, chain, int(hours * 3600), heal, lane, team
 
     def checked_repo(repo):
         from swarmforge.repos import normalize_repo, preflight
@@ -2265,7 +2312,7 @@ def queue_forms() -> None:
         title = st.text_input("Title", key="qa_title")
         body = st.text_area("Description with acceptance criteria", height=200, key="qa_body")
         repo = repo_picker("Repository", "qa_repo")
-        mode, budget, cycles, approval, chain, runtime, heal, lane = common("qa")
+        mode, budget, cycles, approval, chain, runtime, heal, lane, team = common("qa")
         if st.button("Add to queue", type="primary"):
             try:
                 if not title.strip() or not body.strip():
@@ -2273,7 +2320,7 @@ def queue_forms() -> None:
                 src = checked_repo(repo)
                 new_id = store.queue_add(title.strip(), body.strip(), src, mode=mode, budget=budget,
                                          max_cycles=int(cycles), chain=int(chain), approval=approval,
-                                         max_runtime_s=runtime, heal_attempts=heal, queue=lane)
+                                         max_runtime_s=runtime, heal_attempts=heal, queue=lane, team=team)
                 store.remember_repo(src)
                 st.session_state.last_queue = lane
                 st.session_state.flash = f"Queued in “{lane}”: {title.strip()}. Press ▶ Start queue when you're ready."
@@ -2288,7 +2335,7 @@ def queue_forms() -> None:
         path = st.text_input("Backlog file (Markdown with **Title:** / **Description:** sections)", value=default,
                              key="qi_path")
         repo_i = repo_picker("Repository for all imported tasks", "qi_repo")
-        mode, budget, cycles, approval, chain, runtime, heal, lane = common("qi")
+        mode, budget, cycles, approval, chain, runtime, heal, lane, team = common("qi")
         found = []
         if path and Path(path).is_file():
             found = rq.parse_backlog(Path(path).read_text(encoding="utf-8"))
@@ -2301,7 +2348,7 @@ def queue_forms() -> None:
                 for f in found:
                     store.queue_add(f.title, f.body, src, mode=mode, budget=budget, max_cycles=int(cycles),
                                     chain=int(chain), approval=approval, max_runtime_s=runtime,
-                                    heal_attempts=heal, queue=lane)
+                                    heal_attempts=heal, queue=lane, team=team)
                 store.remember_repo(src)
                 st.session_state.last_queue = lane
                 st.session_state.flash = f"Imported {len(found)} task(s). Press ▶ Start queue when you're ready."

@@ -26,6 +26,7 @@ from pathlib import Path
 
 from .config import Config
 from .db import Store
+from .launcher import pid_alive
 
 WORKER_KEY = "queue_worker_pid"
 PAUSED_KEY = "queue_paused"
@@ -94,12 +95,24 @@ RESTARTED = "restarted as task #"
 
 def requeue(store: Store, item: dict, **kw) -> tuple[int, bool]:
     """Queue a finished/failed item again at the front of the waiting line. Returns (item id, created).
-    If a copy is already waiting or running, that copy is returned instead of adding another one."""
+    If a copy is already waiting or running, that copy is returned instead of adding another one.
+    The duplicate check and the insert are one transaction, so two retries cannot both add a copy."""
+    with store.transaction():
+        return _requeue(store, item, **kw)
+
+
+def _requeue(store: Store, item: dict, **kw) -> tuple[int, bool]:
     for q in store.queue_items(include_finished=False):
         if q["id"] != item["id"] and q["status"] in ("queued", "running") and \
                 q["title"] == item["title"] and q["body"] == item["body"] and q["repo"] == item["repo"]:
             return q["id"], False
     extra = {k: item.get(k) for k in ("issue_url", "queue") if item.get(k) and k not in kw}
+    previous = store.get_run(item["run_id"]) if item.get("run_id") else None
+    lineage = item.get("execution_id") or (previous or {}).get("execution_id")
+    if lineage and "execution_id" not in kw:
+        extra["execution_id"] = lineage
+    if previous and "retry_of" not in kw:
+        extra["retry_of"] = previous["id"]
     new_id = store.queue_add(item["title"], item["body"], item["repo"], **extra, **kw)
     mine = lane(store.queue_item(new_id))
     waiting = [q for q in store.queue_items() if q["status"] == "queued" and q["id"] != new_id and lane(q) == mine]
@@ -128,6 +141,25 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     from .orchestrator import Orchestrator, new_run_id
     cfg = fresh_config(cfg, echo)        # settings edited since the worker started apply to this task
     c = copy.deepcopy(cfg)
+    item = dict(item)
+    if not item.get("execution_id") and item.get("project_id") and item.get("project_key"):
+        prior = store._one("SELECT r.execution_id FROM queue_items q JOIN runs r ON r.id=q.run_id "
+                           "WHERE q.project_id=? AND q.project_key=? AND q.milestone=? AND r.execution_id IS NOT NULL ORDER BY q.id LIMIT 1",
+                           (item["project_id"], item["project_key"], item.get("milestone")))
+        item["execution_id"] = (prior or {}).get("execution_id")
+    team = item.get("team")
+    if item.get("project_id") and not team:
+        from .projects.store import Projects
+        team = (Projects(store).get(item["project_id"]) or {}).get("team")
+    if team:
+        from .config import ConfigError
+        from .teams import apply_team
+        try:
+            c = apply_team(c, team)
+        except ConfigError as e:     # unknown/incomplete team: fail this task, don't run other models
+            store.queue_update(item["id"], status="failed", finished_at=time.time(),
+                               note=f"model team problem: {e}"[:500])
+            return store.queue_item(item["id"])
     if item.get("project_id"):
         from .projects.store import Projects
         ps = Projects(store)
@@ -144,6 +176,10 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         remaining = min(p["budget_usd"] - ps.spent(p["id"]),
                         ms["estimate_usd"] * cfg.projects.escalate_budget_factor - ps.spent(p["id"], p["current_milestone"]))
         requested = min(float(item["budget"] or c.limits.budget_usd), c.limits.budget_usd)
+        if item.get("execution_id"):
+            allowance = store._one("SELECT budget_usd-spent_usd AS remaining FROM execution_allowances WHERE id=?", (item["execution_id"],))
+            if allowance:
+                requested = min(requested, max(0, allowance["remaining"]))
         if remaining <= 0 or requested > remaining:
             from .projects.service import stop
             stop(ps, p, "The next run needs a budget review before it starts.", {"requested": requested, "remaining": remaining})
@@ -161,22 +197,33 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
     issues.mkdir(parents=True, exist_ok=True)
     issue_file = issues / f"{run_id}.md"
     issue_file.write_text(f"# {item['title']}\n\n{item['body']}\n", encoding="utf-8")
-    store.queue_update(item["id"], status="running", run_id=run_id, started_at=time.time(),
-                       base_branch=base, note=note)
+    with store.transaction():  # the project check and the claim of this item are one decision
+        if item.get("project_id"):
+            from .projects.decisions import lead_active
+            claim = lead_active(store.conn, item["project_id"])
+            state = store.conn.execute("SELECT status FROM projects WHERE id=?", (item["project_id"],)).fetchone()
+            if claim or not state or state["status"] != "running":
+                return {**store.queue_item(item["id"]), "_deferred": True}
+        claimed = store.conn.execute("UPDATE queue_items SET status='running',run_id=?,started_at=?,base_branch=?,note=? WHERE id=? AND status='queued'",
+                                     (run_id, time.time(), base, note, item["id"]))
+        if not claimed.rowcount:
+            return {**(store.queue_item(item["id"]) or item), "_deferred": True}
     issue_url = item.get("issue_url")
     src = {"issue_url": issue_url} if issue_url else {"issue_file": str(issue_file), "repo": item["repo"]}
     if issue_url:
         _hook("on_run_start", cfg, item, echo=echo)
     def make(cc, seed, ctx=None, heal_of=None, attempt=None):
+        execution_id = item.get("execution_id")
         orch = Orchestrator(cc, store, mode=item["mode"], echo=echo, llm_transport=llm_transport,
                             sandbox=sandbox, seed_run_id=seed, heal_of=heal_of, heal_attempt=attempt,
-                            heal_context=ctx)
+                            heal_context=ctx, execution_id=execution_id, retry_of=item.get("retry_of"))
         if item["approval"] == "yes":
             orch.approve = lambda q: True
         else:
             orch.approve = dashboard_approver(store, lambda: orch.run_id, cc.approval.timeout_s)
         return orch
     await make(c, item.get("seed_run_id")).execute(**src, base_branch=base, run_id=run_id)
+    store.queue_update(item["id"], execution_id=store.get_run(run_id).get("execution_id"))
 
     async def launch(cc, seed, ctx, heal_of, attempt):
         rid = new_run_id()
@@ -190,9 +237,14 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         # Docker down, image missing, no API key...: every other task would hit the same wall, so keep
         # this one in line and pause its queue until the problem is fixed (Resume starts it again).
         name = lane(item)
-        set_lane_paused(store, name, True)
-        store.queue_update(item["id"], status="queued", run_id=None, started_at=None,
-                           note=f"{ENV_PAUSE_NOTE}: {(run['state_reason'] or '')[:300]}")
+        with store.transaction():  # the item goes back in line exactly when its lane pauses
+            set_lane_paused(store, name, True)
+            # A run stopped by the environment check never cloned or wrote anything: the next attempt
+            # continues from whatever this item continued from before, not from the empty blocked run.
+            seed = run_id if run.get("integration_branch") else item.get("seed_run_id")
+            store.queue_update(item["id"], status="queued", run_id=None, started_at=None,
+                               seed_run_id=seed,
+                               note=f"{ENV_PAUSE_NOTE}: {(run['state_reason'] or '')[:300]}")
         if echo:
             echo(f"queue '{name}' paused: environment problem ({(run['state_reason'] or '')[:200]}). "
                  "Fix it, then resume the queue.")
@@ -228,6 +280,42 @@ def environment_blocked(store: Store, run: dict | None) -> bool:
     return any(e["kind"] == "environment" and e["level"] == "error"
                for e in store._all("SELECT kind, level FROM events WHERE run_id = ? AND kind = 'environment'",
                                    (run["id"],)))
+
+
+ENV_RECHECK_S = 60.0
+
+
+def environment_paused_lanes(store: Store) -> list[str]:
+    """Lanes that paused themselves for an environment problem (not by you, not for a failed task)."""
+    lanes = []
+    for item in store.queue_items(include_finished=False):
+        name = lane(item)
+        if item["status"] == "queued" and (item.get("note") or "").startswith(ENV_PAUSE_NOTE) \
+                and lane_paused(store, name) and name not in lanes:
+            lanes.append(name)
+    return lanes
+
+
+async def resume_environment_paused(store: Store, cfg: Config, echo=None, check=None) -> list[str]:
+    """When Docker/keys are fine again, resume the lanes the environment paused. They paused
+    themselves, so they resume themselves; a lane you paused stays paused."""
+    lanes = environment_paused_lanes(store)
+    if not lanes:
+        return []
+    from .preflight import environment_problems
+    problems = await asyncio.to_thread(check or environment_problems, cfg)
+    if problems:
+        return []
+    with store.transaction():
+        for name in lanes:
+            set_lane_paused(store, name, False)
+            for item in store.queue_items(include_finished=False):
+                if lane(item) == name and (item.get("note") or "").startswith(ENV_PAUSE_NOTE):
+                    store.queue_update(item["id"], note="environment fixed; resumed automatically")
+    if echo:
+        for name in lanes:
+            echo(f"queue[{name}] resumed: the environment problem is fixed")
+    return lanes
 
 
 def retry_blocked(store: Store, queue: str | None = None) -> list[int]:
@@ -287,6 +375,22 @@ async def _run_safe(cfg, store, item, *, echo, llm_transport, sandbox) -> dict:
         return store.queue_item(item["id"])
 
 
+async def _reconcile_on_start(store: Store, cfg: Config, echo) -> None:
+    """Settle pushes/PRs/merges a crashed worker left open, so their tasks can be retried."""
+    from .reconcile import open_checkpoints, open_requests, reconcile_all
+    if not open_checkpoints(store) and not open_requests(store):
+        return
+    try:
+        lines = await asyncio.to_thread(reconcile_all, store, cfg)
+    except Exception as exc:  # noqa: BLE001 - GitHub unreachable: records stay open, nothing is repeated
+        if echo:
+            echo(f"reconcile: could not check interrupted external actions ({type(exc).__name__}: {exc})")
+        return
+    for line in lines:
+        if echo:
+            echo(f"reconcile: {line['operation']}: {line['outcome']} — {line['note']}")
+
+
 async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, sandbox=None,
                max_items: int | None = None, poll_s: float = 2.0) -> int:
     """Work through every queue ("pile"). Each queue runs its items strictly in order, one at a time;
@@ -294,8 +398,7 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
     The global pause stops new starts everywhere; a failed item (policy "stop") pauses only its queue."""
     # Two dashboard launches can race before either child records its PID. Claim the worker
     # inside a write transaction so a project cannot dispatch duplicate runs in that window.
-    with store._lock, store.conn:
-        store.conn.execute("BEGIN IMMEDIATE")
+    with store.transaction():
         other = worker_pid(store)
         if other and other != os.getpid():
             if echo:
@@ -303,8 +406,10 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
             return 0
         store.conn.execute("INSERT INTO kv(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                            (WORKER_KEY, str(os.getpid())))
+    await _reconcile_on_start(store, cfg, echo)
     done = started = 0
     running: dict[str, tuple[dict, asyncio.Task]] = {}
+    external_running: set[int] = set()
     project_poll = 0.0
     project_task = None
     try:
@@ -312,8 +417,30 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
         for i in store.queue_items(include_finished=False):
             if i["status"] == "running":
                 prior = store.get_run(i["run_id"]) if i.get("run_id") else None
-                if i.get("project_id") and prior and prior["state"] in ("COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"):
-                    store.queue_update(i["id"], status="done" if prior["state"] == "COMPLETED" else "failed", finished_at=time.time(), note="Recovered completed project run after worker restart")
+                if prior and prior.get("execution_id"):
+                    owner = store._one("SELECT active_run,owner_pid FROM execution_allowances WHERE id=?", (prior["execution_id"],))
+                    if owner and owner["active_run"] == prior["id"] and pid_alive(owner["owner_pid"]):
+                        external_running.add(i["id"])
+                        continue
+                if prior and prior["state"] in ("COMPLETED", "FAILED", "BLOCKED", "CANCELLED", "BUDGET_EXCEEDED"):
+                    if prior.get("execution_id"):
+                        from .execution import recover
+                        recover(store, prior["id"])
+                    store.queue_update(i["id"], status={"COMPLETED": "done", "CANCELLED": "cancelled"}.get(prior["state"], "failed"),
+                                       execution_id=prior.get("execution_id"), finished_at=time.time(), note="Recovered completed run after worker restart; external actions were not repeated")
+                    continue
+                if prior:
+                    from .execution import ensure_allowance, recover
+                    from .postmortem import resumable
+                    if prior.get("pid") and pid_alive(prior["pid"]):
+                        continue  # a live owner must finish or be explicitly cancelled
+                    eid = ensure_allowance(store, prior["id"], cfg, prior.get("heal_of") or prior.get("seed_run_id"))
+                    retry = recover(store, prior["id"])
+                    store.queue_update(i["id"], status="queued" if retry else "failed", execution_id=eid,
+                                       seed_run_id=prior["id"] if resumable(store, prior["id"]) else None,
+                                       retry_of=prior["id"], run_id=None if retry else prior["id"],
+                                       started_at=None if retry else i.get("started_at"),
+                                       note="Lost worker: recovering retained work within the shared allowance" if retry else "Lost worker: recovery stopped; review retained evidence and external actions")
                     continue
                 # put it back in line once (the worker was restarted, e.g. for new code); a second
                 # interruption marks it failed so a task that crashes the worker can't loop forever
@@ -329,12 +456,19 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                     store.update_run(run["id"], state="FAILED", finished_at=time.time(),
                                      state_reason="the queue worker stopped while this run was going")
         limit = max(1, int(getattr(cfg.limits, "max_parallel_queues", 3) or 1))
+        env_check_at = 0.0
         while True:
+            if time.monotonic() >= env_check_at:
+                env_check_at = time.monotonic() + ENV_RECHECK_S
+                await resume_environment_paused(store, cfg, echo)
             for name, (item, task) in list(running.items()):
                 if not task.done():
                     continue
                 del running[name]
                 result = task.result()
+                if result.get("_deferred"):
+                    started -= 1
+                    continue
                 done += 1
                 if echo:
                     echo(f"queue[{name}]: #{item['id']} -> {result['status']}")
@@ -358,12 +492,16 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
             if project_task is not None and project_task.done():
                 project_task.result()
                 project_task = None
+                # Give queued tasks a dispatch opportunity after a slow lead turn;
+                # starting another refresh immediately would reclaim its project fence.
+                project_poll = max(project_poll, time.monotonic() + poll_s)
             if can_start and project_task is None and time.monotonic() >= project_poll:
                 project_task = asyncio.create_task(projects.tick(cfg, store, transport=llm_transport))
                 project_poll = time.monotonic() + 10
             startable = []
             if can_start:
-                seen = set(running)
+                seen = set(running) | {lane(q) for q in store.queue_items(include_finished=False)
+                                       if q["id"] in external_running and q["status"] == "running"}
                 for item in store.queue_items(include_finished=False):
                     name = lane(item)
                     if item["status"] != "queued" or name in seen or lane_paused(store, name) or not projects.can_start(store, item):
@@ -400,6 +538,7 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
             await asyncio.gather(project_task, return_exceptions=True)
         for _, task in running.values():          # worker cancelled (Ctrl+C): stop the runs it owns
             task.cancel()
+        await asyncio.gather(*(task for _, task in running.values()), return_exceptions=True)
         if store.kv_get(WORKER_KEY) == str(os.getpid()):
             store.kv_set(WORKER_KEY, None)
     return done

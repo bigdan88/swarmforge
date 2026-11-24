@@ -71,20 +71,33 @@ class Note:
         return "---\n" + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True) + "---\n\n" + self.body.strip() + "\n"
 
 
-def parse_note(path: Path) -> Note:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    fm: dict = {}
-    body = text
-    if text.startswith("---"):
-        parts = text.split("\n---", 1)
-        if len(parts) == 2:
+def normalize_newlines(text: str) -> str:
+    """LF, CRLF and old-Mac CR notes all parse the same; a UTF-8 byte-order mark is ignored."""
+    return text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def split_front_matter(text: str) -> tuple[dict, str]:
+    """YAML front matter and body. Only a leading block that parses to a mapping is front matter:
+    a note that merely starts with a --- horizontal rule keeps all of its text."""
+    text = normalize_newlines(text)
+    if text.startswith("---\n") or text == "---":
+        head, sep, body = text[3:].partition("\n---")
+        if sep and (body == "" or body.startswith("\n") or body.startswith("-")):
             try:
-                fm = yaml.safe_load(parts[0][3:]) or {}
+                meta = yaml.safe_load(head)
             except yaml.YAMLError:
-                fm = {}
-            body = parts[1].lstrip("-").lstrip("\n")
-    if not isinstance(fm, dict):
-        fm = {}
+                meta = None
+            if meta is None and not head.strip():
+                meta = {}
+            if isinstance(meta, dict):
+                return meta, body.lstrip("-").lstrip("\n")
+    return {}, text
+
+
+def parse_note(path: Path) -> Note:
+    # read_text already turns CRLF/CR into LF; the shared splitter also ignores a byte-order mark and
+    # keeps a note that starts with a --- horizontal rule intact (never drop body text before a save).
+    fm, body = split_front_matter(path.read_text(encoding="utf-8", errors="replace"))
     tags = fm.get("tags") or []
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",") if t.strip()]

@@ -90,6 +90,8 @@ def render(cfg, st, store):
         st.progress(sum(m["status"] == "done" for m in milestones) / len(milestones))
         st.caption(" → ".join(("✓ " if m["status"] == "done" else "● " if m["idx"] == p["current_milestone"] else "○ ") + m["name"] for m in milestones))
         st.link_button("Open repository", "https://github.com/" + p["repo"])
+    if p.get("team"):
+        st.caption(f"Model team: **{p['team']}**")
     @st.fragment(run_every=3 if p["status"] == "running" else None)
     def activity():
         current = ps.get(pid)
@@ -186,7 +188,17 @@ def render(cfg, st, store):
                 action = "Create private repository" if p["definition"]["repository_kind"] == "new" else "Use existing repository"
                 st.caption(f"{action} · {p['repo']}. After launch, the first tasks appear on Work as soon as planning finishes.")
                 st.caption("Launch approves task runs and pull requests within this spec and budget. The existing merge rules apply.")
-                if st.button("Approve and launch", type="primary", key="launch_" + pid):
+                from swarmforge.dashboard_pages.team_ui import team_config, team_picker
+                key = "project_team_" + pid
+                if key not in st.session_state:
+                    st.session_state[key] = p.get("team") or ""
+                chosen = team_picker(cfg, st, key, " The lead and every task of this project use it.")
+                if (chosen or None) != (p.get("team") or None):
+                    store._exec("UPDATE projects SET team = ? WHERE id = ?", (chosen, pid))
+                team_error = team_config(cfg, chosen)[1]
+                if team_error:
+                    st.error(f"Model team: {team_error}")
+                if st.button("Approve and launch", type="primary", key="launch_" + pid, disabled=bool(team_error)):
                     try:
                         service.approve(store, pid)
                         from swarmforge.runqueue import start_worker

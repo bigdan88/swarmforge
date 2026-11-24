@@ -312,7 +312,7 @@ def contrast_findings(
 
 
 def _default_open_page(viewport: dict | None = None) -> Callable[[str], Any]:
-    """Real-browser page factory: one headless Chromium page per theme."""
+    """Real-browser page factory: one shared browser, one page per theme."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as e:  # pragma: no cover - depends on the sandbox
@@ -320,9 +320,14 @@ def _default_open_page(viewport: dict | None = None) -> Callable[[str], Any]:
             "playwright is not installed; run `playwright install chromium`"
         ) from e
 
+    state: dict[str, Any] = {"api": None, "browser": None}
+
     def open_page(theme: str):
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch()
+        if state["browser"] is None:
+            pw = sync_playwright().start()
+            state["api"] = pw
+            state["browser"] = pw.chromium.launch()
+        browser = state["browser"]
         page = browser.new_page(
             color_scheme=theme,  # type: ignore[arg-type]
             viewport=viewport,  # type: ignore[arg-type]
@@ -348,11 +353,28 @@ def _default_open_page(viewport: dict | None = None) -> Callable[[str], Any]:
             def close(self):
                 try:
                     page.close()
-                finally:
-                    browser.close()
-                    pw.stop()
+                except Exception:  # noqa: BLE001, S110 - best effort cleanup
+                    pass
 
         return _Page()
+
+    def _shutdown():
+        browser = state["browser"]
+        state["browser"] = None
+        api = state["api"]
+        state["api"] = None
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001, S110 - best effort cleanup
+                pass
+        if api is not None:
+            try:
+                api.stop()
+            except Exception:  # noqa: BLE001, S110 - best effort cleanup
+                pass
+
+    open_page.shutdown = _shutdown  # type: ignore[attr-defined]
 
     return open_page
 
@@ -397,69 +419,81 @@ def audit(
     findings: list[dict] = []
     results: list[dict] = []
     errors: list[str] = []
-    for theme in themes:
-        page = None
-        error: str | None = None
-        snapshot: Any = None
-        pairs: list = []
-        try:
-            page = factory(theme)
-            page.goto(tab_url, wait_until="load")
-            page.wait_for_timeout(wait_ms)
-            snapshot_error: str | None = None
-            contrast_error: str | None = None
+    try:
+        for theme in themes:
+            page = None
+            error: str | None = None
+            snapshot: Any = None
+            pairs: list = []
             try:
-                acc = getattr(page, "accessibility", None)
-                if acc is not None and hasattr(acc, "snapshot"):
-                    snapshot = acc.snapshot()
-                else:
-                    snapshot = page.aria_snapshot()
-            except Exception as e:  # noqa: BLE001 - any browser failure is recorded
-                snapshot = None
-                snapshot_error = f"accessibility snapshot failed: {e}"
-            if snapshot is None and snapshot_error is None:
-                snapshot_error = "accessibility snapshot returned no data"
-            try:
-                pairs = page.evaluate(CONTRAST_JS)
-            except Exception as e:  # noqa: BLE001 - any browser failure is recorded
-                pairs = []
-                contrast_error = f"contrast probe failed: {e}"
-            if not isinstance(pairs, list):
-                pairs = []
-            # label findings need the snapshot; contrast findings run regardless
-            if snapshot_error is None:
-                findings.extend(label_findings(tab, theme, snapshot))
-            findings.extend(contrast_findings(tab, theme, pairs, min_ratio=min_ratio))
-            error = (
-                "; ".join(e for e in (snapshot_error, contrast_error) if e is not None)
-                or None
-            )
-        except Exception as e:  # noqa: BLE001 - any browser failure is recorded
-            error = str(e)
-        finally:
-            if page is not None:
+                page = factory(theme)
+                page.goto(tab_url, wait_until="load")
+                page.wait_for_timeout(wait_ms)
+                snapshot_error: str | None = None
+                contrast_error: str | None = None
                 try:
-                    page.close()
-                except Exception:  # noqa: BLE001, S110 - best effort cleanup
-                    pass
-        if error is not None:
-            errors.append(f"{theme}: {error}")
-        results.append(
-            {
-                "theme": theme,
-                "error": error,
-                "interactive": len(
-                    [
-                        n
-                        for n in flatten_a11y_tree(snapshot)
-                        if n.get("role") in INTERACTIVE_ROLES
-                    ]
+                    acc = getattr(page, "accessibility", None)
+                    if acc is not None and hasattr(acc, "snapshot"):
+                        snapshot = acc.snapshot()
+                    else:
+                        snapshot = page.aria_snapshot()
+                except Exception as e:  # noqa: BLE001 - any browser failure is recorded
+                    snapshot = None
+                    snapshot_error = f"accessibility snapshot failed: {e}"
+                if snapshot is None and snapshot_error is None:
+                    snapshot_error = "accessibility snapshot returned no data"
+                try:
+                    pairs = page.evaluate(CONTRAST_JS)
+                except Exception as e:  # noqa: BLE001 - any browser failure is recorded
+                    pairs = []
+                    contrast_error = f"contrast probe failed: {e}"
+                if not isinstance(pairs, list):
+                    pairs = []
+                # label findings need the snapshot; contrast findings run regardless
+                if snapshot_error is None:
+                    findings.extend(label_findings(tab, theme, snapshot))
+                findings.extend(
+                    contrast_findings(tab, theme, pairs, min_ratio=min_ratio)
                 )
-                if snapshot is not None
-                else 0,
-                "text_pairs": len(pairs),
-            }
-        )
+                error = (
+                    "; ".join(
+                        e for e in (snapshot_error, contrast_error) if e is not None
+                    )
+                    or None
+                )
+            except Exception as e:  # noqa: BLE001 - any browser failure is recorded
+                error = str(e)
+            finally:
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:  # noqa: BLE001, S110 - best effort cleanup
+                        pass
+            if error is not None:
+                errors.append(f"{theme}: {error}")
+            results.append(
+                {
+                    "theme": theme,
+                    "error": error,
+                    "interactive": len(
+                        [
+                            n
+                            for n in flatten_a11y_tree(snapshot)
+                            if n.get("role") in INTERACTIVE_ROLES
+                        ]
+                    )
+                    if snapshot is not None
+                    else 0,
+                    "text_pairs": len(pairs),
+                }
+            )
+    finally:
+        shut = getattr(factory, "shutdown", None)
+        if callable(shut):
+            try:
+                shut()
+            except Exception:  # noqa: BLE001, S110 - best effort cleanup
+                pass
 
     return {
         "ok": len(errors) < len(results),

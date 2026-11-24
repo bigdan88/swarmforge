@@ -87,6 +87,10 @@ projects:
   max_task_failures: 2
   escalate_budget_factor: 2.0
   escalate_failures: 3
+  max_lead_actions: 3        # total decision calls per progress/reply epoch, including rejected calls
+  lead_budget_usd: 0.5       # shared decision allowance, also within project/milestone spending
+  lead_timeout_s: 300        # seconds per short decision call
+  investigation_timeout_s: 900  # spike upper bound, also limited by the shared task allowance
 
 # Models allowed to receive image blocks (list-content chat messages). Matched case-
 # insensitively as exact ids or substrings. Models not listed are vision-capable only if
@@ -100,8 +104,11 @@ vision_models: [Qwen/Qwen3-VL]   # the designer role reviews screenshots; matche
 reasoning_effort: medium
 
 limits:
-  budget_usd: 20.0            # hard stop for the whole run (provider-reported + estimated cost)
-  max_runtime_s: 21600        # wall clock for the whole run (6 h); also settable per run in the dashboard
+  budget_usd: 20.0            # total across the original task and every retry/replacement
+  max_runtime_s: 21600        # total wall clock (6 h), including pauses/waits/restart downtime
+  no_progress_s: 1800         # stop after 30 min without new retained evidence (approval waits excluded)
+  repeat_action_limit: 6     # stop repeated actions/results and recurring failures
+  max_recoveries: 1          # total bounded recoveries for stalls/lost workers across the task lineage
   busy_wait_s: 900            # keep retrying a busy model (HTTP 429/503) this long, then use its fallback_models
   same_repo: coordinate       # several runs per repo: a manager checks they're different enough; each
                               # works on its own branch, is updated with main before its PR (or: serial | parallel)
@@ -112,6 +119,11 @@ limits:
   max_conflict_resolutions: 3
   task_retries: 1
   max_planning_attempts: 2
+  # speed options (measure with `swarmforge bench-suite` before/after; see docs/SPEED_OPTIONS.md)
+  direct_repairs: false        # a small repair cycle goes straight to a developer, no planner call
+  direct_repair_max_problems: 3
+  parallel_review: false       # the reviewer reads the diff while the final test suite runs
+  tester_with_developers: false   # experimental: acceptance tests are written while developers code
 
 sandbox:
   mode: docker                # docker (recommended) | local (UNSANDBOXED, last resort)
@@ -127,6 +139,9 @@ project:
   # Executed by the orchestrator (not by an LLM) to produce test evidence. pytest gets
   # --junitxml added automatically for per-test results.
   test_command: python -m pytest -q
+  # Other runners: Vitest (`npx vitest run`), Node (`node --test`) and gotestsum get their JUnit flag
+  # automatically; for anything else put {junit} where the report path belongs, e.g.
+  #   test_command: JEST_JUNIT_OUTPUT_FILE={junit} npx jest --reporters=default --reporters=jest-junit
 
 github:
   token_env: GITHUB_TOKEN     # falls back to `gh auth token` if gh is installed and logged in
@@ -150,11 +165,12 @@ knowledge:                    # Zettelkasten shared by all runs (Obsidian-compat
 self_heal:                    # when a run fails: diagnose why, then retry with more effort
   enabled: true
   max_attempts: 2             # automatic retries per task (0 = never); per task in the dashboard too
-  time_factor: 1.5            # each retry gets 1.5x the time, 2.25x on the 2nd retry, ...
-  budget_factor: 1.5          # ... the budget ...
+  time_factor: 1.5            # role-session effort only; never expands the total task deadline
+  budget_factor: 1.5          # accepted for older configs; never expands the task spending allowance
   extra_repair_cycles: 1      # ... one more repair cycle ...
   steps_factor: 1.5           # ... and 1.5x the agent steps per session
-  max_total_budget_usd: 0     # cap for a task plus its retries; 0 = 3x the task's budget
+  max_total_budget_usd: 0     # optional lower total cap; 0 = original task budget
+  max_total_runtime_s: 0      # cap on wall-clock for a task plus its retries; 0 = 3x the task's max_runtime_s (6h default -> 18h)
   diagnose: true              # ask a model why a run failed (one cheap call); stored under Failures
   diagnosis_role: planner
 

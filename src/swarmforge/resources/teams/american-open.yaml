@@ -1,0 +1,27 @@
+description: American open-weight models - NVIDIA Nemotron, OpenAI gpt-oss and Google Gemma.
+roles:
+  planner:
+    model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+    fallback_models: [openai/gpt-oss-120b]
+  developer_backend:
+    model: openai/gpt-oss-120b
+    fallback_models: [nvidia/NVIDIA-Nemotron-3-Super-120B-A12B]
+  developer_frontend:
+    model: openai/gpt-oss-120b
+    fallback_models: [nvidia/NVIDIA-Nemotron-3-Super-120B-A12B]
+  reviewer:                 # must differ from the developer models, fallbacks included
+    model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+    fallback_models: [google/gemma-4-31B-it]
+  tester:
+    model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B
+    fallback_models: [openai/gpt-oss-20b]
+  librarian:
+    model: google/gemma-4-26B-A4B-it
+    fallback_models: [nvidia/NVIDIA-Nemotron-3.5-Lightning]
+  designer:
+    model: nvidia/NVIDIA-Nemotron-3.5-Super-VL
+    fallback_models: [google/gemma-4-31B-it]
+  lead:
+    model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+    fallback_models: [openai/gpt-oss-120b]
+vision_models: [nvidia/NVIDIA-Nemotron-3.5-Super-VL, google/gemma-4]

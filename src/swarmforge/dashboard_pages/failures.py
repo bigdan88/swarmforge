@@ -57,6 +57,16 @@ def render(alt, cfg, diagnose_now, fmt_ts, open_run_button, pd, st, store):
                f"diagnosed by {f['diagnosed_by']}")
     st.markdown(f"**Cause:** {CATEGORIES.get(f['category'], f['category'])}"
                 + (f"  ·  **What happened next:** {f['outcome']}" if f["outcome"] else ""))
+    if cfg:
+        try:
+            from swarmforge.postmortem import chain_usage
+            cu = chain_usage(store, cfg, f["run_id"])
+        except Exception:  # noqa: BLE001 - a broken chain must not crash the page
+            cu = None
+        if cu:
+            label = "chain" if len(cu["chain"]) > 1 else "attempt"
+            st.markdown(f"**{label}:** {cu['elapsed_s'] / 3600:.1f}h / {cu['runtime_cap_s'] / 3600:.0f}h · "
+                        f"${cu['cost_usd']:.2f} / ${cu['budget_cap_usd']:.0f}")
     st.markdown("#### Why it failed")
     st.write(f["root_cause"])
     st.markdown("#### What to do differently")

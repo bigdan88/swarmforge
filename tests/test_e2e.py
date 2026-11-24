@@ -1,6 +1,7 @@
 """Offline end-to-end tests: real orchestrator, git worktrees, scheduler, sandbox and pytest
 execution; only the model API is replaced by scripted responses."""
 import shutil
+import time
 import subprocess
 from pathlib import Path
 
@@ -366,33 +367,81 @@ async def test_continue_from_stopped_run(cfg, sample_repo):
     assert any("starting from the previous attempt's result" in e["message"] for e in store.events(second))
 
 
-async def test_continue_from_missing_workspace_is_blocked(cfg, sample_repo):
+async def test_continue_from_a_missing_workspace_uses_the_pushed_branch_or_starts_fresh(cfg, sample_repo):
+    """A cleaned-up workspace no longer blocks the retry (it used to need a manual "Start again")."""
+    cfg.limits.max_runtime_s = 1200
     cfg.limits.max_repair_cycles = 0
     store, first, _ = await _run(cfg, sample_repo)
-    shutil.rmtree(cfg.workdir / "runs" / first / "repo")
+    r1 = store.get_run(first)
+    repo1 = cfg.workdir / "runs" / first / "repo"
+    t1_commit = subprocess.run(["git", "log", "--format=%H", "--grep", "^T1:", r1["integration_branch"]],
+                               cwd=repo1, capture_output=True, text=True).stdout.split()[0]
+    # never pushed and the clone is gone: start fresh from the base, with the diagnosis in the task
+    shutil.rmtree(repo1, ignore_errors=True)
     orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport, seed_run_id=first)
     second = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
-    r2 = store.get_run(second)
-    assert r2["state"] == "BLOCKED" and "Start again" in r2["state_reason"]
+    assert store.get_run(second)["state"] != "BLOCKED", store.get_run(second)["state_reason"]
+    assert any("was never pushed. Starting fresh" in e["message"] for e in store.events(second))
+
+    # pushed to the source repository (GitHub, in real use): continue from that branch
+    store, third, _ = await _run(cfg, sample_repo)
+    r3 = store.get_run(third)
+    repo3 = cfg.workdir / "runs" / third / "repo"
+    t1_commit = subprocess.run(["git", "log", "--format=%H", "--grep", "^T1:", r3["integration_branch"]],
+                               cwd=repo3, capture_output=True, text=True).stdout.split()[0]
+    subprocess.run(["git", "push", "--quiet", str(sample_repo), r3["integration_branch"]], cwd=repo3, check=True)
+    shutil.rmtree(repo3, ignore_errors=True)
+    orch = Orchestrator(cfg, store, echo=None, llm_transport=_provider().transport, seed_run_id=third)
+    fourth = await orch.execute(issue_file=str(ISSUE), repo=str(sample_repo))
+    r4 = store.get_run(fourth)
+    assert r4["state"] != "BLOCKED", r4["state_reason"]
+    assert any("continuing from its pushed branch" in e["message"] for e in store.events(fourth))
+    assert subprocess.run(["git", "merge-base", "--is-ancestor", t1_commit, r4["integration_branch"]],
+                          cwd=cfg.workdir / "runs" / fourth / "repo").returncode == 0
 
 
 async def test_live_settings_and_runtime_watchdog(cfg):
     import asyncio
-    import time
+    import os
+    from swarmforge.execution import Execution, SharedBudget, ensure_allowance
     from swarmforge.llm import Budget
     store = Store(cfg.db_path)
+    store.create_run("r-live", budget_usd=5, max_runtime_s=300, max_repair_cycles=2, pid=os.getpid())
     orch = Orchestrator(cfg, store, echo=None)
     orch.run_id = "r-live"
-    store.create_run("r-live", budget_usd=5, max_runtime_s=300, max_repair_cycles=2)
+    # Without the run lifecycle the watchdog refuses to start instead of reporting a fake timeout.
+    with pytest.raises(RuntimeError, match="allowance was acquired"):
+        await orch._watchdog(asyncio.ensure_future(asyncio.sleep(0)), every_s=0.05)
+    # The supported lifecycle, as Orchestrator.run() sets it up: the shared allowance is acquired first.
+    orch.execution = Execution(store, "r-live", ensure_allowance(store, "r-live", cfg, None, None))
+    orch.execution.acquire(None)
+    original = orch.execution.row()
+    # Legacy per-run budgets still follow live dashboard edits...
     orch.budget = Budget(5)
     store.update_run("r-live", budget_usd=9, max_runtime_s=1, max_repair_cycles=0)
     orch._apply_live_settings()
     assert orch.budget.limit == 9 and orch.cfg.limits.max_repair_cycles == 0 and orch.cfg.limits.max_runtime_s == 1
     assert any("budget changed" in e["message"] for e in store.events("r-live"))
+    # ...but a live edit never enlarges or extends the shared allowance.
+    orch.budget = SharedBudget(orch.execution)
+    store.update_run("r-live", budget_usd=50)
+    orch._apply_live_settings()
+    after = orch.execution.row()
+    assert (after["budget_usd"], after["deadline"]) == (original["budget_usd"], original["deadline"])
+    # Shortening the time limit live stops the work as a timeout, not as a task failure.
+    orch._started, orch._timed_out, orch._execution_stop = time.monotonic(), False, None
+    slow = asyncio.ensure_future(asyncio.sleep(30))
+    await asyncio.wait_for(orch._watchdog(slow, every_s=0.05), 10)
+    assert orch._timed_out and orch._execution_stop is None
+    await asyncio.sleep(0)
+    assert slow.cancelled()
+    # Reaching the shared deadline itself is recorded as an exhausted allowance.
+    store._exec("UPDATE execution_allowances SET deadline=? WHERE id=?", (time.time() - 1, orch.execution.id))
+    orch.cfg.limits.max_runtime_s = 300
     orch._started, orch._timed_out = time.monotonic(), False
     slow = asyncio.ensure_future(asyncio.sleep(30))
     await asyncio.wait_for(orch._watchdog(slow, every_s=0.05), 10)
-    assert orch._timed_out
+    assert not orch._timed_out and orch._execution_stop.kind == "allowance_exhausted"
     await asyncio.sleep(0)
     assert slow.cancelled()
 
@@ -421,8 +470,15 @@ async def test_failed_run_gets_postmortem_and_heals_itself(cfg, sample_repo):
     assert any(n.type == "failure" and n.run == first for n in vault.notes())
     assert vault.get("Failures") is not None
 
+    first_row = store.get_run(first)
+    spent = store.cost_summary(first)["total"]
+
     async def launch(c, seed, ctx, heal_of, attempt):
-        assert c.limits.max_repair_cycles == attempt and c.limits.max_runtime_s > cfg.limits.max_runtime_s
+        # Self-healing shares the original task allowance: one more repair cycle, but never more
+        # time or money than the original task has left (no replacement allowance, no extension).
+        assert c.limits.max_repair_cycles == attempt
+        assert c.limits.max_runtime_s <= cfg.limits.max_runtime_s - (time.time() - first_row["created_at"]) + 1
+        assert c.limits.budget_usd <= cfg.limits.budget_usd - spent + 1e-9
         assert "README.md did not document --format" in ctx
         return await make(c, seed, ctx, heal_of, attempt).execute(issue_file=str(ISSUE), repo=str(sample_repo))
     last = await heal(cfg, store, first, launch)

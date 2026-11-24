@@ -55,6 +55,63 @@ def _git_problem() -> tuple[str, str] | None:
     return None
 
 
+_DESKTOP_TRIED_AT = 0.0
+DESKTOP_START_WAIT_S = 120.0
+
+
+def _docker_answers(d: str, timeout_s: int) -> tuple[bool, list[str]]:
+    try:
+        info = subprocess.run([d, "info", "--format", "{{.ServerVersion}}"], check=False, capture_output=True,
+                              text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, ["`docker info` did not answer"]
+    if info.returncode == 0:
+        return True, []
+    return False, (info.stderr or info.stdout).strip().splitlines()[-1:]
+
+
+def docker_desktop_path() -> str | None:
+    """Docker Desktop's launcher on Windows/macOS, if installed (Linux runs dockerd as a service)."""
+    import os
+    import sys
+    if sys.platform == "win32":
+        for base in (os.environ.get("ProgramFiles"), r"C:\Program Files"):
+            if base and os.path.isfile(os.path.join(base, "Docker", "Docker", "Docker Desktop.exe")):
+                return os.path.join(base, "Docker", "Docker", "Docker Desktop.exe")
+    if sys.platform == "darwin" and os.path.isdir("/Applications/Docker.app"):
+        return "/Applications/Docker.app"
+    return None
+
+
+def start_docker_desktop(d: str, wait_s: float = DESKTOP_START_WAIT_S, *, sleep=None) -> bool:
+    """Start Docker Desktop when it is installed but not running, and wait for its engine.
+
+    The usual cause of "Docker is not responding" is simply that Docker Desktop was not started after a
+    reboot. Tried at most once every ten minutes per process; SWARMFORGE_NO_DOCKER_AUTOSTART=1 turns it off."""
+    import os
+    import sys
+    import time
+    global _DESKTOP_TRIED_AT
+    path = docker_desktop_path()
+    if not path or os.environ.get("SWARMFORGE_NO_DOCKER_AUTOSTART") == "1" or time.time() - _DESKTOP_TRIED_AT < 600:
+        return False
+    _DESKTOP_TRIED_AT = time.time()
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-g", path])  # noqa: S603,S607 - fixed arguments
+        else:
+            subprocess.Popen([path], close_fds=True)  # noqa: S603 - fixed path under Program Files
+    except OSError:
+        return False
+    sleep = sleep or time.sleep
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        sleep(5)
+        if _docker_answers(d, 15)[0]:
+            return True
+    return False
+
+
 def _docker_problem(cfg: Config, docker_timeout_s: int) -> tuple[str, str] | None:
     """(message, fix) when the docker binary is missing or the daemon does not answer."""
     d = cfg.sandbox.docker_binary
@@ -66,18 +123,9 @@ def _docker_problem(cfg: Config, docker_timeout_s: int) -> tuple[str, str] | Non
                 "(unsandboxed)."
             ),
         )
-    try:
-        info = subprocess.run(
-            [d, "info", "--format", "{{.ServerVersion}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=docker_timeout_s,
-        )
-        ok = info.returncode == 0
-        err = (info.stderr or info.stdout).strip().splitlines()[-1:] if not ok else []
-    except subprocess.TimeoutExpired:
-        ok, err = False, ["`docker info` did not answer"]
+    ok, err = _docker_answers(d, docker_timeout_s)
+    if not ok and start_docker_desktop(d):  # not started since the last reboot: start it and wait
+        ok, err = True, []
     if not ok:
         return (
             "Docker is not responding ("

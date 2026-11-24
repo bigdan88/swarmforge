@@ -1,5 +1,8 @@
 # SwarmForge
 
+An optional React web interface is under development. See the [local web preview guide](docs/WEB_INTERFACE.md)
+for installation and launch instructions. The existing Streamlit dashboard remains available.
+
 ![SwarmForge — Autonomous software teams](src/swarmforge/resources/brand/banner.png)
 
 An autonomous multi-agent software team built from Chinese open models (Qwen, DeepSeek, Kimi,
@@ -20,7 +23,11 @@ and cost, and every human intervention.
 swarmforge run https://github.com/you/repo/issues/42
 ```
 
-Current local team (`swarmforge.yaml`, 2026-11-02):
+The local configuration now selects the [balanced model team](docs/TEAMS.md), chosen November 22,
+2026: Qwen4-Max project lead, Qwen3.8-Flash planner/tester, DeepSeek V4.1 Flash backend, MiMo V2.6 Pro
+frontend, GLM-5.3 reviewer, DeepSeek V4 Flash 0731 librarian and the existing Qwen3-VL designer.
+
+Previous local team snapshot (2026-11-02):
 
 | Role | Model (DeepInfra) | Runtime / tools |
 |---|---|---|
@@ -38,6 +45,9 @@ relative to the configuration file. Profiles override model/runtime settings onl
 `swarmforge.example.yaml` retains a built-in-runtime team using Qwen3.5, DeepSeek, Kimi, GLM and
 MiniMax. Copying that example does not select the local team above. Any role can use any model;
 the reviewer must differ from developer models unless explicitly overridden.
+
+To switch whole lineups by name (for example an American team using Claude, or NVIDIA/OpenAI/Google
+open-weight models) and benchmark them against each other, see [model teams](docs/TEAMS.md).
 
 ## Principles
 
@@ -470,12 +480,25 @@ If a retry can fix the failure, SwarmForge **heals itself**:
 
 * It starts a new attempt that continues from the failed run's code.
 * The diagnosis is added to the task.
-* The new attempt gets more effort: 1.5x the time, budget and agent steps, compounding with each
-  attempt, plus one more repair cycle.
+* Retries use the original task's remaining time and spending allowance. Agent steps and repair
+  cycles can increase within that allowance; restarting never replenishes it.
 * It never retries problems a human must fix first, such as Docker being down, a missing key or
   a bad repository.
-* Retries are capped by *Auto-fix attempts* (default 2, settable per task) and by a total budget
-  of 3x the task's budget. See `self_heal:` in `swarmforge.example.yaml`.
+* Retries are capped by *Auto-fix attempts* (default 2, settable per task), the original task budget,
+  and a persisted wall-clock deadline. The clock includes pauses, approval waits and restart downtime
+  after the first attempt starts. Stalls and lost workers share a separate recovery cap (default 1).
+  A self-healing chain is also capped at a total wall-clock of 3x the run's time limit
+  (`self_heal.max_total_runtime_s`, seconds; 0 = the default 3x). When a cap is reached, the failure
+  records "not retried: self-healing budget/time cap reached" instead of launching another attempt.
+  See `self_heal:` in `swarmforge.example.yaml`.
+
+Work run details, Projects activity, execution reports and `swarmforge status RUN --json` show
+the attempt, last meaningful result, next action and remaining task allowance. Repeated actions,
+recurring failures and lack of new evidence stop the work. Reports and code remain available.
+See [Bounded execution and recovery](docs/EXECUTION.md) for defaults, migration and recovery rules.
+The adaptive project lead now uses [validated actions](docs/LEAD_ACTIONS.md) for inspection, bounded
+investigation, task planning/review and concrete questions, with a retained decision journal and
+persisted limits on model calls and spending.
 
 On the Work page, a task that healed itself shows as "Done (fixed itself, attempt N)". Its earlier
 attempts are listed under Failures.

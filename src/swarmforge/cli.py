@@ -50,7 +50,8 @@ def cmd_run(args, cfg) -> int:
     def make(c, seed=None, heal_context=None, heal_of=None, attempt=None):
         o = Orchestrator(c, store, mode="single" if args.single else getattr(args, "mode", "swarm"), single_role=args.role,
                          test_command=args.test_command, sandbox_image=args.sandbox_image,
-                         seed_run_id=seed, heal_of=heal_of, heal_attempt=attempt, heal_context=heal_context)
+                         seed_run_id=seed, heal_of=heal_of, heal_attempt=attempt, heal_context=heal_context,
+                         retry_of=getattr(args, "retry_of", None))
         holder["orch"] = o
         if mode == "yes":
             o.approve = lambda q: True  # noqa: E731
@@ -202,6 +203,7 @@ def cmd_status(args, cfg) -> int:
         print(f"run not found: {args.run_id}")
         return 2
     c = store.cost_summary(run["id"])
+    from .execution import snapshot, progress_text
     if args.json:
         tasks = store.tasks(run["id"])
         for t in tasks:
@@ -211,6 +213,7 @@ def cmd_status(args, cfg) -> int:
             "mode": run["mode"],
             "state": run["state"],
             "state_reason": run["state_reason"],
+            "execution": snapshot(store, run["id"]),
             "issue_title": run["issue_title"],
             "issue_url": run["issue_url"],
             "repo": run["repo"],
@@ -248,6 +251,9 @@ def cmd_status(args, cfg) -> int:
     print(f"Branch     {run['integration_branch'] or '-'}")
     print(f"PR         {run['pr_url'] or '-'}")
     print(f"Interventions {len(store.interventions(run['id']))}")
+    progress = progress_text(store, run["id"])
+    if progress:
+        print(progress)
     print("\nTasks:")
     for t in store.tasks(run["id"]):
         print(f"  {t['task_key']:14} {t['state']:11} {t['role'] or '':20} {(t['model'] or '')[:36]:36} {(t['title'] or '')[:50]}")
@@ -301,7 +307,7 @@ def cmd_cancel(args, cfg) -> int:
         return 0
     request_cancel(store, run["id"])
     store.event(run["id"], "cancel", "cancel requested from CLI", level="warn")
-    print(f"cancel requested for {run['id']}; the orchestrator stops at the next agent step")
+    print(f"cancel requested for {run['id']}; the watchdog stops its task lineage and underlying work")
     return 0
 
 
@@ -478,6 +484,32 @@ def cmd_publish(args, cfg) -> int:
     return asyncio.run(publish_run(cfg, store, args.run_id, approve))
 
 
+def cmd_reconcile(args, cfg) -> int:
+    """Ask GitHub what really happened to interrupted pushes, PRs and merges; settle the records."""
+    from .reconcile import open_checkpoints, open_requests, reconcile_all, uncertain_model_calls
+    store = _store(cfg)
+    if args.list:
+        rows = [("task", r["run_id"], r["name"].removeprefix("external:"), r["status"]) for r in open_checkpoints(store)]
+        rows += [("web action", r["key"][:12], f"{r['operation']} {r['target']}".strip(), r["status"]) for r in open_requests(store)]
+        for source, ref, op, status in rows:
+            print(f"{source:10}  {ref:28}  {status:9}  {op}")
+        if not rows:
+            print("Nothing to reconcile.")
+    else:
+        lines = reconcile_all(store, cfg)
+        for line in lines:
+            print(f"{line['outcome']:9}  {line['source']:10}  {line['operation']}  — {line['note']}")
+        if not lines:
+            print("Nothing to reconcile.")
+        stuck = [x for x in lines if x["outcome"] in ("conflict", "unknown")]
+        if stuck:
+            print(f"\n{len(stuck)} need you: inspect them on GitHub (evidence is kept in the reconciliations table).")
+    calls = uncertain_model_calls(store)
+    if calls:
+        print(f"\n{calls} model call(s) ended with an unknown outcome and stay charged (providers cannot be asked).")
+    return 0
+
+
 def cmd_bench(args, cfg) -> int:
     from .benchmark import run_benchmark
     store = _store(cfg)
@@ -588,6 +620,7 @@ def cmd_queue(args, cfg) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="swarmforge", description="Autonomous multi-agent software development")
     p.add_argument("--config", "-c", help="path to swarmforge.yaml")
+    p.add_argument("--team", help="model team to use for this command (see `swarmforge teams`)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="run the swarm on a GitHub issue URL or a local issue file")
@@ -606,8 +639,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default self_heal.max_attempts; 0 disables)")
     r.add_argument("--continue-from", metavar="RUN",
                    help="start from a stopped run's result and its unresolved problems")
+    r.add_argument("--retry-of", metavar="RUN",
+                   help="retry with the original task allowance, including when starting code from scratch")
     r.add_argument("--sandbox-image", help="override the sandbox image for this run (must already be built)")
-    r.add_argument("--mode", choices=["swarm", "reviewed", "single"], default="swarm")
+    r.add_argument("--mode", choices=["swarm", "reviewed", "single", "auto"], default="swarm")
     r.add_argument("--single", action="store_true", help="single-agent baseline mode")
     r.add_argument("--role", help="developer role for --single (default: first developer role)")
     r.add_argument("--max-cycles", type=int, help="override limits.max_repair_cycles")
@@ -694,7 +729,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--knowledge", action="store_true", help="use a frozen copy of the knowledge vault")
     s.add_argument("--same-repo", choices=["serial", "coordinate", "parallel"], default="coordinate")
     s.add_argument("--limit", type=int)
+    s.add_argument("--teams", nargs="+", metavar="TEAM",
+                   help="compare model teams (see `swarmforge teams`); --budget then applies to EACH team")
     s.set_defaults(fn=cmd_bench_suite)
+
+    s = sub.add_parser("teams", help="list the model teams you can choose from")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_teams)
 
     s = sub.add_parser("check", help="validate config, tools and provider connectivity")
     s.add_argument("--live", action="store_true", help="also send a tiny tool-calling request to each role's model")
@@ -736,6 +777,10 @@ def build_parser() -> argparse.ArgumentParser:
     vu.add_argument("--port", type=int, default=None, help="port for the dashboard server")
     v.set_defaults(fn=cmd_visual)
 
+    s = sub.add_parser("reconcile", help="check on GitHub whether interrupted pushes, PRs and merges happened")
+    s.add_argument("--list", action="store_true", help="only list open records; do not contact GitHub")
+    s.set_defaults(fn=cmd_reconcile)
+
     s = sub.add_parser("publish", help="push an approved run's branch and open the draft PR")
     s.add_argument("run_id")
     s.add_argument("--yes", action="store_true")
@@ -764,7 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             x.add_argument("file", help="e.g. docs/SELF_IMPROVEMENT_BACKLOG.md")
         x.add_argument("--repo", required=True, help="local folder, owner/repo or GitHub URL")
-        x.add_argument("--mode", choices=["swarm", "reviewed", "single"], default="swarm")
+        x.add_argument("--mode", choices=["swarm", "reviewed", "single", "auto"], default="swarm")
         x.add_argument("--budget", type=float, default=None)
         x.add_argument("--max-cycles", type=int, default=None)
         x.add_argument("--max-runtime-hours", type=float, default=None)
@@ -1016,8 +1061,24 @@ def cmd_bench_suite(args, cfg) -> int:
     from .evaluation import run_suite
     result = asyncio.run(run_suite(cfg, _store(cfg), args.suite, runs=args.runs, modes=args.modes,
                                   budget=args.budget, label=args.label, knowledge=args.knowledge,
-                                  same_repo=args.same_repo, limit=args.limit))
+                                  same_repo=args.same_repo, limit=args.limit, teams=args.teams))
     print(json.dumps(result["summary"], indent=2))
+    return 0
+
+
+def cmd_teams(args, cfg) -> int:
+    from .teams import list_teams
+    teams = list_teams(cfg)
+    if args.json:
+        print(json.dumps({"current": cfg.team, "teams": teams}, indent=2))
+        return 0
+    print(f"current: {cfg.team or '(the roles written in swarmforge.yaml)'}\n")
+    for name, t in teams.items():
+        print(f"{name}{'  (current)' if name == cfg.team else ''}: {t['description']}")
+        for role, model in t["models"].items():
+            print(f"    {role:<20} {model}")
+    print("\nUse one: `team: NAME` in swarmforge.yaml, or `swarmforge --team NAME run ...`; "
+          "`swarmforge --team NAME check --live` tests every model first.")
     return 0
 
 
@@ -1030,11 +1091,13 @@ def cmd_project(args, cfg) -> int:
         action = args.project_cmd
         if action == "new":
             p = ps.create(args.name)
+            if cfg.team:          # `swarmforge --team NAME project new ...`: the project's runs use that team
+                store._exec("UPDATE projects SET team = ? WHERE id = ?", (cfg.team, p["id"]))
             if args.definition:
                 ps.draft(p["id"], json.loads(Path(args.definition).read_text(encoding="utf-8")))
             print(json.dumps(ps.get(p["id"]), indent=2))
         elif action == "status":
-            print(json.dumps({"project": ps.get(args.id), "milestones": ps.milestones(args.id), "tasks": ps.items(args.id), "spent_usd": ps.spent(args.id)}, indent=2))
+            print(json.dumps({"project": ps.get(args.id), "milestones": ps.milestones(args.id), "tasks": ps.items(args.id), "spent_usd": ps.spent(args.id), "lead_decisions": ps.decisions(args.id)}, indent=2))
         elif action == "chat":
             print(asyncio.run(lead.interview(cfg, store, args.id, args.reply)))
         else:
@@ -1060,6 +1123,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args, None) or 0
     try:
         cfg = load_config(args.config)
+        if getattr(args, "team", None):
+            from .teams import apply_team
+            cfg = apply_team(cfg, args.team)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         return 2

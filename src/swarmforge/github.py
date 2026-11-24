@@ -68,12 +68,17 @@ def _headers(token: str | None) -> dict:
     return h
 
 
+def _not_in_transaction(_request) -> None:
+    from .db import outside_transaction
+    outside_transaction("A GitHub API call")
+
+
 class GitHubClient:
     def __init__(self, cfg: GitHubConfig, transport: httpx.BaseTransport | None = None):
         self.cfg = cfg
         self.token = get_token(cfg)
         self._client = httpx.Client(base_url=cfg.api_url, headers=_headers(self.token), timeout=30,
-                                    transport=transport)
+                                    transport=transport, event_hooks={"request": [_not_in_transaction]})
 
     def fetch_issue(self, url: str) -> Issue:
         owner, repo, num = parse_issue_url(url)
@@ -223,6 +228,8 @@ def check_branch_safe(branch: str, default_branch: str, prefix: str) -> None:
 def push_branch(repo_dir: Path, owner: str, repo: str, branch: str, token: str,
                 default_branch: str, prefix: str) -> None:
     """Push a new branch. Never force-pushes; refuses if the remote branch already exists."""
+    from .db import outside_transaction
+    outside_transaction("A git push")
     check_branch_safe(branch, default_branch, prefix)
     url = f"https://github.com/{owner}/{repo}.git"
     auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()

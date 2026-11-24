@@ -1,0 +1,36 @@
+description: Balanced DeepInfra roster selected November 22, 2026; quality remains to be benchmarked.
+roles:
+  lead:
+    model: Qwen/Qwen4-Max
+    fallback_models: [Qwen/Qwen3.8-Max]
+  planner:
+    model: Qwen/Qwen3.8-Flash
+    fallback_models: [Qwen/Qwen3.8-Max]
+  developer_backend:
+    model: deepseek-ai/DeepSeek-V4.1-Flash-1017
+    fallback_models: [deepseek-ai/DeepSeek-V4-Flash-0731]
+  developer_frontend:
+    model: XiaomiMiMo/MiMo-V2.6-Pro
+    fallback_models: [XiaomiMiMo/MiMo-V2.6-Flash]
+  reviewer:
+    model: zai-org/GLM-5.3
+    fallback_models: [moonshotai/Kimi-K2.6]
+  tester:
+    model: Qwen/Qwen3.8-Flash
+    fallback_models: [MiniMaxAI/MiniMax-M3]
+  librarian:
+    model: deepseek-ai/DeepSeek-V4-Flash-0731
+    fallback_models: [Qwen/Qwen3.8-Flash]
+  designer:
+    model: Qwen/Qwen3-VL-235B-A22B-Instruct
+  chat:
+    model: deepseek-ai/DeepSeek-V4.1-Flash-1017
+    fallback_models: [Qwen/Qwen3.8-Flash]
+vision_models:
+  - Qwen/Qwen4-Max
+  - deepseek-ai/DeepSeek-V4.1-Flash-1017
+  - XiaomiMiMo/MiMo-V2.6-Pro
+  - XiaomiMiMo/MiMo-V2.6-Flash
+  - moonshotai/Kimi-K2.6
+  - MiniMaxAI/MiniMax-M3
+  - Qwen/Qwen3-VL

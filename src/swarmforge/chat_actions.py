@@ -83,6 +83,8 @@ def retry_failure(cfg: Config, store: Store, run_id: str, instructions: str, *, 
     fail = store.failure(run["id"])
     seed = run["id"] if continue_code and resumable(store, run["id"]) else None
     runtime = int(time_limit_h * 3600) if time_limit_h else None
+    from .execution import approve_retry
+    approve_retry(store, cfg, run["id"], budget=budget, runtime_s=runtime)
     item = next((q for q in store.queue_items() if q.get("run_id") == run["id"]), None)
     if item:
         base_body = item["body"].split("\n\n" + GUIDANCE_HEADER)[0]
@@ -101,7 +103,8 @@ def retry_failure(cfg: Config, store: Store, run_id: str, instructions: str, *, 
             "\n\n" + GUIDANCE_HEADER)[0]
         new_run, _ = (start_run or _start_run)(cfg, repo=run.get("repo"), issue_title=run.get("issue_title") or "Retry",
                                           issue_body=body + guidance(run, fail, instructions), budget=budget,
-                                          max_cycles=max_cycles, max_runtime_s=runtime, seed_run_id=seed)
+                                          max_cycles=max_cycles, max_runtime_s=runtime, seed_run_id=seed,
+                                          retry_of=run["id"])
         msg = f"Started again as run {new_run}" + (" (continuing from its code)" if seed else "") + "."
     if fail:
         store.failure_update(run["id"], outcome=f"retried from chat at {time.strftime('%H:%M')}: "

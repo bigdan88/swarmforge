@@ -66,6 +66,8 @@ async def _request(
     params: dict | None = None,
 ) -> httpx.Response:
     """GET `url`, retrying anonymously on 401/403 when a token was used."""
+    from ..db import outside_transaction
+    outside_transaction("A GitHub API call")
     try:
         r = await client.get(url, params=params)
         if r.status_code in (401, 403) and token:

@@ -50,12 +50,18 @@ class RoleConfig:
     extra_body: dict[str, Any] = field(default_factory=dict)
     # tried in order when the main model is busy/unavailable for longer than limits.busy_wait_s
     fallback_models: list[str] = field(default_factory=list)
+    # stronger model used instead of `model` when a coding task is retried or runs in a repair cycle
+    # (start cheap, pay for strength only when the cheap attempt was not enough); unset = never escalate
+    escalation_model: str | None = None
 
 
 @dataclass
 class Limits:
     budget_usd: float = 20.0
     max_runtime_s: int = 21600     # 6 hours
+    no_progress_s: int = 1800      # wall-clock window without new retained evidence
+    repeat_action_limit: int = 6   # identical actions/results before bounded recovery
+    max_recoveries: int = 1        # shared across retries, stalls and lost workers
     busy_wait_s: int = 900         # keep retrying a busy/rate-limited model this long before falling back
     max_concurrent_agents: int = 2
     one_run_per_repo: bool = True     # false = runs on the same repository never wait for each other
@@ -70,6 +76,11 @@ class Limits:
     max_conflict_resolutions: int = 3
     task_retries: int = 1          # extra attempts for a coding task whose agent failed
     max_planning_attempts: int = 2
+    # --- speed options (all off by default; measure with `swarmforge bench-suite` before relying on them)
+    direct_repairs: bool = False      # a small repair cycle goes straight to a developer: no planner call
+    direct_repair_max_problems: int = 3
+    parallel_review: bool = False     # the reviewer reads the diff while the final test suite runs
+    tester_with_developers: bool = False   # experimental: acceptance tests are written while developers code
 
 
 @dataclass
@@ -118,10 +129,19 @@ class ProjectsConfig:
     max_task_failures: int = 2
     escalate_budget_factor: float = 2.0
     escalate_failures: int = 3
+    max_lead_actions: int = 3          # persisted cap per progress/reply epoch, including rejected calls
+    lead_timeout_s: int = 300         # each short decision call; inspection is separately bounded
+    lead_budget_usd: float = 0.5      # all decision calls in one epoch, also capped by project/milestone
+    investigation_timeout_s: int = 900
 
     def __post_init__(self):
         if not 1 <= self.horizon <= 3 or self.max_task_failures < 1 or self.escalate_failures < 2 or self.escalate_budget_factor < 1:
             raise ConfigError("projects: invalid horizon, failure thresholds or budget factor")
+        import math
+        if type(self.max_lead_actions) is not int or not 1 <= self.max_lead_actions <= 6:
+            raise ConfigError("projects.max_lead_actions must be between 1 and 6")
+        if not all(math.isfinite(v) and v > 0 for v in (self.lead_timeout_s, self.lead_budget_usd, self.investigation_timeout_s)):
+            raise ConfigError("Project lead and investigation allowances must be finite and positive")
 
 
 @dataclass
@@ -171,7 +191,6 @@ class ReviewConfig:
     allow_same_model_review: bool = False
     require_junit: bool = False  # compatibility opt-out for non-JUnit projects
     require_verified_criteria: bool = False
-    a11y_gate: bool = False  # run the Playwright accessibility audit after dashboard-changing PRs (needs a configured preview)
 
 
 @dataclass
@@ -189,11 +208,12 @@ class KnowledgeConfig:
 class SelfHealConfig:
     enabled: bool = True
     max_attempts: int = 2              # automatic retries after a failure (0 = never retry)
-    time_factor: float = 1.5           # each retry gets this much more time (compounding) ...
-    budget_factor: float = 1.5         # ... and budget ...
+    time_factor: float = 1.5           # legacy role-session effort; cannot expand task allowance
+    budget_factor: float = 1.5         # legacy config compatibility; cannot expand task allowance
     extra_repair_cycles: int = 1       # ... and repair cycles ...
     steps_factor: float = 1.5          # ... and agent steps per session
-    max_total_budget_usd: float = 0.0  # cap for a run plus all its retries; 0 = 3x the first run's budget
+    max_total_budget_usd: float = 0.0  # optional LOWER cap across retries; 0 = original task budget
+    max_total_runtime_s: int = 0     # cap on wall-clock for a run plus all its retries; 0 = 3x the first run's limits.max_runtime_s
     diagnose: bool = True              # ask a model why a run failed (cheap, ~1 call)
     diagnosis_role: str = "planner"
     diagnosis_budget_usd: float = 0.5
@@ -249,6 +269,7 @@ class Config:
     reasoning_effort: str | None = None          # default thinking level for every role (none|low|medium|high)
     vision_models: list[str] = field(default_factory=list)  # models that accept image blocks (exact or substring match)
     visual_role: str = "designer"                # role that reviews screenshots of UI changes (skipped if absent)
+    team: str | None = None                      # named model team applied on top of roles (see teams.py)
     active_variant: str | None = None            # variant id from `swarmforge variants` applied to every run
     prompt_addenda: dict = field(default_factory=dict)   # filled from the active variant (role group -> text)
     variant_applied: bool = False                # runtime flag: the variant overlay is already applied
@@ -348,6 +369,9 @@ def parse_config(raw: dict, source_path: Path | None = None) -> Config:
         vault = ((source_path.parent if source_path else Path.cwd()) / vault).resolve()
     cfg.knowledge.resolved_vault = vault
     validate_config(cfg)
+    if raw.get("team"):
+        from .teams import apply_team
+        cfg = apply_team(cfg, str(raw["team"]))
     return cfg
 
 
@@ -372,6 +396,11 @@ def validate_config(cfg: Config) -> None:
     lim = cfg.limits
     if lim.budget_usd <= 0:
         raise ConfigError("limits.budget_usd must be > 0")
+    import math
+    if not all(math.isfinite(x) and x > 0 for x in (lim.budget_usd, lim.max_runtime_s, lim.no_progress_s)):
+        raise ConfigError("task budget, runtime and no_progress_s must be finite and > 0")
+    if lim.repeat_action_limit < 2 or not 0 <= lim.max_recoveries <= 5:
+        raise ConfigError("repeat_action_limit must be >= 2 and max_recoveries between 0 and 5")
     if lim.max_concurrent_agents < 1:
         raise ConfigError("limits.max_concurrent_agents must be >= 1")
     if not 0 <= lim.max_repair_cycles <= 10:
@@ -387,6 +416,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("self_heal.max_attempts must be between 0 and 5")
     if sh.time_factor < 1 or sh.budget_factor < 1 or sh.steps_factor < 1:
         raise ConfigError("self_heal factors must be >= 1")
+    if sh.max_total_runtime_s < 0:
+        raise ConfigError("self_heal.max_total_runtime_s must be >= 0")
     if sh.diagnosis_role not in cfg.roles:
         sh.diagnosis_role = "planner"
     if cfg.sandbox.mode not in ("docker", "local"):

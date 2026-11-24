@@ -24,6 +24,10 @@ from .config import Config
 from .db import Store
 
 CATEGORIES = {
+    "stalled": "No useful progress",
+    "lost_worker": "Worker exited before finishing",
+    "allowance_exhausted": "Shared task allowance exhausted",
+    "external_uncertain": "External action needs reconciliation",
     "time_limit": "Ran out of time",
     "budget": "Ran out of budget",
     "model_unavailable": "Model provider busy or unavailable",
@@ -38,7 +42,7 @@ CATEGORIES = {
     "other": "Other",
 }
 # failures a new attempt (with more effort) can plausibly fix; the rest need a human
-RETRYABLE = {"stale_base", "time_limit", "budget", "model_unavailable", "planning", "tests_failing", "review_rejected",
+RETRYABLE = {"stalled", "lost_worker", "stale_base", "time_limit", "budget", "model_unavailable", "planning", "tests_failing", "review_rejected",
              "agent_failure", "crash", "other"}
 FAILED_STATES = {"FAILED", "BLOCKED", "BUDGET_EXCEEDED"}
 
@@ -70,6 +74,8 @@ class Diagnosis:
 
 # ------------------------------------------------------------------ evidence
 def classify(run: dict, events: list[dict], tasks: list[dict], tests: list[dict]) -> str:
+    if run.get("stop_kind") in ("stalled", "lost_worker", "allowance_exhausted", "external_uncertain"):
+        return run["stop_kind"]
     reason = (run.get("state_reason") or "").lower()
     errors = " ".join(e["message"].lower() for e in events if e["level"] in ("error", "warn"))[-4000:]
     state = run["state"]
@@ -165,6 +171,10 @@ def evidence(store: Store, run_id: str) -> str:
 def rules_diagnosis(category: str, run: dict) -> Diagnosis:
     reason = run.get("state_reason") or ""
     fixes = {
+        "stalled": "Inspect retained evidence first. Change the failed approach or split the work; escalate if no bounded alternative is supported.",
+        "lost_worker": "Inspect the saved code and verification checkpoint; do not repeat uncertain external actions.",
+        "allowance_exhausted": "Review retained evidence and explicitly approve a revised scope or allowance before continuing.",
+        "external_uncertain": "Inspect the pending operation and confirm its remote outcome before authorizing further execution. Do not replay the write.",
         "time_limit": "Give the run more time, keep tasks smaller, and avoid slow full-suite runs inside agents.",
         "budget": "Give the run more budget, or split the task into smaller ones.",
         "model_unavailable": "Retry later; the provider was busy. Fallback models are tried automatically.",
@@ -197,13 +207,13 @@ def parse_diagnosis(text: str, fallback: Diagnosis) -> Diagnosis | None:
     cat = d.get("category") if d.get("category") in CATEGORIES else fallback.category
     retry = d.get("retry")
     retry = bool(retry) if isinstance(retry, bool) else fallback.retry
-    if fallback.category in ("environment", "repository", "cancelled"):
+    if fallback.category in ("environment", "repository", "cancelled", "allowance_exhausted", "external_uncertain"):
         retry = False  # a new attempt can't fix these; never loop on them
     return Diagnosis(category=cat, root_cause=str(d["root_cause"])[:2000], fix=str(d.get("fix") or fallback.fix)[:3000],
                      retry=retry, lesson=str(d.get("lesson") or "")[:500])
 
 
-async def diagnose(cfg: Config, store: Store, run_id: str, *, transport=None) -> Diagnosis | None:
+async def diagnose(cfg: Config, store: Store, run_id: str, *, transport=None, budget=None, allow_model=True) -> Diagnosis | None:
     """Build and store the post-mortem for a run that did not complete. Returns None for completed or
     cancelled runs. Never raises: a broken diagnosis must not hide the failure itself."""
     from .llm import Budget, LLMClient
@@ -225,10 +235,12 @@ async def diagnose(cfg: Config, store: Store, run_id: str, *, transport=None) ->
     ev = evidence(store, run_id)
     diag = rules_diagnosis(category, run)
     # environment/repository problems are clear from the rules and need a human; don't spend a model call
-    if cfg.self_heal.diagnose and category not in ("environment", "repository"):
+    if cfg.self_heal.diagnose and allow_model and category not in ("environment", "repository", "allowance_exhausted"):
         role = cfg.self_heal.diagnosis_role
         try:
-            llm = LLMClient(cfg, store, run_id, Budget(cfg.self_heal.diagnosis_budget_usd), transport=transport)
+            if budget is None and run.get("execution_id"):
+                raise ValueError("A finished task cannot allocate a fresh diagnosis budget")
+            llm = LLMClient(cfg, store, run_id, budget or Budget(cfg.self_heal.diagnosis_budget_usd), transport=transport)
             res = await llm.chat(role, [
                 {"role": "system", "content": SYSTEM % json.dumps(list(CATEGORIES))},
                 {"role": "user", "content": f"Rule-based first guess: {category}\n\n<evidence>\n{ev}\n</evidence>"}],
@@ -326,25 +338,31 @@ def resumable(store: Store, run_id: str) -> bool:
     return any(t["state"] == "INTEGRATED" and t["kind"] in ("implement", "fix") for t in store.tasks(run_id))
 
 
-def escalate(cfg: Config, attempt: int, *, budget_cap: float | None = None, category: str = "") -> Config:
+def escalate(cfg: Config, attempt: int, *, budget_cap: float | None = None,
+            time_cap: float | None = None, category: str = "") -> Config:
     """A copy of the config with more effort for self-healing attempt `attempt` (1, 2, ...)."""
     sh = cfg.self_heal
     c = copy.deepcopy(cfg)
-    c.limits.max_runtime_s = int(min(72 * 3600, cfg.limits.max_runtime_s * sh.time_factor ** attempt))
-    budget = cfg.limits.budget_usd * sh.budget_factor ** attempt
+    c.limits.max_runtime_s = cfg.limits.max_runtime_s  # retries share the original deadline (see execution.py)
+    if time_cap is not None:
+        c.limits.max_runtime_s = min(c.limits.max_runtime_s, int(time_cap))
+    budget = cfg.limits.budget_usd
     if budget_cap is not None:
         budget = min(budget, budget_cap)
-    c.limits.budget_usd = round(max(0.1, budget), 2)
+    c.limits.budget_usd = max(0.0, budget)
     c.limits.max_repair_cycles = min(10, cfg.limits.max_repair_cycles + sh.extra_repair_cycles * attempt)
     if category == "model_unavailable":
         c.limits.busy_wait_s = int(cfg.limits.busy_wait_s * 2 ** attempt)
         # Provider availability is not evidence that the task needs more tokens or repairs.
         c.limits.budget_usd = round(min(cfg.limits.budget_usd, budget_cap or cfg.limits.budget_usd), 2)
         c.limits.max_repair_cycles = cfg.limits.max_repair_cycles
-        return c
-    for r in c.roles.values():
-        r.max_steps = int(min(200, r.max_steps * sh.steps_factor ** attempt))
-        r.timeout_s = int(min(6 * 3600, r.timeout_s * sh.time_factor ** attempt))
+    else:
+        for r in c.roles.values():
+            r.max_steps = int(min(200, r.max_steps * sh.steps_factor ** attempt))
+            r.timeout_s = int(min(6 * 3600, r.timeout_s * sh.time_factor ** attempt))
+    if time_cap is not None:
+        for r in c.roles.values():
+            r.timeout_s = min(r.timeout_s, int(time_cap))
     return c
 
 
@@ -359,10 +377,62 @@ def heal_context(fail: dict, attempt: int, max_attempts: int) -> str:
         "working code rather than rewriting it.\n"
         "Take more care than last time: first reproduce and understand the problem (read the code, run the "
         "failing tests), fix the root cause rather than the symptom, and verify every acceptance criterion "
-        "with a test before finishing. You have more time, budget and steps than the previous attempt."])
+        "with a test before finishing. This attempt shares the original task's remaining time and spending allowance."])
 
 
 Launch = Callable[[Config, "str | None", "str | None", str, int], Awaitable[str]]
+
+
+def heal_chain(store: Store, run_id: str) -> list[str]:
+    """The self-healing chain containing `run_id`, head-first: walk back via runs.heal_of, then
+    forward via failures.heal_run_id. Bounded and cycle-safe; always contains at least one id."""
+    head = run_id
+    for _ in range(12):
+        run = store.get_run(head)
+        if not run or not run.get("heal_of"):
+            break
+        head = run["heal_of"]
+    chain = [head]
+    cur = head
+    for _ in range(12):
+        fail = store.failure(cur)
+        nxt = fail.get("heal_run_id") if fail else None
+        if not nxt or nxt in chain:
+            break
+        chain.append(nxt)
+        cur = nxt
+    return chain
+
+
+def chain_usage(store: Store, cfg: Config, run_id: str) -> dict:
+    """Accumulated time and cost across the self-healing chain of `run_id`, with the chain caps.
+    Failure columns win, then run rows, then config defaults; never raises on odd data."""
+    chain = heal_chain(store, run_id)
+    elapsed = 0.0
+    runtime_cap = 0.0
+    cost = 0.0
+    for rid in chain:
+        run = store.get_run(rid)
+        fail = store.failure(rid)
+        if fail and fail.get("elapsed_s") is not None:
+            elapsed += fail["elapsed_s"]
+        elif run:
+            end = run.get("finished_at") or run.get("updated_at")
+            elapsed += max(0.0, end - run["created_at"]) if end is not None else 0.0
+        if run and run.get("max_runtime_s"):
+            runtime_cap += run["max_runtime_s"]
+        else:
+            runtime_cap += cfg.limits.max_runtime_s
+        if fail and fail.get("cost_usd") is not None:
+            cost += fail["cost_usd"]
+        else:
+            cost += store.cost_summary(rid)["total"]
+    head = store.get_run(chain[0])
+    cap = cfg.self_heal.max_total_budget_usd or 3 * (
+        (head.get("budget_usd") if head else None) or cfg.limits.budget_usd)
+    return {"chain": chain, "attempts": len(chain) - 1, "elapsed_s": float(elapsed),
+            "runtime_cap_s": float(runtime_cap), "cost_usd": float(cost),
+            "budget_cap_usd": float(cap)}
 
 
 async def heal(cfg: Config, store: Store, run_id: str, launch: Launch, *, attempts: int | None = None,
@@ -373,9 +443,14 @@ async def heal(cfg: Config, store: Store, run_id: str, launch: Launch, *, attemp
     sh = cfg.self_heal
     max_attempts = sh.max_attempts if attempts is None else max(0, min(5, attempts))
     first = store.get_run(run_id)
-    cap = sh.max_total_budget_usd or 3 * (first["budget_usd"] or cfg.limits.budget_usd)
+    if first.get("stop_kind") == "lineage_invalid":
+        return run_id
+    from .execution import ensure_allowance, snapshot
+    ensure_allowance(store, run_id, cfg, first.get("heal_of") or first.get("retry_of") or first.get("seed_run_id"))
+    cap = snapshot(store, run_id)["budget_usd"]
+    tcap = sh.max_total_runtime_s or 3 * (first["max_runtime_s"] or cfg.limits.max_runtime_s)
     chain = [run_id]
-    attempt = 0
+    attempt = int(first.get("heal_attempt") or 0)
     while True:
         run = store.get_run(run_id)
         if run["state"] == "COMPLETED" or not sh.enabled or attempt >= max_attempts:
@@ -388,21 +463,37 @@ async def heal(cfg: Config, store: Store, run_id: str, launch: Launch, *, attemp
         if not fail["retry"]:
             store.failure_update(run_id, outcome="needs you: not retried automatically")
             break
-        spent = sum(store.cost_summary(r)["total"] for r in chain)
-        left = cap - spent
+        # The specific caps first (budget, then chain time), so the outcome says which one stopped it;
+        # then the shared allowance (its persisted deadline, or another attempt owning it).
+        allowance = snapshot(store, run_id)
+        left = allowance["remaining_usd"]
         if left < 0.25:
             store.failure_update(run_id, outcome=f"not retried: self-healing budget cap ${cap:.2f} reached")
             break
+        elapsed = sum((store.get_run(r)["finished_at"] or time.time()) - store.get_run(r)["created_at"]
+                      for r in chain)
+        time_left = tcap - elapsed
+        if time_left < 600:
+            store.failure_update(run_id, outcome=f"not retried: self-healing time cap {tcap / 3600:.1f}h reached")
+            break
+        if allowance["remaining_s"] <= 0 or run.get("stop_kind") in ("allowance_exhausted", "concurrent_attempt", "external_uncertain"):
+            store.failure_update(run_id, outcome="not retried: shared execution allowance exhausted or owned by another attempt")
+            break
         attempt += 1
         seed = run_id if resumable(store, run_id) else None
-        c = escalate(cfg, attempt, budget_cap=left, category=fail["category"])
+        c = escalate(cfg, attempt, budget_cap=left, time_cap=time_left, category=fail["category"])
+        c.limits.max_runtime_s = max(.01, min(c.limits.max_runtime_s, allowance["remaining_s"]))
+        want = cfg.limits.max_runtime_s
+        clamp_note = (f" (clamped to {c.limits.max_runtime_s / 3600:.1f} h left of the {tcap / 3600:.1f} h "
+                      f"chain time cap)" if c.limits.max_runtime_s < want and time_left < want else "")
         if echo:
             echo(f"self-healing: attempt {attempt}/{max_attempts} after {fail['category']} "
                  f"({'continuing from' if seed else 'restarting; nothing to continue from in'} {run_id}); "
                  f"time {c.limits.max_runtime_s / 3600:.1f} h, budget ${c.limits.budget_usd:.2f}, "
-                 f"repair cycles {c.limits.max_repair_cycles}")
-        store.event(run_id, "selfheal", f"starting self-healing attempt {attempt}/{max_attempts}")
+                 f"repair cycles {c.limits.max_repair_cycles}{clamp_note}")
+        store.event(run_id, "selfheal", f"starting self-healing attempt {attempt}/{max_attempts}{clamp_note}")
         new_id = await launch(c, seed, heal_context(fail, attempt, max_attempts), run_id, attempt)
+        ensure_allowance(store, new_id, cfg, run_id)
         store.failure_update(run_id, heal_run_id=new_id, outcome=f"retrying (attempt {attempt})")
         chain.append(new_id)
         run_id = new_id

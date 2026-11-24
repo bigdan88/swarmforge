@@ -97,8 +97,24 @@ def parse_junit(path: Path) -> tuple[dict[str, str], list[dict], dict[str, int]]
 
 
 def with_junit(command: str, junit_container_path: str) -> str:
-    if "pytest" in command and "--junitxml" not in command:
-        return f"{command} --junitxml={junit_container_path}"
+    """Make the test command write a JUnit XML report where the orchestrator looks for it.
+
+    Known runners get their own flag (pytest, Vitest, Node's built-in runner, gotestsum). For any other
+    runner put the placeholder ``{junit}`` in ``project.test_command`` where the report path belongs, e.g.
+    ``JEST_JUNIT_OUTPUT_FILE={junit} npx jest --reporters=default --reporters=jest-junit``."""
+    path = junit_container_path
+    if "{junit}" in command:
+        return command.replace("{junit}", path)
+    if "pytest" in command:
+        return command if "--junitxml" in command else f"{command} --junitxml={path}"
+    if re.search(r"\bvitest\b", command) and "--reporter" not in command and "--outputFile" not in command:
+        return f"{command} --reporter=default --reporter=junit --outputFile.junit={path}"
+    if re.search(r"\bnode\b.*\s--test\b", command) and "--test-reporter" not in command:
+        return (f"{command} --test-reporter=spec --test-reporter-destination=stdout "
+                f"--test-reporter=junit --test-reporter-destination={path}")
+    if re.search(r"\bgotestsum\b", command) and "--junitfile" not in command:
+        head, sep, tail = command.partition(" -- ")
+        return f"{head} --junitfile {path}{sep}{tail}"
     return command
 
 

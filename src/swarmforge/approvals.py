@@ -27,6 +27,11 @@ def dashboard_approver(store, run_id_getter: Callable[[], str], timeout_s: int,
                 return row["status"] == "approved"
             if store.cancel_requested(run_id):
                 break
+            run = store.get_run(run_id)
+            if run and run.get("execution_id"):
+                allowance = store._one("SELECT deadline FROM execution_allowances WHERE id=?", (run["execution_id"],))
+                if run.get("finished_at") or (allowance and time.time() >= allowance["deadline"]):
+                    break
             time.sleep(poll_s)
         store.decide_approval(aid, False, by="timeout")
         return False
