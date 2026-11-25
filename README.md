@@ -66,6 +66,10 @@ open-weight models) and benchmark them against each other, see [model teams](doc
 * **Measured, not guessed.** Each model call records tokens and DeepInfra's reported cost.
   Estimates and missing data are labelled as such.
 
+Application verification is documented in [product verification](docs/PRODUCT_VERIFICATION.md).
+Project checks distinguish unit coverage from real application evidence; `swarmforge verify` reruns
+frozen customer journeys without agent calls.
+
 ## Install
 
 Requires Python 3.11+, Git, and Docker Desktop (or Docker Engine).

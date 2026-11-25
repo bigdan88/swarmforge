@@ -37,6 +37,7 @@ class ToolContext:
     browse_count: int = 0
     test_command: str = "python -m pytest -q"                     # base command used by run_tests
     base_sha: str | None = None                                  # run's base commit for git_changes
+    research_counts: dict[str, int] = field(default_factory=dict)  # web_search/fetch_url calls so far
 
     async def aclose(self) -> None:
         """Stop every process and the sandbox session this agent started."""
@@ -318,6 +319,11 @@ def list_skills(ctx: ToolContext) -> str:
     except pi_skills.SkillError as e:
         raise ToolError(str(e)) from e
 
+
+from .research import RESEARCH_IMPLS, RESEARCH_SCHEMAS  # noqa: E402
+
+TOOL_SCHEMAS.update(RESEARCH_SCHEMAS)
+ASYNC_IMPLS.update(RESEARCH_IMPLS)
 
 SYNC_IMPLS["load_skill"] = load_skill
 SYNC_IMPLS["list_skills"] = list_skills

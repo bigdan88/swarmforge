@@ -401,6 +401,47 @@ def _has_module(m: str) -> bool:
 
 
 # ------------------------------------------------------------------ check
+def cmd_verify(args, cfg) -> int:
+    """Run a repository's declared application checks without starting agents or model calls."""
+    from dataclasses import asdict
+    from .deps import ensure_deps
+    from .sandbox import make_sandbox
+    from .verification import (CONTRACT_FILE, install_application, parse_checks, prepare_workspace,
+                               run_checks)
+    from .workspace import GitWorkspace
+    repo = Path(args.repo).resolve()
+    if args.timeout <= 0:
+        raise ValueError("Verification timeout must be positive")
+    contract = Path(args.contract).resolve() if args.contract else repo / CONTRACT_FILE
+    raw = json.loads(contract.read_text(encoding="utf-8"))
+    checks = parse_checks(raw["checks"] if isinstance(raw, dict) else raw)
+    if not checks:
+        raise ValueError("The verification contract contains no application checks")
+    artifacts = Path(args.artifacts).resolve()
+    import uuid
+    target = artifacts / ("workspace-" + uuid.uuid4().hex[:8])
+    if artifacts == repo or repo in artifacts.parents and ".swarmforge" not in artifacts.relative_to(repo).parts:
+        raise ValueError("Use an artifacts directory outside the repository or under .swarmforge")
+    artifacts.mkdir(parents=True, exist_ok=True)
+    prepare_workspace(repo, target)
+    sandbox = make_sandbox(cfg.sandbox)
+    async def execute():
+        if cfg.sandbox.dependency_install:
+            status, _, _ = await ensure_deps(sandbox, target, network=cfg.sandbox.install_network,
+                                             timeout_s=cfg.sandbox.install_timeout_s, cache_dir=cfg.workdir / "pipcache")
+            if status == "failed":
+                print("blocked: application dependencies could not be installed")
+                return 2
+        problem = await install_application(sandbox, target, artifacts, args.timeout)
+        if problem:
+            print("blocked: " + problem)
+            return 2
+        results = await run_checks(sandbox, target, checks, artifacts, commit_sha=GitWorkspace.head(repo), timeout_s=args.timeout)
+        print(json.dumps([asdict(row) for row in results], indent=2))
+        return 0 if all(row.status == "passed" for row in results) else 2
+    return asyncio.run(execute())
+
+
 def cmd_check(args, cfg) -> int:
     from .checks import run_checks
     return asyncio.run(run_checks(cfg, live=args.live, roles=args.roles))
@@ -736,6 +777,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("teams", help="list the model teams you can choose from")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_teams)
+
+    s = sub.add_parser("verify", help="run real application checks without model calls")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--contract", help="verification JSON (default: REPO/swarmforge.verify.json)")
+    s.add_argument("--artifacts", default=".swarmforge/verification")
+    s.add_argument("--timeout", type=int, default=300, help="total check allowance in seconds")
+    s.set_defaults(fn=cmd_verify)
 
     s = sub.add_parser("check", help="validate config, tools and provider connectivity")
     s.add_argument("--live", action="store_true", help="also send a tiny tool-calling request to each role's model")

@@ -248,8 +248,19 @@ async def choose_action(cfg, store, project, repository, snapshot, items, contex
         context["actions_remaining"] = policy["max_actions"] - store._one("SELECT COUNT(*) AS n FROM project_decisions WHERE project_id=? AND epoch=?", (project["id"], cycle))["n"]
         last_call = store._one("SELECT COALESCE(MAX(id),0) AS id FROM llm_calls WHERE run_id=?", ("project:" + project["id"],))["id"]
         response_error = None
+        # A long project gives the lead a long context; after each timeout since the last applied
+        # decision, allow twice as long (up to 20 min) instead of failing the same way again.
+        timeouts = store._one("SELECT COUNT(*) AS n FROM project_decisions WHERE project_id=? AND status='failed' AND result LIKE '%TimeoutError%' "
+                              "AND id > (SELECT COALESCE(MAX(id),0) FROM project_decisions WHERE project_id=? AND status='applied')",
+                              (project["id"], project["id"]))["n"]
+        timeout_s = min(max(policy["timeout_s"], 1200), policy["timeout_s"] * 2 ** min(timeouts, 4))
+        if timeouts:
+            context["_lead_timeouts"], context["_lead_time_limit_s"] = timeouts, timeout_s
+        else:
+            context.pop("_lead_timeouts", None)
+            context.pop("_lead_time_limit_s", None)
         try:
-            result = await asyncio.wait_for(ask(cfg, store, project, lead.LEAD, context, transport), timeout=policy["timeout_s"])
+            result = await asyncio.wait_for(ask(cfg, store, project, lead.LEAD, context, transport), timeout=timeout_s)
         except ProjectError as exc:
             # Invalid JSON is a known, side-effect-free response failure. Its call
             # was already charged by the model client; repair it inside this cap.
@@ -307,15 +318,17 @@ async def choose_action(cfg, store, project, repository, snapshot, items, contex
                 normalization = (normalization + " " if normalization else "") + "Ordered tasks after their prerequisites without changing scope or readiness."
             validate_scope(action, project, items, catalog, max_runtime_s=cfg.limits.max_runtime_s,
                            investigation_timeout_s=cfg.projects.investigation_timeout_s)
-            if action.kind == ActionKind.BROWSER and cfg.projects.autonomous and any(q.get("merged_sha") and q["milestone"] == project["current_milestone"] for q in items) and not any(c["status"] == "failed" for c in context["verification"]):
+            merged_work = any(q.get("merged_sha") and q["milestone"] <= project["current_milestone"] for q in items)
+            if action.kind == ActionKind.BROWSER and cfg.projects.autonomous and merged_work and not any(c["status"] == "failed" for c in context["verification"]):
                 action = replace(action, kind=ActionKind.EVALUATE)
                 normalization = (normalization + " " if normalization else "") + "Kept unavailable browser observations unverified for the final preview review."
             converted = ({"action": "continue_plan", "task_id": action.task_id, "queue_manifest": expected_queue, "normalization": normalization}
                          if action.kind == ActionKind.CONTINUE else action.legacy(project["spec"]))
             spec = validate(project, converted, cfg.projects.horizon) if action.kind in (
                 ActionKind.PLAN, ActionKind.INVESTIGATE, ActionKind.REVIEW, ActionKind.EVALUATE, ActionKind.ESCALATE) else None
-            if action.kind == ActionKind.EVALUATE and (not any(q.get("merged_sha") and q["milestone"] == project["current_milestone"] for q in items)
-                                                       or any(c["status"] == "failed" for c in context["verification"])):
+            from .autonomy import deferral_allowed
+            if action.kind == ActionKind.EVALUATE and (not merged_work or (
+                    any(c["status"] == "failed" for c in context["verification"]) and not deferral_allowed(store, project))):
                 raise ProjectError("Milestone completion requires merged work and no failed checks")
             if action.kind == ActionKind.INSPECT:
                 identity = encoded({"paths": sorted(action.paths), "runs": sorted(action.run_ids)})

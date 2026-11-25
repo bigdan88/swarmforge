@@ -303,6 +303,32 @@ class DashboardActions:
                     raise ValueError("The approved spec changed. Reload before amending it.")
                 service.amend(store, target, validate(args.get("definition")))
             return {"project_id": target, "message": "Revised specification approved. The project stays paused until you continue."}
+        if operation == "launch_project_changes":
+            if self.config is None or args.get("spending_authorized") is not True:
+                raise ValueError("Approve launching the proposed changes and their budget")
+            extra = args.get("extra_budget", 0)
+            if not isinstance(extra, (int, float)) or isinstance(extra, bool):
+                raise ValueError("Extra budget must be a number")
+            from ..runqueue import RESTART_KEY, worker_pid
+            p = service.launch_discussed_changes(store, target, extra_budget=float(extra),
+                                                 min_budget=max(self.config.projects.lead_budget_usd, .5))
+            if self.worker_start is None and worker_pid(store):
+                store.kv_set(RESTART_KEY, "1")
+            return {"project_id": target, "message": f"Changes launched; the lead is planning them (approved budget ${p['budget_usd']:.2f})."
+                    + self._start_authorized_worker()}
+        if operation == "request_project_changes":
+            if self.config is None or args.get("spending_authorized") is not True:
+                raise ValueError("Approve the change round and its budget before reopening the project")
+            extra = args.get("extra_budget", 0)
+            if not isinstance(extra, (int, float)) or isinstance(extra, bool):
+                raise ValueError("Extra budget must be a number")
+            from ..runqueue import RESTART_KEY, worker_pid
+            p = service.request_changes(store, target, text(args, "request", 16000), extra_budget=float(extra),
+                                        min_budget=max(self.config.projects.lead_budget_usd, .5))
+            if self.worker_start is None and worker_pid(store):
+                store.kv_set(RESTART_KEY, "1")  # hand over to a worker with the current code
+            return {"project_id": target, "message": f"Reopened with a new change round (approved budget ${p['budget_usd']:.2f})."
+                    + self._start_authorized_worker()}
         if operation == "extend_project_task":
             if self.config is None or args.get("spending_authorized") is not True:
                 raise ValueError("Approve the displayed additional task allowance before continuing")
@@ -370,6 +396,20 @@ class DashboardActions:
                 raise ValueError("Load model configuration before talking to the project lead")
             p = ps.get(target)
             expected = args.get("expected_spec")
+            if p["status"] not in ("drafting", "cancelled"):
+                # After launch (including finished projects) the conversation is a discussion
+                # with the lead; any change plan it proposes runs only after "launch".
+                from ..projects.lead import discuss
+                question = text(args, "message", 16000)
+                if self.chat_background:
+                    from .chat_requests import start_reply
+
+                    async def project_discussion(config, store, question, *, conversation, on_text=None, question_saved=False):
+                        return await discuss(config, store, target, question, on_text=on_text, question_saved=question_saved)
+                    start_reply(store, self.config, project_discussion, p["conversation_id"], question, save_question=True)
+                    return {"project_id": target, "message": "Sent. The lead's reply appears as it arrives."}
+                asyncio.run(discuss(self.config, store, target, question))
+                return {"project_id": target, "message": "The lead replied."}
             if p["status"] != "drafting" or expected != hashlib.sha256(p["spec"].encode()).hexdigest():
                 raise ValueError("Reload the current draft before continuing its interview")
             if "answers" in args:

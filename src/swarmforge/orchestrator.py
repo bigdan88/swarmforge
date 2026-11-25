@@ -23,6 +23,7 @@ import yaml
 from . import prompts
 from .agent.runtime import AgentResult, AgentSpec, run_agent
 from .agent.navtools import NAV_READONLY, NAV_TOOLS
+from .agent.research import research_tools
 from .agent.tools import DEV_TOOLS, EXEC_TOOLS, READ_TOOLS, WRITE_TOOLS, TerminalTool, ToolContext, ToolError
 from .config import Config
 from .db import Store
@@ -461,7 +462,10 @@ class Orchestrator:
 
         # -------------------------------------------------- planning
         self.sm.transition(RunState.PLANNING)
+        from . import product_gate
+        product_gate.configure(self)
         plan = await self._make_plan(repo_summary)
+        product_gate.freeze(self, plan)
         self.plan = plan
         self.store.update_run(self.run_id, plan_json=json.dumps(plan.to_dict()))
         self.sm.transition(RunState.TASK_VALIDATION)
@@ -624,15 +628,19 @@ class Orchestrator:
                 except json.JSONDecodeError as e:
                     return None, f"plan is not valid JSON: {e}"
             try:
-                return validate_plan(data, self.cfg.developer_roles, self.cfg.limits.max_tasks,
-                                     existing_ids=existing, require_criteria=require_criteria), None
-            except PlanValidationError as e:
-                return None, "plan validation failed:\n- " + "\n- ".join(e.errors)
+                plan = validate_plan(data, self.cfg.developer_roles, self.cfg.limits.max_tasks,
+                                     existing_ids=existing, require_criteria=require_criteria)
+                if require_criteria:
+                    from .product_gate import validate
+                    validate(self, plan)
+                return plan, None
+            except (PlanValidationError, ValueError) as e:
+                return None, "plan validation failed: " + str(e)
         return TerminalTool("submit_plan", "Submit the implementation plan (validated by the orchestrator).",
                             PLAN_JSON_SCHEMA, v)
 
     async def _make_plan(self, repo_summary: str) -> Plan:
-        if self.mode in ("single", "reviewed"):
+        if self.mode == "single" or self.mode == "reviewed" and not getattr(self, "_requirement_catalog", []):
             role = self.single_role
             self.log("plan", f"{self.mode} mode: one task for role {role}, no initial planner")
             return Plan(summary=f"{self.mode} workflow: one developer implements the whole issue.",
@@ -645,6 +653,9 @@ class Orchestrator:
         user = "\n\n".join([
             prompts.render_issue(self.issue.title, self.issue.body),
             prompts.render_repo_summary(repo_summary),
+            "Approved requirement IDs and minimum evidence levels:\n" + json.dumps(getattr(self, "_requirement_catalog", [])) +
+            "\nAssigned requirement IDs: " + json.dumps(getattr(self, "_assigned_requirements", [])) +
+            "\nPreviously frozen application checks (reuse unchanged):\n" + json.dumps(getattr(self, "_previous_verification", [])),
             self.knowledge_block,
             f"Available developer roles: {self.cfg.developer_roles} "
             f"(models: {', '.join(f'{r}={self.cfg.roles[r].model}' for r in self.cfg.developer_roles)}).",
@@ -996,13 +1007,22 @@ class Orchestrator:
         if self.plan.acceptance_criteria:
             mapping = (tester_report or {}).get("criteria_tests", {})
             results = evaluate_criteria(mapping, [(c.id, c.text) for c in self.plan.acceptance_criteria], ev)
+            from . import product_gate
+            from .verification import enforce_evidence
+            application_evidence, commit = await product_gate.execute(self, cycle)
+            results = enforce_evidence(results, self.plan.acceptance_criteria, application_evidence, commit_sha=commit)
             for r in results:
                 self.store.record_acceptance(self.run_id, cycle=cycle, **r)
             summary = {s: sum(1 for r in results if r["status"] == s) for s in ("satisfied", "failed", "unverified")}
             self.log("test", f"acceptance criteria: {summary}", data=results)
             self._criteria_results = results
+            product_gate.unavailable(application_evidence)
         else:
             self._criteria_results = []
+            if getattr(self, "_verification_checks", []):
+                from . import product_gate
+                application_evidence, _ = await product_gate.execute(self, cycle)
+                product_gate.unavailable(application_evidence)
         if tester_report:
             for d in tester_report["defects"]:
                 self.store.record_finding(self.run_id, cycle=cycle, source="tester", severity=d["severity"],
@@ -1190,7 +1210,8 @@ class Orchestrator:
 
     def _gate(self, cycle, ev: TestEvidence, tester_report, review, failed_tasks) -> list[dict]:
         from .services.assessment import assess_gate
-        return assess_gate(ev, criteria=getattr(self, "_criteria_results", []),
+        from .product_gate import findings
+        return findings(self) + assess_gate(ev, criteria=getattr(self, "_criteria_results", []),
                            tester_report=tester_report, review=review, failed_tasks=failed_tasks,
                            task_rows=self.store.tasks(self.run_id), scope=self._repair_scope(),
                            visual_findings=getattr(self, "_visual_findings", []), policy=self.cfg.review)
@@ -1755,15 +1776,15 @@ class Orchestrator:
             return mr2.ok
 
     def _exec_tools(self) -> list[str]:
-        return EXEC_TOOLS + (DEV_TOOLS + NAV_TOOLS if self.cfg.sandbox.dev_tools else [])
+        return EXEC_TOOLS + (DEV_TOOLS + NAV_TOOLS if self.cfg.sandbox.dev_tools else []) + research_tools(self.cfg)
 
     def _review_tools(self) -> list[str]:
         """Read-only tools for the reviewer: files plus outline/find_symbol/git_changes/git_history."""
-        return READ_TOOLS + NAV_READONLY
+        return READ_TOOLS + NAV_READONLY + research_tools(self.cfg)
 
     def _plan_tools(self) -> list[str]:
         """Read-only tools for the planner: files plus outline/find_symbol/git_changes/git_history."""
-        return READ_TOOLS + NAV_READONLY
+        return READ_TOOLS + NAV_READONLY + research_tools(self.cfg)
 
     def _check_cancel(self) -> None:
         if self._should_cancel():
@@ -1774,7 +1795,7 @@ class Orchestrator:
         if kind == "tool_result":
             from .execution import observe_tool
             if getattr(self, "execution", None):
-                observe_tool(self.execution, ctx, data or {})
+                observe_tool(self.execution, ctx, data or {}, agent=key)
             # Retain output in the transcript; progress telemetry contains hashes only.
             return
         self.log("agent", msg, task_key=key, role=role, data=data)

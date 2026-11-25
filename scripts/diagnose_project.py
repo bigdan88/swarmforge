@@ -47,6 +47,16 @@ def main():
                              "WHERE q.project_id=? ORDER BY q.id DESC LIMIT 15", (p["id"],)):
             reason = f" — {q['state_reason'][:160]}" if q["state_reason"] else ""
             print(f"  #{q['id']} [{q['status']}/{q['state'] or '-'}] {q['title'][:70]}  run={q['run_id'] or '-'}{reason}")
+        print(f"\nSpec size: {len(p['spec'] or ''):,} characters")
+        print("\nProject lead model calls (latest 10):")
+        for c in con.execute("SELECT * FROM llm_calls WHERE run_id=? ORDER BY id DESC LIMIT 10", ("project:" + p["id"],)):
+            c = dict(c)
+            took = (c.get("ended_at") or 0) - (c.get("started_at") or 0)
+            print(f"  {when(c.get('started_at'))}  {c.get('model')}  status={c.get('status')}  "
+                  f"prompt_tokens={c.get('prompt_tokens')}  {took:.0f}s  {str(c.get('error') or '')[:160]}")
+        print("\nProject lead model events (latest 10):")
+        for e in con.execute("SELECT ts,level,substr(message,1,200) AS m FROM events WHERE run_id=? ORDER BY id DESC LIMIT 10", ("project:" + p["id"],)):
+            print(f"  {when(e['ts'])}  [{e['level']}] {e['m']}")
         print("\nEvents (latest 12):")
         for e in con.execute("SELECT ts,kind,substr(detail,1,200) AS d FROM project_events WHERE project_id=? ORDER BY id DESC LIMIT 12", (p["id"],)):
             print(f"  {when(e['ts'])}  {e['kind']}: {(e['d'] or '').splitlines()[0] if e['d'] else ''}")

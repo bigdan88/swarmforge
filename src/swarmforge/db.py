@@ -276,6 +276,11 @@ class Store:
 
     # columns added after the first release; existing databases get them on open
     MIGRATIONS = [
+        ("acceptance", "requirement_id", "TEXT"),
+        ("acceptance", "evidence_level", "TEXT NOT NULL DEFAULT 'unit'"),
+        ("acceptance", "required_level", "TEXT NOT NULL DEFAULT 'unit'"),
+        ("acceptance", "commit_sha", "TEXT"),
+        ("queue_items", "requirement_ids", "TEXT"),
         ("queue_items", "depends_on", "TEXT"),
         ("queue_items", "project_action", "TEXT"),
         ("runs", "execution_id", "TEXT"),
@@ -602,7 +607,7 @@ class Store:
                     "status", "run_id", "base_branch", "result_branch", "note", "started_at",
                     "finished_at", "position", "max_runtime_s", "seed_run_id", "heal_attempts", "issue_url",
                     "queue", "project_id", "milestone", "project_key", "merged_sha", "project_processed",
-                    "team", "execution_id", "retry_of", "depends_on", "project_action")
+                    "team", "execution_id", "retry_of", "depends_on", "project_action", "requirement_ids")
 
     def queue_add(self, title: str, body: str, repo: str, **fields: Any) -> int:
         row = self._one("SELECT MAX(position) AS m FROM queue_items")

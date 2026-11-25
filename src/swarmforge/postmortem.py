@@ -450,6 +450,7 @@ async def heal(cfg: Config, store: Store, run_id: str, launch: Launch, *, attemp
     cap = snapshot(store, run_id)["budget_usd"]
     tcap = sh.max_total_runtime_s or 3 * (first["max_runtime_s"] or cfg.limits.max_runtime_s)
     chain = [run_id]
+    fresh: set[str] = set()
     attempt = int(first.get("heal_attempt") or 0)
     while True:
         run = store.get_run(run_id)
@@ -481,6 +482,15 @@ async def heal(cfg: Config, store: Store, run_id: str, launch: Launch, *, attemp
             break
         attempt += 1
         seed = run_id if resumable(store, run_id) else None
+        # Plan again instead of polishing a dead end: when the same kind of failure has now
+        # happened twice in a row, the next attempt starts from a fresh plan (with the diagnosis)
+        # rather than continuing the previous attempt's work.
+        previous = store.failure(chain[-2]) if len(chain) > 1 else None
+        replan = bool(seed and previous and previous["category"] == fail["category"] and chain[-1] not in fresh)
+        if replan:
+            seed = None
+            store.event(run_id, "selfheal", f"the same failure ({fail['category']}) happened twice; "
+                                            "the next attempt plans again from scratch")
         c = escalate(cfg, attempt, budget_cap=left, time_cap=time_left, category=fail["category"])
         c.limits.max_runtime_s = max(.01, min(c.limits.max_runtime_s, allowance["remaining_s"]))
         want = cfg.limits.max_runtime_s
@@ -493,6 +503,8 @@ async def heal(cfg: Config, store: Store, run_id: str, launch: Launch, *, attemp
                  f"repair cycles {c.limits.max_repair_cycles}{clamp_note}")
         store.event(run_id, "selfheal", f"starting self-healing attempt {attempt}/{max_attempts}{clamp_note}")
         new_id = await launch(c, seed, heal_context(fail, attempt, max_attempts), run_id, attempt)
+        if replan:
+            fresh.add(new_id)  # its own work is continued next time, not thrown away again
         ensure_allowance(store, new_id, cfg, run_id)
         store.failure_update(run_id, heal_run_id=new_id, outcome=f"retrying (attempt {attempt})")
         chain.append(new_id)

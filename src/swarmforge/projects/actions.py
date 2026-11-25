@@ -62,6 +62,7 @@ class TaskProposal:
     depends_on: tuple[str, ...] = ()
     replaces: tuple[int, ...] = ()
     max_runtime_s: int | None = None
+    check_ids: tuple[str, ...] = ()
 
     @classmethod
     def parse(cls, value: Any) -> TaskProposal:
@@ -87,7 +88,8 @@ class TaskProposal:
                    strings(value.get("acceptance_criteria", []), "Acceptance criteria"),
                    tuple(path(p) for p in strings(value.get("files", []), "Expected files", 40)),
                    value["ready"], value["kind"], float(budget),
-                   strings(value.get("depends_on", []), "Dependencies"), tuple(replaces), runtime)
+                   strings(value.get("depends_on", []), "Dependencies"), tuple(replaces), runtime,
+                   strings(value.get("check_ids", []), "Requirement IDs", 30))
 
     def payload(self) -> dict:
         return {k: list(v) if isinstance(v, tuple) else v for k, v in asdict(self).items()}
@@ -235,7 +237,11 @@ def validate_scope(action: LeadAction, project: dict, items: list[dict], evidenc
     for key in planned:
         visit(key)
     seen: set[str] = set()
+    from ..verification import project_requirements
+    requirement_ids = {r["id"] for r in project_requirements(project["definition"], project["current_milestone"])}
     for task in action.tasks:
+        if set(task.check_ids) - requirement_ids:
+            raise ProjectError("Task check_ids must name approved current or earlier requirements")
         if task.key in seen:
             raise ProjectError("Task keys must be unique")
         if task.ready and set(task.depends_on) - available:

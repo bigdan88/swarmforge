@@ -14,6 +14,7 @@ import asyncio
 import json
 import math
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -148,6 +149,15 @@ def parse_usage(raw_usage: dict | None, prices: dict | None) -> Usage:
 
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 BUSY_STATUS = RETRY_STATUS  # "model busy"/overloaded/rate limited/gateway errors: wait patiently
+
+
+class ContextTooLarge(LLMError):
+    """The provider rejected the request because the input is too long for the model."""
+
+
+_TOO_LARGE = re.compile(
+    r"range of input length|maximum context length|context[_ ]length[_ ]exceeded|prompt is too long|"
+    r"input is too long|too many (input )?tokens|reduce the length of the messages", re.IGNORECASE)
 
 
 class _ModelUnavailable(Exception):
@@ -363,6 +373,12 @@ class LLMClient:
                         continue
                     self._record(role, model, pc, task_key, started, Usage(), "error", last_err)
                     raise _ModelUnavailable(last_err)
+                if r.status_code >= 400 and _TOO_LARGE.search(r.text or ""):
+                    # A deterministic "request too large" error, sometimes sent as HTTP 500: retrying
+                    # the same request (or waiting for "busy" to pass) can never succeed.
+                    last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+                    self._record(role, model, pc, task_key, started, Usage(), "error", last_err)
+                    raise ContextTooLarge(f"{role} ({model}): request is larger than the model accepts: {last_err}")
                 if r.status_code in BUSY_STATUS:
                     last_err = f"HTTP {r.status_code}: {r.text[:300]}"
                     waited = time.time() - started

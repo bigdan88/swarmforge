@@ -11,6 +11,14 @@ keeps unavailable observations explicitly pending, and continues later software 
 marking those observations passed. The recovery policy, limits and final review behavior are documented
 in [Projects](PROJECTS.md#unattended-preview-delivery).
 
+## Product verification update (November 25, 2026)
+
+Project acceptance now uses stable check IDs and typed evidence. A thin stub can help construction,
+but product checks require real execution through the normal application entry point. Expectations
+are frozen before coding and rerun after repairs. Missing runtime/model/device capabilities remain
+blocked, and independent future work follows the existing unattended recovery policy. See
+[product verification](PRODUCT_VERIFICATION.md) for contracts, clean workspaces and the runner.
+
 ## Summary and goals
 
 SwarmForge should build a whole app from one approved spec by planning in rolling waves: fixed milestones, a short detailed horizon, and a replan after every merged task. Today a big request becomes \~20 sequential tasks planned up front, and tasks 4–20 are built on what the planner assumed tasks 1–3 would produce. This feature adds a **Project**: a kickoff chat that writes a spec, one human approval to launch, a "lead" step that replans from the real code after each merge, and a human checkpoint at the end of each milestone.

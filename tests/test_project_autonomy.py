@@ -93,7 +93,16 @@ def test_invalid_planning_cannot_create_unlimited_new_rounds_even_after_worker_r
         finish(service.advance(cfg, store, pid, repository=Repo(), ask=invalid))
     assert len(calls) == cfg.projects.max_lead_actions * (cfg.projects.auto_recovery_rounds + 1)
     assert ps.get(pid)["status"] == "waiting_for_you"
-    assert not autonomy.recover_waiting(cfg, store, ps.get(pid))
+    # The supervisor gives one more backed-off round, then waits; it never loops freely.
+    assert autonomy.recover_waiting(cfg, store, ps.get(pid))
+    finish(service.advance(cfg, store, pid, repository=Repo(), ask=invalid))
+    autonomy._context(store, ps.get(pid), "test", "", 0)  # skip the retry delay; the back-off is separate
+    finish(service.advance(cfg, store, pid, repository=Repo(), ask=invalid))
+    assert ps.get(pid)["status"] == "waiting_for_you"
+    assert not autonomy.recover_waiting(cfg, store, ps.get(pid))  # back-off window
+    cfg.projects.supervisor_rounds_per_day = 1
+    store.kv_set("project_supervisor:" + pid, json.dumps({"rounds": [time.time() - 7200]}))
+    assert not autonomy.recover_waiting(cfg, store, ps.get(pid))  # daily cap
     assert not ps.items(pid)
 
 
@@ -141,9 +150,11 @@ def test_auto_recovery_is_bounded_across_distinct_failed_attempts(unattended, cf
             store.update_run(run, state="BUDGET_EXCEEDED", stop_kind="allowance_exhausted", state_reason="The next call does not fit")
             store.queue_update(task_id, run_id=run)
             service.stop(ps, ps.get(pid), "Task stopped", {"run_id": run})
-        assert autonomy.recover_waiting(cfg, store, ps.get(pid)) is (attempt < 2)
+        assert autonomy.recover_waiting(cfg, store, ps.get(pid))
+    # Money is bounded: two doublings, then the supervisor only re-plans within what is left.
     assert store._one("SELECT budget_usd FROM execution_allowances WHERE id=?", (eid,))["budget_usd"] == 4
-    assert ps.get(pid)["status"] == "waiting_for_you"
+    assert any(json.loads(e["detail"]).get("kind") == "supervisor" for e in ps.events(pid) if e["kind"] == "automatic_recovery")
+    assert ps.get(pid)["status"] == "running"
 
 
 def test_unverified_device_checks_are_deferred_to_final_review_without_pretending_they_passed(unattended, cfg, monkeypatch):
@@ -225,6 +236,67 @@ def test_questions_get_an_automatic_alternative_before_interrupting_the_owner(un
     assert not any(e["kind"] == "escalation" for e in ps.events(pid))
     finish(service.advance(cfg, store, pid, repository=Repo(), ask=model))
     assert ps.items(pid)
+
+
+def test_later_milestone_can_evaluate_existing_merged_work_without_a_new_build(unattended, cfg):
+    store, ps, pid = unattended
+    q = store.queue_add("Already implemented features", "body", "owner/inventory", project_id=pid,
+                        milestone=0, project_key="features", queue=service.lane(pid))
+    store.create_run("merged-features")
+    store.queue_update(q, status="done", project_processed=1, run_id="merged-features", merged_sha="main-1")
+    ps.update(pid, current_milestone=1)
+    store.kv_set(autonomy._verification_key(ps.get(pid)), "1")
+    store.kv_set("project_recovery:" + pid, "old-task-lineage")
+    original = fixed(ps.get(pid)["spec"])
+    async def model(*args):
+        return decision("request_browser_verification", checks=ps.get(pid)["definition"]["milestones"][1]["checks"])
+    finish(service.advance(cfg, store, pid, repository=Repo(), ask=model))
+    assert ps.get(pid)["current_milestone"] == 2 and ps.get(pid)["status"] == "running"
+    assert len(ps.items(pid)) == 1  # no redundant evidence-only task
+    report = json.loads(ps.milestones(pid)[1]["report"])
+    assert all(c["status"] == "needs you" for c in report["checks"])
+    assert ps.milestones(pid)[1]["status"] == "verification_pending"
+    assert fixed(ps.get(pid)["spec"]) == original
+    assert store.kv_get("project_recovery:" + pid) is None
+
+
+def test_only_latest_merged_result_can_verify_checks_built_in_an_earlier_milestone(unattended):
+    store, ps, pid = unattended
+    ps.update(pid, current_milestone=1)
+    text = ps.get(pid)["definition"]["milestones"][1]["checks"][0]
+    for n, status in enumerate(("satisfied", "unsatisfied")):
+        rid = f"merged-{n}"
+        store.create_run(rid)
+        q = store.queue_add("Previously built", "body", "owner/inventory", project_id=pid, milestone=0)
+        store.queue_update(q, status="done", project_processed=1, run_id=rid, merged_sha=f"sha-{n}")
+        store._exec("INSERT INTO test_runs(run_id,cycle,ts,command,exit_code) VALUES (?,1,1,'pytest',0)", (rid,))
+        store._exec("INSERT INTO acceptance(run_id,cycle,text,status,evidence,requirement_id,evidence_level,commit_sha) VALUES (?,1,?,?,?,'M2C1','product','tested-sha')", (rid, text, status, "Recorded application evidence"))
+        check = service.verify_checks(store, ps.get(pid))[0]
+        assert check["status"] == ("passed" if n == 0 else "failed")
+    assert not check["evidence"]  # an older pass never hides a newer regression
+
+
+def test_legacy_browser_handoff_recovers_without_claiming_owner_verification(unattended, cfg):
+    from swarmforge.projects.decisions import LeadTurn, epoch
+    store, ps, pid = unattended
+    q = store.queue_add("Previously merged", "body", "owner/inventory", project_id=pid, milestone=0)
+    store.create_run("built")
+    store.queue_update(q, status="done", project_processed=1, run_id="built", merged_sha="main-1")
+    ps.update(pid, current_milestone=1)
+    p = ps.get(pid)
+    turn = LeadTurn.claim(store, pid)
+    turn.begin(epoch(store, p), {}, 3)
+    turn.candidate(decision("request_browser_verification", checks=p["definition"]["milestones"][1]["checks"]),
+                   action="request_browser_verification", reason="Browser observations unavailable")
+    service.stop(ps, p, "Browser journey verification is required", {}, turn=turn, decision_status="blocked", decision_result={})
+    turn.release()
+    assert autonomy.recover_waiting(cfg, store, ps.get(pid))
+    assert ps.get(pid)["status"] == "running"
+    assert store.kv_get(autonomy._verification_key(p)) == "1"
+    assert not any(m["role"] == "user" for m in store.conversation_messages(p["conversation_id"]))
+    assert all(c["status"] == "needs you" for c in service.verify_checks(store, ps.get(pid)))
+    service.pause(store, pid)
+    assert not autonomy.recover_waiting(cfg, store, ps.get(pid))  # a later owner pause wins
 
 
 def test_unattended_delivery_can_reallocate_milestone_estimates_but_not_the_project_cap(unattended, cfg):

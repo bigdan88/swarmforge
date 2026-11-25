@@ -88,8 +88,8 @@ def _decision(store, project, running, planning_retry, question):
                 continue
             state = check.get("status")
             checks.append({"text": str(check.get("text") or "")[:4000], "status": state,
-                           "explanation": "Recorded evidence passed." if state == "passed" else
-                           "No passing automated evidence is linked to this milestone check. It has not been verified.",
+                           "explanation": check.get("explanation") or ("Recorded evidence passed." if state == "passed" else
+                           "No passing automated evidence is linked to this milestone check. It has not been verified."),
                            "evidence": check.get("evidence", [])[:4]})
         decision.update(kind="checkpoint", title=f"Review milestone {project['current_milestone'] + 1}: {milestone['name'] if milestone else ''}",
                         summary="The lead submitted a milestone for review. This is a checkpoint, not a task crash.",

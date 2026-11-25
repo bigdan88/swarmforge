@@ -282,7 +282,7 @@ def test_role_tool_lists_in_orchestrator(tmp_path):
     assert set(ALL_NAV) <= set(resolver)
 
     for role_tools in (Orchestrator._review_tools(fake_self), Orchestrator._plan_tools(fake_self)):
-        assert set(role_tools) == set(READ_TOOLS + READONLY_NAV), \
+        assert set(role_tools) == set(READ_TOOLS + READONLY_NAV + ["web_search", "fetch_url"]), \
             "reviewer/planner are offered only the read-only nav tools"
         for name in ("run_tests", "http_request", "format_code", "list_packages"):
             assert name not in role_tools
@@ -297,6 +297,7 @@ def test_nav_tools_absent_when_dev_tools_disabled(tmp_path):
 
     raw = base_raw(tmp_path)
     raw["sandbox"]["dev_tools"] = False
+    raw["sandbox"]["research"] = False
     cfg = parse_config(raw)
     tools = Orchestrator._exec_tools(SimpleNamespace(cfg=cfg))
     assert tools == EXEC_TOOLS

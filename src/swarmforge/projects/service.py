@@ -11,7 +11,7 @@ from pathlib import Path
 from . import lead
 from .autonomy import milestone_limit
 from .repository import Repository
-from .spec import ProjectError, fixed, replace_living, validate
+from .spec import ProjectError, compact_living, fixed, replace_living, validate
 from .store import Projects
 
 
@@ -141,6 +141,114 @@ def resume(store, pid, reply="continue", *, confirm_manual=False, expected_spec=
         store.kv_set("project_auto_context:" + pid, None)
 
 
+def change_checks(request: str) -> list[str]:
+    """Done-when statements for a change round, taken from the owner's own words."""
+    parts = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip() for line in request.splitlines()]
+    parts = [x for x in parts if len(x) > 3]
+    if len(parts) <= 1:
+        parts = [x.strip() for x in re.split(r"(?<=[.!?])\s+", request.strip()) if len(x.strip()) > 3]
+    checks = [x[:500] for x in parts][:4] or [request.strip()[:500]]
+    checks.append("All existing behavior and tests keep passing after these changes")
+    return checks[:5] if len(checks) >= 2 else checks + ["The change is described in the README or changelog"]
+
+
+def request_changes(store, pid, request, *, extra_budget=0.0, min_budget=0.5):
+    """Reopen a finished project with a new milestone made from the owner's change request.
+
+    Explicit owner action (the lead cannot call it): the request becomes the milestone's goal and
+    done-when checks, optional extra money is added to the approved budget, and the project runs
+    again with the same lead, history and repository."""
+    from ..runqueue import set_lane_paused
+    from .spec import render
+    request = (request or "").strip()
+    if len(request) < 10:
+        raise ProjectError("Describe the changes or improvements you want")
+    if len(request) > 16000:
+        raise ProjectError("Keep the request within 16000 characters")
+    if not isinstance(extra_budget, (int, float)) or not 0 <= extra_budget <= 500:
+        raise ProjectError("Extra budget must be between $0 and $500")
+    ps = Projects(store)
+    with store.transaction():
+        p = ps.get(pid)
+        if p["status"] != "done":
+            raise ProjectError("Only a finished project can be reopened with a change request; "
+                               "use a correction while it is still running or waiting")
+        d = json.loads(json.dumps(p["definition"]))
+        spent = ps.spent(pid)
+        budget = round(float(d["budget_usd"]) + float(extra_budget), 2)
+        available = round(budget - spent, 2)
+        if available < min_budget:
+            raise ProjectError(f"Only ${max(available, 0):.2f} of the approved budget is left; add extra budget for this round")
+        index = len(d["milestones"])
+        rounds = sum(1 for m in d["milestones"] if m.get("change_request")) + 1
+        title = re.sub(r"\s+", " ", request.splitlines()[0])[:70]
+        d["budget_usd"] = budget
+        d["milestones"].append({"name": f"Changes {rounds}: {title}", "goal": request, "checks": change_checks(request),
+                                "estimate_usd": available, "estimate_hours": 6, "change_request": True})
+        validate(d)
+        living = p["spec"][len(fixed(p["spec"])) + len("## Living\n"):]
+        now = time.time()
+        store.conn.execute("UPDATE projects SET budget_usd=?,definition=?,spec=?,previous_spec=NULL,observed_sha=NULL,"
+                           "status='running',current_milestone=?,last_error=NULL WHERE id=?",
+                           (budget, json.dumps(d), render(d, living), index, pid))
+        store.conn.execute("INSERT INTO milestones(project_id,idx,name,estimate_usd,estimate_hours,status,started_at) VALUES (?,?,?,?,?,?,?)",
+                           (pid, index, d["milestones"][-1]["name"], available, 6, "current", now))
+        store.conn.execute("INSERT INTO chat_messages(conversation_id,role,content,created_at) VALUES (?,'user',?,?)",
+                           (p["conversation_id"], "Change request: " + request, now))
+        store.conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, p["conversation_id"]))
+        store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)",
+                           (pid, now, "changes_requested", json.dumps({"request": request, "milestone": index, "extra_budget": extra_budget,
+                                                                       "budget_usd": budget})))
+        set_lane_paused(store, lane(pid), False)
+        store.kv_set("project_auto_context:" + pid, None)
+        store.kv_set("project_supervisor:" + pid, None)
+    return ps.get(pid)
+
+
+def launch_discussed_changes(store, pid, *, extra_budget=0.0, min_budget=0.5):
+    """Turn the lead's latest proposed change plan into work, whatever the project's state.
+
+    Finished: reopen with a change round. At a review or stopped: the milestone stays open and the
+    lead replans with the owner's feedback (nothing is accepted on the owner's behalf). Running:
+    the feedback is handed to the lead's next turn."""
+    raw = store.kv_get("project_change_proposal:" + pid)
+    if not raw:
+        raise ProjectError("There is no proposed change plan to launch; describe what you want in the conversation first")
+    proposal = json.loads(raw)
+    text = (proposal.get("title") or "Owner feedback") + "\n" + "\n".join("- " + c for c in proposal["changes"])
+    ps = Projects(store)
+    p = ps.get(pid)
+    if not isinstance(extra_budget, (int, float)) or not 0 <= extra_budget <= 500:
+        raise ProjectError("Extra budget must be between $0 and $500")
+    if p["status"] == "done":
+        result = request_changes(store, pid, text, extra_budget=extra_budget, min_budget=min_budget)
+    elif p["status"] in ("at_checkpoint", "waiting_for_you", "running"):
+        if extra_budget:
+            with store.transaction():
+                current = ps.get(pid)
+                d = json.loads(json.dumps(current["definition"]))
+                d["budget_usd"] = round(float(d["budget_usd"]) + float(extra_budget), 2)
+                store.conn.execute("UPDATE projects SET budget_usd=?,definition=? WHERE id=?", (d["budget_usd"], json.dumps(d), pid))
+        feedback = ("The owner reviewed the project and says it does not work as intended. Do NOT accept or close the "
+                    "milestone. Plan and build these changes, with tests that prove each one:\n" + text)
+        if p["status"] == "running":
+            from .autonomy import _context
+            with store.transaction():
+                _context(store, ps.get(pid), "owner_feedback", feedback, 0)
+                store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)",
+                                   (pid, time.time(), "reply", json.dumps({"reply": feedback})))
+        else:
+            resume(store, pid, feedback)  # the milestone stays open: a correction, not an acceptance
+        result = ps.get(pid)
+    else:
+        raise ProjectError(f"A {p['status']} project cannot take changes")
+    store.kv_set("project_change_proposal:" + pid, None)
+    with store.transaction():
+        store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)",
+                           (pid, time.time(), "changes_launched", json.dumps({"proposal": proposal, "extra_budget": extra_budget})))
+    return result
+
+
 def extend_task_allowance(cfg, store, pid, *, expected_spec, expected_recovery, extra_budget, hours):
     """Explicit, bounded recovery approval. Keep the original lineage, costs and evidence."""
     import hashlib
@@ -265,7 +373,7 @@ def validate_plan(p, result, horizon):
             raise ProjectError(f"Lead must supply the {heading.lower()} section")
         if old and old.group(1).strip() and old.group(1).strip() not in new.group(1):
             living = living[:new.start(1)] + old.group(1).rstrip() + "\n\n" + living[new.start(1):]
-    spec = fixed_text + "## Living\n\n" + living
+    spec = compact_living(fixed_text + "## Living\n\n" + living)
     if action == "escalate":
         attempts = result.get("attempts", [])
         steps = {a.get("step") for a in attempts if isinstance(a, dict) and a.get("step") in (1, 2, 3, 4) and str(a.get("result", "")).strip()}
@@ -296,24 +404,38 @@ def validate_plan(p, result, horizon):
 
 
 def verify_checks(store, p):
+    from ..verification import LEVELS, project_requirements
     ps = Projects(store)
     items = ps.items(p["id"])
-    merged = [q for q in items if q["milestone"] == p["current_milestone"] and q["merged_sha"] and q.get("run_id")]
+    # A task may have implemented later milestones early. Reuse the latest merged
+    # project result, while still requiring exact check text and actual passing tests.
+    merged = [q for q in items if q["milestone"] <= p["current_milestone"] and q["merged_sha"] and q.get("run_id")]
     latest = merged[-1:]  # Earlier evidence may have been invalidated by a subsequent task.
     checks = []
-    for text in p["definition"]["milestones"][p["current_milestone"]]["checks"]:
+    requirements = project_requirements(p["definition"], p["current_milestone"])
+    current_ids = {f"M{p['current_milestone'] + 1}C{ci + 1}" for ci in range(len(p["definition"]["milestones"][p["current_milestone"]]["checks"]))}
+    for requirement in (r for r in requirements if r["id"] in current_ids):
+        text, rid, required = requirement["text"], requirement["id"], requirement["evidence_level"]
         evidence = []
         status = "needs you"
+        explanation = f"Requires {required} evidence for {rid}; no matching current execution is recorded."
         for q in latest:
             tests = [t for t in store.test_runs(q["run_id"]) if t["label"] != "baseline"]
             if not tests or tests[-1]["exit_code"] != 0 or tests[-1]["timed_out"]:
                 continue
-            for a in store._all("SELECT * FROM acceptance WHERE run_id=? AND text=? ORDER BY cycle DESC LIMIT 1", (q["run_id"], text)):
-                if a["status"].lower() in ("pass", "passed", "satisfied") and a.get("evidence"):
-                    evidence.append({"run": q["run_id"], "sha": q["merged_sha"], "evidence": a["evidence"], "test": tests[-1]["command"]})
-                elif a["status"].lower() in ("fail", "failed", "unsatisfied", "not_satisfied"):
+            for a in store._all("SELECT * FROM acceptance WHERE run_id=? AND (requirement_id=? OR (requirement_id IS NULL AND text=?)) ORDER BY cycle DESC,id DESC LIMIT 1", (q["run_id"], rid, text)):
+                actual = a.get("evidence_level") or "unit"
+                current = a.get("cycle") == tests[-1].get("cycle")
+                sufficient = LEVELS.get(actual, -1) >= LEVELS[required] and (required == "unit" or bool(a.get("commit_sha")))
+                if a["status"].lower() in ("pass", "passed", "satisfied") and a.get("evidence") and sufficient and current:
+                    evidence.append({"run": q["run_id"], "sha": q["merged_sha"], "tested_sha": a.get("commit_sha"), "level": actual, "evidence": a["evidence"], "test": tests[-1]["command"]})
+                elif current and a["status"].lower() in ("fail", "failed", "unsatisfied", "not_satisfied"):
                     status = "failed"
-        checks.append({"text": text, "status": "passed" if evidence else status, "evidence": evidence})
+                    explanation = a.get("evidence") or "The latest check failed."
+                else:
+                    explanation = f"{rid} requires {required} evidence; recorded evidence is {actual}. " + str(a.get("evidence") or "")
+        checks.append({"id": rid, "text": text, "required_level": required, "status": "passed" if evidence else status,
+                       "explanation": "Verified by current execution." if evidence else explanation, "evidence": evidence})
     return checks
 
 
@@ -321,7 +443,8 @@ def checkpoint(store, p, reason, *, config=None):
     ps = Projects(store)
     items = ps.items(p["id"])
     checks = verify_checks(store, p)
-    if any(c["status"] == "failed" for c in checks):
+    from .autonomy import deferral_allowed
+    if any(c["status"] == "failed" for c in checks) and not (config and config.projects.autonomous and deferral_allowed(store, p)):
         raise ProjectError("Milestone has failed checks; the lead must plan repairs")
     ms = ps.milestones(p["id"])[p["current_milestone"]]
     shots = []
@@ -454,6 +577,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                                 pos = store.conn.execute("SELECT COALESCE(MAX(position),0)+1 FROM queue_items").fetchone()[0]
                                 store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts,seed_run_id) VALUES (?,?,?,?,?,'queued',?,0,'yes',?,?,?,?, 'swarm',0,?)",
                                                    (pos, title, body, p["repo"], time.time(), lane(pid), pid, p["current_milestone"], q["project_key"], budget, q["run_id"]))
+                                store.conn.execute("UPDATE queue_items SET requirement_ids=? WHERE id=last_insert_rowid()", (q.get("requirement_ids") or "[]",))
                                 ps.event(pid, "fix_up", {"supersedes": q["id"], "reason": reason})
                             return
                         ps.update(pid, last_error="Waiting for the previous task's PR to merge: " + run["pr_url"])
@@ -495,7 +619,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                     seed = run["id"] if run and resumable(store, run["id"]) else q.get("seed_run_id")
                     store._exec("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
                     diagnosis = str((run or {}).get("state_reason") or q.get("note") or "Inspect the retained run evidence")
-                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + diagnosis, p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=seed, execution_id=(run or {}).get("execution_id"), retry_of=(run or {}).get("id"), max_runtime_s=q.get("max_runtime_s"), max_cycles=q.get("max_cycles"), team=q.get("team"), depends_on=q.get("depends_on") or "[]")
+                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + diagnosis, p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=seed, execution_id=(run or {}).get("execution_id"), retry_of=(run or {}).get("id"), max_runtime_s=q.get("max_runtime_s"), max_cycles=q.get("max_cycles"), team=q.get("team"), depends_on=q.get("depends_on") or "[]", requirement_ids=q.get("requirement_ids") or "[]")
                     from ..runqueue import set_lane_paused
                     set_lane_paused(store, lane(pid), False)
                     return
@@ -544,10 +668,12 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                 if path.exists():
                     report = path.read_text(encoding="utf-8", errors="replace")[-16000:]
             recent.append({"task": q, "run": r, "report": report})
-        context = {"date": datetime.now(UTC).date().isoformat(), "spec": p["spec"], "repository": snapshot,
+        context = {"date": datetime.now(UTC).date().isoformat(), "spec": compact_living(p["spec"]), "repository": snapshot,
                    "milestone": p["current_milestone"], "recent_outcomes": recent,
                    "chat": store.conversation_messages(p["conversation_id"])[-12:], "budget_remaining": p["budget_usd"] - spent,
                    "verification": verify_checks(store, p)}
+        from ..verification import project_requirements
+        context["requirements"] = project_requirements(p["definition"], p["current_milestone"])
         landed = next((q for q in reversed(ps.items(pid)) if q["merged_sha"] and q.get("run_id")), None)
         if landed and hasattr(repo, "change"):
             run = store.get_run(landed["run_id"])
@@ -644,7 +770,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                  decision_result={"result": "Escalated for a human decision", "proposal": result["proposal"]})
             return
         if result["action"] == "checkpoint":
-            if not any(q["merged_sha"] and q["milestone"] == p["current_milestone"] for q in ps.items(pid)):
+            if not any(q["merged_sha"] and q["milestone"] <= p["current_milestone"] for q in ps.items(pid)):
                 raise ProjectError("A milestone cannot finish without merged work")
             checkpoint(store, p, result["reason"], config=cfg)
             turn.mark("applied", {"result": "Milestone checks evaluated", "status": ps.get(pid)["status"]})
@@ -678,13 +804,14 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                     if seed:
                         store.conn.execute("UPDATE queue_items SET seed_run_id=?,retry_of=? WHERE id=?", (seed, seed, qid))
                 runtime = t.get("max_runtime_s") or (min(cfg.projects.investigation_timeout_s, cfg.limits.max_runtime_s) if t["kind"] == "spike" else cfg.limits.max_runtime_s)
-                store.conn.execute("UPDATE queue_items SET depends_on=?,project_action=?,max_runtime_s=? WHERE id=?",
-                                   (json.dumps(t.get("depends_on", [])), action.kind.value, runtime, qid))
+                store.conn.execute("UPDATE queue_items SET depends_on=?,project_action=?,max_runtime_s=?,requirement_ids=? WHERE id=?",
+                                   (json.dumps(t.get("depends_on", [])), action.kind.value, runtime, json.dumps(t.get("check_ids", [])), qid))
             store.conn.execute("INSERT INTO project_events(project_id,ts,kind,detail) VALUES (?,?,?,?)", (pid, time.time(), "replan", json.dumps({"sha": snapshot["sha"], "reason": result["reason"], "tasks": result["tasks"], "changed_keys": changed})))
             turn.mark("applied", {"result": "Scheduled approved tasks in the existing project lane", "task_keys": [t["key"] for t in result["tasks"]]}, connection=store.conn)
             set_lane_paused(store, lane(pid), False)
             store.kv_set("project_recovery:" + pid, None)
             store.kv_set("project_auto_context:" + pid, None)
+        await asyncio.to_thread(close_superseded_prs, store, pid, repo, [t["title"] for t in result["tasks"]])
     finally:
         from .autonomy import instructions
         recovery = instructions(store, pid) if cfg.projects.autonomous else {}
@@ -693,6 +820,39 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
         store.kv_set(activity_key, activity)
         if own:
             repo.close()
+
+
+def close_superseded_prs(store, pid, repo, replacement_titles=()):
+    """Close PRs of project tasks that a new plan abandoned, so they don't pile up.
+
+    After a replan, a finished task whose PR never merged (held, its fix-ups failed or were
+    cancelled) will not be merged by the project any more: the new plan replaces it. Its PR is
+    commented and closed; the branch stays. Merged or already-closed PRs are left alone, and
+    each PR is handled once. Best effort: a GitHub error is recorded and never stops the project."""
+    ps = Projects(store)
+    rows = store._all("SELECT q.id,q.title,r.pr_url FROM queue_items q JOIN runs r ON r.id=q.run_id "
+                      "WHERE q.project_id=? AND q.status='done' AND q.project_processed=1 AND q.merged_sha IS NULL "
+                      "AND r.pr_url IS NOT NULL AND r.pr_url != ''", (pid,))
+    closed = []
+    for row in rows:
+        key = "project_pr_closed:" + row["pr_url"]
+        if store.kv_get(key):
+            continue
+        try:
+            pr = repo.pull(row["pr_url"])
+            if pr.get("state") == "open" and not pr.get("merged_at"):
+                plan = "; ".join(t[:120] for t in list(replacement_titles)[:5]) or "a revised plan"
+                repo.close_pull(row["pr_url"], "Superseded: the SwarmForge project lead replaced this task "
+                                f"(#{row['id']} {row['title'][:120]}) with a new plan: {plan}. Closed automatically; "
+                                "the branch is kept if you want to look at it.")
+                closed.append(row["pr_url"])
+            store.kv_set(key, "1")
+        except Exception as e:  # noqa: BLE001 - housekeeping must never stop the project
+            ps.event(pid, "pr_close_failed", {"pr": row["pr_url"], "error": f"{type(e).__name__}: {e}"[:300]})
+            store.kv_set(key, "1")
+    if closed:
+        ps.event(pid, "prs_closed", {"prs": closed, "reason": "superseded by a new plan"})
+    return closed
 
 
 def stop(ps, p, proposal, detail, *, turn=None, decision_status=None, decision_result=None):

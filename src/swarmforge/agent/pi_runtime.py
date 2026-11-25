@@ -36,7 +36,7 @@ SF_BIN = ".swarmforge/bin"                   # the `sf` command (SwarmForge tool
 # SwarmForge tools offered to Pi developers through `sf` (Pi has its own read/write/edit/bash)
 SF_TOOLS = ("start_process", "read_process_output", "stop_process", "browse", "check_code", "run_tests",
             "outline", "find_symbol", "git_changes", "git_history", "http_request", "format_code",
-            "list_packages", "edit_lines", "apply_patch", "load_skill", "list_skills")
+            "list_packages", "edit_lines", "apply_patch", "load_skill", "list_skills", "web_search", "fetch_url")
 
 
 def _refresh_changed_files(ctx) -> None:
@@ -386,8 +386,8 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
             argv = pi_argv_head(command, model_id, thinking, extra_args)
             # files written from Windows may lack the exec bit inside the Linux container: set it here
             script = ('chmod +x /workspace/' + SF_BIN + '/sf 2>/dev/null; export PATH="/workspace/' + SF_BIN
-                      + ':$PATH"; SF_S="$(cat "$SF_SYS")"; SF_P="$(cat "$SF_PROMPT")"; '
-                      'exec timeout -k 10 "$SF_T" "$@" --append-system-prompt "$SF_S" -- "$SF_P" '
+                      + ':$PATH"; '
+                      'exec timeout -k 10 "$SF_T" "$@" --append-system-prompt "$SF_SYS" -- "@$SF_PROMPT" '
                       '> "$SF_OUT" 2> "$SF_ERR"')
             run = await session.exec_argv(["sh", "-c", script, "sh", *argv], timeout_s=timeout_s + 60, env={
                 "SF_T": str(int(timeout_s)), "SF_OUT": rel + ".jsonl", "SF_ERR": rel + ".err",
@@ -410,7 +410,10 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
                         "SF_TOOLS_URL": f"http://127.0.0.1:{relay.port}",
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "PYTHONPATH": str((ctx.workspace / DEPS_DIR).resolve())})
-            argv = pi_argv(command, model_id, thinking, system, prompt, extra_args)
+            system_file, prompt_file = pidir / f"{token}.system", pidir / f"{token}.prompt"
+            system_file.write_text(system, encoding="utf-8", newline="\n")
+            prompt_file.write_text(prompt, encoding="utf-8", newline="\n")
+            argv = pi_argv(command, model_id, thinking, str(system_file.resolve()), "@" + str(prompt_file.resolve()), extra_args)
             timed_out = await _run_local(argv, ctx.workspace, env, out_file, err_file, timeout_s)
         else:
             raise RuntimeError("the Pi harness needs the docker or local sandbox")
@@ -440,7 +443,9 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
             result.status = "error"
             result.error = "Pi ended without a final answer" + (f": {'; '.join(ev['errors'])}" if ev["errors"] else "") \
                 + (f" (stderr: {err.strip()})" if err.strip() else "")
-            if agent.calls == 0:
+            if "Argument list too long" in err or "WinError 206" in err:
+                result.error += " - The harness exceeded the operating system command-length limit before contacting the model. This is not evidence of a relay/network failure."
+            elif agent.calls == 0:
                 result.error += (" — Pi never reached the model relay. With Docker, try `pi: {relay_host: 0.0.0.0}` "
                                  "in swarmforge.yaml (Docker Desktop may not forward to 127.0.0.1)")
         else:

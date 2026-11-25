@@ -170,7 +170,7 @@ knowledge:                    # Zettelkasten shared by all runs (Obsidian-compat
 
 self_heal:                    # when a run fails: diagnose why, then retry with more effort
   enabled: true
-  max_attempts: 2             # automatic retries per task (0 = never); per task in the dashboard too
+  max_attempts: 4             # automatic retries per task (0 = never); the 3rd+ attempt re-plans if the same failure repeats
   time_factor: 1.5            # role-session effort only; never expands the total task deadline
   budget_factor: 1.5          # accepted for older configs; never expands the task spending allowance
   extra_repair_cycles: 1      # ... one more repair cycle ...

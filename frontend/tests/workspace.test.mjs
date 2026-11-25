@@ -251,6 +251,41 @@ test('resolved planning failures are history and do not appear to be an active a
   assert.ok(!html.includes('attempts in the current planning round'));assert.ok(!html.includes('Retry planning automatically'));
 });
 
+test('automatic planning is clearly informational and an active task replaces an old planning message',async()=>{
+  const {ProjectActivity,projectActivity}=await import(pathToFileURL(join(output,'ProjectActivity.js')));
+  const props={tasks:[],activity:'Choosing the next bounded project action',queue:{paused:false,worker_running:true},session,navigate(){},onRefresh(){}};
+  const planning=renderToStaticMarkup(createElement(ProjectActivity,props));
+  assert.match(planning,/No input needed/);assert.match(planning,/lead is planning automatically/);
+  assert.match(planning,/do not need to select or approve anything/);assert.match(planning,/Refresh status/);
+  assert.ok(!planning.includes('Run approved work'));assert.ok(!planning.includes('Choosing the next bounded'));
+  const tasks=[{id:'task-111',status:'running',title:'Write README',stage:'DEVELOPING'}];
+  assert.equal(projectActivity(tasks,props.activity).title,'The team is working');
+  const running=renderToStaticMarkup(createElement(ProjectActivity,{...props,tasks}));
+  assert.match(running,/Write README/);assert.match(running,/View active task/);assert.match(running,/developing/);
+  assert.ok(!running.includes('lead is planning'));
+});
+
+test('a stopped or paused worker offers a concrete way to continue and outages never claim work is healthy',async()=>{
+  const {ProjectActivity}=await import(pathToFileURL(join(output,'ProjectActivity.js')));
+  const props={tasks:[],activity:'Choosing the next bounded project action',session,navigate(){},onRefresh(){}};
+  for(const queue of [{worker_running:false,paused:false},{worker_running:true,paused:true}]){
+    const html=renderToStaticMarkup(createElement(ProjectActivity,{...props,queue}));
+    assert.match(html,/Worker needs attention/);assert.match(html,/Run approved work/);
+    assert.match(html,/existing allowances/);assert.ok(!html.includes('No input needed'));
+  }
+  const offline=renderToStaticMarkup(createElement(ProjectActivity,{...props,queue:null,error:'Disconnected'}));
+  assert.match(offline,/Could not refresh live progress/);assert.match(offline,/Refresh status/);
+  assert.ok(!offline.includes('No input needed'));
+});
+
+test('a new dashboard build offers reload without discarding unsent text automatically',async()=>{
+  const {DashboardUpdate}=await import(pathToFileURL(join(output,'DashboardUpdate.js')));
+  assert.equal(renderToStaticMarkup(createElement(DashboardUpdate,{available:false})), '');
+  const html=renderToStaticMarkup(createElement(DashboardUpdate,{available:true}));
+  assert.match(html,/Dashboard update available/);assert.match(html,/Reload dashboard/);
+  assert.match(html,/Running projects continue/);assert.match(html,/Copy any unsent text/);
+});
+
 test('drafts are stored per workspace and a stale tab cannot act on a replacement workspace',async()=>{
   const api=await import(pathToFileURL(join(output,'api.js')));
   const store=new Map();

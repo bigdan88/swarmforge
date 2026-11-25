@@ -520,3 +520,35 @@ def test_sent_request_with_lost_response_still_retains_spend(cfg, tmp_path):
         assert e.row()["spent_usd"] == cfg.limits.budget_usd
         assert store._one("SELECT COUNT(*) AS n FROM execution_calls WHERE status='uncertain'")["n"] == 1
     asyncio.run(scenario())
+
+
+def test_a_new_attempt_is_not_stopped_by_earlier_attempts_reads(cfg, tmp_path):
+    """Retries re-read the same files; lineage-wide action counts used to stop them on step one."""
+    store = Store(tmp_path / "db")
+    cfg.limits.max_recoveries = 5
+    e = attempt(store, cfg)
+    ctx = SimpleNamespace(workspace=tmp_path, files_written=set())
+    read = {"name": "read_file", "args": {"path": "swarmforge.project.yml"}, "output": "test: pytest"}
+    for _ in range(cfg.limits.repeat_action_limit - 1):
+        observe_tool(e, ctx, read, agent="planner")
+    e.poll()
+    e.finish("task_failure", "tests failed")
+    retry = attempt(store, cfg, "retry", "first")
+    observe_tool(retry, ctx, read, agent="planner")
+    retry.poll()  # the retry's first read is not the sixth repeat
+    failures = store._one("SELECT COUNT(*) n FROM execution_evidence WHERE execution_id='first' AND kind='action'")["n"]
+    assert failures == 1
+
+
+def test_different_agents_reading_the_same_file_is_not_a_loop(cfg, tmp_path):
+    store = Store(tmp_path / "db")
+    e = attempt(store, cfg)
+    ctx = SimpleNamespace(workspace=tmp_path, files_written=set())
+    read = {"name": "git_changes", "args": {}, "output": "M app.py"}
+    for n in range(cfg.limits.repeat_action_limit + 2):
+        observe_tool(e, ctx, read, agent=f"developer-{n}")
+    e.poll()
+    for _ in range(cfg.limits.repeat_action_limit):
+        observe_tool(e, ctx, read, agent="reviewer")
+    with pytest.raises(ExecutionStopped, match="Recurring action"):
+        e.poll()  # one agent repeating itself is still caught

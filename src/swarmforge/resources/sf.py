@@ -25,6 +25,8 @@
   sf patch PATH '<hunks JSON or unified diff>'   anchored hunks / diff; '-' or no arg reads stdin
   sf skills                                     list available skills/playbooks
   sf skill NAME                                 print a knowledge-base playbook (reusable lesson)
+  sf search QUERY... [--n N]                    search the internet: titles, URLs, snippets
+  sf fetch URL [--start N] [--max-chars N]      read a public web page as text (cite the URL)
   sf call TOOL '{"json": "args"}'               any tool with raw JSON arguments
 
 Prefer `sf edit` / `sf patch` over whole-file rewrites: they validate every anchor first and
@@ -240,6 +242,28 @@ def parse(argv):
         if not isinstance(hunks, list):
             hunks = payload
         return "apply_patch", {"path": rest[0], "hunks": hunks}
+    if cmd == "search":
+        words, n = [], None
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--n":
+                n = int(_take(rest, i, "--n"))
+                i += 2
+                continue
+            words.append(rest[i])
+            i += 1
+        if not words:
+            raise Usage("sf search QUERY... [--n N]")
+        return "web_search", {"query": " ".join(words), **({"max_results": n} if n else {})}
+    if cmd == "fetch":
+        if not rest:
+            raise Usage("sf fetch URL [--start N] [--max-chars N]")
+        a = {"url": rest[0]}
+        if "--start" in rest:
+            a["start"] = int(_take(rest, rest.index("--start"), "--start"))
+        if "--max-chars" in rest:
+            a["max_chars"] = int(_take(rest, rest.index("--max-chars"), "--max-chars"))
+        return "fetch_url", a
     if cmd == "packages":
         return "list_packages", ({"name": rest[0]} if rest else {})
     if cmd == "skills":

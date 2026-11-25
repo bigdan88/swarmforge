@@ -85,7 +85,7 @@ class WorkReader:
             if fold:
                 base += (", keyed AS (SELECT *, " + self._lineage_key(run_cols, queue_cols) + " AS fold_key FROM picked), "
                          "ranked AS (SELECT *, COUNT(*) OVER (PARTITION BY fold_key) AS attempts, ROW_NUMBER() OVER "
-                         "(PARTITION BY fold_key ORDER BY " + rank + ",created_at DESC,id DESC) AS fold_rank FROM keyed), "
+                         "(PARTITION BY fold_key ORDER BY " + rank + ",COALESCE(finished_at,updated_at,created_at) DESC,created_at DESC,id DESC) AS fold_rank FROM keyed), "
                          "shown AS (SELECT * FROM ranked WHERE fold_rank=1) ")
             else:
                 base += ", shown AS (SELECT *, 1 AS attempts FROM picked) "

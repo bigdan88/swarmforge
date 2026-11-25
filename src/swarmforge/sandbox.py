@@ -163,19 +163,36 @@ class DockerSandbox(Sandbox):
         return r.returncode == 0
 
     def build_image(self, dockerfile: str = "Dockerfile.sandbox", tag: str | None = None,
-                    build_args: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+                    build_args: dict[str, str] | None = None, *, quiet: bool = False) -> subprocess.CompletedProcess:
         text = resources.files("swarmforge").joinpath(f"resources/{dockerfile}").read_text()
         build_args = {"BASE_IMAGE": self.cfg.base_image, **(build_args or {})}
+        recipe = recipe_hash(dockerfile, build_args)
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             Path(td, "Dockerfile").write_text(text)
             constraints = resources.files("swarmforge").joinpath("resources/constraints-linux.txt").read_text(encoding="utf-8-sig")
             Path(td, "constraints-linux.txt").write_text(constraints, encoding="utf-8")
-            args = [self.cfg.docker_binary, "build", "--progress=plain"]
+            args = [self.cfg.docker_binary, "build", "--progress=plain", "--label", f"{RECIPE_LABEL}={recipe}"]
             for k, v in build_args.items():
                 args += ["--build-arg", f"{k}={v}"]
             # Output streams straight to the terminal so the user sees pull/pip progress.
-            return subprocess.run(args + ["-t", tag or self.cfg.image, td])
+            extra = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace"} if quiet else {}
+            return subprocess.run(args + ["-t", tag or self.cfg.image, td], **extra)
+
+
+RECIPE_LABEL = "swarmforge.recipe"
+
+
+def recipe_hash(dockerfile: str, build_args: dict[str, str]) -> str:
+    """Fingerprint of what an image was built from: its Dockerfile, pinned versions and args.
+    An image whose label differs was built from an older recipe and is missing what changed."""
+    import hashlib
+    import json
+    files = resources.files("swarmforge")
+    parts = [files.joinpath(f"resources/{dockerfile}").read_text(encoding="utf-8-sig"),
+             files.joinpath("resources/constraints-linux.txt").read_text(encoding="utf-8-sig"),
+             json.dumps(build_args, sort_keys=True)]
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
 
 
 class LocalSandbox(Sandbox):

@@ -338,3 +338,33 @@ def test_example_yaml_documents_max_total_runtime_s():
     section = readme.split("## Failures and self-healing", 1)[1].split("\n## ", 1)[0]
     assert "self_heal.max_total_runtime_s" in section
     assert "3x" in section
+
+
+async def test_same_failure_twice_makes_the_next_attempt_plan_again(cfg, monkeypatch):
+    """Retries continue the previous attempt's work, but a repeated failure kind gets a fresh plan."""
+    from swarmforge import postmortem
+
+    store = Store(cfg.db_path)
+    cfg.self_heal.max_attempts = 3
+    store.create_run("a0", budget_usd=5, max_runtime_s=3600, state="FAILED", state_reason="frontend agent timed out")
+    store.failure_save("a0", category="agent_failure", retry=1, root_cause="frontend model timed out", fix="use backend")
+    _deadline_extended(store, cfg, "a0")
+    monkeypatch.setattr(postmortem, "resumable", lambda *a: True)
+    seeds = []
+
+    async def launch(c, seed, ctx, heal_of, attempt):
+        rid = f"a{attempt}"
+        seeds.append(seed)
+        store.create_run(rid, budget_usd=5, max_runtime_s=3600, state="FAILED" if attempt < 3 else "COMPLETED",
+                         state_reason="timed out again", heal_of=heal_of)
+        if attempt < 3:
+            store.failure_save(rid, category="agent_failure", retry=1, root_cause="same", fix="same")
+        return rid
+
+    assert await heal(cfg, store, "a0", launch) == "a3"
+    assert seeds == ["a0", None, "a2"]  # continue, then a fresh plan after the repeat, then continue it
+    assert "fixed itself on attempt 3" in store.failure("a0")["outcome"]
+
+
+def test_default_retries_are_four():
+    assert SelfHealConfig().max_attempts == 4

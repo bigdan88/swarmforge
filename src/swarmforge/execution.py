@@ -144,6 +144,10 @@ class Execution:
             number = db.execute("SELECT COALESCE(MAX(number),0)+1 FROM execution_attempts WHERE execution_id=?", (self.id,)).fetchone()[0]
             db.execute("INSERT INTO execution_attempts(run_id,execution_id,parent_run,number,started_at,last_progress_at,next_action) "
                        "VALUES (?,?,?,?,?,?,?)", (self.run_id, self.id, parent_run, number, now, now, "Inspect retained work and execute the approved task"))
+            # Repeated-action counting is per attempt: a fresh attempt naturally re-reads
+            # the same files, and earlier attempts' counts must not stop it on its first step.
+            # Repeated *failures* stay lineage-wide; they are real evidence of a loop.
+            db.execute("DELETE FROM execution_evidence WHERE execution_id=? AND kind='action'", (self.id,))
             db.execute("UPDATE execution_allowances SET active_run=?,owner_token=?,owner_pid=?,heartbeat=? WHERE id=?",
                        (self.run_id, self.token, os.getpid(), now, self.id))
 
@@ -291,8 +295,11 @@ def refresh_changed_files(ctx):
             ctx.files_written.add(path)
 
 
-def observe_tool(execution, ctx, data):
-    """Classify completed tool evidence, never a heartbeat or free-form model claim."""
+def observe_tool(execution, ctx, data, agent=None):
+    """Classify completed tool evidence, never a heartbeat or free-form model claim.
+
+    `agent` scopes repeated-action counting to one agent: several agents reading the
+    same file is normal teamwork, not one agent looping."""
     name, args = data.get("name", ""), data.get("args", {})
     name = str(name).removeprefix("sf ")
     name = {"read": "read_file", "write": "write_file", "edit": "edit_file"}.get(name, name)
@@ -307,7 +314,7 @@ def observe_tool(execution, ctx, data):
     digest = hashlib.sha256(output.encode()).hexdigest()
     evidence = {"tool": name, "arguments": args, "result_hash": digest}
     action = name.replace("_", " ") + ": " + str(args.get("path") or args.get("command") or args.get("query") or "repository evidence")[:220]
-    execution.observe("action", {"tool": name, "arguments": args}, summary=action)
+    execution.observe("action", {"tool": name, "arguments": args, **({"agent": agent} if agent else {})}, summary=action)
     failed = output.startswith(("ERROR:", "REJECTED:")) or bool(data.get("failed"))
     command = (getattr(ctx, "commands_run", None) or [{}])[-1]
     if name in {"run_command", "run_tests", "check_code"} and (command.get("exit_code") or command.get("timed_out")):

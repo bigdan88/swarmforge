@@ -29,6 +29,7 @@ from .db import Store
 from .launcher import pid_alive
 
 WORKER_KEY = "queue_worker_pid"
+PREVIOUS_WORKER_KEY = "queue_worker_previous_pid"  # a worker that handed over and is finishing its runs
 PAUSED_KEY = "queue_paused"
 POLICY_KEY = "queue_on_failure"  # "stop" | "continue"
 LANE_PAUSED = "queue_paused:{}"   # per queue ("pile")
@@ -41,6 +42,41 @@ DEFAULT_QUEUE = "main"
 class BacklogItem:
     title: str
     body: str
+
+
+
+RESTART_WAIT_PREFIX = "Updated SwarmForge code is ready. "
+
+
+def note_restart_wait(store, running_items):
+    """Say why idle projects are quiet while the worker drains for a code reload.
+
+    While a restart is pending no project lead runs (it must load the new code),
+    so a project with no task of its own would otherwise look stuck."""
+    waiting = ", ".join(f"#{i['id']} {str(i.get('title') or '')[:60]}" for i in running_items[:3])
+    busy = {i.get("project_id") for i in running_items}
+    for row in store._all("SELECT id FROM projects WHERE status='running'"):
+        key = "project_activity:" + row["id"]
+        current = store.kv_get(key) or ""
+        if waiting and row["id"] not in busy:
+            text = (RESTART_WAIT_PREFIX + f"The project lead resumes after the running work finishes: {waiting}"
+                    + (" and others" if len(running_items) > 3 else "") + ".")
+            if current != text:
+                store.kv_set(key, text)
+        elif current.startswith(RESTART_WAIT_PREFIX):
+            store.kv_set(key, None)
+
+def _can_hand_over(store, running_items) -> bool:
+    """Safe only while every running item's allowance is visibly owned by this process,
+    so a new worker classifies it as externally running instead of crashed."""
+    for item in running_items:
+        item = store.queue_item(item["id"]) or item  # the dispatch-time copy predates its run id
+        run = store.get_run(item["run_id"]) if item.get("run_id") else None
+        owner = store._one("SELECT active_run,owner_pid FROM execution_allowances WHERE id=?",
+                           (run["execution_id"],)) if run and run.get("execution_id") else None
+        if not owner or owner["active_run"] != run["id"] or owner["owner_pid"] != os.getpid():
+            return False
+    return True
 
 
 def parse_backlog(text: str) -> list[BacklogItem]:
@@ -424,9 +460,15 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
     external_running: set[int] = set()
     project_poll = 0.0
     project_task = None
+    handed_over = False
     try:
         # recover items left 'running' by a crashed worker
+        previous = store.kv_get(PREVIOUS_WORKER_KEY)
+        previous_alive = bool(previous and previous != str(os.getpid()) and pid_alive(int(previous)))
         for i in store.queue_items(include_finished=False):
+            if i["status"] == "running" and previous_alive:
+                external_running.add(i["id"])  # the worker that handed over to us is still finishing it
+                continue
             if i["status"] == "running":
                 prior = store.get_run(i["run_id"]) if i.get("run_id") else None
                 if prior and prior.get("execution_id"):
@@ -490,8 +532,26 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                     if echo:
                         echo(f"queue[{name}] paused because #{item['id']} did not complete (policy: stop on failure)")
             paused = store.kv_get(PAUSED_KEY) == "1"
-            restart = store.kv_get(RESTART_KEY) == "1"      # new code was installed: finish, then restart
+            restart = handed_over or store.kv_get(RESTART_KEY) == "1"      # new code was installed: finish, then restart
+            if restart and running and not handed_over and (project_task is None or project_task.done()) \
+                    and _can_hand_over(store, [item for item, _ in running.values()]):
+                # Hand over instead of draining: a fresh worker with the new code starts now and
+                # leaves these runs alone (their allowances are owned by this live process); this
+                # process only finishes them. Projects and other lanes no longer wait for them.
+                store.kv_set(RESTART_KEY, None)
+                store.kv_set(PREVIOUS_WORKER_KEY, str(os.getpid()))
+                store.kv_set(WORKER_KEY, None)
+                handed_over = True
+                note_restart_wait(store, [])
+                if echo:
+                    echo(f"queue worker handing over to a new worker; finishing {len(running)} running item(s) here")
+                start_worker(cfg, store, keep_pause=True)
+            elif restart and running and not handed_over:
+                note_restart_wait(store, [item for item, _ in running.values()])
+            if handed_over and not running:
+                break
             if restart and not running and (project_task is None or project_task.done()):
+                note_restart_wait(store, [])
                 store.kv_set(RESTART_KEY, None)
                 store.kv_set(WORKER_KEY, None)
                 if echo:
@@ -543,6 +603,13 @@ async def work(cfg: Config, store: Store, *, echo=print, llm_transport=None, san
                 if not paused and not restart and (max_items is None or started < max_items) and any(p["status"] == "running" for p in Projects(store).list()):
                     await asyncio.sleep(poll_s)
                     continue
+                if not paused and not restart and max_items is None:
+                    from .projects.autonomy import supervision_pending
+                    if supervision_pending(fresh_config(cfg, echo), store):
+                        # A stopped unattended project will be reopened after its back-off:
+                        # an idle exit here is what left projects dead overnight.
+                        await asyncio.sleep(max(poll_s, 15))
+                        continue
                 if paused or not startable or (max_items is not None and started >= max_items):
                     break
                 continue

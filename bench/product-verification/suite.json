@@ -1,0 +1,6 @@
+[
+  {"mode": "healthy", "expected": "passed"},
+  {"mode": "empty", "expected": "empty"},
+  {"mode": "wrong", "expected": "failed"},
+  {"mode": "missing", "expected": "failed"}
+]

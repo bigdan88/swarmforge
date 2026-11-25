@@ -466,7 +466,7 @@ except Exception as e:
 async def http_request(ctx: ToolContext, method: str, url: str, json_body=None, headers=None) -> str:
     if not LOCAL_URL_RE.match(url or ""):
         raise ToolError("http_request only talks to local apps started with start_process "
-                        "(e.g. http://localhost:8501). The sandbox has no internet access.")
+                        "(e.g. http://localhost:8501). For public sites use fetch_url.")
     method = str(method or "GET").upper()
     if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
         raise ToolError(f"unsupported HTTP method: {method!r}")

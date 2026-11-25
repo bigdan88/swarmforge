@@ -1,5 +1,10 @@
 # Bounded task execution and recovery (preview)
 
+Pi receives its system and task instructions through file references on both Docker and local runs.
+The Docker wrapper must pass those references all the way into Pi, rather than expand the files back
+into process arguments: Linux also limits individual argument length. An argument-length startup
+failure is reported as such, without suggesting that it proves a relay/network fault.
+
 ## Architecture assessment
 
 The existing orchestrator already owns planning, development, tests, review, repair and publication.

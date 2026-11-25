@@ -16,8 +16,11 @@ PLAN_JSON_SCHEMA: dict = {
             "type": "array",
             "description": "Issue-level acceptance criteria that tests must demonstrate.",
             "items": {"type": "object", "required": ["id", "text"],
-                      "properties": {"id": {"type": "string"}, "text": {"type": "string"}}},
+                      "properties": {"id": {"type": "string"}, "text": {"type": "string"},
+                                     "requirement_id": {"type": ["string", "null"]},
+                                     "evidence_level": {"type": "string", "enum": ["unit", "integration", "product"]}}},
         },
+        "verification_checks": {"type": "array", "description": "Frozen real application checks. Each has id, criteria (AC or requirement IDs), level (integration/product), preflight, fixtures, timeout_s and steps. Steps execute command.argv and assert real file/json/sqlite/http/browser outputs; see docs/PRODUCT_VERIFICATION.md.", "items": {"type": "object"}},
         "tasks": {
             "type": "array",
             "items": {
@@ -55,6 +58,8 @@ class Task:
 class Criterion:
     id: str
     text: str
+    evidence_level: str = "unit"
+    requirement_id: str | None = None
 
 
 @dataclass
@@ -62,6 +67,7 @@ class Plan:
     summary: str
     tasks: list[Task]
     acceptance_criteria: list[Criterion] = field(default_factory=list)
+    verification_checks: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -133,11 +139,26 @@ def validate_plan(data: Any, developer_roles: list[str], max_tasks: int,
         if isinstance(c, str):
             criteria.append(Criterion(id=f"AC{i + 1}", text=c))
         elif isinstance(c, dict) and isinstance(c.get("text"), str):
-            criteria.append(Criterion(id=str(c.get("id") or f"AC{i + 1}"), text=c["text"]))
+            level = c.get("evidence_level", "unit")
+            requirement = c.get("requirement_id")
+            if level not in ("unit", "integration", "product"):
+                errors.append(f"acceptance_criteria[{i}].evidence_level is invalid")
+            if requirement is not None and (not isinstance(requirement, str) or not ID_RE.fullmatch(requirement)):
+                errors.append(f"acceptance_criteria[{i}].requirement_id is invalid")
+            criteria.append(Criterion(id=str(c.get("id") or f"AC{i + 1}"), text=c["text"],
+                                      evidence_level=level, requirement_id=requirement))
         else:
             errors.append(f"acceptance_criteria[{i}] must have id and text")
     if require_criteria and not criteria:
         errors.append("acceptance_criteria must list the issue-level criteria (at least one)")
+    if len({c.id for c in criteria}) != len(criteria) or any(not ID_RE.fullmatch(c.id) for c in criteria):
+        errors.append("Acceptance criterion IDs must be valid and unique")
+    from .verification import VerificationError, parse_checks
+    try:
+        verification_checks = parse_checks(data.get("verification_checks", []))
+    except VerificationError as exc:
+        errors.append(str(exc))
+        verification_checks = []
 
     tasks: list[Task] = []
     seen: set[str] = set()
@@ -183,7 +204,8 @@ def validate_plan(data: Any, developer_roles: list[str], max_tasks: int,
             errors.append(str(e))
     if errors:
         raise PlanValidationError(errors)
-    return auto_split_plan(Plan(summary=summary.strip(), tasks=tasks, acceptance_criteria=criteria))
+    return auto_split_plan(Plan(summary=summary.strip(), tasks=tasks, acceptance_criteria=criteria,
+                               verification_checks=verification_checks))
 
 
 # ------------------------------------------------------- auto-split post-pass

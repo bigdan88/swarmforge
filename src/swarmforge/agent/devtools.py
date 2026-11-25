@@ -391,7 +391,7 @@ async def browse_raw(ctx: ToolContext, url: str, *, actions: list | None = None,
     errors, controls, and `screenshot_file`: the PNG on the host when `screenshot_name` was given)."""
     if not LOCAL_URL_RE.match(url or ""):
         raise ToolError("browse only opens local apps, e.g. http://localhost:8501 (start the app with "
-                        "start_process first). The sandbox has no internet access.")
+                        "start_process first). For public sites use fetch_url.")
     if actions is not None and not isinstance(actions, list):
         raise ToolError("actions must be a list of objects, e.g. [{\"click\": \"text=Save\"}]")
     if screenshot_name is not None and not re.fullmatch(r"[\w.-]+/?[\w.-]*\.png", screenshot_name):

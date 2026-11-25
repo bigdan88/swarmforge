@@ -139,10 +139,71 @@ def _docker_problem(cfg: Config, docker_timeout_s: int) -> tuple[str, str] | Non
     return None
 
 
+DEV_IMAGE = "swarmforge-dev-sandbox:latest"
+_REBUILD_LOCK = __import__("threading").RLock()
+_REBUILD_TRIED: dict[str, float] = {}  # recipe -> last attempt (monotonic)
+
+
+def _recipe_of(cfg: Config, img: str):
+    """(dockerfile, build_args) for SwarmForge's own images; None for anything else."""
+    if img == cfg.sandbox.image:
+        return "Dockerfile.sandbox", {}
+    if img == DEV_IMAGE:
+        return "Dockerfile.dev-sandbox", {"BASE": cfg.sandbox.image}
+    return None
+
+
+def _image_label(cfg: Config, img: str) -> str | None:
+    """The image's recipe label, "" when it has none, None when the image is missing."""
+    from .sandbox import RECIPE_LABEL
+    r = subprocess.run([cfg.sandbox.docker_binary, "image", "inspect", "--format",
+                        "{{ index .Config.Labels \"" + RECIPE_LABEL + "\" }}", img],
+                       check=False, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    value = (r.stdout or "").strip()
+    return "" if value in ("", "<no value>") else value
+
+
+def refresh_image(cfg: Config, img: str) -> bool:
+    """Rebuild one of SwarmForge's own sandbox images when it is missing or was built from an
+    older recipe (for example the Dockerfile gained a package the tests now import). Runs at most
+    once per recipe per hour per process; SWARMFORGE_NO_IMAGE_REBUILD=1 turns it off.
+    Returns True when the image is current afterwards."""
+    import os
+    import time
+    from .sandbox import DockerSandbox, recipe_hash
+    recipe = _recipe_of(cfg, img)
+    if not recipe:
+        return _image_label(cfg, img) is not None
+    dockerfile, extra = recipe
+    with _REBUILD_LOCK:
+        if img == DEV_IMAGE and not refresh_image(cfg, cfg.sandbox.image):
+            return False
+        sb = DockerSandbox(cfg.sandbox)
+        want = recipe_hash(dockerfile, {"BASE_IMAGE": cfg.sandbox.base_image, **extra})
+        if _image_label(cfg, img) == want:
+            return True
+        if os.environ.get("SWARMFORGE_NO_IMAGE_REBUILD") == "1" or time.monotonic() - _REBUILD_TRIED.get(want, -1e9) < 3600:
+            return False
+        _REBUILD_TRIED[want] = time.monotonic()
+        try:
+            ok = sb.build_image(dockerfile=dockerfile, tag=img, build_args=extra or None, quiet=True).returncode == 0
+        except OSError:
+            ok = False
+        if ok:
+            _TOOL_CHECKS.clear()
+        return ok
+
+
 def _image_problems(cfg: Config, image: str | None) -> list[tuple[str, str]]:
-    """(message, fix) when the sandbox image is not built yet (docker mode only)."""
+    """(message, fix) when the sandbox image is not built yet (docker mode only).
+
+    SwarmForge's own images rebuild themselves when missing or out of date; an outdated
+    image that cannot be rebuilt is still used (it worked before), a missing one blocks."""
     img = image or cfg.sandbox.image
-    if (
+    current = refresh_image(cfg, img) if _recipe_of(cfg, img) else False
+    if not current and (
         subprocess.run(
             [cfg.sandbox.docker_binary, "image", "inspect", img],
             check=False,

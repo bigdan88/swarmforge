@@ -99,6 +99,12 @@ class Repository:
             raise ProjectError("PR belongs to a different repository")
         return d
 
+    def close_pull(self, url, comment):
+        """Comment on and close an open PR (its branch is kept)."""
+        n = int(url.rstrip("/").split("/")[-1])
+        self.request("POST", self.root + f"/issues/{n}/comments", json={"body": comment})
+        self.request("PATCH", self.root + f"/pulls/{n}", json={"state": "closed"})
+
     def change(self, url):
         n = int(url.rstrip("/").split("/")[-1])
         files = self.request("GET", self.root + f"/pulls/{n}/files", params={"per_page": 50})

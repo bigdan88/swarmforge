@@ -392,7 +392,7 @@ def test_latest_failed_check_cannot_be_reported_as_passed(state):
     q = s.queue_add("Build", "body", "owner/inventory", project_id=pid, milestone=0)
     s.create_run("r")
     s.queue_update(q, status="done", merged_sha="main-2", run_id="r", project_processed=1)
-    s._exec("INSERT INTO test_runs(run_id,ts,command,exit_code) VALUES ('r',1,'pytest',0)")
+    s._exec("INSERT INTO test_runs(run_id,cycle,ts,command,exit_code) VALUES ('r',1,1,'pytest',0)")
     text = definition()["milestones"][0]["checks"][0]
     s._exec("INSERT INTO acceptance(run_id,cycle,text,status,evidence) VALUES ('r',1,?,'unsatisfied','Missing flow')", (text,))
     assert service.verify_checks(s, ps.get(pid))[0]["status"] == "failed"
@@ -575,3 +575,167 @@ async def test_project_task_reuses_existing_fake_team_pipeline(cfg, sample_repo)
     assert ps.spent(pid) > 0
     assert not result["merged_sha"]  # Ordinary run completion alone never completes the project task.
     s.close()
+
+
+class ClosingRepo(Repo):
+    def __init__(self, states):
+        super().__init__()
+        self.states, self.closed = states, []
+
+    def pull(self, url):
+        state = self.states[url]
+        return {"state": "closed" if state == "closed" else "open", "merged_at": "t" if state == "merged" else None,
+                "base": {"ref": "main"}, "merge_commit_sha": self.sha}
+
+    def close_pull(self, url, comment):
+        assert "Superseded" in comment and "Timeline v2" in comment
+        self.closed.append(url)
+
+
+def test_replan_closes_prs_of_abandoned_tasks_once(state):
+    s, ps, pid = state
+    service.approve(s, pid)
+    prs = {}
+    for n, kind in enumerate(["open", "merged", "closed", "open"], start=1):
+        qid = s.queue_add(f"Task {n}", "x", "owner/inventory", queue=service.lane(pid))
+        rid = f"r{n}"
+        s.create_run(rid)
+        url = f"https://github.com/owner/inventory/pull/{n}"
+        s.update_run(rid, state="COMPLETED", pr_url=url)
+        prs[url] = kind
+        # 1-3 were superseded (processed without merging); 4 is still waiting to merge
+        s.queue_update(qid, status="done", run_id=rid, project_id=pid, project_processed=0 if n == 4 else 1)
+    repo = ClosingRepo(prs)
+    assert service.close_superseded_prs(s, pid, repo, ["Timeline v2"]) == ["https://github.com/owner/inventory/pull/1"]
+    assert repo.closed == ["https://github.com/owner/inventory/pull/1"]
+    assert service.close_superseded_prs(s, pid, repo, ["Timeline v2"]) == []  # each PR handled once
+    assert any(e["kind"] == "prs_closed" for e in ps.events(pid))
+
+
+def test_a_github_error_while_closing_never_stops_the_project(state):
+    s, ps, pid = state
+    qid = s.queue_add("Task", "x", "owner/inventory", queue=service.lane(pid))
+    s.create_run("r1")
+    s.update_run("r1", state="COMPLETED", pr_url="https://github.com/owner/inventory/pull/9")
+    s.queue_update(qid, status="done", run_id="r1", project_id=pid, project_processed=1)
+
+    class Broken(Repo):
+        def pull(self, url):
+            raise service.ProjectError("GitHub GET: HTTP 502")
+    assert service.close_superseded_prs(s, pid, Broken(), []) == []
+    assert any(e["kind"] == "pr_close_failed" for e in ps.events(pid))
+
+
+def test_living_logs_stay_bounded_when_the_lead_paraphrases_them():
+    from swarmforge.projects.spec import LOG_LIMIT_CHARS, compact_living
+    original = render(definition())
+    head = fixed(original)
+    decisions = "\n".join(f"- 2026-11-{i % 28 + 1:02d}: decision {i} " + "x" * 120 for i in range(400))
+    living = ("## Living\n\n### Current state\nWorking.\n\n### Decisions made\n" + decisions + "\n" + decisions
+              + "\n\n### Plan\nNext\n\n### Plan changes\n- one\n- one\n\n### Open questions\nNone\n")
+    spec = compact_living(head + living)
+    assert fixed(spec) == head  # the owner's part is byte-identical
+    section = spec.split("### Decisions made")[1].split("### Plan")[0]
+    assert len(section) <= LOG_LIMIT_CHARS + 200
+    assert "decision 399" in section and "decision 0 " not in section  # newest kept, oldest trimmed
+    assert "older entries trimmed" in section
+    assert spec.split("### Plan changes")[1].count("- one") == 1  # exact duplicates dropped
+    assert compact_living(spec) == spec  # stable: compacting twice changes nothing
+
+
+def test_accepted_plan_writes_a_bounded_spec(state):
+    s, ps, pid = state
+    p = ps.get(pid)
+    huge = "\n".join(f"- old decision {i} " + "y" * 200 for i in range(2000))
+    head = fixed(p["spec"])
+    ps.update(pid, spec=head + "## Living\n\n### Current state\nx\n\n### Decisions made\n" + huge
+              + "\n\n### Plan\n\n### Plan changes\n\n### Open questions\n")
+    result = proposal()
+    result["living"] = result["living"].replace("2026-11-03: choose Flask", "2026-11-24: paraphrased history")
+    spec = service.validate_plan(ps.get(pid), result, 3)
+    assert len(spec) < 40000 and "paraphrased history" in spec
+
+
+def _finished(state):
+    s, ps, pid = state
+    service.approve(s, pid)
+    s._exec("UPDATE milestones SET status='done' WHERE project_id=?", (pid,))
+    ps.update(pid, status="done", current_milestone=2)
+    return s, ps, pid
+
+
+def test_a_finished_project_reopens_with_a_change_round(state):
+    s, ps, pid = _finished(state)
+    budget = ps.get(pid)["budget_usd"]
+    p = service.request_changes(s, pid, "- Make the cards bigger\n- Use a warmer color palette\n- Add a dark mode toggle",
+                                extra_budget=10)
+    assert p["status"] == "running" and p["current_milestone"] == 3 and p["budget_usd"] == budget + 10
+    m = p["definition"]["milestones"][3]
+    assert m["change_request"] and m["name"].startswith("Changes 1: ")
+    assert m["checks"][:3] == ["Make the cards bigger", "Use a warmer color palette", "Add a dark mode toggle"]
+    assert "existing behavior and tests keep passing" in m["checks"][-1]
+    assert "#### 4. Changes 1:" in p["spec"] and fixed(p["spec"]).count("#### ") == 4
+    assert ps.milestones(pid)[3]["status"] == "current"
+    assert any(e["kind"] == "changes_requested" for e in ps.events(pid))
+    s._exec("UPDATE milestones SET status='done' WHERE project_id=?", (pid,))
+    ps.update(pid, status="done")
+    p = service.request_changes(s, pid, "Rename the app to Horse Match everywhere it appears in the UI.")
+    assert p["current_milestone"] == 4 and p["definition"]["milestones"][4]["name"].startswith("Changes 2: ")
+    assert len(p["definition"]["milestones"][4]["checks"]) == 2  # one sentence + keep existing behavior
+
+
+def test_change_requests_need_a_finished_project_a_request_and_money(state):
+    s, ps, pid = state
+    service.approve(s, pid)
+    with pytest.raises(ProjectError, match="Only a finished project"):
+        service.request_changes(s, pid, "Make it nicer please")
+    s._exec("UPDATE milestones SET status='done' WHERE project_id=?", (pid,))
+    ps.update(pid, status="done", current_milestone=2)
+    with pytest.raises(ProjectError, match="Describe"):
+        service.request_changes(s, pid, "  ")
+    s.record_llm_call("project:" + pid, task_key="project-lead:m0", cost_usd=ps.get(pid)["budget_usd"], cost_source="estimated", status="ok")
+    with pytest.raises(ProjectError, match="add extra budget"):
+        service.request_changes(s, pid, "Make the cards bigger")
+    assert service.request_changes(s, pid, "Make the cards bigger", extra_budget=5)["status"] == "running"
+
+
+def test_discussing_a_project_then_launching_the_proposed_changes(state):
+    import asyncio
+
+    from swarmforge.projects import lead
+
+    s, ps, pid = _finished(state)
+    seen = {}
+
+    async def fake_call(cfg, store, p, system, context, transport=None, **kw):
+        seen["system"], seen["context"] = system, context
+        return {"reply": "The import never picks up .MOV files. I would fix the watcher.",
+                "proposal": {"title": "Fix import", "changes": ["Import picks up .MOV files", "Show import errors in the UI"]}}
+
+    lead_call = lead.call
+    lead.call = fake_call
+    try:
+        reply = asyncio.run(lead.discuss(None, s, pid, "Nothing shows up after I copy files in."))
+    finally:
+        lead.call = lead_call
+    assert "MOV" in reply and seen["system"] is lead.DISCUSS
+    assert seen["context"]["messages"][-1]["content"] == "Nothing shows up after I copy files in."
+    last = s.conversation_messages(ps.get(pid)["conversation_id"])[-1]
+    assert last["role"] == "assistant"
+    p = service.launch_discussed_changes(s, pid, extra_budget=5)
+    assert p["status"] == "running"
+    m = p["definition"]["milestones"][-1]
+    assert m["change_request"] and "Import picks up .MOV files" in m["checks"]
+    with pytest.raises(ProjectError, match="no proposed change plan"):
+        service.launch_discussed_changes(s, pid)  # each plan launches once
+
+
+def test_launching_changes_at_a_review_keeps_the_milestone_open(state):
+    s, ps, pid = state
+    service.approve(s, pid)
+    ps.update(pid, status="at_checkpoint")
+    s.kv_set("project_change_proposal:" + pid, json.dumps({"title": "Search is broken", "changes": ["Keyword search returns results"]}))
+    p = service.launch_discussed_changes(s, pid)
+    assert p["status"] == "running" and p["current_milestone"] == 0  # not accepted on the owner's behalf
+    reply = [e for e in ps.events(pid) if e["kind"] == "reply"][-1]
+    assert "Do NOT accept" in reply["detail"] and "Keyword search returns results" in reply["detail"]

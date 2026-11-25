@@ -31,7 +31,8 @@ def assess_gate(ev: TestEvidence, *, criteria: list[dict], tester_report: dict |
         problems.append({"kind": "tests", "summary": f"test suite not passing: {ev.short()}",
                          "detail": ev.failure_report()})
     for r in criteria:
-        if r["status"] == "failed" or (policy.require_verified_criteria and r["status"] != "satisfied"):
+        required = r.get("required_level", "unit") != "unit"
+        if r["status"] == "failed" or ((required or policy.require_verified_criteria) and r["status"] != "satisfied"):
             problems.append({"kind": "acceptance", "summary": f"acceptance criterion {r['criterion_id']} failing",
                              "detail": f"{r['criterion_id']}: {r['text']}\nEvidence: {r['evidence']}"})
     blocking = set(policy.blocking_severities)

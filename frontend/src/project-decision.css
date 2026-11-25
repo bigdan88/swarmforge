@@ -6,3 +6,9 @@
 .decision-checks .passed{color:#359c7c}.decision-option{border-top:1px solid var(--line);margin:1.2rem 0;padding-top:.4rem}
 .project-decision form{border-top:1px solid var(--line);margin:1.2rem 0;padding-top:1rem}.project-decision>button.link-button{margin-top:.75rem}
 .project-decision input{max-width:18rem}.project-decision button{white-space:normal;text-align:left}.project-decision .form-grid{max-width:42rem}
+.project-activity{margin-top:1rem;padding:1.1rem 1.2rem;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+.project-activity .badge{color:inherit;background:var(--hover)}
+.project-activity h3{margin:.6rem 0}.project-activity p{margin:.6rem 0;line-height:1.6;overflow-wrap:anywhere}
+.project-activity .button-row{margin-top:.9rem;flex-wrap:wrap}.project-activity button{white-space:normal}
+.project-activity.attention{border-left:3px solid var(--accent)}
+.dashboard-update{display:block}.dashboard-update p{margin:.5rem 0}

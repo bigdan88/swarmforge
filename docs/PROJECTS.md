@@ -33,7 +33,7 @@ The lead can also request bounded repository/evidence inspection, investigations
 milestone evaluation, a pause or a concrete question. Application code validates each typed action and
 retains its evidence and outcome in **Projects → Plan** and `swarmforge project status`. Decision
 calls share a persisted cap; they cannot repeat inspections or rewrite the plan indefinitely. Browser
-verification requests remain unverified until a journey runner is available. Unattended mode can carry
+verification requests alone remain unverified; build tasks can supply executable application journeys. Unattended mode can carry
 those observations to the final preview review while building the remaining software.
 See [validated lead actions](LEAD_ACTIONS.md) for contracts, defaults and recovery behavior.
 
@@ -51,7 +51,7 @@ are preserved. A repository migration or a different milestone count requires a 
 
 A milestone report shows its checks, available light/dark screenshots, plan changes, elapsed time,
 spend against estimate and the next milestone. Automatic check evidence comes from recorded acceptance
-and passing test results of the latest merged task. Unverifiable checks say **needs you**, not passed;
+and execution results of the latest merged task, matched by stable requirement ID and required evidence level. Unverifiable checks say **needs you**, not passed;
 in manual mode, explicitly confirm them before continuing. Screenshots come from the existing visual capture pipeline;
 when none were captured the report says so. A correction keeps the current milestone open and goes
 back to the lead. Approving the last report completes the project.
@@ -96,8 +96,9 @@ unverified checks and advances the milestone; it does not require extra checkbox
 When every check has passing recorded evidence and the approved spec has `ask_before: None`,
 the milestone advances automatically. Missing evidence and unavailable physical checks never pass
 on an agent's assertion. Build criteria should be machine-testable; human observations and report
-instructions belong in descriptions and open questions. The lead is instructed to use exact approved
-milestone check text when a build can prove it, so evidence can be linked without fuzzy matching.
+instructions belong in descriptions and open questions. Checks use stable IDs such as M1C1, so paraphrased wording does not require duplicate evidence-carrier tests.
+Project checks default to product execution; the approved definition can explicitly declare unit or integration evidence.
+See [product verification](PRODUCT_VERIFICATION.md) for frozen application checks, runtime prerequisites and the standalone runner.
 
 An exhausted task offers a bounded recovery extension: approve a specific additional USD amount
 and recovery time window, then the lead revises the plan. The extension retains the same execution
@@ -114,6 +115,14 @@ mode may reallocate approved project funds under the bounded policy below. The t
 continues to apply.
 
 ## Unattended preview delivery
+
+The progress panel separates **No input needed** activity from an actual decision. Planning means
+the lead is choosing work automatically; a running task takes precedence and offers **View active
+task**. **Refresh status** rechecks both the project and worker. A paused or stopped worker has a
+**Run approved work** button on the project itself, within the existing allowances. Connection errors
+are labelled as unavailable live status rather than implying the project is still working normally.
+Open dashboards detect newer interface builds and offer **Reload dashboard**; they do not discard
+unsent form text automatically. Reloading the interface does not interrupt background project work.
 
 Set `projects.autonomous: true` to work toward a usable preview without routine milestone replies.
 The sample configuration enables it; older configurations retain manual checkpoints until the owner
@@ -137,6 +146,10 @@ remain enforced. `auto_recovery_rounds` defaults to 2 and `auto_retry_delay_s` t
   the milestone is labelled `verification_pending`; the swarm can build later milestones with fixtures.
   These checks remain unverified and are gathered in the final preview review. Failed checks are never
   accepted as passing. A project with deferred observations stays at a final checkpoint until owner review.
+- Features already merged in an earlier milestone can be evaluated later without manufacturing another
+  merge. Check evidence still requires the approved requirement ID, sufficient evidence level and current execution from the latest merged
+  project result; an older pass cannot hide a newer failure. Older browser-verification stops can reopen
+  automatically for this evaluation, keeping unavailable observations on the final review list.
 - Resolved planning rejections are labelled **Corrected automatically** in **Recovery history**, separately
   from the current project state and the current planning round.
 

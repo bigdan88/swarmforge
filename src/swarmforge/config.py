@@ -96,6 +96,7 @@ class SandboxConfig:
     docker_binary: str = "docker"
     dependency_install: bool = True   # install the project's declared packages (network only for that step)
     install_network: str = "bridge"
+    research: bool = True             # agents get web_search/fetch_url (run on the host, public sites only)
     install_timeout_s: int = 900
     reuse_container: bool = True      # agents' run_command execs into one long-lived container per agent
     dev_tools: bool = True            # processes, headless browser and check_code for developers/tester
@@ -139,6 +140,7 @@ class ProjectsConfig:
     autonomous: bool = False  # owner-selected unattended operation within the approved project cap
     auto_recovery_rounds: int = 2  # persisted recovery cap per problem between real progress/owner replies
     auto_retry_delay_s: float = 15.0
+    supervisor_rounds_per_day: int = 8  # unattended re-plans after any non-owner stop, with growing back-off; 0 = off
 
     def __post_init__(self):
         import re
@@ -153,6 +155,8 @@ class ProjectsConfig:
             raise ConfigError("projects.autonomous must be boolean and auto_recovery_rounds between 0 and 3")
         if type(self.auto_retry_delay_s) not in (int, float) or not math.isfinite(self.auto_retry_delay_s) or not 0 <= self.auto_retry_delay_s <= 300:
             raise ConfigError("projects.auto_retry_delay_s must be between 0 and 300")
+        if type(self.supervisor_rounds_per_day) is not int or not 0 <= self.supervisor_rounds_per_day <= 24:
+            raise ConfigError("projects.supervisor_rounds_per_day must be between 0 and 24")
         if type(self.min_build_budget_usd) not in (int, float) or not math.isfinite(self.min_build_budget_usd) or not 0 <= self.min_build_budget_usd <= 500:
             raise ConfigError("projects.min_build_budget_usd must be between 0 and 500")
         if type(self.max_lead_actions) is not int or not 1 <= self.max_lead_actions <= 6:
@@ -224,7 +228,8 @@ class KnowledgeConfig:
 @dataclass
 class SelfHealConfig:
     enabled: bool = True
-    max_attempts: int = 2              # automatic retries after a failure (0 = never retry)
+    max_attempts: int = 4              # automatic retries after a failure (0 = never retry); the shared
+                                       # task allowance still bounds money and time across all of them
     time_factor: float = 1.5           # legacy role-session effort; cannot expand task allowance
     budget_factor: float = 1.5         # legacy config compatibility; cannot expand task allowance
     extra_repair_cycles: int = 1       # ... and repair cycles ...
