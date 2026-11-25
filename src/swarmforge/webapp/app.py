@@ -45,6 +45,8 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
     instance_id = uuid.uuid4().hex[:12]
     notes = NotesReader(getattr(config.knowledge, "resolved_vault", None) if config is not None else None)
     artifacts = ArtifactReader(runs_root or database.resolve().parent / "runs")
+    if actions is not None:
+        actions.review_artifacts = artifacts  # the explainer reads the same evidence the review shows
     assets = assets or Path(__file__).parents[1] / "resources" / "web"
 
     @app.middleware("http")
@@ -168,6 +170,26 @@ def create_app(database: Path, assets: Path | None = None, runs_root: Path | Non
     @app.get("/api/v1/projects", response_model=ProjectPage)
     def projects(limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0, le=100000), search: str = Query("", max_length=200)):
         return workspace.projects(limit=limit, offset=offset, search=search)
+
+    @app.get("/api/v1/projects/{pid}/review")
+    def project_review_view(pid: str):
+        from .review import project_review
+        with reader.connection() as conn:
+            review = project_review(conn, artifacts, pid)
+        if review is None:
+            raise HTTPException(404, "Project not found")
+        return review
+
+    @app.get("/api/v1/projects/{pid}/review.md")
+    def project_review_document(pid: str):
+        from .review import project_review, review_markdown
+        with reader.connection() as conn:
+            review = project_review(conn, artifacts, pid)
+        if review is None:
+            raise HTTPException(404, "Project not found")
+        name = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in review["name"])[:60] or "project"
+        return Response(review_markdown(review), media_type="text/markdown; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{name}-review.md"'})
 
     @app.get("/api/v1/projects/{pid}", response_model=ProjectDetail)
     def project(pid: str):

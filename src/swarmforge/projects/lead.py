@@ -38,6 +38,7 @@ Walking skeleton first; prove one short input through real dependencies before e
 Stubs can help construction but cannot verify product checks. For existing repos survey first.
 Schedule a cheap single-agent spike for uncertainty; cap its budget at the smaller of $2 or 10% of the total project budget. Findings matter, code is not published.
 Agents can research the public internet (web_search, fetch_url): research spikes (hardware, products, prices, APIs, libraries) must use current sources and cite URLs, not memory.
+If the product has a user interface (web pages, a dashboard, a local web UI), the first build task must add a `preview:` section to swarmforge.project.yml (command that starts the app, port, the main pages) so every later run captures light/dark screenshots for the owner's review; keep it working as pages are added.
 After a second failure split/rewrite/defer/drop, don't retry unchanged. Preserve the same key for the same problem.
 Plan only the current milestone: 2–3 ready tasks at most, then tentative one-line placeholders. Tasks run sequentially;
 New build tasks must allow at least context.min_build_budget_usd for implementation, review and tests; use more

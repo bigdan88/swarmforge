@@ -177,7 +177,7 @@ class RetainedReport(PublicResponse):
 
 class ActionCommand(PublicResponse):
     operation: Literal["cancel_work", "retry_work", "decide_approval", "queue_task", "start_queue", "pause_queue",
-                       "start_project", "create_project", "save_project", "amend_project", "retry_project_lead", "extend_project_task", "launch_project", "pause_project", "cancel_project", "resume_project", "request_project_changes", "launch_project_changes", "launch_chat_task",
+                       "start_project", "create_project", "save_project", "amend_project", "retry_project_lead", "extend_project_task", "launch_project", "pause_project", "cancel_project", "resume_project", "request_project_changes", "launch_project_changes", "explain_project", "launch_chat_task",
                        "create_conversation", "rename_conversation", "send_message", "project_message",
                        "create_note", "save_note", "delete_note", "diagnose_failure", "merge_pr", "update_pr",
                        "mark_features_read", "set_archived", "save_settings", "test_models"]

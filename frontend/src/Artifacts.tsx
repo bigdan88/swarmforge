@@ -4,8 +4,8 @@ import {parseArtifacts, parseReport, type ArtifactListing, type RetainedReport} 
 export function Artifacts({itemId,runId}:{itemId:string;runId:string}) {
   const [listing,setListing]=useState<ArtifactListing|null>(null);
   const [report,setReport]=useState<RetainedReport|null>(null);
-  const [reportOpen,setReportOpen]=useState(false);
-  const [galleryOpen,setGalleryOpen]=useState(false);
+  const [reportOpen,setReportOpen]=useState(true);
+  const [galleryOpen,setGalleryOpen]=useState(true);
   const [revision,setRevision]=useState(0);
   const [loading,setLoading]=useState(false);
   const [reportLoading,setReportLoading]=useState(false);
@@ -56,7 +56,7 @@ export function Artifacts({itemId,runId}:{itemId:string;runId:string}) {
           {report&&<><p className="muted">Retained report, shown as text. Links and embedded content stay inactive.</p><pre className="retained-report" tabIndex={0}>{report.text}</pre>{report.truncated&&<p className="muted">This report exceeds the preview limit. Showing the first 256 KiB; the retained file is unchanged.</p>}</>}
         </div>}
       </>:<p className="muted">{listing.report_status==='missing'?'No report has been retained yet.':'The retained report is unavailable in this preview.'}</p>}
-      <details onToggle={e=>setGalleryOpen(e.currentTarget.open)}><summary>Screenshots ({listing.screenshots.length})</summary>
+      <details open={galleryOpen} onToggle={e=>setGalleryOpen(e.currentTarget.open)}><summary>Screenshots ({listing.screenshots.length})</summary>
         {!listing.screenshots.length&&<p className="muted">No readable screenshots were found for this run.</p>}
         {listing.screenshots_unavailable&&<p className="muted">Some screenshot files are unavailable or could not be safely opened.</p>}
         {listing.screenshots_truncated&&<p className="muted">This gallery shows a bounded selection of up to 24 files. More retained evidence remains in the existing dashboard.</p>}

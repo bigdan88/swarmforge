@@ -1,15 +1,15 @@
 # SwarmForge
 
-An optional React web interface is under development. See the [local web preview guide](docs/WEB_INTERFACE.md)
-for installation and launch instructions. The existing Streamlit dashboard remains available.
-
 ![SwarmForge — Autonomous software teams](src/swarmforge/resources/brand/banner.png)
 
 An autonomous multi-agent software team built from Chinese open models (Qwen, DeepSeek, Kimi,
 GLM, MiniMax) served by DeepInfra.
 
-Use **Projects** to turn an approved app spec into a rolling milestone plan. Open **What's new**
-for searchable, plain-language feature highlights and links to each change. See the
+Use **Projects** to turn an idea into an approved spec and a rolling milestone plan that the lead
+replans as it goes, unattended overnight if you like. At every milestone, and once it's done, the
+project's **Review** tab explains in plain English what was built, with a diagram of how it's built,
+a flowchart of how it works and screenshots. Not happy with something? **Talk to the lead**: it
+proposes a change plan you can launch, even on finished projects. See the
 [Projects and feature history guide](docs/PROJECTS.md) for the workflow, CLI and current boundaries.
 
 **You give it a GitHub issue URL → a planner breaks it into a task graph → two coding agents
@@ -57,7 +57,8 @@ open-weight models) and benchmark them against each other, see [model teams](doc
 * **Sandboxed by default.** Docker containers use a read-only root filesystem, dropped capabilities
   and scoped writable mounts. Built-in commands default to no network; Pi sessions use
   `pi.network` (normally `bridge`) to reach the host model relay. Bridge networking is not a
-  relay-only firewall. Provider keys stay on the host; Pi receives a per-agent relay token.
+  relay-only firewall. Agents research through two tools instead: `web_search` and `fetch_url`
+  (public addresses only; turn off with `sandbox.research: false`). Provider keys stay on the host; Pi receives a per-agent relay token.
   See [docs/SECURITY.md](docs/SECURITY.md) for the boundaries and exceptions.
 * **Publishing and merging are configurable.** Branches use `swarmforge/*` and are never
   force-pushed. The example requires push approval and disables automatic merging. The local
@@ -77,7 +78,9 @@ Requires Python 3.11+, Git, and Docker Desktop (or Docker Engine).
 ```bash
 python -m venv .venv
 # Windows: .\.venv\Scripts\Activate.ps1     macOS/Linux: source .venv/bin/activate
-pip install -e ".[dashboard]"          # add ,dev for the test suite
+pip install -e ".[interface]"          # add ,dev for the test suite
+npm ci --prefix frontend               # Node 22.12+: builds the web interface
+npm run build --prefix frontend
 cp swarmforge.example.yaml swarmforge.yaml
 cp .env.example .env                   # put DEEPINFRA_API_KEY (and optionally GITHUB_TOKEN) here
 swarmforge sandbox build               # builds swarmforge-sandbox:latest (python + pytest)
@@ -86,42 +89,41 @@ swarmforge check --live                # config, docker, models, prices, live to
 
 ## Use
 
-The dashboard is the control center:
+The web app is the control center. Start it from the repository folder:
 
 ```bash
-swarmforge dashboard          # opens http://localhost:8501
+python scripts/react_dashboard.py --allow-actions   # opens http://127.0.0.1:8600
 ```
 
-* **Work**: one list of everything: running runs, waiting queue tasks, finished and failed work,
-  with filters (All / Active / Waiting / Finished / Failed) and search. **Click any task** to open
-  it right underneath. **Tick the boxes** to act on several tasks at once: delete (with their run
-  history and, optionally, their files), cancel, run again, or move to the front of the queue.
-  Opening a task shows:
-  * **Waiting task**: change anything (title, description, repository, team, budget, repair cycles,
-    time limit, chaining, GitHub approval), move it up/down or to the front, or remove it.
-  * **Running run**: change its budget, time limit and repair cycles while it runs (applied within a
-    few seconds, no restart), or cancel it. Approve or decline GitHub pushes.
-  * **Failed/stopped run**: start it again from scratch, or continue from where it stopped, with new
-    limits.
-  * Every run shows these tabs: **Delegation** (planner → tasks → agents → tester → reviewer →
-    repair cycles, with each agent's brief and hand-back), **Agents & timeline**, **Transcripts**
-    (each agent's prompt, reasoning, tool calls and results), **Tests, Review, Knowledge, Tokens &
-    cost, Console, Events**.
+`--allow-actions` turns on the buttons that change things (start the worker, launch projects, talk to
+the lead); without it the app is read-only. Stop it with Ctrl+C and run the same command to restart.
+Try it on sample data, without models or your database, with `python scripts/react_dashboard.py --demo`.
+Installed wheels use `python -m swarmforge.webapp` with the same flags. See the
+[web interface guide](docs/WEB_INTERFACE.md) for every option.
 
-  The queue bar at the top starts, pauses and resumes the queue worker. Queued tasks run one after
-  another; with chaining, each task starts from the previous task's result on the same repository.
-  CLI: `swarmforge queue import FILE --repo R`, `queue list`, `queue resume`, `queue pause`.
-* **New task**: the repository field remembers the repositories you used before (newest first)
-  and still accepts a new folder, owner/repo or URL. *Start now* (describe the work or paste a GitHub issue URL, point it at a
-  repository, set budget, repair cycles and time limit, **Start run**; **Prepare sample** for a
-  one-click demo) or *Add to the queue* (one task, or import a backlog file such as
-  `docs/SELF_IMPROVEMENT_BACKLOG.md`). Runs are background processes and keep going if you close
-  the browser.
-* Every page has its own address (`?page=work`, `?page=failures`, …), handy for bookmarks on an iPad.
-* **Chat**: ask the assistant about run and swarm statuses.
-* **Knowledge**: the Zettelkasten. Browse, search, edit and link notes, view the note graph,
-  and write your own notes for the agents to use.
-* **Benchmarks**: single agent vs swarm comparisons.
+* **Work**: one list of everything: running, waiting, finished and failed tasks, with search and
+  status filters. Open a task to see its progress (understand → plan → build → test → review →
+  deliver), the agents and their transcripts, checks, cost, and its **Report & screenshots**
+  (finished tasks open there). Cancel, retry, archive, and approve or decline GitHub pushes. The
+  queue controls start, pause and resume the queue worker.
+* **New task**: describe the work or paste a GitHub issue URL, pick the repository, allowance, model
+  team, repair cycles and time limit. Tasks are queued and keep running if you close the browser.
+* **Projects**: plan a project in a short chat with the lead, review and approve the spec and budget,
+  then follow its milestones. When a milestone waits for you, or the project is done, **Review what
+  was built** shows a plain-English explainer (what you can do now, how to try it, what's not done
+  yet, what needs you), a diagram of how it's built, a flowchart of how it works, screenshots, and
+  underneath every check, pull request and test result. **Download the report** saves it as
+  Markdown (GitHub renders its diagrams). **Talk to the lead** about anything that's wrong; it
+  proposes a change plan, and **Launch these changes** starts the work, also on finished projects.
+* **Chat**: ask about runs and the swarm, get improvement suggestions and fix failed tasks.
+* **Pull requests**, **Failures**, **History**, **Speed**, **Benchmarks**, **Knowledge** (the
+  Zettelkasten), **Model teams**, **Settings** and **What's new**.
+* Every page has its own address (`?page=work`, `?page=projects`, …), handy for bookmarks.
+
+The older Streamlit dashboard (`pip install -e ".[dashboard]"`, then `swarmforge dashboard` on
+port 8501) still works but no longer gets new features.
+
+Queue from the CLI: `swarmforge queue import FILE --repo R`, `queue list`, `queue resume`, `queue pause`.
 
 Everything is also available from the CLI:
 
@@ -377,7 +379,7 @@ Time spent waiting doesn't count against a run's time limit. `serial` restores o
 
 ## Pull requests page and Update & restart
 
-* **Pull requests** (dashboard page): every open PR on the GitHub repositories SwarmForge works on, with
+* **Pull requests** (page): every open PR on the GitHub repositories SwarmForge works on, with
   its status (ready, draft, behind, conflicts), size, and "What the swarm did" for PRs a run opened.
   Tick *I've reviewed these changes*, then **Merge** one or **Merge all ready** (oldest first; drafts
   are marked ready, branches that are only behind main are updated first, PRs that conflict are
@@ -391,6 +393,14 @@ Time spent waiting doesn't count against a run's time limit. `serial` restores o
   button. From a terminal: `swarmforge update`.
 * After a restart the dashboard runs in the background (no terminal window). Its log is in
   `<workdir>/logs/dashboard-restart.log`; stop it with the `Stop-Process` one-liner or by restarting your PC.
+
+## Agents on the internet: research tools
+
+Planners, developers, testers and reviewers can `web_search` (Brave or Tavily with an API key in
+`.env`, otherwise DuckDuckGo) and `fetch_url` (a page as readable text). Pi agents use `sf search`
+and `sf fetch`. Requests only go to public internet addresses, never to your machine or local
+network, and each run has a search and fetch limit. Research spikes cite the pages they used.
+Turn the tools off with `sandbox.research: false`.
 
 ## Chat: improve SwarmForge and fix failed tasks
 

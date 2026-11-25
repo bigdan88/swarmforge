@@ -196,12 +196,20 @@ test('work details use accessible tabs and keep controls outside the initial ove
     reason:'Checking the result',created_at:100,updated_at:120,finished_at:null,pr_url:null};
   const html=renderToStaticMarkup(createElement(WorkDetails,{item,session,onDone(){},onArchived(){}}));
   assert.equal((html.match(/role="tab"/g)||[]).length,7);
-  for(const tab of ['Overview','Sequence','Bots','Checks','Files','Activity','Controls'])assert.ok(html.includes(tab),tab);
+  for(const tab of ['Overview','Sequence','Bots','Checks','Report &amp; screenshots','Activity','Controls'])assert.ok(html.includes(tab),tab);
   assert.equal((html.match(/aria-selected="true"/g)||[]).length,1);
   assert.match(html,/role="tabpanel"[^>]*hidden=""/);
   assert.match(html,/Happening now/);assert.match(html,/Up next/);
   assert.ok(!html.includes('Recent events'),'the event wall does not render by default');
   assert.ok(!html.includes('Read retained report'),'files are loaded only on their tab');
+});
+
+test('a finished task opens on its report and screenshots',async()=>{
+  const {WorkDetails}=await import(pathToFileURL(join(output,'WorkDetails.js')));
+  const item={id:'task-2',title:'Redesign',repo:'example/app',status:'done',stage:'COMPLETED',run_id:'r2',
+    reason:'draft PR created',created_at:100,updated_at:120,finished_at:130,pr_url:'https://github.com/example/app/pull/3'};
+  const html=renderToStaticMarkup(createElement(WorkDetails,{item,session,onDone(){},onArchived(){}}));
+  assert.match(html,/aria-selected="true"[^>]*>Report &amp; screenshots/);
 });
 
 test('work overview, sequence and bots use recorded results without implying finished acceptance',async()=>{

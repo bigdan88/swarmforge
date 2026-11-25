@@ -9,7 +9,7 @@ import {attentionTask,botRoster,checkPassed,currentChecks,dependencyLevels,finis
 
 const name=(value:string|null)=>value?.replaceAll('_',' ').toLowerCase()||'Not recorded';
 const when=(value:number|null)=>value===null?'Not recorded':new Date(value*1000).toLocaleString();
-const tabs=[['overview','Overview'],['sequence','Sequence'],['bots','Bots'],['checks','Checks'],['files','Files'],['activity','Activity'],['controls','Controls']] as const;
+const tabs=[['overview','Overview'],['sequence','Sequence'],['bots','Bots'],['checks','Checks'],['files','Report & screenshots'],['activity','Activity'],['controls','Controls']] as const;
 type Tab=typeof tabs[number][0];
 function Brief({text,fallback}:{text?:string|null;fallback:string}){
   return !text?<p className="muted">{fallback}</p>:text.length>180?<details className="work-note"><summary>{text.slice(0,160)}…</summary><p>{text}</p></details>:<p>{text}</p>;
@@ -73,7 +73,7 @@ export function BotsPanel({item,execution}:{item:Work;execution?:Execution|null}
 
 export function WorkDetails({item,session,onDone,onArchived}:{item:Work;session:Session|null;onDone:()=>void;onArchived:()=>void}){
   const key=`sf-work-tab:${item.id}`;
-  const [tab,setTab]=useState<Tab>(()=>{const saved=readLocal(key,'overview');return tabs.some(t=>t[0]===saved)?saved as Tab:'overview';});
+  const [tab,setTab]=useState<Tab>(()=>{const fallback:Tab=item.status==='done'&&item.run_id?'files':'overview';const saved=readLocal(key,fallback);return tabs.some(t=>t[0]===saved)?saved as Tab:fallback;});
   const [opened,setOpened]=useState(()=>new Set<Tab>([tab,'controls']));
   const [pending,setPending]=useState(0);const id=useId();
   const {snapshot,events,error,updated}=useEvidence(item.id,item.run_id);
@@ -88,6 +88,7 @@ export function WorkDetails({item,session,onDone,onArchived}:{item:Work;session:
   return <div className="work-detail-workspace"><div className="work-detail-title"><div><p className="work-item-meta">{item.repo||'No repository'} · {item.id}{execution?` · ${execution.mode} mode`:''}</p><h3>{item.title}</h3></div><div className="work-title-actions"><span className={`badge ${item.status}`}>{name(item.status)}</span>{pr&&<a className="work-pr" href={pr} target="_blank" rel="noreferrer">Pull request ↗</a>}</div></div>
     <div className="work-live-line"><span className={item.status==='running'?'live-dot':''}/><span>{item.stage?name(item.stage):'Not started'}</span>{(execution?.repair_cycle??0)>0&&<span className="repair-badge">Repair cycle {execution?.repair_cycle}</span>}<small>{updated?`Updated ${new Date(updated).toLocaleTimeString()}`:'Connecting to progress…'}</small></div>
     <PhaseStrip item={item} execution={execution}/>
+    {item.status==='done'&&item.run_id&&tab!=='files'&&<div className="work-decision" role="status"><strong>Finished — review what it did</strong><button onClick={()=>setTab('files')}>Open report & screenshots</button></div>}
     {pending>0&&<div className="work-decision" role="status"><strong>{pending} {pending===1?'approval needs':'approvals need'} your decision</strong><button onClick={()=>setTab('controls')}>Review approvals</button></div>}
     {error&&<p role="alert" className="error">{error} {snapshot&&'Showing the last successful snapshot.'}</p>}
     {snapshot&&item.run_id&&snapshot.execution===undefined&&<p className="work-attention">Restart the Python dashboard server to load task sequencing and bot details. Existing evidence is available below.</p>}

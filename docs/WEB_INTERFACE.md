@@ -1,9 +1,9 @@
-# React web dashboard (preview)
+# Web interface
 
-SwarmForge has an optional React/TypeScript dashboard served by a loopback FastAPI application.
+SwarmForge's main interface is a React/TypeScript web app served by a loopback FastAPI application.
 It includes Work, New task, Projects, Chat, Pull requests, Failures, History, Knowledge, Outcomes,
-Model teams, Settings and What's new. This is local, unmerged preview work; it does not establish
-completion of every migration milestone. Streamlit remains available and its default command is unchanged.
+Model teams, Settings and What's new. The older Streamlit dashboard (`swarmforge dashboard`) remains
+available but no longer gets new features.
 
 ## Build and open
 

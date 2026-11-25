@@ -311,11 +311,26 @@ class DashboardActions:
                 raise ValueError("Extra budget must be a number")
             from ..runqueue import RESTART_KEY, worker_pid
             p = service.launch_discussed_changes(store, target, extra_budget=float(extra),
-                                                 min_budget=max(self.config.projects.lead_budget_usd, .5))
+                                                 min_budget=max(self.config.projects.min_build_budget_usd, self.config.projects.lead_budget_usd, .5))
             if self.worker_start is None and worker_pid(store):
                 store.kv_set(RESTART_KEY, "1")
             return {"project_id": target, "message": f"Changes launched; the lead is planning them (approved budget ${p['budget_usd']:.2f})."
                     + self._start_authorized_worker()}
+        if operation == "explain_project":
+            if self.config is None:
+                raise ValueError("Writing the explainer needs the model configuration")
+            from ..projects import explainer
+            from ..webapp.artifacts import ArtifactReader
+            from ..webapp.review import project_review
+            artifacts = getattr(self, "review_artifacts", None) or ArtifactReader(store.path.resolve().parent / "runs")
+            review = project_review(store.conn, artifacts, target)
+            if review is None:
+                raise ValueError("Project not found")
+            if not review["tasks"] and not review["milestones"]:
+                raise ValueError("Nothing has been built yet, so there is nothing to explain")
+            state = explainer.start(store, self.config, target, review)
+            return {"project_id": target, "message": "The lead is already writing the explainer." if state.get("started_at", 0) < time.time() - 2
+                    else "The lead is writing a plain-English explainer with diagrams (usually about a minute)."}
         if operation == "request_project_changes":
             if self.config is None or args.get("spending_authorized") is not True:
                 raise ValueError("Approve the change round and its budget before reopening the project")
@@ -324,7 +339,7 @@ class DashboardActions:
                 raise ValueError("Extra budget must be a number")
             from ..runqueue import RESTART_KEY, worker_pid
             p = service.request_changes(store, target, text(args, "request", 16000), extra_budget=float(extra),
-                                        min_budget=max(self.config.projects.lead_budget_usd, .5))
+                                        min_budget=max(self.config.projects.min_build_budget_usd, self.config.projects.lead_budget_usd, .5))
             if self.worker_start is None and worker_pid(store):
                 store.kv_set(RESTART_KEY, "1")  # hand over to a worker with the current code
             return {"project_id": target, "message": f"Reopened with a new change round (approved budget ${p['budget_usd']:.2f})."
