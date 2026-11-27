@@ -193,6 +193,24 @@ def build_report(store, run_id: str) -> str:
     L += [f"- {x}" for x in lim] or ["- None identified by the automated gates. A human should still review the diff."]
     L.append("")
 
+    try:
+        from .worklog import for_run
+        earlier = for_run(store, run_id, limit=6000)
+    except Exception:  # noqa: BLE001 - the report must always be written
+        earlier = ""
+    if earlier:
+        L += [earlier.replace("## Work log: every earlier attempt at this work", "## Earlier attempts at this work", 1), ""]
+    ralph = store.kv_get("ralph_summary:" + run_id)
+    if ralph:
+        try:
+            r = json.loads(ralph)
+            L += ["## Ralph loop", "", f"{r.get('passes', 0)} pass(es): {r.get('kept', 0)} kept, {r.get('thrown_away', 0)} thrown away. "
+                  f"Stopped because {r.get('stopped') or '?'}."
+                  + (f" {r['open_items']} plan item(s) still open." if r.get("open_items") else ""),
+                  "The plan, notes and pass log are in this run's artifacts (ralph-PLAN.md, ralph-NOTES.md, ralph-LOG.md).", ""]
+        except ValueError:
+            pass
+
     L += ["## Timeline", "", "```"]
     for e in events:
         who = f"[{e['task_key']}/{e['role']}]" if e["role"] else (f"[{e['task_key']}]" if e["task_key"] else "")
@@ -239,6 +257,9 @@ def build_pr_body(store, run_id: str) -> str:
         L += ["", "| Acceptance criterion | Status |", "|---|---|"]
         L += [f"| {a['criterion_id']}: {a['text'][:90]} | {a['status']} |" for a in acc if a["cycle"] == lc]
     L += ["", "## Review", ""]
+    if (json.loads(run.get("config_json") or "{}").get("review") or {}).get("independent_agents") is False:
+        L += ["Developer self tests selected: no independent tester, code reviewer or visual-review agent. "
+              "The orchestrator executed the configured tests and required application checks.", ""]
     cur = [f for f in findings if f["cycle"] == run["repair_cycle"]]
     L += [f"- Findings in final review: {len(cur)} "
           f"({sum(1 for f in cur if blocks(f, run))} blocking)",

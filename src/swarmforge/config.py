@@ -208,6 +208,7 @@ class AutoMergeConfig:
 
 @dataclass
 class ReviewConfig:
+    independent_agents: bool = True
     blocking_severities: list[str] = field(default_factory=lambda: ["critical", "major"])
     allow_same_model_review: bool = False
     require_junit: bool = False  # compatibility opt-out for non-JUnit projects
@@ -401,7 +402,7 @@ EFFORTS = ("none", "low", "medium", "high")
 
 
 def validate_config(cfg: Config) -> None:
-    for name in ("require_junit", "require_verified_criteria"):
+    for name in ("require_junit", "require_verified_criteria", "independent_agents"):
         if not isinstance(getattr(cfg.review, name), bool):
             raise ConfigError(f"review.{name} must be true or false")
     for where, eff in [("reasoning_effort", cfg.reasoning_effort),

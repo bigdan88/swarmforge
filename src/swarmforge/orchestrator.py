@@ -77,7 +77,7 @@ class Orchestrator:
                  heal_of: str | None = None, heal_attempt: int | None = None,
                  heal_context: str | None = None, execution_id: str | None = None,
                  retry_of: str | None = None):
-        assert mode in ("swarm", "single", "reviewed", "auto")
+        assert mode in ("swarm", "single", "reviewed", "auto", "ralph")
         from .effective_config import resolve_variant
         self.cfg, self._variant_note = resolve_variant(config, store)
         self.store = store
@@ -286,6 +286,11 @@ class Orchestrator:
                 except Exception as e:  # the post-mortem must never change the run outcome
                     self.log("postmortem", f"post-mortem failed: {type(e).__name__}: {e}", level="warn")
             try:
+                from .worklog import record
+                record(self.store, self.run_id)
+            except Exception as e:  # the work log must never change the run outcome
+                self.log("worklog", f"could not update the work log: {type(e).__name__}: {e}", level="warn")
+            try:
                 path = write_summary(self.store, self.run_id, self.run_dir)
                 self.log("report", f"summary written to {path}")
             except Exception as e:
@@ -376,6 +381,12 @@ class Orchestrator:
             issue.body = issue.body.rstrip() + "\n\n" + self.heal_context
             self.log("selfheal", f"self-healing attempt {self.heal_attempt} after run {self.heal_of}: the "
                                  "diagnosis of why it failed was added to the task")
+        from . import worklog
+        log_text = worklog.for_run(self.store, self.run_id)
+        if log_text:
+            issue.body = issue.body.rstrip() + "\n\n" + log_text
+            self.log("worklog", f"{log_text.count('### Attempt')} earlier attempt(s) at this work were added to the task",
+                     data={"lineage": worklog.lineage(self.store, self.run_id)})
         self.store.update_run(self.run_id, issue_title=issue.title, issue_number=issue.number,
                               repo=issue.full_repo or str(source))
         self.log("issue", f"issue: {issue.title}")
@@ -457,6 +468,11 @@ class Orchestrator:
                          f"integration branch {self.ws.integration_branch})")
         repo_summary = await self._inspect_repo()
         self._retrieve_knowledge()
+        if self.mode == "ralph":
+            from .ralph import RalphLoop
+            await RalphLoop(self).run(repo_summary)
+            await self._deliver()
+            return
         if self.mode == "auto":
             await self._route(repo_summary)
 
@@ -482,7 +498,7 @@ class Orchestrator:
             self._check_cancel()
             # -------------------------------------------- execution
             self.sm.transition(RunState.TASK_EXECUTION)
-            if (cycle == 0 and self.cfg.limits.tester_with_developers and self.mode == "swarm"
+            if (cycle == 0 and self.cfg.review.independent_agents and self.cfg.limits.tester_with_developers and self.mode == "swarm"
                     and plan.acceptance_criteria):
                 self.log("test", "tester starts now, alongside the developers (limits.tester_with_developers)")
                 self._early_tester = asyncio.ensure_future(self._run_tester(0, early=True))
@@ -507,7 +523,7 @@ class Orchestrator:
 
             # -------------------------------------------- testing + review
             self.sm.transition(RunState.TESTING)
-            if self.cfg.limits.parallel_review and self.mode != "single":
+            if self.cfg.limits.parallel_review and self.mode != "single" and self.cfg.review.independent_agents:
                 # the reviewer reads the diff while the full suite runs; the gate below still needs both
                 evidence, tester_report, review = await self._test_and_review(cycle)
                 self.sm.transition(RunState.CODE_REVIEW)
@@ -628,7 +644,8 @@ class Orchestrator:
                 except json.JSONDecodeError as e:
                     return None, f"plan is not valid JSON: {e}"
             try:
-                plan = validate_plan(data, self.cfg.developer_roles, self.cfg.limits.max_tasks,
+                roles = [self.single_role] if self.mode == "reviewed" else self.cfg.developer_roles
+                plan = validate_plan(data, roles, self.cfg.limits.max_tasks,
                                      existing_ids=existing, require_criteria=require_criteria)
                 if require_criteria:
                     from .product_gate import validate
@@ -657,8 +674,8 @@ class Orchestrator:
             "\nAssigned requirement IDs: " + json.dumps(getattr(self, "_assigned_requirements", [])) +
             "\nPreviously frozen application checks (reuse unchanged):\n" + json.dumps(getattr(self, "_previous_verification", [])),
             self.knowledge_block,
-            f"Available developer roles: {self.cfg.developer_roles} "
-            f"(models: {', '.join(f'{r}={self.cfg.roles[r].model}' for r in self.cfg.developer_roles)}).",
+            f"Available developer roles: {[self.single_role] if self.mode == 'reviewed' else self.cfg.developer_roles} "
+            f"(models: {', '.join(f'{r}={self.cfg.roles[r].model}' for r in ([self.single_role] if self.mode == 'reviewed' else self.cfg.developer_roles))}).",
             f"Maximum number of tasks: {self.cfg.limits.max_tasks}. "
             f"Up to {self.cfg.limits.max_concurrent_agents} tasks can run concurrently.",
             self._peer_note(),
@@ -800,11 +817,17 @@ class Orchestrator:
             s = args.get("summary")
             if not isinstance(s, str) or not s.strip():
                 return None, "summary must be a non-empty string"
-            return {"summary": s.strip(), "tests": str(args.get("tests_run", ""))}, None
+            mapping = args.get("criteria_tests", {})
+            if not isinstance(mapping, dict) or any(not isinstance(k, str) or not isinstance(v, list)
+                    or any(not isinstance(t, str) or not t.strip() for t in v) for k, v in mapping.items()):
+                return None, "criteria_tests must map criterion IDs to lists of executed test IDs"
+            return {"summary": s.strip(), "tests": str(args.get("tests_run", "")), "criteria_tests": mapping}, None
         return TerminalTool("finish", "Call when the task is fully implemented and tested.", {
             "type": "object", "required": ["summary"],
             "properties": {"summary": {"type": "string", "description": "What you changed and why."},
-                           "tests_run": {"type": "string", "description": "Test commands you ran and results."}}},
+                           "tests_run": {"type": "string", "description": "Test commands you ran and results."},
+                           "criteria_tests": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                                              "description": "Acceptance criterion ID to exact test IDs; the orchestrator reruns these tests."}}},
             v)
 
     def _dev_prompt(self, task: Task, attempt: int, prev_error: str | None) -> str:
@@ -825,6 +848,15 @@ class Orchestrator:
         if self.knowledge_dev_block:
             parts.append(self.knowledge_dev_block)
         parts.append(self._test_hint())
+        if not self.cfg.review.independent_agents:
+            criteria = getattr(getattr(self, "plan", None), "acceptance_criteria", [])
+            handoff = ('End with a JSON object {"summary":"what changed","criteria_tests":{"AC1":["tests/test_app.py::test_case"]}}. '
+                       'Do not call finish: Pi uses this final JSON message as the hand-off.'
+                       if self.cfg.roles[task.role].runtime == "pi" else
+                       'Return criteria_tests in finish, mapping each criterion ID to exact test IDs from the configured suite.')
+            parts.append("You are responsible for implementation and self tests. There is no separate tester or reviewer. "
+                         "Write tests for the acceptance criteria. " + handoff + " Assertions of success do not count as evidence.\n" +
+                         "\n".join(f"{c.id}: {c.text}" for c in criteria))
         if attempt > 1:
             parts.append(f"NOTE: a previous attempt at this task ended with: {prev_error}. Your worktree "
                          "contains whatever that attempt changed. Review it and complete the task.")
@@ -868,6 +900,8 @@ class Orchestrator:
                  task_key=task.id, role=task.role)
         ok = await self._integrate(task, branch)
         if ok:
+            if not self.cfg.review.independent_agents:
+                self.store.kv_set(f"self_tests:{self.run_id}:{task.id}", json.dumps(res.value.get("criteria_tests", {})))
             await asyncio.to_thread(self.ws.remove_worktree, path)
         return ok
 
@@ -968,6 +1002,14 @@ class Orchestrator:
             await asyncio.gather(early, return_exceptions=True)
 
     async def _tester_phase(self, cycle: int) -> dict | None:
+        if not self.cfg.review.independent_agents:
+            mapping = {}
+            for task in self.store.tasks(self.run_id):
+                saved = self.store.kv_get(f"self_tests:{self.run_id}:{task['task_key']}")
+                for cid, tests in json.loads(saved or "{}").items():
+                    mapping[cid] = list(dict.fromkeys([*mapping.get(cid, []), *tests]))
+            self.log("test", "Developer self tests: skipping the independent tester; orchestrator execution still required")
+            return {"summary": "Developer self tests", "criteria_tests": mapping, "defects": []}
         tester_report = None
         early = getattr(self, "_early_tester", None)
         if cycle == 0 and early is not None:
@@ -1100,7 +1142,7 @@ class Orchestrator:
         by itself: a preview that won't start or a model error is logged and skipped."""
         from . import visual
         pv = getattr(self, "preview", None)
-        if self.mode == "single" or pv is None:
+        if self.mode == "single" or not self.cfg.review.independent_agents or pv is None:
             return []
         changed = await asyncio.to_thread(self.ws.changed_files)
         if not visual.should_capture(pv, changed):
@@ -1159,8 +1201,8 @@ class Orchestrator:
         return findings
 
     async def _review(self, cycle: int, ev: TestEvidence | None) -> dict | None:
-        if self.mode == "single":
-            self.log("review", "single-agent baseline: independent review skipped by design")
+        if self.mode == "single" or not self.cfg.review.independent_agents:
+            self.log("review", "Independent review skipped by the selected validation policy")
             return None
         diff = await asyncio.to_thread(self.ws.diff)
         crit = "\n".join(f"- {c.id}: {c.text}" for c in self.plan.acceptance_criteria)

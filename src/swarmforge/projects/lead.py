@@ -23,6 +23,11 @@ Return JSON with the short human reply FIRST, before questions or definition, so
 Or return questions=[] and definition with string fields name,goal,users,repo,repository_kind (new|existing),
 out_of_scope,stack,hosting,deadline,latitude,ask_before; numeric budget_usd; 3-6 ordered milestones with
 {name,goal,checks:[2-5 concrete observable user outcomes],estimate_usd,estimate_hours}.
+Include execution:{"developers":1|2,"validation":"self"|"independent"}. Propose one developer with
+self tests for simple low-risk projects; independent testing/review for riskier projects; two developers
+only when substantial work separates across files/interfaces. Respect the owner's choice in an existing
+draft unless they ask to change it. Explain the choice; the owner reviews it before launch. Developer
+count and validation are separate choices. Self tests do not reduce approved evidence requirements.
 Default checks need product evidence. Documentation-only checks may explicitly set evidence_requirements
 to {"M1C1":"unit"} (milestone 1, check 1); use integration for real library/CLI checks, product for a
 normal user journey. These expectations are reviewed in the approved specification.
@@ -40,6 +45,8 @@ Schedule a cheap single-agent spike for uncertainty; cap its budget at the small
 Agents can research the public internet (web_search, fetch_url): research spikes (hardware, products, prices, APIs, libraries) must use current sources and cite URLs, not memory.
 If the product has a user interface (web pages, a dashboard, a local web UI), the first build task must add a `preview:` section to swarmforge.project.yml (command that starts the app, port, the main pages) so every later run captures light/dark screenshots for the owner's review; keep it working as pages are added.
 After a second failure split/rewrite/defer/drop, don't retry unchanged. Preserve the same key for the same problem.
+Each recent outcome has a work_log: every attempt at that task (approach, failing tests, review problems, diagnosis,
+the owner's reasons). Read it before re-planning a task, and never plan an approach it shows already failed.
 Plan only the current milestone: 2–3 ready tasks at most, then tentative one-line placeholders. Tasks run sequentially;
 New build tasks must allow at least context.min_build_budget_usd for implementation, review and tests; use more
 when needed within approved caps. Single-agent research spikes can remain cheaper. This minimum does not

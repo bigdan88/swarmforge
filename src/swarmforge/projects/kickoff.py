@@ -120,6 +120,7 @@ def normalize(raw: dict, choices: dict, previous: dict | None = None) -> dict:
     if not isinstance(raw, dict):
         raise ProjectError("The lead must draft a project definition.")
     d = {**(previous or {}), **raw}
+    d.setdefault("execution", {"developers": 1, "validation": "independent"})
     for key, value in OPTIONAL_DEFAULTS.items():
         if not isinstance(d.get(key), str) or not d[key].strip():
             d[key] = value

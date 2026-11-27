@@ -1,5 +1,5 @@
-import {useEffect} from 'react';
-import {label,record,rows,str,num,useGet,type Session} from './api';
+import {useEffect,useState} from 'react';
+import {label,record,rows,str,num,useAction,useGet,type Session} from './api';
 import {ActionButton,Feedback} from './ui';
 export function WorkControls({itemId,session,onDone,onPendingChange}:{itemId:string;session:Session|null;onDone:()=>void;onPendingChange?:(count:number)=>void}){
   const {data,error,refresh}=useGet(`/api/v1/work/${encodeURIComponent(itemId)}/controls`,record,4000);
@@ -11,7 +11,7 @@ export function WorkControls({itemId,session,onDone,onPendingChange}:{itemId:str
     <div className="button-row">{data?.can_cancel===true&&<ActionButton operation="cancel_work" target={itemId} disabled={!session?.actions_enabled} onDone={done}>Cancel task</ActionButton>}
       {data?.can_retry===true&&<><p className="muted">Retry uses the original task’s remaining allowance.</p><ActionButton operation="retry_work" target={itemId} args={{spending_authorized:true}} disabled={!session?.models_enabled} onDone={done}>Approve retry within remaining allowance</ActionButton></>}
     </div>{str(data?.project_id)&&<p className="muted">Project retries stay with the project lead to preserve budgets and merge barriers.</p>}
-    {rows(data?.approvals).map(approval=><div className="approval-card" key={num(approval.id)}><h4>Approval requested</h4><p>{str(approval.question)}</p>{approval.truncated===true&&<p className="muted">This request is shortened. Review it in full in the existing dashboard before approving.</p>}<div className="button-row"><ActionButton operation="decide_approval" target={String(approval.id)} args={{approved:true}} disabled={!session?.actions_enabled||approval.truncated===true} onDone={done}>Approve this action</ActionButton><ActionButton operation="decide_approval" target={String(approval.id)} args={{approved:false}} disabled={!session?.actions_enabled} onDone={done}>Decline</ActionButton></div></div>)}
+    {rows(data?.approvals).map(approval=><div className="approval-card" key={num(approval.id)}><h4>Approval requested</h4><p>{str(approval.question)}</p>{approval.truncated===true&&<p className="muted">This request is shortened. Review it in full in the existing dashboard before approving.</p>}<div className="button-row"><ActionButton operation="decide_approval" target={String(approval.id)} args={{approved:true}} disabled={!session?.actions_enabled||approval.truncated===true} onDone={done}>Approve this action</ActionButton></div><DeclineForm id={String(approval.id)} disabled={!session?.actions_enabled} onDone={done}/></div>)}
   </section>;
 }
 export function QueueControls({session}:{session:Session|null}){
@@ -22,4 +22,17 @@ export function QueueControls({session}:{session:Session|null}){
     <div className="button-row"><ActionButton operation="start_queue" args={{spending_authorized:true}} disabled={!session?.models_enabled} onDone={refresh}>Run approved work</ActionButton><ActionButton operation="pause_queue" disabled={!session?.actions_enabled} onDone={refresh}>Pause new starts</ActionButton></div>
     <div className="lane-list">{rows(data?.lanes).map((lane,i)=><span className="badge" key={i}>{str(lane.name)} · {label(lane.status)} {num(lane.count)}</span>)}</div>
   </details></section>;
+}
+
+/** Declining says why: the reason is kept for every later attempt, and can start a follow-up right away. */
+function DeclineForm({id,disabled,onDone}:{id:string;disabled:boolean;onDone:()=>void}){
+  const action=useAction(`decline:${id}`);
+  const [reason,setReason]=useState(''),[followUp,setFollowUp]=useState(true);
+  return <form className="decline-form" onSubmit={async e=>{e.preventDefault();const r=await action.send('decide_approval',id,{approved:false,reason:reason.trim(),follow_up:followUp&&!!reason.trim()});if(r)onDone();}}>
+    <label>Why are you declining? <span className="muted">(kept for every later attempt at this task)</span>
+      <textarea rows={3} maxLength={2000} value={reason} onChange={e=>setReason(e.target.value)} placeholder="For example: the export button is in the wrong place, and the CSV columns are out of order."/></label>
+    <label className="check"><input type="checkbox" checked={followUp} disabled={!reason.trim()} onChange={e=>setFollowUp(e.target.checked)}/> Queue a follow-up that continues this work and fixes what I wrote</label>
+    <button type="submit" disabled={disabled||action.pending}>{action.pending?'Working…':reason.trim()&&followUp?'Decline and fix it':'Decline'}</button>
+    <Feedback error={action.error} message={action.message}/>
+  </form>;
 }

@@ -198,7 +198,24 @@ class DashboardActions:
                 raise ValueError("Choose approve or decline")
             if args["approved"] and (len(row["question"]) > 4000 or "\0" in row["question"]):
                 raise ValueError("Review the complete approval question in the existing dashboard before approving")
+            reason = args.get("reason")
+            if reason is not None and (not isinstance(reason, str) or len(reason) > 2000):
+                raise ValueError("Keep the reason under 2,000 characters")
+            follow_up = args.get("follow_up", False)
+            if type(follow_up) is not bool or (follow_up and args["approved"]):
+                raise ValueError("A follow-up applies only when declining")
+            if follow_up and not store._one("SELECT id FROM queue_items WHERE run_id=?", (row["run_id"],)):
+                raise ValueError("Only queued tasks can get an automatic follow-up; start a new task instead")
             store.decide_approval(int(target), args["approved"], by="react-dashboard")
+            if not args["approved"]:
+                from ..worklog import owner_said
+                if reason and reason.strip():
+                    owner_said(store, row["run_id"], reason)
+                if follow_up:
+                    from ..runqueue import DECLINE_FOLLOW_UP_KEY
+                    store.kv_set(DECLINE_FOLLOW_UP_KEY + row["run_id"], (reason or "").strip())
+                    return {"message": "Declined. A follow-up that fixes this will be queued as soon as this run stops."}
+                return {"message": "Declined" + (". Your reason is kept for any later attempt." if reason and reason.strip() else "")}
             return {"message": "Approval decision recorded"}
         if operation == "queue_task":
             if self.config is None:
@@ -227,7 +244,7 @@ class DashboardActions:
             if args.get("spending_authorized") is not True:
                 raise ValueError("Explicit spending authorization is required")
             mode = args.get("mode", "swarm")
-            if mode not in ("swarm", "reviewed", "single", "auto"):
+            if mode not in ("swarm", "reviewed", "single", "auto", "ralph"):
                 raise ValueError("Unknown workflow")
             def whole(key, low, high):
                 value = args.get(key)
@@ -316,6 +333,17 @@ class DashboardActions:
                 store.kv_set(RESTART_KEY, "1")
             return {"project_id": target, "message": f"Changes launched; the lead is planning them (approved budget ${p['budget_usd']:.2f})."
                     + self._start_authorized_worker()}
+        if operation == "set_project_workflow":
+            from ..projects.store import Projects
+            from ..runqueue import PROJECT_WORKFLOW_KEY
+            if not Projects(store).get(target):
+                raise ValueError("Project not found")
+            workflow = args.get("workflow")
+            if workflow not in ("team", "ralph"):
+                raise ValueError("Choose team or ralph")
+            store.kv_set(PROJECT_WORKFLOW_KEY + target, workflow if workflow == "ralph" else None)
+            return {"project_id": target, "message": "Build tasks will run in Ralph mode: one agent, fresh passes, from their next start."
+                    if workflow == "ralph" else "Build tasks will run with the project's team again, from their next start."}
         if operation == "explain_project":
             if self.config is None:
                 raise ValueError("Writing the explainer needs the model configuration")

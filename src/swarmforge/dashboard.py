@@ -1682,8 +1682,8 @@ def waiting_editor(i: dict) -> None:
         body = st.text_area("Description and acceptance criteria", i["body"], height=240, key=f"qe_d_{i['id']}")
         repo = repo_picker("Repository", f"qe_r_{i['id']}", value=i["repo"])
         c1, c2, c3, c4, c5 = st.columns(5)
-        mode = c1.selectbox("Team", ["swarm", "reviewed", "single", "auto"], index=["swarm", "reviewed", "single", "auto"].index(i["mode"] or "swarm"),
-                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent", "auto": "Auto (pick by task size)"}.get)
+        mode = c1.selectbox("Team", ["swarm", "reviewed", "single", "auto", "ralph"], index=["swarm", "reviewed", "single", "auto", "ralph"].index(i["mode"] or "swarm"),
+                            key=f"qe_m_{i['id']}", format_func={"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent", "auto": "Auto (pick by task size)", "ralph": "Ralph loop (one agent, fresh passes)"}.get)
         budget = c2.number_input("Budget (USD)", 0.5, 500.0, float(i["budget"] or cfg.limits.budget_usd), 0.5,
                                  key=f"qe_b_{i['id']}")
         cycles = c3.number_input("Max repair cycles", 0, 10, int(i["max_cycles"] if i["max_cycles"] is not None
@@ -2284,8 +2284,8 @@ def queue_forms() -> None:
 
     def common(prefix):
         c1, c2, c3, c5, c4 = st.columns(5)
-        mode = c1.selectbox("Workflow", ["swarm", "reviewed", "single", "auto"], key=f"{prefix}_mode",
-                            format_func=lambda m: {"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent", "auto": "Auto (pick by task size)"}[m])
+        mode = c1.selectbox("Workflow", ["swarm", "reviewed", "single", "auto", "ralph"], key=f"{prefix}_mode",
+                            format_func=lambda m: {"swarm": "Swarm", "reviewed": "One developer + test/review", "single": "Single agent", "auto": "Auto (pick by task size)", "ralph": "Ralph loop (one agent, fresh passes)"}[m])
         budget = c2.number_input("Budget per task (USD)", 0.5, 500.0, 5.0, 0.5, key=f"{prefix}_budget")
         cycles = c3.number_input("Max repair cycles", 0, 10, 2, key=f"{prefix}_cycles")
         hours = c5.number_input("Time limit per task (h)", 0.05, 72.0, _hrs(cfg.limits.max_runtime_s),

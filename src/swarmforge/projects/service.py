@@ -577,7 +577,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                                 pos = store.conn.execute("SELECT COALESCE(MAX(position),0)+1 FROM queue_items").fetchone()[0]
                                 store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts,seed_run_id) VALUES (?,?,?,?,?,'queued',?,0,'yes',?,?,?,?, 'swarm',0,?)",
                                                    (pos, title, body, p["repo"], time.time(), lane(pid), pid, p["current_milestone"], q["project_key"], budget, q["run_id"]))
-                                store.conn.execute("UPDATE queue_items SET requirement_ids=? WHERE id=last_insert_rowid()", (q.get("requirement_ids") or "[]",))
+                                store.conn.execute("UPDATE queue_items SET requirement_ids=?,project_action=? WHERE id=last_insert_rowid()", (q.get("requirement_ids") or "[]", q.get("project_action")))
                                 ps.event(pid, "fix_up", {"supersedes": q["id"], "reason": reason})
                             return
                         ps.update(pid, last_error="Waiting for the previous task's PR to merge: " + run["pr_url"])
@@ -619,7 +619,7 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                     seed = run["id"] if run and resumable(store, run["id"]) else q.get("seed_run_id")
                     store._exec("UPDATE queue_items SET status='cancelled',project_processed=1 WHERE project_id=? AND status IN ('queued','tentative')", (pid,))
                     diagnosis = str((run or {}).get("state_reason") or q.get("note") or "Inspect the retained run evidence")
-                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + diagnosis, p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=seed, execution_id=(run or {}).get("execution_id"), retry_of=(run or {}).get("id"), max_runtime_s=q.get("max_runtime_s"), max_cycles=q.get("max_cycles"), team=q.get("team"), depends_on=q.get("depends_on") or "[]", requirement_ids=q.get("requirement_ids") or "[]")
+                    store.queue_add(q["title"], q["body"] + "\nPrevious failure: " + diagnosis, p["repo"], project_id=pid, milestone=p["current_milestone"], project_key=q["project_key"], queue=lane(pid), chain=0, heal_attempts=0, budget=q["budget"], mode=q["mode"], seed_run_id=seed, execution_id=(run or {}).get("execution_id"), retry_of=(run or {}).get("id"), max_runtime_s=q.get("max_runtime_s"), max_cycles=q.get("max_cycles"), team=q.get("team"), depends_on=q.get("depends_on") or "[]", requirement_ids=q.get("requirement_ids") or "[]", project_action=q.get("project_action"))
                     from ..runqueue import set_lane_paused
                     set_lane_paused(store, lane(pid), False)
                     return
@@ -660,14 +660,18 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
         if p["observed_sha"] == snapshot["sha"] and not progress and any(q["status"] == "queued" for q in items):
             return
         recent = []
+        from .. import worklog
         for q in ps.items(pid)[-12:]:
             r = store.get_run(q["run_id"]) if q.get("run_id") else None
+            # Every attempt at this task (what was tried, failing tests, review problems, diagnoses,
+            # the owner's reasons), then the end of the latest report for detail.
+            log = worklog.render(store, f"project:{pid}:{q['milestone']}:{q['project_key']}", limit=5000) if q.get("project_key") else ""
             report = ""
             if r and r.get("run_dir"):
                 path = Path(r["run_dir"]) / "report.md"
                 if path.exists():
-                    report = path.read_text(encoding="utf-8", errors="replace")[-16000:]
-            recent.append({"task": q, "run": r, "report": report})
+                    report = path.read_text(encoding="utf-8", errors="replace")[-(6000 if log else 16000):]
+            recent.append({"task": q, "run": r, "work_log": log, "report": report})
         context = {"date": datetime.now(UTC).date().isoformat(), "spec": compact_living(p["spec"]), "repository": snapshot,
                    "milestone": p["current_milestone"], "recent_outcomes": recent,
                    "chat": store.conversation_messages(p["conversation_id"])[-12:], "budget_remaining": p["budget_usd"] - spent,
@@ -792,8 +796,10 @@ async def _advance(cfg, store, pid, *, repository=None, ask=None, transport=None
                 key = ("spike:" if t["kind"] == "spike" else "") + t["key"].removeprefix("spike:")
                 body = t["description"] + "\n\nAcceptance criteria:\n" + "\n".join(t.get("acceptance_criteria", [])) + "\nLikely files: " + ", ".join(t.get("files", [])) + "\n\nApproved project spec (fixed part must be unchanged):\n" + proposal
                 status = "queued" if t.get("ready") else "tentative"
+                from .spec import execution_policy
+                mode = "single" if t["kind"] == "spike" else "reviewed" if action.kind == ActionKind.REVIEW or execution_policy(p["definition"])["developers"] == 1 else "swarm"
                 store.conn.execute("INSERT INTO queue_items(position,title,body,repo,created_at,status,queue,chain,approval,project_id,milestone,project_key,budget,mode,heal_attempts,execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                   (pos + i + 1, t["title"], body, p["repo"], time.time(), status, lane(pid), 0, "yes", pid, p["current_milestone"], key, t["budget_usd"], "single" if t["kind"] == "spike" else "reviewed" if action.kind == ActionKind.REVIEW else "swarm", 0, recovery_lineage))
+                                   (pos + i + 1, t["title"], body, p["repo"], time.time(), status, lane(pid), 0, "yes", pid, p["current_milestone"], key, t["budget_usd"], mode, 0, recovery_lineage))
                 qid = store.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 if recovery_lineage and t.get("ready") and t["kind"] == "build":
                     from ..postmortem import resumable

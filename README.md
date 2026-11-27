@@ -394,6 +394,31 @@ Time spent waiting doesn't count against a run's time limit. `serial` restores o
 * After a restart the dashboard runs in the background (no terminal window). Its log is in
   `<workdir>/logs/dashboard-restart.log`; stop it with the `Stop-Process` one-liner or by restarting your PC.
 
+## Ralph mode: one agent, many fresh passes
+
+Pick **Ralph loop** as a task's workflow (or `swarmforge run ... --mode ralph`), or switch a whole
+project with **Switch to Ralph mode** on its Overview tab. One developer agent then works in short
+passes, each starting fresh with no memory. Its memory is three files kept with the run:
+`PLAN.md` (a checklist the agent writes and ticks off), `NOTES.md` (what it learned) and `LOG.md`
+(what SwarmForge saw each pass). Each pass does one plan item.
+
+Code decides, not the agent: after every pass SwarmForge runs the tests. A pass is kept only if it
+changed something and nothing that passed before now fails; otherwise it is thrown away and the log
+says why, so the next fresh pass sees it. The loop stops when the plan is done, when several passes
+in a row make no progress, or before the money or time left can't cover another pass. The result is
+published like any other run. The plan files are never committed to your repository; a retry or
+follow-up continues from them. Ralph mode has no separate tester or reviewer, so it suits
+well-specified work with good tests.
+
+## Work log: every attempt remembers the ones before it
+
+Retries, self-healing attempts, fix-ups and a project's repeated tasks share one **work log**: for
+every earlier attempt, the approach, the failing tests and their errors, open review problems, the
+diagnosis, and what you said when you declined it. Each new attempt starts with the whole log, the
+project lead reads it before re-planning a task, and each run's report lists the earlier attempts.
+When you decline a push, say why: your reason goes into the log, and **Decline and fix it** queues
+a follow-up that continues the same code with your reason added.
+
 ## Agents on the internet: research tools
 
 Planners, developers, testers and reviewers can `web_search` (Brave or Tavily with an API key in

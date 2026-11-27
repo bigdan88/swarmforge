@@ -10,9 +10,19 @@ class ProjectError(ValueError):
     pass
 
 
+def execution_policy(d: dict) -> dict:
+    policy = d.get("execution", {"developers": 2, "validation": "independent"})
+    if (not isinstance(policy, dict) or set(policy) != {"developers", "validation"}
+            or type(policy.get("developers")) is not int or policy["developers"] not in (1, 2)
+            or policy.get("validation") not in ("self", "independent")):
+        raise ProjectError("Execution requires developers (1 or 2) and validation (self or independent)")
+    return dict(policy)
+
+
 def validate(d: dict) -> dict:
     if not isinstance(d, dict):
         raise ProjectError("The project definition must be an object")
+    execution_policy(d)
     for k in ("name", "goal", "users", "repo", "out_of_scope", "stack", "hosting", "deadline", "latitude", "ask_before"):
         if not isinstance(d.get(k), str) or not d[k].strip():
             raise ProjectError(f"Missing {k}; use 'None' when explicitly unconstrained")
@@ -60,6 +70,10 @@ def render(d: dict, living: str = "### Current state\nAwaiting launch.\n\n### De
     for i, milestone in enumerate(d["milestones"], 1):
         if milestone.get("evidence_requirements"):
             lines.insert(lines.index("## Living"), "Verification for milestone " + str(i) + ": " + ", ".join(f"{key}={value}" for key, value in milestone["evidence_requirements"].items()) + "\n")
+    if "execution" in d:
+        policy = execution_policy(d)
+        validation = "Developer self tests; no separate tester or reviewer" if policy["validation"] == "self" else "Independent tester and reviewer"
+        lines.insert(lines.index("## Living"), f"### Execution\nDevelopers: {policy['developers']}\nValidation: {validation}\nApproved evidence requirements and delivery gates still apply.\n")
     text = "\n".join(lines)
     fixed(text)
     return text

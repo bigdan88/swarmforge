@@ -26,7 +26,7 @@ administrative setup before the project can run.
 The lead uses `roles.lead` when configured and otherwise uses `planner`. It reads the current default
 branch, representative source files, project spec, recent reports, landed diff and remaining plan.
 It makes a short structured planning call rather than starting a new agent runtime. Each build task
-is an ordinary swarm run in the project's own queue lane. A spike is a single-agent run with no PR
+uses the existing run pipeline in the project's own queue lane. A spike is a single-agent run with no PR
 publication; its report feeds the next plan.
 
 The lead can also request bounded repository/evidence inspection, investigations, independent review,
@@ -113,6 +113,47 @@ floor even if the lead proposes less, and records the adjustment alongside the o
 In manual mode, existing shared task allowances require an explicit recovery extension. Unattended
 mode may reallocate approved project funds under the bounded policy below. The total project cap
 continues to apply.
+
+## Developer count, validation and measurements
+
+In **Projects → Review proposal → Edit draft**, choose one or up to two developers,
+and separately choose **Developer self tests** or **Independent tester and reviewer**.
+The kickoff lead proposes one developer for simpler projects and more developers only
+when substantial work separates. The execution policy is displayed in the Fixed spec
+and needs launch approval. Existing definitions without this field keep two developers
+and independent validation. Change an approved policy through **Edit approved scope**
+at a pause; the lead cannot silently lower it.
+
+Scripted definitions use `execution: {"developers": 1, "validation": "self"}`;
+developers accepts 1 or 2, validation accepts `self` or `independent`. Developer count
+is a maximum; configured concurrency and available roles can reduce it. One-developer
+projects use the existing `reviewed` execution mode, with validation recorded separately.
+Research spikes remain unpublished single-agent runs. An explicit lead request for
+independent review strengthens validation for that task.
+
+With self tests, developers implement and test their work and map criteria to test IDs.
+There is no separate tester, code reviewer or visual-review agent. The orchestrator
+reruns the configured suite, checks its actual JUnit results and runs frozen application
+checks. Missing evidence remains unverified. Product checks still need product evidence;
+self tests do not waive the fixed spec, budget, merge policy or publication guards.
+
+**Projects → Overview → Project measurements** shows merged deliveries, the fraction of
+merged tasks delivered without repairs or retries, cost per merged task, attempts and
+repair cycles. Delivery rate compares merged tasks with started build tasks (including
+unfinished tasks), counting retries of the same milestone/task key once and excluding
+research spikes. Expand the details for workflow comparisons, phase time, acceptance
+observations, recorded owner actions, automatic recoveries and approval waiting.
+Owner actions count launch, scope approval, checkpoint replies, pauses, cancellations,
+planning retries and allowance extensions; conversation messages are not counted.
+Cost includes lead calls and retained prior attempts;
+unpriced calls are flagged. Completion is distinct from merging. No-delivery rates and
+cost-per-delivery are unavailable rather than zero. These are operational comparisons,
+not controlled benchmarks or measurements of escaped defects or human working time.
+
+`swarmforge project status PROJECT_ID` includes the full `metrics` object, including
+model usage. Run metrics/CSV also record mode, validation and developer roles used.
+All measurements are derived from retained evidence; no paid builds are launched to
+populate them. Project phase time sums run durations and may overlap in parallel runs.
 
 ## Unattended preview delivery
 

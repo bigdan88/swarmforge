@@ -51,7 +51,7 @@ def start_run(cfg: Config, *, repo: str | None, issue_url: str | None = None,
         args.append("--single")
         if single_role:
             args += ["--role", single_role]
-    elif mode in ("reviewed", "auto"):
+    elif mode in ("reviewed", "auto", "ralph"):
         args += ["--mode", mode]
     elif mode != "swarm":
         raise ValueError(f"unknown run mode: {mode}")

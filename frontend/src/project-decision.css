@@ -69,3 +69,12 @@
 .dg-chip.dg-user{background:#fef3c7;border-color:#d97706}.dg-chip.dg-ui{background:#dbeafe;border-color:#3b82f6}.dg-chip.dg-service{background:#eef2ff;border-color:#6366f1}
 .dg-chip.dg-data{background:#dcfce7;border-color:#16a34a}.dg-chip.dg-external{background:#f3f4f6;border-color:#6b7280}.dg-chip.dg-device{background:#ffedd5;border-color:#ea580c}.dg-chip.dg-ai{background:#fae8ff;border-color:#c026d3}
 :root[data-theme=dark] .dg-chip{color:#111827}
+
+/* Declining a push says why; projects can switch to Ralph mode */
+.decline-form{display:flex;flex-direction:column;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.decline-form>label{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.decline-form textarea{width:100%;color:inherit;border:1px solid var(--line);background:var(--input);border-radius:7px;padding:9px;font:inherit;resize:vertical}
+.decline-form label.check{flex-direction:row;align-items:center;gap:8px}
+.decline-form button{align-self:flex-start}
+.workflow-choice{display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap;border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:16px;background:var(--panel)}
+.workflow-choice h3{margin:0 0 4px}.workflow-choice p{margin:0;max-width:70ch}

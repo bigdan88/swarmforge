@@ -683,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--retry-of", metavar="RUN",
                    help="retry with the original task allowance, including when starting code from scratch")
     r.add_argument("--sandbox-image", help="override the sandbox image for this run (must already be built)")
-    r.add_argument("--mode", choices=["swarm", "reviewed", "single", "auto"], default="swarm")
+    r.add_argument("--mode", choices=["swarm", "reviewed", "single", "auto", "ralph"], default="swarm")
     r.add_argument("--single", action="store_true", help="single-agent baseline mode")
     r.add_argument("--role", help="developer role for --single (default: first developer role)")
     r.add_argument("--max-cycles", type=int, help="override limits.max_repair_cycles")
@@ -857,7 +857,7 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             x.add_argument("file", help="e.g. docs/SELF_IMPROVEMENT_BACKLOG.md")
         x.add_argument("--repo", required=True, help="local folder, owner/repo or GitHub URL")
-        x.add_argument("--mode", choices=["swarm", "reviewed", "single", "auto"], default="swarm")
+        x.add_argument("--mode", choices=["swarm", "reviewed", "single", "auto", "ralph"], default="swarm")
         x.add_argument("--budget", type=float, default=None)
         x.add_argument("--max-cycles", type=int, default=None)
         x.add_argument("--max-runtime-hours", type=float, default=None)
@@ -1145,7 +1145,8 @@ def cmd_project(args, cfg) -> int:
                 ps.draft(p["id"], json.loads(Path(args.definition).read_text(encoding="utf-8")))
             print(json.dumps(ps.get(p["id"]), indent=2))
         elif action == "status":
-            print(json.dumps({"project": ps.get(args.id), "milestones": ps.milestones(args.id), "tasks": ps.items(args.id), "spent_usd": ps.spent(args.id), "lead_decisions": ps.decisions(args.id)}, indent=2))
+            from .projects.metrics import project_metrics
+            print(json.dumps({"project": ps.get(args.id), "milestones": ps.milestones(args.id), "tasks": ps.items(args.id), "spent_usd": ps.spent(args.id), "lead_decisions": ps.decisions(args.id), "metrics": project_metrics(store, args.id)}, indent=2))
         elif action == "chat":
             print(asyncio.run(lead.interview(cfg, store, args.id, args.reply)))
         else:

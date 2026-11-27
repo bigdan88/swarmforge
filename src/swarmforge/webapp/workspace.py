@@ -73,13 +73,15 @@ class WorkspaceReader(WorkReader):
                     last["actions"] = {**last.get("actions", {}), "project_questions": recovery_questions(has_brief, choices), "kickoff_defaults": choices}
             from ..projects.recovery import recovery_state
             recovery = recovery_state(ReadStore(conn), {**item, "spec": spec})
+            from ..projects.metrics import project_metrics
             return {"project": item, "spec": spec[:256000], "spec_sha": hashlib.sha256(spec.encode()).hexdigest(),
-                    "definition": draft,
+                    "definition": draft, "metrics": project_metrics(ReadStore(conn), pid),
                     "truncated": len(spec) > 256000 or len(definition) > 64000,
                     "milestones": [dict(r) for r in conn.execute("SELECT idx,name,status,estimate_usd,spent_usd,started_at,finished_at,substr(report,1,16000) AS report FROM milestones WHERE project_id=? ORDER BY idx LIMIT 6", (pid,))],
                     "tasks": [dict(r) for r in conn.execute(self.queue_projection + " WHERE q.project_id=? ORDER BY q.position LIMIT 100", (pid,))],
                     "events": [dict(r) for r in conn.execute("SELECT id,ts,kind,substr(detail,1,12000) AS detail FROM project_events WHERE project_id=? ORDER BY id DESC LIMIT 50", (pid,))],
-                    "messages": messages, "requests": requests, "recovery": recovery}
+                    "messages": messages, "requests": requests, "recovery": recovery,
+                    "workflow": "ralph" if (conn.execute("SELECT value FROM kv WHERE key=?", ("project_workflow:" + pid,)).fetchone() or [None])[0] == "ralph" else "team"}
 
     @staticmethod
     def _messages(conn, cid):

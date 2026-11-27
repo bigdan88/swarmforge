@@ -63,6 +63,8 @@ def settings_label(config_json: str | None) -> str:
         parts.append("block=" + "+".join(block))
     if "tester_every_cycle" in lim:
         parts.append("tester=" + ("every" if lim["tester_every_cycle"] else "once"))
+    if (c.get("review") or {}).get("independent_agents") is False:
+        parts.append("validation=self")
     return " ".join(parts)
 
 
@@ -127,8 +129,18 @@ def run_metrics(store, run_id: str) -> dict | None:
         "browse_calls": sum(1 for m in msgs if m.startswith(("sf browse: ", "browse: "))),
     }
     total = end - run["created_at"]
+    try:
+        config = json.loads(run.get("config_json") or "{}")
+    except (ValueError, TypeError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    developer_roles = config.get("developer_roles") or []
+    actual_developers = {t.get("role") for t in tasks if t.get("role") in developer_roles}
     return {
         "run_id": run_id, "title": run.get("issue_title") or "", "state": run["state"],
+        "mode": run.get("mode"), "developer_roles_used": len(actual_developers),
+        "validation": "self" if (config.get("review") or {}).get("independent_agents") is False else "independent",
         "started": run["created_at"], "total_s": total, "work_s": total - phases["waiting"],
         "repair_cycles": run.get("repair_cycle") or 0, "cost_usd": sum(c.get("cost_usd") or 0 for c in calls),
         "phases_s": phases, "approval_wait_s": approval_s,
@@ -157,6 +169,7 @@ def flat(m: dict) -> dict:
     for role, r in sorted(m["roles"].items()):
         row[f"{role}_min"] = r["time_s"] / 60
     row["started"] = m["started"]
+    row.update(mode=m.get("mode"), validation=m.get("validation"), developer_roles_used=m.get("developer_roles_used"))
     return row
 
 

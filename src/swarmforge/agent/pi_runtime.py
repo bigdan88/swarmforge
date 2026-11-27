@@ -449,7 +449,19 @@ async def run_pi_agent(*, relay: ModelRelay, ctx: ToolContext, role: str, task_k
                 result.error += (" — Pi never reached the model relay. With Docker, try `pi: {relay_host: 0.0.0.0}` "
                                  "in swarmforge.yaml (Docker Desktop may not forward to 127.0.0.1)")
         else:
-            value, err = terminal.validate({"summary": ev["final"]})
+            payload = {"summary": ev["final"]}
+            # Pi has no SwarmForge finish tool. A structured final hand-off carries
+            # developer test mappings through the same validator as built-in agents.
+            final = ev["final"].strip()
+            if final.startswith("```json") and final.endswith("```"):
+                final = final[7:-3].strip()
+            try:
+                structured = json.loads(final)
+            except (ValueError, TypeError):
+                structured = None
+            if isinstance(structured, dict) and "summary" in structured:
+                payload = structured
+            value, err = terminal.validate(payload)
             if err:
                 result.status, result.error = "error", err
             else:

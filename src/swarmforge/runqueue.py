@@ -171,6 +171,14 @@ def result_branch_of(run: dict) -> str | None:
     return None
 
 
+
+PROJECT_WORKFLOW_KEY = "project_workflow:"
+
+
+def project_workflow(store, project_id: str) -> str:
+    """How a project's build tasks run: "team" (the approved developers/validation) or "ralph"."""
+    return "ralph" if store.kv_get(PROJECT_WORKFLOW_KEY + project_id) == "ralph" else "team"
+
 async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_transport=None,
                    sandbox=None) -> dict:
     from .approvals import dashboard_approver
@@ -202,6 +210,22 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
         p = ps.get(item["project_id"])
         if p["status"] != "running":
             return store.queue_item(item["id"])
+        from .projects.spec import execution_policy
+        policy = execution_policy(p["definition"])
+        if not str(item.get("project_key") or "").startswith("spike:"):
+            # Resolve from the approved definition, never from a lead's task prose.
+            developers = 1 if item.get("project_action") == "request_review" else policy["developers"]
+            c.developer_roles = c.developer_roles[:developers]
+            c.limits.max_concurrent_agents = min(c.limits.max_concurrent_agents, developers)
+            c.review.independent_agents = policy["validation"] == "independent" or item.get("project_action") == "request_review"
+            item["mode"] = "reviewed" if developers == 1 else "swarm"
+            # The owner can switch a project to Ralph mode (one agent, fresh passes) at any time;
+            # it applies to build tasks from their next start. A requested review keeps its reviewer.
+            if project_workflow(store, p["id"]) == "ralph" and item.get("project_action") != "request_review":
+                item["mode"] = "ralph"
+                c.developer_roles = c.developer_roles[:1]
+                c.limits.max_concurrent_agents = 1
+            store.queue_update(item["id"], mode=item["mode"])
         # One approved project owns publication; detached auto-fixes would escape its budget/lane.
         c.auto_merge.auto_fix = False
         c.auto_merge.enabled = True
@@ -298,7 +322,41 @@ async def run_item(cfg: Config, store: Store, item: dict, *, echo=None, llm_tran
                        + f"{run['state']}: {(run['state_reason'] or '')[:300]}")
     if issue_url:
         _hook("on_run_end", cfg, store, item, run_id, echo=echo)
+    follow_up_after_decline(store, cfg, item, run_id, echo=echo)
     return store.queue_item(item["id"])
+
+
+DECLINE_FOLLOW_UP_KEY = "decline_followup:"
+
+
+def follow_up_after_decline(store: Store, cfg: Config, item: dict, run_id: str, echo=None) -> int | None:
+    """The owner declined publishing this run and asked for a fix: queue a follow-up that continues
+    this run's code with their reason added. The decision was the owner's, so the task's allowance is
+    renewed like an approved retry."""
+    reason = store.kv_get(DECLINE_FOLLOW_UP_KEY + run_id)
+    if reason is None:
+        return None
+    store.kv_set(DECLINE_FOLLOW_UP_KEY + run_id, None)
+    run = store.get_run(run_id)
+    try:
+        from .execution import approve_retry, snapshot
+        snap = snapshot(store, run_id) or {}
+        runtime = float(run.get("max_runtime_s") or cfg.limits.max_runtime_s)
+        if snap:
+            approve_retry(store, cfg, run_id, budget=float(snap.get("spent_usd") or 0) + float(item.get("budget") or run.get("budget_usd") or cfg.limits.budget_usd),
+                          runtime_s=max(1.0, time.time() - float(snap["created_at"])) + runtime)
+        body = (item["body"].rstrip() + "\n\n## The owner declined the previous attempt\n"
+                + (reason.strip() or "No reason given.") + "\nContinue from that attempt's code and fix this.")
+        qid, _ = requeue(store, {**item, "body": body}, seed_run_id=run_id if continuation_available(run) else None,
+                         approval="dashboard", chain=0,
+                         **{k: item[k] for k in ("budget", "mode", "max_cycles", "max_runtime_s", "team") if item.get(k) is not None})
+        store.event(run_id, "queue", f"queued follow-up task #{qid} with the owner's reason for declining")
+        if echo:
+            echo(f"queued follow-up task #{qid}: continues {run_id} with your reason for declining")
+        return qid
+    except Exception as e:  # noqa: BLE001 - never let this change the finished run
+        store.event(run_id, "queue", f"could not queue the follow-up after decline: {type(e).__name__}: {e}", level="warn")
+        return None
 
 
 def _hook(name: str, *args, echo=None) -> None:

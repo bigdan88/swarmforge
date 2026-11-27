@@ -75,7 +75,8 @@ class Projects:
             raise ProjectError("Invalid project update")
         self.store._exec("UPDATE projects SET " + ",".join(f"{k}=?" for k in kw) + " WHERE id=?", (*kw.values(), pid))
 
-    def spent(self, pid, milestone=None):
+    def run_ids(self, pid, milestone=None):
+        """All retained attempts, including continuations whose queue pointer moved."""
         items = self.items(pid)
         run_ids = {q["run_id"] for q in items if q.get("run_id") and (milestone is None or q["milestone"] == milestone)}
         # Include every self-healing attempt, not just the last run attached to the queue row.
@@ -91,6 +92,10 @@ class Projects:
             run = self.store.get_run(rid)
             if run and run.get("execution_id"):
                 run_ids.update(r["id"] for r in self.store._all("SELECT id FROM runs WHERE execution_id=?", (run["execution_id"],)))
+        return run_ids
+
+    def spent(self, pid, milestone=None):
+        run_ids = self.run_ids(pid, milestone)
         if milestone is None:
             lead = self.store.cost_summary("project:" + pid)["total"]
         else:

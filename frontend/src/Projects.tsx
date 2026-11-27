@@ -85,6 +85,8 @@ function ProjectDetail({id,session,navigate}:{id:string;session:Session|null;nav
     <section className="panel" role="tabpanel" id={`ppanel-${active_tab}`} aria-labelledby={`ptab-${active_tab}`}>
       {active_tab==='proposal'&&<><div className="detail-heading"><h2>Proposed specification</h2><button type="button" onClick={()=>downloadText(str(view.data?.spec),'project-spec.md')}>Download specification</button></div><p className="muted">Check the scope, repository, milestones and total API allowance. Return to Plan in chat to request changes.</p><Markdown text={str(view.data.spec)}/>{view.data.truncated===true&&<p className="error">This proposal is shortened; launch is disabled.</p>}</>}
       {active_tab==='overview'&&<>
+        <ProjectWorkflow id={id} workflow={str(view.data.workflow)||'team'} session={session} onDone={()=>view.refresh()}/>
+        <ProjectMetrics metrics={record(view.data.metrics??{})}/>
         <ol className="stepper">{ms.map((m,i)=>{const st=str(savedMs.find(x=>num(x.idx)===i)?.status)||(status==='drafting'?'planned':'not started');return <li key={i} className={`${i===idx&&!['done','drafting'].includes(status)?'current':''} ${DONE.has(st)||st==='accepted'?'done':''}`}><button type="button" onClick={()=>setTab('milestones')}><span className="step-num">{i+1}</span><span className="step-name">{str(m.name)}</span><span className="badge">{label(st)}</span></button></li>;})}{!ms.length&&<li className="muted">No milestones yet.</li>}</ol>
         {ms.length>0&&<div className="current-milestone"><h3>{status==='done'?'Last milestone':status==='drafting'?'First milestone':'Current milestone'}: {str(current.name)}</h3><p>{str(current.goal)}</p>{Array.isArray(current.checks)&&current.checks.length>0&&<><p className="muted">Done when:</p><ul>{current.checks.map((c,j)=><li key={j}>{str(c)}</li>)}</ul></>}</div>}
         <h3>Recent activity</h3>{events.slice(0,5).map(e=><p key={num(e.id)} className="activity"><small className="muted">{stamp(e.ts)}</small> {label(e.kind)}{str(e.detail)&&<span className="muted"> — {str(e.detail).split('\n')[0].slice(0,140)}</span>}</p>)}{!events.length&&<p className="muted">Nothing has happened yet.</p>}{events.length>5&&<button type="button" className="link-button" onClick={()=>setTab('history')}>All activity →</button>}
@@ -97,6 +99,29 @@ function ProjectDetail({id,session,navigate}:{id:string;session:Session|null;nav
         <h3>Decisions and events</h3>{events.map(e=><details key={num(e.id)}><summary>{label(e.kind)} · {stamp(e.ts)}</summary><pre>{str(e.detail)}</pre></details>)}{!events.length&&<p className="muted">No events yet.</p>}<p className="muted">Latest 50 events.</p></>}
     </section>
   </>;
+}
+
+function ProjectMetrics({metrics:m}:{metrics:Row}){
+  const policy=record(m.execution??{}),phases=record(m.run_phase_s??{}),evidence=record(m.acceptance_observations??{});
+  return <section aria-label="Project measurements"><h3>Project measurements</h3>
+    <p className="muted">Up to {num(policy.developers)} developer{num(policy.developers)===1?'':'s'} · {policy.validation==='self'?'Developer self tests':'Independent tester and reviewer'}. Runs are attempts; delivered tasks have merged.</p>
+    <div className="project-stats">
+      <div><span>Delivered tasks</span><strong>{num(m.merged_tasks)}</strong></div>
+      <div><span>Started tasks delivered</span><strong>{m.delivery_rate==null?'—':`${Math.round(num(m.delivery_rate)*100)}%`}</strong></div>
+      <div><span>Delivered without repair or retry</span><strong>{m.first_pass_delivery_rate==null?'—':`${Math.round(num(m.first_pass_delivery_rate)*100)}%`}</strong></div>
+      <div><span>Cost per delivered task</span><strong>{m.cost_per_merged_task_usd==null?'—':money(m.cost_per_merged_task_usd)}</strong></div>
+      <div><span>Repair cycles / attempts</span><strong>{num(m.repair_cycles)} / {num(m.runs)}</strong></div>
+    </div>
+    <p className="muted">Independent validation models: {money(m.independent_validation_cost_usd)} · Lead: {money(m.lead_cost_usd)} · {num(m.model_calls)} model calls · {num(m.tokens).toLocaleString()} tokens.</p>
+    {num(m.unpriced_calls)>0&&<p className="notice">{num(m.unpriced_calls)} model calls have no recorded price; cost totals are incomplete.</p>}
+    <details><summary>Time, evidence and workflow comparison</summary>
+      <p>Elapsed since launch: {(num(m.elapsed_s)/3600).toFixed(1)} hours. Recorded owner actions: {num(m.owner_actions)} · Automatic recoveries: {num(m.automatic_recoveries)} · Publication approval decisions: {num(m.approval_decisions)}; approval waiting: {(num(m.approval_wait_s)/60).toFixed(1)} minutes.</p>
+      <p className="muted">Run phase minutes: {Object.entries(phases).map(([key,value])=>`${key} ${(num(value)/60).toFixed(1)}`).join(' · ')}. Summed run time can include overlapping work.</p>
+      <p>Acceptance observations from each attempt’s latest cycle: {num(evidence.satisfied)} satisfied · {num(evidence.failed)} failed · {num(evidence.unverified)} unverified. These are observations, not a project acceptance rate.</p>
+      {rows(m.workflows).map(w=><p key={str(w.workflow)}><strong>{str(w.workflow)}</strong>: {num(w.completed)} completed / {num(w.runs)} attempts · {money(w.cost_usd)} · {(num(w.run_s)/60).toFixed(1)} run minutes · {num(w.repair_cycles)} repairs</p>)}
+      <p className="muted">Cost includes retained attempts and lead calls. Delivery compares merged work with started build tasks, including unfinished work; retries of the same task count once. First-pass delivery measures merged tasks only. These do not measure escaped defects or human working time.</p>
+    </details>
+  </section>;
 }
 
 function LaunchProposal({id,project,session,message,onDone}:{id:string;project:Row;session:Session|null;message?:Row;onDone:(r:{message:string})=>void}){
@@ -149,4 +174,15 @@ export function ProjectQuestions({id,session,spec,question,onDone,busy=false}:{i
       <span className="muted kickoff-hint">Nothing launches until you approve the proposal.</span>
     </fieldset><Feedback error={action.error} message={action.message}/>
   </form>;
+}
+
+/** Team (the approved developers, tester and reviewer) or Ralph mode (one agent in fresh passes). */
+function ProjectWorkflow({id,workflow,session,onDone}:{id:string;workflow:string;session:Session|null;onDone:()=>void}){
+  const ralph=workflow==='ralph';
+  return <section className="workflow-choice" aria-label="How build tasks run">
+    <div><h3>How build tasks run: {ralph?'Ralph mode':'Team'}</h3>
+      <p className="muted">{ralph?'One developer agent works in short, fresh passes from a plan it keeps; SwarmForge runs the tests after every pass and throws away passes that break anything. Cheap and hard to stop, but no separate reviewer.'
+        :'The approved team: developers, an independent tester and a reviewer, with repair cycles.'} Changes apply from each task's next start.</p></div>
+    <ActionButton operation="set_project_workflow" target={id} args={{workflow:ralph?'team':'ralph'}} disabled={!session?.actions_enabled} onDone={onDone}>{ralph?'Switch back to the team':'Switch to Ralph mode'}</ActionButton>
+  </section>;
 }
